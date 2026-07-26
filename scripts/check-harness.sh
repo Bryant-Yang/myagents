@@ -12,6 +12,8 @@ required=(
   docs/workflow.md
   docs/harness-controls.md
   docs/git-commit-conventions.md
+  docs/adr/README.md
+  docs/adr/0001-persistent-room-command-bus-mcp.md
   scripts/check-redlines.sh
 )
 
@@ -43,6 +45,8 @@ docs = [
     root / "docs/workflow.md",
     root / "docs/harness-controls.md",
     root / "docs/git-commit-conventions.md",
+    root / "docs/adr/README.md",
+    root / "docs/adr/0001-persistent-room-command-bus-mcp.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -74,10 +78,16 @@ if [ ! -x .venv/bin/python ]; then
 fi
 
 .venv/bin/python -m py_compile \
-  main.py orchestrator.py host.py \
-  acp/*.py adapters/*.py tests/*.py
+  main.py myagents_mcp.py orchestrator.py host.py \
+  acp/*.py adapters/*.py control/*.py storage/*.py tests/*.py \
+  scripts/e2e-m3-real.py
 .venv/bin/python tests/test_basic.py
 .venv/bin/python tests/test_acp.py
 .venv/bin/python tests/test_phase2.py
+.venv/bin/python tests/test_storage.py
+.venv/bin/python tests/test_m25.py
+.venv/bin/python tests/test_m3_bus.py
+.venv/bin/python tests/test_m3_control.py
+.venv/bin/python tests/test_m3_mcp.py
 
 echo "✓ myagents Harness 全部通过"

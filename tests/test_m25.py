@@ -1,0 +1,772 @@
+"""M2.5 里程碑测试：Orchestrator 持久化 timeline + seq cursor。
+
+覆盖：
+- persistent 重启恢复 timeline（seq/created_at 续接）
+- stateful agent cursor 落盘并在重启后恢复，只发新 seq
+- 持久化 cursor 超出 timeline → 构造即 fail loudly
+- 用户消息落盘失败：history 不变、adapter 不被调用
+- checkpoint 写失败：adapter 已调用但内存/磁盘 cursor 不推进，下轮补发
+- JSONL agent 重启后 prompt 含恢复的 history 快照
+- ACP restore：load 成功保留 cursor；load 失败/无 capability 回退 new 时
+  cursor 归 0 走 bootstrap；checkpoint 写失败零 prompt 且状态不假提交；
+  prompt 失败 cursor 不推进
+
+全部使用 tempfile，不触碰真实状态目录。
+
+运行：.venv/bin/python tests/test_m25.py
+"""
+
+import asyncio
+import contextlib
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from acp.adapter import AcpAdapter
+from adapters.base import AgentEvent
+from orchestrator import Orchestrator, OrchestratorClosedError
+from storage.store import (CorruptedStorageError, RoomBusyError, RoomStore,
+                           WorkdirMismatchError)
+
+SERVER = str(Path(__file__).parent / "fake_acp_server.py")
+_FAKE_ENV_KEYS = ("FAKE_ACP_STATE", "FAKE_ACP_FAIL_LOAD",
+                  "FAKE_ACP_NO_LOAD_CAP", "FAKE_ACP_FAIL_PROMPT")
+
+
+class FakeJsonl:
+    """无状态假 agent：记录最后一次 prompt。"""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.last_prompt: str | None = None
+
+    async def stream(self, prompt: str, workdir: str):
+        self.last_prompt = prompt
+        yield AgentEvent("text", f"{self.name} 回复")
+        yield AgentEvent("done")
+
+
+class StatefulFake:
+    """有状态假 agent：代表 session 已另行恢复（本文件不测试 ACP）。"""
+
+    stateful_session = True
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.prompts: list[str] = []
+
+    async def stream(self, prompt: str, workdir: str):
+        self.prompts.append(prompt)
+        yield AgentEvent("text", f"{self.name} 回复{len(self.prompts)}")
+        yield AgentEvent("done")
+
+
+class _Room:
+    """临时房间：workdir 与 state_root 都在 tempfile 里，互不相含。"""
+
+    def __init__(self) -> None:
+        # Keep control.sock under macOS' short AF_UNIX pathname limit.
+        self._tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        root = Path(self._tmp.name)
+        self.workdir = str(root / "work")
+        self.state_root = root / "state"
+        Path(self.workdir).mkdir()
+
+    def open_store(self) -> RoomStore:
+        return RoomStore(self.workdir, state_root=self.state_root)
+
+    def make_orch(self, **adapters) -> Orchestrator:
+        """真实 Orchestrator（挂本房间的 store）+ 假 adapter。"""
+        orch = Orchestrator(self.workdir, store=self.open_store())
+        for name, adapter in adapters.items():
+            orch.adapters[name] = adapter
+        return orch
+
+    def cleanup(self) -> None:
+        self._tmp.cleanup()
+
+
+def _raises(exc_type, fn) -> None:
+    try:
+        fn()
+    except exc_type:
+        return
+    raise AssertionError(f"未抛出 {exc_type.__name__}")
+
+
+# ---- 1. persistent 重启恢复 timeline ----
+
+def test_restart_restores_timeline() -> None:
+    room = _Room()
+    orch1 = room.make_orch()
+    m1 = orch1._append_message("user", "hello")
+    assert m1.seq == 1 and m1.created_at  # seq + UTC 时间戳来自 store
+
+    # 模拟重启：先 close 旧 owner（释放 lease），再开新 Orchestrator
+    asyncio.run(orch1.aclose())
+    orch2 = room.make_orch()
+    assert [(m.seq, m.speaker, m.text) for m in orch2.history] == [
+        (1, "user", "hello")]
+    assert orch2.history[0].created_at == m1.created_at
+    # seq 续接，不从 1 重新开始
+    assert orch2._append_message("user", "world").seq == 2
+    asyncio.run(orch2.aclose())
+    room.cleanup()
+    print("ok  persistent 重启恢复 timeline（seq 续接）")
+
+
+# ---- 2. stateful cursor 落盘 + 重启恢复 ----
+
+def test_stateful_cursor_survives_restart() -> None:
+    room = _Room()
+    kimi = StatefulFake("kimi")
+    orch1 = room.make_orch(kimi=kimi)
+    noop = lambda n, e: None
+
+    asyncio.run(orch1.dispatch("@kimi 任务一", noop))
+    # 成功交付后 cursor 落盘：推进到 prompt 构造时的快照末尾 seq=1
+    #（user 消息；agent 自己的回复 seq2 靠 speaker 过滤跳过）
+    assert orch1._cursors["kimi"] == 1
+    store1 = room.open_store()
+    assert store1.get_agent_state("kimi")["cursor"] == 1
+
+    # 重启：先 close 旧 owner；cursor 从 state.json 恢复，只发 seq>1 的新消息
+    asyncio.run(orch1.aclose())
+    kimi2 = StatefulFake("kimi")
+    orch2 = room.make_orch(kimi=kimi2)
+    assert orch2._cursors["kimi"] == 1
+    asyncio.run(orch2.dispatch("@kimi 任务二", noop))
+    p = kimi2.prompts[0]
+    assert "任务二" in p
+    assert "任务一" not in p and "kimi 回复1" not in p  # 不重发已交付历史
+    assert room.open_store().get_agent_state("kimi")["cursor"] == 3
+    asyncio.run(orch2.aclose())
+    room.cleanup()
+    print("ok  stateful cursor 落盘 + 重启恢复（只发新 seq）")
+
+
+# ---- 3. cursor 超出 timeline → 构造即 fail loudly ----
+
+def test_cursor_ahead_of_timeline_fails() -> None:
+    room = _Room()
+    store = room.open_store()
+    store.set_agent_state("kimi", cursor=5)  # 空 timeline 上的悬空 cursor
+    _raises(CorruptedStorageError,
+            lambda: Orchestrator(room.workdir, store=store))
+    room.cleanup()
+    print("ok  cursor 超出 timeline → 构造 fail loudly")
+
+
+# ---- 4. 用户消息落盘失败：history 不变、adapter 不被调用 ----
+
+def test_user_append_failure_atomic() -> None:
+    room = _Room()
+    kimi = StatefulFake("kimi")
+    orch = room.make_orch(kimi=kimi)
+
+    def boom(*args, **kwargs):
+        raise OSError("模拟磁盘写失败")
+    orch.store.append = boom  # type: ignore[union-attr]
+
+    _raises(OSError,
+            lambda: asyncio.run(orch.dispatch("@kimi 任务一", lambda n, e: None)))
+    assert orch.history == []          # 没落盘成功就不进 history
+    assert kimi.prompts == []          # adapter 根本没被调用
+    asyncio.run(orch.aclose())
+    room.cleanup()
+    print("ok  用户消息落盘失败（history 不变 + adapter 未调用）")
+
+
+# ---- 5. checkpoint 写失败：cursor 不推进，下轮补发 ----
+
+def test_checkpoint_failure_resends() -> None:
+    room = _Room()
+    kimi = StatefulFake("kimi")
+    orch = room.make_orch(kimi=kimi)
+    noop = lambda n, e: None
+
+    store = orch.store
+    assert store is not None
+    orig_set = store.set_agent_state
+
+    def boom(*args, **kwargs):
+        raise OSError("模拟 checkpoint 写失败")
+    store.set_agent_state = boom  # type: ignore[method-assign]
+
+    # adapter 正常执行完（回复已进 history/timeline），但 checkpoint 失败
+    # → 异常向 dispatch 传播，内存/磁盘 cursor 都不推进
+    _raises(OSError, lambda: asyncio.run(orch.dispatch("@kimi 任务一", noop)))
+    assert len(kimi.prompts) == 1                       # adapter 确实被调用了
+    assert [m.speaker for m in orch.history] == ["user", "kimi"]
+    assert orch._cursors["kimi"] == 0                   # 内存 cursor 不动
+    assert store.get_agent_state("kimi")["cursor"] == 0  # 磁盘 cursor 不动
+
+    # 恢复写盘后下一轮：按旧 cursor 补发失败轮的增量
+    store.set_agent_state = orig_set  # type: ignore[method-assign]
+    asyncio.run(orch.dispatch("@kimi 任务二", noop))
+    p = kimi.prompts[-1]
+    assert "任务一" in p and "任务二" in p
+    assert orch._cursors["kimi"] > 0
+    assert store.get_agent_state("kimi")["cursor"] == orch._cursors["kimi"]
+    asyncio.run(orch.aclose())
+    room.cleanup()
+    print("ok  checkpoint 写失败（cursor 不推进 + 下轮补发）")
+
+
+# ---- 6. JSONL 重启后 prompt 含恢复的 history 快照 ----
+
+def test_jsonl_restart_sees_history() -> None:
+    room = _Room()
+    orch1 = room.make_orch(codex=FakeJsonl("codex"))
+    asyncio.run(orch1.dispatch("@codex 你好", lambda n, e: None))
+
+    asyncio.run(orch1.aclose())  # 重启前先 close 旧 owner
+    codex2 = FakeJsonl("codex")
+    orch2 = room.make_orch(codex=codex2)
+    asyncio.run(orch2.dispatch("@codex 继续", lambda n, e: None))
+    prompt = codex2.last_prompt
+    assert "你好" in prompt and "codex 回复" in prompt  # 恢复的历史进了快照
+    assert "继续" in prompt
+    asyncio.run(orch2.aclose())
+    room.cleanup()
+    print("ok  JSONL 重启后 prompt 含恢复的 history 快照")
+
+
+# ---- ACP restore：真实 AcpAdapter + fake ACP server + tempfile RoomStore ----
+
+def _set_fake_env(room: "_Room", **flags: str) -> None:
+    os.environ["FAKE_ACP_STATE"] = str(Path(room._tmp.name) / "fake_acp_state")
+    for key, value in flags.items():
+        os.environ[key] = value
+
+
+def _clear_fake_env() -> None:
+    for key in _FAKE_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+def _fake_state_raw(room: "_Room") -> str:
+    path = Path(room._tmp.name) / "fake_acp_state"
+    return path.read_text() if path.exists() else ""
+
+
+def _make_acp_orch(room: "_Room") -> tuple[Orchestrator, AcpAdapter]:
+    adapter = AcpAdapter("kimi", [sys.executable, SERVER])
+    return room.make_orch(kimi=adapter), adapter
+
+
+def test_acp_load_success_keeps_cursor() -> None:
+    """重启后 load 成功（restored）：保留 cursor，prompt 只含新 seq。"""
+    room = _Room()
+    _set_fake_env(room)
+    noop = lambda n, e: None
+
+    async def run() -> None:
+        orch1, adapter1 = _make_acp_orch(room)
+        await orch1.dispatch("@kimi fast round", noop)
+        state = room.open_store().get_agent_state("kimi")
+        assert state["session_id"] == "fake-session-1"
+        cursor_r1 = state["cursor"]
+        assert cursor_r1 > 0
+        await orch1.aclose()  # 重启前 close 旧 owner（回收 adapter + 释放 lease）
+
+        # 重启：新 store + 新 adapter；load 命中 stored session → 保留 cursor
+        orch2, adapter2 = _make_acp_orch(room)
+        assert orch2._cursors["kimi"] == cursor_r1
+        await orch2.dispatch("@kimi 第二轮", noop)
+        raw = _fake_state_raw(room)
+        assert "load:fake-session-1" in raw
+        tail = raw[raw.rindex("load:fake-session-1"):]
+        assert "第二轮" in tail and "fast round" not in tail  # 纯增量
+        await orch2.aclose()
+        assert adapter2._started is False  # 进程已回收，无残留
+
+    try:
+        asyncio.run(run())
+    finally:
+        _clear_fake_env()
+        room.cleanup()
+    print("ok  ACP load 成功保留 cursor（prompt 不含旧内容）")
+
+
+def test_acp_load_failure_resets_cursor() -> None:
+    """load 被 agent 拒绝 → 回退 new：cursor 归 0，新 session id 落盘，
+    bootstrap 只发最近 history_limit 条。"""
+    room = _Room()
+    store = room.open_store()
+    for i in range(30):
+        store.append("user", f"老消息{i}")          # seq 1..30
+    store.set_agent_state("kimi", cursor=25, session_id="fake-session-1")
+    _set_fake_env(room, FAKE_ACP_FAIL_LOAD="1")
+
+    async def run() -> None:
+        orch, adapter = _make_acp_orch(room)
+        assert orch._cursors["kimi"] == 25  # 构造时从 store 恢复
+        await orch.dispatch("@kimi 现在呢", lambda n, e: None)
+        raw = _fake_state_raw(room)
+        assert "load:fake-session-1" in raw            # 尝试过 load
+        assert raw.index("load:") < raw.index("new:")  # 失败后回退 new
+        tail = raw[raw.index("new:"):]
+        # cursor 归 0 → bootstrap 最近 12 条（seq20..31）
+        assert "老消息19" in tail       # 保留旧 cursor=25 时不会出现
+        assert "老消息18" not in tail   # bootstrap 窗口有界
+        assert "现在呢" in tail
+        state = room.open_store().get_agent_state("kimi")
+        assert state["session_id"] == "fake-session-1"  # 新 session id 落盘
+        assert state["cursor"] == 31    # 成功后推进到快照末尾
+        await orch.aclose()
+
+    try:
+        asyncio.run(run())
+    finally:
+        _clear_fake_env()
+        room.cleanup()
+    print("ok  ACP load 失败回退 new（cursor 归 0 + bootstrap 限界）")
+
+
+def test_acp_no_load_capability_resets_cursor() -> None:
+    """agent 不声明 loadSession：直接 new（不算失败），cursor 归 0。"""
+    room = _Room()
+    store = room.open_store()
+    for i in range(30):
+        store.append("user", f"老消息{i}")
+    store.set_agent_state("kimi", cursor=25, session_id="fake-session-1")
+    _set_fake_env(room, FAKE_ACP_NO_LOAD_CAP="1")
+
+    async def run() -> None:
+        orch, adapter = _make_acp_orch(room)
+        await orch.dispatch("@kimi 现在呢", lambda n, e: None)
+        raw = _fake_state_raw(room)
+        assert "load:" not in raw      # capability 不支持，根本没尝试
+        assert "new:" in raw
+        tail = raw[raw.index("new:"):]
+        assert "老消息19" in tail and "老消息18" not in tail
+        state = room.open_store().get_agent_state("kimi")
+        assert state["session_id"] == "fake-session-1"
+        assert state["cursor"] == 31
+        await orch.aclose()
+
+    try:
+        asyncio.run(run())
+    finally:
+        _clear_fake_env()
+        room.cleanup()
+    print("ok  ACP 无 load capability 直接 new（cursor 归 0）")
+
+
+def test_acp_reconnect_load_keeps_cursor() -> None:
+    """adapter aclose 后下一轮：fresh start + load 成功，保留 cursor。"""
+    room = _Room()
+    _set_fake_env(room)
+    noop = lambda n, e: None
+
+    async def run() -> None:
+        orch, adapter = _make_acp_orch(room)
+        await orch.dispatch("@kimi fast round", noop)
+        cursor_r1 = orch._cursors["kimi"]
+        assert cursor_r1 > 0
+        await adapter.aclose()
+        assert adapter._started is False
+
+        await orch.dispatch("@kimi 第二轮", noop)
+        raw = _fake_state_raw(room)
+        assert "load:fake-session-1" in raw
+        tail = raw[raw.rindex("load:fake-session-1"):]
+        assert "第二轮" in tail and "fast round" not in tail
+        assert orch._cursors["kimi"] > cursor_r1  # 正常推进
+        await orch.aclose()
+
+    try:
+        asyncio.run(run())
+    finally:
+        _clear_fake_env()
+        room.cleanup()
+    print("ok  ACP aclose 后重连 load 成功（保留 cursor）")
+
+
+def test_acp_checkpoint_failure_no_commit() -> None:
+    """checkpoint 写失败：零 prompt、adapter reset、内存/磁盘不假提交、
+    dispatch 抛异常（不伪装成 agent 调用失败）。"""
+    room = _Room()
+    store = room.open_store()
+    store.append("user", "旧消息")  # seq 1
+    store.set_agent_state("kimi", cursor=1, session_id="fake-session-1")
+    _set_fake_env(room)
+
+    async def run() -> None:
+        orch, adapter = _make_acp_orch(room)
+        assert orch._cursors["kimi"] == 1
+        inner_store = orch.store
+        assert inner_store is not None
+        orig_set = inner_store.set_agent_state
+
+        def boom(*args, **kwargs):
+            raise OSError("模拟 checkpoint 写失败")
+        inner_store.set_agent_state = boom  # type: ignore[method-assign]
+
+        events = []
+        try:
+            await orch.dispatch("@kimi fast round",
+                                lambda n, e: events.append(e))
+            raise AssertionError("checkpoint 失败必须向 dispatch 传播")
+        except Exception as exc:
+            assert "checkpoint" in str(exc)
+        # error event 如实发出，但不是"调用失败"式的 agent 错误收尾
+        assert any(e.kind == "error" and "checkpoint" in e.text
+                   for e in events)
+        raw = _fake_state_raw(room)
+        assert "load:fake-session-1" in raw  # prepare 已做
+        assert "prompt:" not in raw          # 但零 prompt
+        # adapter 按 stream_prepared 契约 reset fresh session
+        assert adapter._started is False and adapter.session_id is None
+        # 内存/磁盘状态不假提交
+        assert orch._cursors["kimi"] == 1
+        inner_store.set_agent_state = orig_set  # type: ignore[method-assign]
+        state = room.open_store().get_agent_state("kimi")
+        assert state == {"cursor": 1, "session_id": "fake-session-1"}
+        # 没有伪装收尾：最后一条只是用户消息，无"调用失败"记录
+        assert orch.history[-1].speaker == "user"
+        await orch.aclose()
+
+    try:
+        asyncio.run(run())
+    finally:
+        _clear_fake_env()
+        room.cleanup()
+    print("ok  ACP checkpoint 写失败（零 prompt + 状态不假提交 + 抛异常）")
+
+
+def test_acp_prompt_failure_keeps_cursor() -> None:
+    """prompt 本身失败：cursor 不推进（内存/磁盘），session id 已落盘。"""
+    room = _Room()
+    _set_fake_env(room, FAKE_ACP_FAIL_PROMPT="1")
+
+    async def run() -> None:
+        orch, adapter = _make_acp_orch(room)
+        events = []
+        # 普通 agent 失败被包容：dispatch 不抛，但 history 诚实记录
+        await orch.dispatch("@kimi fast round",
+                            lambda n, e: events.append(e))
+        assert any(e.kind == "error" for e in events)
+        assert "调用失败" in orch.history[-1].text
+        assert orch._cursors["kimi"] == 0  # 不推进
+        state = room.open_store().get_agent_state("kimi")
+        assert state["cursor"] == 0
+        assert state["session_id"] == "fake-session-1"  # checkpoint 已提交
+        await orch.aclose()
+
+    try:
+        asyncio.run(run())
+    finally:
+        _clear_fake_env()
+        room.cleanup()
+    print("ok  ACP prompt 失败（cursor 不推进 + session id 已落盘）")
+
+
+# ---- TUI 恢复显示 ----
+
+def test_tui_restore_display() -> None:
+    """mount 时按 seq 渲染持久化 history（只渲染），就绪行存在，
+    mount/unmount 后 timeline 不重复 append。"""
+    from textual.widgets import RichLog
+    from main import ChatApp
+
+    room = _Room()
+    store = room.open_store()
+    store.append("user", "恢复我")
+    store.append("kimi", "已恢复的回复")
+
+    async def run() -> None:
+        orch = Orchestrator(room.workdir, store=room.open_store())
+        assert [(m.seq, m.speaker) for m in orch.history] == [
+            (1, "user"), (2, "kimi")]
+        # workdir 不一致的注入必须 fail loudly，不能静默换房
+        with tempfile.TemporaryDirectory() as other:
+            _raises(WorkdirMismatchError,
+                    lambda: ChatApp(workdir=other, orchestrator=orch))
+
+        app = ChatApp(workdir=room.workdir, orchestrator=orch)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            text = "\n".join(str(line.text)
+                             for line in app.query_one(RichLog).lines)
+            assert "[user] 恢复我" in text
+            assert "[kimi] 已恢复的回复" in text
+            # 顺序按 seq：user 在前，kimi 在后；恢复提示与就绪行都在
+            assert text.index("[user] 恢复我") < text.index("[kimi] 已恢复的回复")
+            assert "已恢复 2 条历史消息" in text
+            assert "聊天室已就绪" in text
+
+    try:
+        asyncio.run(run())
+        # mount/unmount 之后 timeline 仍恰好两条：恢复显示不产生 append
+        final = room.open_store().read(0, limit=10)
+        assert len(final["items"]) == 2
+    finally:
+        room.cleanup()
+    print("ok  TUI 恢复显示（按 seq 渲染 + 不重复 append）")
+
+
+# ---- 持久确认时序与 close 竞态 ----
+
+def test_tui_user_append_failure_shows_error() -> None:
+    """用户消息落盘失败：RichLog 不出现该用户文本，出现红色持久化错误。"""
+    from textual.widgets import Input, RichLog
+    from main import ChatApp
+
+    room = _Room()
+
+    async def run() -> None:
+        orch = Orchestrator(room.workdir, store=room.open_store())
+        store = orch.store
+        assert store is not None
+
+        def boom(*args, **kwargs):
+            raise OSError("模拟用户消息落盘失败")
+        store.append = boom  # type: ignore[method-assign]
+
+        app = ChatApp(workdir=room.workdir, orchestrator=orch)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            box = app.query_one(Input)
+            box.value = "这条不该出现"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            text = "\n".join(str(line.text)
+                             for line in app.query_one(RichLog).lines)
+            assert "这条不该出现" not in text   # 未持久确认就不显示
+            assert "派发失败" in text            # 持久化错误如实显示
+            assert "落盘失败" in text
+
+    try:
+        asyncio.run(run())
+        assert room.open_store().read()["items"] == []  # timeline 无残留
+    finally:
+        room.cleanup()
+    print("ok  TUI 用户 append 失败（不显示文本 + 显示持久化错误）")
+
+
+def test_agent_reply_append_failure_no_done() -> None:
+    """agent 最终 append 失败：事件里有 text chunk 但无 done，dispatch 抛。"""
+    room = _Room()
+
+    async def run() -> None:
+        kimi = StatefulFake("kimi")
+        orch = room.make_orch(kimi=kimi)
+        store = orch.store
+        assert store is not None
+        orig_append = store.append
+
+        def selective(speaker, text, command_id=None):
+            if speaker != "user":  # 用户消息照常，agent 回复落盘失败
+                raise OSError("模拟回复落盘失败")
+            return orig_append(speaker, text, command_id=command_id)
+        store.append = selective  # type: ignore[method-assign]
+
+        events = []
+        try:
+            await orch.dispatch("@kimi 你好",
+                                lambda n, e: events.append((n, e)))
+            raise AssertionError("回复 append 失败必须向 dispatch 传播")
+        except OSError:
+            pass
+        kinds = [(n, e.kind) for n, e in events]
+        assert ("user", "committed") in kinds      # 用户消息已确认
+        assert ("kimi", "text") in kinds           # text chunk 已流出
+        assert ("kimi", "done") not in kinds       # 但绝不能发 done
+        assert kimi.prompts  # adapter 确实执行过
+        await orch.aclose()
+
+    try:
+        asyncio.run(run())
+    finally:
+        room.cleanup()
+    print("ok  agent 回复 append 失败（有 text 无 done + dispatch 抛）")
+
+
+def test_queued_dispatch_aborted_on_close() -> None:
+    """排队等 delivery lock 的同 agent dispatch：aclose 后拿到锁即放弃——
+    不第二次调用 adapter（无 ACP 重启），抛 OrchestratorClosedError。"""
+    room = _Room()
+    _set_fake_env(room)
+
+    async def run() -> None:
+        orch, adapter = _make_acp_orch(room)
+        noop = lambda n, e: None
+        t1 = asyncio.create_task(orch.dispatch("@kimi slow", noop))
+        # 等第一轮 prompt 真正到达 server（挂起在 slow）
+        for _ in range(100):
+            if "prompt:" in _fake_state_raw(room):
+                break
+            await asyncio.sleep(0.05)
+        assert "prompt:" in _fake_state_raw(room)
+
+        t2 = asyncio.create_task(orch.dispatch("@kimi fast round", noop))
+        await asyncio.sleep(0.2)  # t2 已提交用户消息，排队等 delivery lock
+
+        close_task = asyncio.create_task(orch.aclose())
+        await asyncio.sleep(0.1)
+        t1.cancel()  # 活跃轮按取消契约收尾，释放 adapter/delivery 锁
+        with contextlib.suppress(asyncio.CancelledError):
+            await t1
+        await close_task
+
+        try:
+            await t2
+            raise AssertionError("排队中的 dispatch 应抛 OrchestratorClosedError")
+        except OrchestratorClosedError:
+            pass
+        raw = _fake_state_raw(room)
+        assert raw.count("prompt:") == 1  # 第二轮没有 prompt
+        assert raw.count("new:") == 1     # 没有 ACP 重启（无第二次 session/new）
+        assert "load:" not in raw
+        assert adapter._started is False
+
+    try:
+        asyncio.run(run())
+    finally:
+        _clear_fake_env()
+        room.cleanup()
+    print("ok  排队 dispatch 在 aclose 后放弃（无二次调用 + 抛 Closed）")
+
+
+def test_dispatch_after_close_rejected() -> None:
+    """aclose 后新 dispatch 直接拒绝：不写 timeline；aclose 幂等。"""
+    room = _Room()
+
+    async def run() -> None:
+        orch = room.make_orch(kimi=StatefulFake("kimi"))
+        await orch.aclose()
+        await orch.aclose()  # 幂等
+        try:
+            await orch.dispatch("@kimi 你好", lambda n, e: None)
+            raise AssertionError("closed 后 dispatch 应抛 OrchestratorClosedError")
+        except OrchestratorClosedError:
+            pass
+        assert orch.history == []
+
+    try:
+        asyncio.run(run())
+        assert room.open_store().read()["items"] == []  # timeline 零写入
+    finally:
+        room.cleanup()
+    print("ok  aclose 后 dispatch 拒绝（不写 timeline + aclose 幂等）")
+
+
+# ---- 房间单写者 lease ----
+
+def test_lease_same_process_conflict() -> None:
+    """同进程第二 owner 构造即抛 RoomBusyError；失败的构造不修改状态；
+    第一 owner aclose 后第二可获取。"""
+    room = _Room()
+    orch1 = room.make_orch()
+    try:
+        # 同进程第二个 persistent Orchestrator：构造即拒绝
+        _raises(RoomBusyError, lambda: room.make_orch())
+        # 失败的构造没有修改任何状态：timeline 仍为空
+        assert room.open_store().read()["items"] == []
+        # 第一 owner 未关闭时正常工作
+        orch1._append_message("user", "第一 owner 的消息")
+        asyncio.run(orch1.aclose())
+        # 第一 aclose 后第二可获取，历史完整
+        orch2 = room.make_orch()
+        assert [m.text for m in orch2.history] == ["第一 owner 的消息"]
+        asyncio.run(orch2.aclose())
+    finally:
+        room.cleanup()
+    print("ok  lease 同进程冲突（BusyError + aclose 后可获取）")
+
+
+def test_lease_cross_process() -> None:
+    """子进程真正持锁时父进程获取失败；子进程正常/异常退出后父进程可获取。"""
+    room = _Room()
+    repo = Path(__file__).resolve().parent.parent
+    child_src = (
+        "import sys, time;"
+        f"sys.path.insert(0, {str(repo)!r});"
+        "from storage.store import RoomStore;"
+        f"s = RoomStore({room.workdir!r}, state_root={str(room.state_root)!r});"
+        "lease = s.acquire_owner();"  # 必须持有引用，否则 __del__ 立即 release
+        "print('acquired', flush=True);"
+        "time.sleep(float(sys.argv[1]))"
+    )
+
+    def spawn(hold_seconds: str) -> subprocess.Popen:
+        return subprocess.Popen(
+            [sys.executable, "-c", child_src, hold_seconds],
+            stdout=subprocess.PIPE, text=True)
+
+    try:
+        # 异常退出（SIGKILL）：持锁中父进程失败；kill 后 OS 释放，可获取
+        proc = spawn("30")
+        try:
+            assert proc.stdout.readline().strip() == "acquired"
+            _raises(RoomBusyError, lambda: room.make_orch())
+        finally:
+            proc.kill()
+            proc.wait()
+        orch = room.make_orch()  # 异常退出后父进程可获取
+        asyncio.run(orch.aclose())
+
+        # 正常退出：持锁中父进程失败；退出后可获取
+        proc2 = spawn("0.3")
+        assert proc2.stdout.readline().strip() == "acquired"
+        _raises(RoomBusyError, lambda: room.make_orch())
+        assert proc2.wait() == 0
+        orch2 = room.make_orch()
+        asyncio.run(orch2.aclose())
+    finally:
+        room.cleanup()
+    print("ok  lease 跨进程（持锁拒绝 + 正常/异常退出后可获取）")
+
+
+def test_stale_owner_lock_not_blocking() -> None:
+    """stale owner.lock 不阻塞获取；lock 文件 0600；release 不删除文件。"""
+    room = _Room()
+    store = room.open_store()
+    lock_path = store.room_dir / "owner.lock"
+    lock_path.write_text("999999")  # 无 flock 的 stale 文件（进程早已退出）
+    os.chmod(lock_path, 0o600)
+    try:
+        orch = room.make_orch()  # stale 文件不妨碍获取
+        orch._append_message("user", "ok")
+        mode = stat.S_IMODE(os.stat(lock_path).st_mode)
+        assert mode == 0o600, oct(mode)
+        # 当前 owner 的 PID 已写入（供冲突提示）
+        assert lock_path.read_text().strip() == str(os.getpid())
+        asyncio.run(orch.aclose())
+        # release 不删除 owner.lock：删除已锁 inode 会产生双锁竞态
+        assert lock_path.exists()
+    finally:
+        room.cleanup()
+    print("ok  stale owner.lock 不阻塞（0600 + release 不删文件）")
+
+
+if __name__ == "__main__":
+    test_restart_restores_timeline()
+    test_stateful_cursor_survives_restart()
+    test_cursor_ahead_of_timeline_fails()
+    test_user_append_failure_atomic()
+    test_checkpoint_failure_resends()
+    test_jsonl_restart_sees_history()
+    test_acp_load_success_keeps_cursor()
+    test_acp_load_failure_resets_cursor()
+    test_acp_no_load_capability_resets_cursor()
+    test_acp_reconnect_load_keeps_cursor()
+    test_acp_checkpoint_failure_no_commit()
+    test_acp_prompt_failure_keeps_cursor()
+    test_tui_restore_display()
+    test_tui_user_append_failure_shows_error()
+    test_agent_reply_append_failure_no_done()
+    test_queued_dispatch_aborted_on_close()
+    test_dispatch_after_close_rejected()
+    test_lease_same_process_conflict()
+    test_lease_cross_process()
+    test_stale_owner_lock_not_blocking()
+    print("\nM2.5 全部通过")

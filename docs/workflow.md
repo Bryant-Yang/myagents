@@ -14,6 +14,7 @@
 | 3 | 新增或迁移 agent | `../HARNESS.md` §1–§3；`acp-migration.md` | R2–R4 | 具体 adapter + `AGENT_SPECS` + tests + README | adapter 接口统一；transport 状态可见；JSONL fallback 无回归 |
 | 4 | 改 TUI 或权限交互 | [`SPEC.md`](SPEC.md) 权限用例；`../HARNESS.md` §4.2–4.3 | R1、R3 | `main.py` + Textual pilot tests | UI 不阻塞；退出无 Future/进程残留；来源 agent 可见 |
 | 5 | 只做 review / 文档 / Harness | 本文件；相关契约；必要时 [`harness-controls.md`](harness-controls.md) | 所有受影响红线 | 对应文档、Sensor 或 review 结论 | 引用无悬空；红线 gate 与相关测试通过 |
+| 6 | 改持久化、恢复、lease、command bus 或 MCP 入口 | [`adr/0001-persistent-room-command-bus-mcp.md`](adr/0001-persistent-room-command-bus-mcp.md)；[`SPEC.md`](SPEC.md) 房间/恢复/控制用例 | R1–R4、单写者 | `storage/`、`control/`、MCP bridge、TUI、对应测试 | storage/M2.5/M3（bus/control/mcp）测试通过；MCP 不创建第二 Orchestrator、不获取 lease、不绕过 TUI 权限 |
 
 不在表内且会改变协议、安全或外部接口的任务，先向用户确认范围。
 

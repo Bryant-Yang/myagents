@@ -1,10 +1,13 @@
 """Fake ACP server：测试用的假 agent，stdio 上讲 NDJSON JSON-RPC。
 
 行为约定（配合 tests/test_acp.py 的断言）：
-- initialize：固定响应；若环境变量 FAKE_ACP_FAIL_INIT=1，回 error
-- session/new / session/list / session/load：固定响应，记入状态文件
+- initialize：固定响应；若环境变量 FAKE_ACP_FAIL_INIT=1，回 error；
+  FAKE_ACP_NO_LOAD_CAP=1 时不声明 loadSession capability
+- session/new / session/list / session/load：固定响应，记入状态文件；
+  FAKE_ACP_FAIL_NEW=1 / FAKE_ACP_FAIL_LOAD=1 时各自回 error
 - session/prompt：
   - 有上一轮未完成（pending）→ 记 "VIOLATION:overlap"（配合串行化测试）
+  - FAKE_ACP_FAIL_PROMPT=1：直接回 error
   - 含 "perm"：发 session/request_permission 反向请求，同步等应答并记录
   - 含 "slow-never"：发一个 chunk 后挂起，收到 cancel 也只记录、永不完成
   - 含 "slow"：发一个 chunk 后挂起；收到 cancel 后延迟
@@ -13,6 +16,9 @@
   - 其他：发 thought + message chunk，再回 stopReason=end_turn
 - session/cancel（通知）：记入状态文件
 - 未知带 id 方法：-32601
+
+状态文件按行记录 new:/load:/prompt:/cancel: 等事件，行序即调用次序，
+测试据此断言 load/new/prompt 的先后关系。
 
 状态文件路径由环境变量 FAKE_ACP_STATE 指定，测试据此断言 server 行为。
 """
@@ -27,6 +33,10 @@ SESSION_ID = "fake-session-1"
 CANCEL_DELAY = float(os.environ.get("FAKE_ACP_CANCEL_DELAY", "0.3"))
 FAIL_INIT = os.environ.get("FAKE_ACP_FAIL_INIT") == "1"
 FAIL_NEW = os.environ.get("FAKE_ACP_FAIL_NEW") == "1"
+FAIL_LOAD = os.environ.get("FAKE_ACP_FAIL_LOAD") == "1"
+FAIL_PROMPT = os.environ.get("FAKE_ACP_FAIL_PROMPT") == "1"
+# initialize 不声明 loadSession capability（模拟不支持 session/load 的 agent）
+NO_LOAD_CAP = os.environ.get("FAKE_ACP_NO_LOAD_CAP") == "1"
 
 # 挂起的 prompt：{"rid": 请求 id, "mode": "slow" | "never"}；同时最多一轮
 PENDING: dict = {"rid": None, "mode": None}
@@ -67,10 +77,12 @@ def main() -> None:
                 send({"jsonrpc": "2.0", "id": rid,
                       "error": {"code": -32000, "message": "init boom"}})
             else:
+                caps = {"sessionCapabilities": {"list": {}}}
+                if not NO_LOAD_CAP:
+                    caps["loadSession"] = True
                 send({"jsonrpc": "2.0", "id": rid, "result": {
                     "protocolVersion": 1,
-                    "agentCapabilities": {"loadSession": True,
-                                          "sessionCapabilities": {"list": {}}},
+                    "agentCapabilities": caps,
                     "authMethods": [],
                     "agentInfo": {"name": "fake-acp", "version": "0.1"},
                 }})
@@ -87,13 +99,21 @@ def main() -> None:
                 "sessions": [{"sessionId": SESSION_ID, "cwd": "/tmp"}]}})
         elif method == "session/load":
             log("load:" + params.get("sessionId", ""))
-            send({"jsonrpc": "2.0", "id": rid, "result": {}})
+            if FAIL_LOAD:
+                send({"jsonrpc": "2.0", "id": rid,
+                      "error": {"code": -32000, "message": "load boom"}})
+            else:
+                send({"jsonrpc": "2.0", "id": rid, "result": {}})
         elif method == "session/prompt":
             if PENDING["rid"] is not None:
                 log("VIOLATION:overlap")
             text = params["prompt"][0]["text"]
             log("prompt:" + text)
             sid = params["sessionId"]
+            if FAIL_PROMPT:
+                send({"jsonrpc": "2.0", "id": rid,
+                      "error": {"code": -32000, "message": "prompt boom"}})
+                continue
             if "perm" in text:
                 send({"jsonrpc": "2.0", "id": 900,
                       "method": "session/request_permission",

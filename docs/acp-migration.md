@@ -1,10 +1,14 @@
 # ACP 迁移设计（最小方案）
 
-状态：**Phase 2 已完成**。ACP 不再是 Kimi 专用临时分支，而是
+状态：**Phase 3 已完成**。ACP 不再是 Kimi 专用临时分支，而是
 **TUI↔coding agent 的统一接入协议**：`acp/` 是与具体 agent 无关的通用
 runtime，kimi 是首个验收 agent（命令 `kimi acp`），codex / opencode
-继续走 JSONL fallback。多-agent 路由仍由 orchestrator 管——ACP 只负责
-传输，不参与"派给谁"的决策。
+继续走 JSONL fallback。Phase 2.5 落地了共享 history 持久化、ACP
+session 映射与重启恢复、房间单写者 lease；Phase 3 落地了内部
+command bus（`control/`）、私有 Unix 控制 socket 与 stdio MCP 外部入口
+（`myagents_mcp.py`）——本机其他 agent 可以向运行中的同一房间注入
+消息，单写者与 TUI 权限决策不变。多-agent 路由仍由
+orchestrator 管——ACP 只负责传输，不参与"派给谁"的决策。
 
 ## 为什么迁移
 
@@ -91,6 +95,43 @@ ACP session 是持久上下文，编排器**不再**每轮转发完整 transcrip
 - JSONL fallback 不受影响：仍用 dispatch 瞬间的完整 transcript 快照
   （最近 12 条，防并发串话）。
 
+## 持久化与 session restore（Phase 2.5）
+
+RoomStore（`storage/store.py`）把房间状态落盘到
+`${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id>`：
+
+- **timeline.jsonl**：append-only，记录单调 `seq`、speaker、text、UTC
+  `created_at`、可选 `command_id`；文本/记录有明确大小上限；损坏记录、
+  seq 回退、半初始化房间全部 fail loudly，绝不静默覆盖。
+- **state.json**：schema version + 规范化 workdir + 每个 stateful agent
+  的 cursor/session_id；同目录临时文件 + `os.replace` 原子写；agents
+  entry 打开时全量校验（缺 cursor/session_id、负 cursor、空 session id
+  都在构造阶段抛 `CorruptedStorageError`）。
+- **seq cursor**：cursor 从 list 下标改为持久 timeline seq。`_messages_for`
+  按 `m.seq > cursor` 选增量，cursor=0 才走 `history_limit` bootstrap；
+  成功交付后先 `set_agent_state` 落盘再更新内存。
+- **checkpoint-before-prompt**：ACP 轮次走
+  `stream_prepared(make_prompt, workdir, resume_session_id)`——prepare
+  （start/load/new）与 prompt 在同一 writer lock 生命周期内。make_prompt
+  在任何 event/prompt 前执行：`fresh and not restored`（新 session）选
+  cursor=0，load 成功或复用活跃 session 保留 cursor；一次
+  `set_agent_state(cursor, session_id)` 原子落盘后才构造 prompt。
+  checkpoint 失败抛内部 `_CheckpointError` 穿透 dispatch（零 prompt，
+  adapter 按契约 reset fresh session），绝不伪装成 agent 调用失败。
+- **session restore**：重启后 `resume_session_id` 取自已持久化状态。
+  load 成功（restored）保留 cursor 继续增量；load 失败或 agent 不声明
+  loadSession 回退 session/new，cursor 归零有界 bootstrap，实际新
+  session id 落盘。
+- **持久确认时序**：用户消息 append 成功后才发 `committed` 事件（TUI
+  此时才显示用户文本）；agent 的 `done` 不再由 adapter 直接转发，只在
+  最终回复落盘成功后的成功轮补发——append 失败无 done。
+- **owner lease**：persistent Orchestrator 构造末尾 `acquire_owner()`
+  （owner.lock，`flock(LOCK_EX|LOCK_NB)`，0600，写入 PID 供冲突提示）；
+  冲突抛 `RoomBusyError`。`aclose()` 先置 closed 标志（新 dispatch 与
+  排队 delivery 抛 `OrchestratorClosedError`），关闭 adapters 后在
+  finally 释放 lease；不删除 owner.lock，stale 文件不妨碍下次获取。
+  只读 RoomStore 辅助实例不获取 lease。
+
 ## 权限策略（Phase 2：进入 TUI）
 
 client 声明 `fs/terminal` 能力为 false（不代理文件/终端）。
@@ -146,14 +187,25 @@ prompt/session 初始化共用 adapter 的同一把锁，不竞态杀进程。
   `AgentSpec` 注册表（transport = acp/jsonl）；ACP 增量上下文
   （history cursor）；权限请求弹到 TUI 让用户决策；TUI 退出统一
   `aclose()`；协议状态可见。JSONL 保留为 fallback。
-- [ ] **Phase 2.5**：共享 history 持久化、ACP session 映射与重启恢复
-- [ ] **Phase 3**：内部 command bus + 受控 MCP 外部入口，让 codex/skill
-  向同一编排会话注入 review；Unix socket 可作为仅本机底层传输
+- [x] **Phase 2.5**：共享 history 持久化（timeline/state + seq cursor）、
+  ACP session 映射与重启恢复（load 保留 cursor / 回退 new 有界
+  bootstrap、checkpoint-before-prompt）、房间单写者 owner lease、
+  持久确认时序与 close 排队保护
+- [x] **Phase 3**：内部 command bus + 受控 MCP 外部入口（已完成）：
+  `control/command_bus.py` FIFO 单 worker（request_id 永久幂等、容量
+  硬上限、close 兜底 cancelled）；`control/server.py` 私有 Unix 控制
+  socket（0600、stale 验证后清理、活跃不抢占、稳定错误码）；
+  `myagents_mcp.py` stdio MCP bridge（官方 SDK `mcp>=1.27,<2`，五个
+  `myagents_*` 工具）只连运行中 TUI 的 socket，绝不实例化第二
+  Orchestrator、不获取 lease、不绕过 TUI 权限。细节见
+  [ADR-0001](adr/0001-persistent-room-command-bus-mcp.md)
 - [ ] **Phase 4**：codex / claude 的 ACP 接入（有官方适配器后），
   JSONL fallback 逐步收缩为兜底
 - [ ] **Phase 5**：里程碑工作流、review → 修改 → 复核闭环与 steering
 
-A2A 不在当前阶段；只有出现跨机器、跨组织 agent 协作需求时再评估。
+A2A 不在当前阶段；Streamable HTTP、远程认证同样不在 M3（M3 是单机
+单用户 stdio 集成，见 ADR-0001 §3）。只有出现跨机器、跨组织 agent
+协作需求时再评估。
 
 ## 风险与注意
 
@@ -161,9 +213,13 @@ A2A 不在当前阶段；只有出现跨机器、跨组织 agent 协作需求时
   Textual TUI 的无工具回合正常；真实 Bash 权限请求弹窗正常，实际 options
   为 allow_once / allow_always / reject_once，选择 allow_once 后工具
   执行结果正确；退出后无残留进程。
-- **仍未覆盖**：cancel 响应时延在真实二进制上的表现（10s 有限超时契约
-  只经 fake server 验证）；长会话的内存/token 增长；session/load 恢复
-  旧会话（协议层有方法，编排器尚未使用）。
+- **M3 真实 E2E 已通过**（2026-07-26）：
+  `scripts/e2e-m3-real.py` 用真实 `kimi acp` + 独立 MCP stdio client
+  完成两轮 TUI 生命周期，第二轮 `session/load` 复用同一 session id，
+  timeline 无重复，退出后无 endpoint/socket/agent 残留。
+- **仍未覆盖**：cancel 响应时延在真实二进制上的表现（10s 有限超时
+  契约只经 fake server 验证）；长会话的内存/token 增长与 compaction
+  后的 restore 行为。
 - **kimi acp 启动开销**：长驻进程只需一次握手，后续 prompt 无进程启动成本，
   比 JSONL 模式更快。
 - **断线**：agent 进程 EOF 时所有 pending request 立即失败（带 stderr 尾段），

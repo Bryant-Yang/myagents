@@ -316,6 +316,334 @@ def test_adapter_bridge() -> None:
     print("ok  AcpAdapter 桥接（text 事件 + stopReason）")
 
 
+def test_restore_load_success() -> None:
+    """M2.5：resume id + loadSession capability → session/load，结果不可歧义。"""
+    async def run() -> None:
+        reset_state()
+        adapter = AcpAdapter("fake", [sys.executable, SERVER])
+        seen = {}
+
+        def make_prompt(prep):
+            seen["prep"] = prep
+            # 惰性回调在判定之后、锁内执行：可以安全使用实际 session id
+            assert adapter._lock.locked()
+            return f"hi from {prep.session_id}"
+
+        events = [ev async for ev in adapter.stream_prepared(
+            make_prompt, "/tmp", resume_session_id="old-session-9")]
+        prep = seen["prep"]
+        assert prep.session_id == "old-session-9"
+        assert prep.restored is True and prep.load_failed is False
+        assert adapter.session_id == "old-session-9"
+        infos = [e.text for e in events if e.kind == "info"]
+        assert infos == ["ACP session 已恢复：old-session-9"], infos
+        texts = [e.text for e in events if e.kind == "text"]
+        assert texts == ["PO", "NG"]
+        evs = state_events()
+        assert "load:old-session-9" in evs
+        assert not any(e.startswith("new:") for e in evs), evs
+        assert evs.index("load:old-session-9") < evs.index(
+            "prompt:hi from old-session-9")
+        # 第二轮复用活跃 session：不再 emit info，不再 load/new
+        reset_state()
+        events2 = [ev async for ev in adapter.stream_prepared(
+            lambda p: "round2", "/tmp", resume_session_id="old-session-9")]
+        assert not [e for e in events2 if e.kind == "info"
+                    and "session" in e.text], events2
+        evs2 = state_events()
+        assert not any(e.startswith(("load:", "new:")) for e in evs2), evs2
+        await adapter.aclose()
+    asyncio.run(run())
+    print("ok  restore：load 成功 → 复用 resume session")
+
+
+def test_restore_load_error_fallback_new() -> None:
+    """M2.5：session/load 的 AcpError 被吞并回退 new，load_failed 如实标记。"""
+    async def run() -> None:
+        os.environ["FAKE_ACP_FAIL_LOAD"] = "1"
+        try:
+            reset_state()
+            adapter = AcpAdapter("fake", [sys.executable, SERVER])
+            seen = {}
+
+            def make_prompt(prep):
+                seen["prep"] = prep
+                return "hi"
+
+            events = [ev async for ev in adapter.stream_prepared(
+                make_prompt, "/tmp", resume_session_id="old-session-9")]
+            prep = seen["prep"]
+            assert prep.session_id == "fake-session-1"
+            assert prep.restored is False and prep.load_failed is True
+            infos = [e.text for e in events if e.kind == "info"]
+            assert infos == ["ACP session 已建立：fake-session-1"], infos
+            evs = state_events()
+            assert evs.index("load:old-session-9") < evs.index("new:/tmp")
+            assert evs.index("new:/tmp") < evs.index("prompt:hi")
+            await adapter.aclose()
+        finally:
+            del os.environ["FAKE_ACP_FAIL_LOAD"]
+    asyncio.run(run())
+    print("ok  restore：load 失败 → 回退 session/new")
+
+
+def test_restore_unsupported_fallback_new() -> None:
+    """M2.5：agent 不声明 loadSession → 直接 session/new，不尝试 load。"""
+    async def run() -> None:
+        os.environ["FAKE_ACP_NO_LOAD_CAP"] = "1"
+        try:
+            reset_state()
+            adapter = AcpAdapter("fake", [sys.executable, SERVER])
+            seen = {}
+
+            def make_prompt(prep):
+                seen["prep"] = prep
+                return "hi"
+
+            async for _ev in adapter.stream_prepared(
+                    make_prompt, "/tmp", resume_session_id="old-session-9"):
+                pass
+            prep = seen["prep"]
+            assert prep.session_id == "fake-session-1"
+            assert prep.restored is False and prep.load_failed is False
+            evs = state_events()
+            assert not any(e.startswith("load:") for e in evs), evs
+            assert "new:/tmp" in evs
+            await adapter.aclose()
+        finally:
+            del os.environ["FAKE_ACP_NO_LOAD_CAP"]
+    asyncio.run(run())
+    print("ok  restore：capability 不支持 → 直接 session/new")
+
+
+def test_prompt_factory_after_decision() -> None:
+    """M2.5：prompt 工厂在 prepare 判定之后执行（状态文件已有 load/new）。"""
+    async def run() -> None:
+        reset_state()
+        adapter = AcpAdapter("fake", [sys.executable, SERVER])
+
+        def make_prompt(prep):
+            evs = state_events()
+            assert "load:resume-1" in evs, evs  # 判定已发生
+            assert not any(e.startswith("prompt:") for e in evs), evs
+            return "after-decision"
+
+        texts = [ev.text async for ev in adapter.stream_prepared(
+            make_prompt, "/tmp", resume_session_id="resume-1")
+            if ev.kind == "text"]
+        assert texts == ["PO", "NG"]
+        await adapter.aclose()
+    asyncio.run(run())
+    print("ok  prompt 工厂在 prepare 判定后执行")
+
+
+def test_aclose_cannot_interleave_prepare_prompt() -> None:
+    """M2.5：prepare→prompt 同锁生命周期，aclose 无法插入中间。"""
+    async def run() -> None:
+        reset_state()
+        adapter = AcpAdapter("fake", [sys.executable, SERVER])
+        prepared = asyncio.Event()
+
+        def make_prompt(prep):
+            assert adapter._lock.locked(), "prompt 构造不在锁内"
+            prepared.set()
+            return "slow task"
+
+        agen = adapter.stream_prepared(make_prompt, "/tmp",
+                                       resume_session_id="resume-1")
+        first = await first_text(agen)
+        assert "开始" in first.text
+        assert prepared.is_set()
+        # prompt 进行中：aclose 必须等锁，不能插在 prepare 与 prompt 之间
+        close_task = asyncio.create_task(adapter.aclose())
+        await asyncio.sleep(0.2)
+        assert not close_task.done(), "aclose 插入了 prepare→prompt 的锁生命周期"
+        await agen.aclose()
+        await asyncio.wait_for(close_task, timeout=5)
+        evs = state_events()
+        assert evs.index("load:resume-1") < evs.index("prompt:slow task")
+        # 重建后下轮 fresh：重新 load 并再次如实报告（不缓存、不误报）
+        events = [ev async for ev in adapter.stream_prepared(
+            lambda p: "round2", "/tmp", resume_session_id="resume-1")]
+        infos = [e.text for e in events if e.kind == "info"]
+        assert infos == ["ACP session 已恢复：resume-1"], infos
+        await adapter.aclose()
+    asyncio.run(run())
+    print("ok  aclose 不能插入 prepare→prompt")
+
+
+def test_resume_no_steal_active_session() -> None:
+    """M2.5：resume id 与活跃 session 不同 → 报错拒绝偷换，不发 load。"""
+    async def run() -> None:
+        reset_state()
+        adapter = AcpAdapter("fake", [sys.executable, SERVER])
+        async for _ in adapter.stream_prepared(lambda p: "hi", "/tmp",
+                                               resume_session_id="s1"):
+            pass
+        assert adapter.session_id == "s1"
+        try:
+            async for _ in adapter.stream_prepared(lambda p: "hi", "/tmp",
+                                                   resume_session_id="s2"):
+                pass
+            raise AssertionError("不同 resume id 应该抛 AcpError")
+        except AcpError as exc:
+            assert "偷换" in str(exc), exc
+        assert adapter.session_id == "s1", "活跃 session 被改了"
+        evs = state_events()
+        assert "load:s2" not in evs and "new:/tmp" not in evs, evs
+        await adapter.aclose()
+    asyncio.run(run())
+    print("ok  resume id 不偷换活跃 session")
+
+
+def test_restore_new_error_propagates() -> None:
+    """M2.5：只吞 load 失败；回退的 session/new 失败照常传播并原子回收。"""
+    async def run() -> None:
+        os.environ["FAKE_ACP_FAIL_LOAD"] = "1"
+        os.environ["FAKE_ACP_FAIL_NEW"] = "1"
+        adapter = AcpAdapter("fake", [sys.executable, SERVER])
+        try:
+            reset_state()
+            try:
+                async for _ in adapter.stream_prepared(
+                        lambda p: "hi", "/tmp", resume_session_id="old-9"):
+                    pass
+                raise AssertionError("session/new 失败应该抛 AcpError")
+            except AcpError as exc:
+                assert "new boom" in str(exc), exc
+            assert adapter._started is False and adapter.session_id is None
+            evs = state_events()
+            assert evs.index("load:old-9") < evs.index("new:/tmp")
+            await asyncio.sleep(0.2)
+        finally:
+            del os.environ["FAKE_ACP_FAIL_LOAD"]
+            del os.environ["FAKE_ACP_FAIL_NEW"]
+            await adapter.aclose()
+    asyncio.run(run())
+    print("ok  restore：session/new 失败照常传播")
+
+
+def test_prompt_error_propagates() -> None:
+    """M2.5：prompt 错误不被 restore 原语吞掉，照常传播给调用方。"""
+    async def run() -> None:
+        os.environ["FAKE_ACP_FAIL_PROMPT"] = "1"
+        try:
+            adapter = AcpAdapter("fake", [sys.executable, SERVER])
+            try:
+                async for _ in adapter.stream_prepared(
+                        lambda p: "hi", "/tmp", resume_session_id="resume-1"):
+                    pass
+                raise AssertionError("prompt 失败应该抛 AcpError")
+            except AcpError as exc:
+                assert "prompt boom" in str(exc), exc
+            # load 已成功、错误发生在 prompt：连接与 session 仍归 adapter
+            assert adapter._started is True
+            assert adapter.session_id == "resume-1"
+            await adapter.aclose()
+        finally:
+            del os.environ["FAKE_ACP_FAIL_PROMPT"]
+    asyncio.run(run())
+    print("ok  prompt 失败照常传播")
+
+
+def test_factory_runs_before_first_event() -> None:
+    """M2.5 原子性：第一个 info 事件返回前，prompt factory 已执行完毕。"""
+    async def run() -> None:
+        reset_state()
+        adapter = AcpAdapter("fake", [sys.executable, SERVER])
+        called = []
+
+        def make_prompt(prep):
+            called.append(prep.session_id)
+            return "hi"
+
+        agen = adapter.stream_prepared(make_prompt, "/tmp",
+                                       resume_session_id="resume-1")
+        first = await agen.__anext__()
+        assert first.kind == "info", first
+        assert called == ["resume-1"], "info 之前 factory 未执行"
+        async for _ in agen:
+            pass
+        await adapter.aclose()
+    asyncio.run(run())
+    print("ok  factory 在第一个 info 事件前执行")
+
+
+def test_fresh_factory_error_resets() -> None:
+    """M2.5 原子性：fresh 轮 factory 抛异常 → 无 info/prompt、连接回收、可重试。"""
+    async def run() -> None:
+        reset_state()
+        adapter = AcpAdapter("fake", [sys.executable, SERVER])
+
+        def bad_factory(prep):
+            raise RuntimeError("checkpoint 写盘失败")
+
+        events = []
+        try:
+            async for ev in adapter.stream_prepared(
+                    bad_factory, "/tmp", resume_session_id="retry-1"):
+                events.append(ev)
+            raise AssertionError("factory 异常应该传播")
+        except RuntimeError as exc:
+            assert "checkpoint" in str(exc)
+        assert events == [], "factory 失败后不应 emit 任何事件"
+        evs = state_events()
+        assert "load:retry-1" in evs  # load 已发生但未被认领
+        assert not any(e.startswith("prompt:") for e in evs), evs
+        # 不留未提交的活跃 session：连接已回收
+        assert adapter._started is False and adapter.session_id is None
+        # 同一 resume id 可重试：重新 load 并成功
+        texts = [ev.text async for ev in adapter.stream_prepared(
+            lambda p: "hi again", "/tmp", resume_session_id="retry-1")
+            if ev.kind == "text"]
+        assert texts == ["PO", "NG"]
+        assert adapter.session_id == "retry-1"
+        evs = state_events()
+        assert evs.count("load:retry-1") == 2, evs
+        await adapter.aclose()
+        # 无残留 fake server 进程
+        await asyncio.sleep(0.2)
+        import subprocess
+        out = subprocess.run(["pgrep", "-f", "fake_acp_server"],
+                             capture_output=True, text=True).stdout.split()
+        assert not out, f"残留 fake server 进程: {out}"
+    asyncio.run(run())
+    print("ok  fresh factory 异常 → 回收连接 + 可原 id 重试")
+
+
+def test_nonfresh_factory_error_keeps_session() -> None:
+    """M2.5 原子性：复用活跃 session 时 factory 异常不销毁现有 session。"""
+    async def run() -> None:
+        reset_state()
+        adapter = AcpAdapter("fake", [sys.executable, SERVER])
+        async for _ in adapter.stream_prepared(lambda p: "hi", "/tmp",
+                                               resume_session_id="keep-1"):
+            pass
+        assert adapter.session_id == "keep-1"
+
+        def bad_factory(prep):
+            raise RuntimeError("boom")
+
+        try:
+            async for _ in adapter.stream_prepared(
+                    bad_factory, "/tmp", resume_session_id="keep-1"):
+                pass
+            raise AssertionError("factory 异常应该传播")
+        except RuntimeError:
+            pass
+        # 非 fresh：已有 session 不受影响，下轮正常
+        assert adapter._started is True and adapter.session_id == "keep-1"
+        texts = [ev.text async for ev in adapter.stream_prepared(
+            lambda p: "still alive", "/tmp", resume_session_id="keep-1")
+            if ev.kind == "text"]
+        assert texts == ["PO", "NG"]
+        evs = state_events()
+        assert not any(e.startswith("prompt:boom") for e in evs)
+        await adapter.aclose()
+    asyncio.run(run())
+    print("ok  非 fresh factory 异常 → 保留活跃 session")
+
+
 if __name__ == "__main__":
     test_initialize()
     test_session_new_list_load()
@@ -331,4 +659,15 @@ if __name__ == "__main__":
     test_double_start_guard()
     test_aclose_serialized_with_stream()
     test_adapter_bridge()
+    test_restore_load_success()
+    test_restore_load_error_fallback_new()
+    test_restore_unsupported_fallback_new()
+    test_prompt_factory_after_decision()
+    test_aclose_cannot_interleave_prepare_prompt()
+    test_resume_no_steal_active_session()
+    test_restore_new_error_propagates()
+    test_prompt_error_propagates()
+    test_factory_runs_before_first_event()
+    test_fresh_factory_error_resets()
+    test_nonfresh_factory_error_keeps_session()
     print("\nACP 全部通过")

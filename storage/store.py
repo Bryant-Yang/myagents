@@ -1,0 +1,506 @@
+"""房间持久化存储（ADR-0001 §2.1、§2.2）。
+
+关键概念：
+- **房间身份**：规范化绝对 workdir 决定稳定 `room_id`（SHA-256 截断，
+  不包含可逆路径）；默认 room 名为 workdir 的 basename。
+- **状态位置**：默认 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id>`，
+  测试可注入临时 `state_root`。状态绝不写进目标 workdir。
+- **fail loudly**：schema 不支持、timeline/state 损坏、workdir 不匹配都抛
+  异常，绝不静默覆盖旧数据；写失败不伪装成功（seq 只在 fsync 后推进，
+  内存可见的 agent 状态只在原子写成功后提交）。
+"""
+
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+APP_NAME = "myagents"
+STATE_SCHEMA_VERSION = 1
+
+DEFAULT_READ_LIMIT = 50
+MAX_READ_LIMIT = 200
+MAX_TEXT_BYTES = 64 * 1024      # 单条消息文本上限（UTF-8 字节）
+MAX_RECORD_BYTES = 128 * 1024   # 单条 JSONL 记录上限（UTF-8 字节）
+
+ROOM_DIR_MODE = 0o700
+STATE_FILE_MODE = 0o600
+
+
+class StorageError(Exception):
+    """持久化层异常的公共基类。"""
+
+
+class SchemaVersionError(StorageError):
+    """state.json 的 schema version 不被本版本代码支持。"""
+
+
+class CorruptedStorageError(StorageError):
+    """timeline.jsonl / state.json 内容损坏或不完整。绝不自动修复或覆盖。"""
+
+
+class WorkdirMismatchError(StorageError):
+    """房间目录里记录的 workdir 与本次打开的规范化 workdir 不一致。"""
+
+
+class RoomBusyError(StorageError):
+    """房间已被另一个进程持有（单写者 lease 冲突）。"""
+
+
+class LimitExceededError(StorageError, ValueError):
+    """文本或单条记录超过明确大小上限。"""
+
+
+def normalize_workdir(workdir: str | Path) -> str:
+    """规范化 workdir：展开 ~、解析符号链接、转为绝对路径。
+
+    必须是已存在的目录——给不存在的路径建房间只会制造悬空状态。
+    """
+    resolved = Path(workdir).expanduser().resolve()
+    if not resolved.is_dir():
+        raise StorageError(f"workdir 不存在或不是目录：{workdir}")
+    return str(resolved)
+
+
+def room_id_for(normalized_workdir: str) -> str:
+    """由规范化 workdir 派生稳定 room_id（不可逆，不含完整路径）。"""
+    return hashlib.sha256(normalized_workdir.encode("utf-8")).hexdigest()[:16]
+
+
+def default_state_root() -> Path:
+    """默认状态根目录：${XDG_STATE_HOME:-~/.local/state}/myagents。
+
+    返回展开并 resolve 后的绝对路径——相对 XDG_STATE_HOME 也必须先
+    resolve，否则 RoomStore 的 workdir 重叠判断会被相对路径绕过。
+    """
+    xdg = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+    return (base / APP_NAME).resolve()
+
+
+def _is_utc_iso(value: str) -> bool:
+    """只接受形如 2026-07-26T08:00:00.123Z 的 UTC ISO-8601 时间戳。"""
+    if not value.endswith("Z") or "T" not in value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None \
+        and parsed.utcoffset() == timezone.utc.utcoffset(None)
+
+
+@dataclass(frozen=True)
+class TimelineRecord:
+    """一条时间线记录：单调 seq、speaker、text、UTC created_at、可选 command_id。"""
+
+    seq: int
+    speaker: str
+    text: str
+    created_at: str
+    command_id: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "seq": self.seq,
+            "speaker": self.speaker,
+            "text": self.text,
+            "created_at": self.created_at,
+            "command_id": self.command_id,
+        }
+
+    @staticmethod
+    def from_dict(data: object, *, line_no: int) -> "TimelineRecord":
+        if not isinstance(data, dict):
+            raise CorruptedStorageError(
+                f"timeline 第 {line_no} 行不是 JSON object")
+        try:
+            seq = data["seq"]
+            speaker = data["speaker"]
+            text = data["text"]
+            created_at = data["created_at"]
+            command_id = data.get("command_id")
+        except KeyError as exc:
+            raise CorruptedStorageError(
+                f"timeline 第 {line_no} 行缺少字段 {exc}") from exc
+        if (not isinstance(seq, int) or isinstance(seq, bool)
+                or not isinstance(speaker, str) or not isinstance(text, str)
+                or not isinstance(created_at, str)
+                or (command_id is not None and not isinstance(command_id, str))):
+            raise CorruptedStorageError(
+                f"timeline 第 {line_no} 行字段类型非法")
+        # 语义校验：重开/读取时必须拒绝写入路径放不进来的值，
+        # 否则损坏记录会被当成合法历史继续服务。
+        if seq <= 0:
+            raise CorruptedStorageError(
+                f"timeline 第 {line_no} 行 seq 非法：{seq}")
+        if not speaker:
+            raise CorruptedStorageError(
+                f"timeline 第 {line_no} 行 speaker 为空")
+        if not _is_utc_iso(created_at):
+            raise CorruptedStorageError(
+                f"timeline 第 {line_no} 行 created_at 非 UTC-Z 格式："
+                f"{created_at!r}")
+        if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
+            raise CorruptedStorageError(
+                f"timeline 第 {line_no} 行 text 超过上限 {MAX_TEXT_BYTES} 字节")
+        return TimelineRecord(seq=seq, speaker=speaker, text=text,
+                              created_at=created_at, command_id=command_id)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class RoomLease:
+    """房间单写者 lease：room_dir/owner.lock 上的进程级 flock。
+
+    - Unix/macOS：fcntl.flock(LOCK_EX|LOCK_NB)，获取失败抛 RoomBusyError；
+    - lock 文件 0600，写入当前 PID（flush+fsync）供冲突错误提示；
+    - 绝不删除 owner.lock——删除已锁 inode 会产生双锁竞态；进程异常
+      退出由 OS 释放 flock，stale 文件不妨碍下次获取；
+    - release() 幂等；支持 context manager；__del__ best effort。
+    """
+
+    def __init__(self, room_dir: Path, workdir: str) -> None:
+        self._path = room_dir / "owner.lock"
+        self._fd: int | None = None
+        fd = os.open(self._path, os.O_CREAT | os.O_RDWR, STATE_FILE_MODE)
+        try:
+            # 已存在文件也强制规范权限；open/chmod 失败保持原异常
+            # （不是 busy），fd 不泄露
+            os.chmod(self._path, STATE_FILE_MODE)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                # 只有 EAGAIN/EWOULDBLOCK 才是锁冲突（busy）：
+                # 读旧 PID 供提示后抛 RoomBusyError
+                pid_hint = ""
+                with contextlib.suppress(OSError):
+                    pid_hint = self._path.read_text(
+                        encoding="utf-8").strip()
+                raise RoomBusyError(
+                    f"房间已被其他进程持有：{room_dir}（workdir={workdir!r}"
+                    + (f"，owner PID={pid_hint}" if pid_hint else "") + ")"
+                ) from None
+        except BaseException:
+            os.close(fd)
+            raise
+        # flock 已成功：PID 写入任一步失败（含 KeyboardInterrupt/
+        # Cancelled）必须立即 unlock+close，原样传播，不依赖 __del__
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, str(os.getpid()).encode("ascii"))
+            os.fsync(fd)
+        except BaseException:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+            raise
+        self._fd = fd
+
+    @property
+    def held(self) -> bool:
+        return self._fd is not None
+
+    def release(self) -> None:
+        """幂等：unlock + close。不删除 lock 文件（见类 docstring）。"""
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def __enter__(self) -> "RoomLease":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self.release()
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+class RoomStore:
+    """一个房间的持久化存储：timeline.jsonl（append-only）+ state.json（原子写）。"""
+
+    def __init__(self, workdir: str | Path,
+                 state_root: str | Path | None = None) -> None:
+        self.workdir = normalize_workdir(workdir)
+        self.room_name = Path(self.workdir).name
+        self.state_root = (Path(state_root).expanduser().resolve()
+                           if state_root is not None else default_state_root())
+        workdir_path = Path(self.workdir)
+        if self.state_root == workdir_path \
+                or self.state_root.is_relative_to(workdir_path):
+            raise StorageError(
+                f"state_root 不能等于 workdir 或位于其子目录内："
+                f"{self.state_root}（workdir={self.workdir}）")
+        self.room_id = room_id_for(self.workdir)
+        self.room_dir = self.state_root / "rooms" / self.room_id
+        self.timeline_path = self.room_dir / "timeline.jsonl"
+        self.state_path = self.room_dir / "state.json"
+        self._state: dict = {}
+        self._next_seq = 1
+        self._open()
+
+    # ---- 打开 / 初始化 ----
+
+    def _open(self) -> None:
+        if self.room_dir.exists():
+            if not self.room_dir.is_dir():
+                raise CorruptedStorageError(
+                    f"房间路径存在但不是目录：{self.room_dir}")
+            entries = list(self.room_dir.iterdir())
+            if entries and not self.state_path.is_file():
+                # 有内容却没有 state.json：半初始化或被破坏，绝不覆盖
+                raise CorruptedStorageError(
+                    f"房间目录存在但缺少 state.json：{self.room_dir}")
+            if entries:
+                self._load_state()
+                self._next_seq = self._scan_timeline()
+                # 内容校验通过后才动权限：目录和两个状态文件都强制规范值
+                os.chmod(self.room_dir, ROOM_DIR_MODE)
+                os.chmod(self.state_path, STATE_FILE_MODE)
+                os.chmod(self.timeline_path, STATE_FILE_MODE)
+                return
+            # 空目录：视为未初始化，走新建流程
+        self._init_fresh()
+
+    def _init_fresh(self) -> None:
+        self.room_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.room_dir, ROOM_DIR_MODE)
+        state = {
+            "schema": STATE_SCHEMA_VERSION,
+            "room_id": self.room_id,
+            "room_name": self.room_name,
+            "workdir": self.workdir,
+            "agents": {},
+        }
+        self._write_state(state)
+        self._state = state
+        # 创建空 timeline（0600），让权限从第一天就正确
+        fd = os.open(self.timeline_path,
+                     os.O_CREAT | os.O_APPEND | os.O_WRONLY, STATE_FILE_MODE)
+        os.close(fd)
+        os.chmod(self.timeline_path, STATE_FILE_MODE)
+        _fsync_dir(self.room_dir)
+
+    def _load_state(self) -> None:
+        try:
+            raw = self.state_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CorruptedStorageError(
+                f"state.json 无法解析：{self.state_path}（{exc}）") from exc
+        if not isinstance(data, dict):
+            raise CorruptedStorageError("state.json 不是 JSON object")
+        schema = data.get("schema")
+        if schema != STATE_SCHEMA_VERSION:
+            raise SchemaVersionError(
+                f"不支持的 state schema：{schema!r}"
+                f"（本版本支持 {STATE_SCHEMA_VERSION}）")
+        if data.get("room_id") != self.room_id:
+            raise CorruptedStorageError(
+                f"state.json 的 room_id 与目录不符：{data.get('room_id')!r}")
+        if data.get("workdir") != self.workdir:
+            raise WorkdirMismatchError(
+                f"房间记录的 workdir 是 {data.get('workdir')!r}，"
+                f"与本次打开的 {self.workdir!r} 不一致")
+        if not isinstance(data.get("agents"), dict):
+            raise CorruptedStorageError("state.json 缺少合法的 agents 映射")
+        # 打开时全量校验 agents entry：损坏状态在构造阶段立即 fail loudly，
+        # 而不是等该 agent 首次访问才发现
+        for agent_name, entry in data["agents"].items():
+            self._validate_agent_entry(agent_name, entry)
+        self._state = data
+
+    def _scan_timeline(self) -> int:
+        """校验整条 timeline 并返回下一个 seq。任何损坏都 fail loudly。"""
+        last_seq = 0
+        for record in self._load_timeline():
+            if record.seq <= last_seq:
+                raise CorruptedStorageError(
+                    f"timeline seq 非严格递增：{record.seq} 出现在 {last_seq} 之后")
+            last_seq = record.seq
+        return last_seq + 1
+
+    def _load_timeline(self) -> list[TimelineRecord]:
+        if not self.timeline_path.is_file():
+            raise CorruptedStorageError(
+                f"缺少 timeline.jsonl：{self.timeline_path}")
+        records: list[TimelineRecord] = []
+        with open(self.timeline_path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                if len(line.encode("utf-8")) > MAX_RECORD_BYTES:
+                    raise CorruptedStorageError(
+                        f"timeline 第 {line_no} 行超过单条记录上限 "
+                        f"{MAX_RECORD_BYTES} 字节")
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise CorruptedStorageError(
+                        f"timeline 第 {line_no} 行不是合法 JSON：{exc}") from exc
+                records.append(TimelineRecord.from_dict(data, line_no=line_no))
+        return records
+
+    # ---- 单写者 lease ----
+
+    def acquire_owner(self) -> RoomLease:
+        """获取本房间的进程级单写者 lease；已被持有时抛 RoomBusyError。
+
+        只读辅助实例不要调用——lease 只属于负责写入的 owner
+        （TUI 的 Orchestrator）；外部工具（如 MCP）应走 command bus。
+        """
+        return RoomLease(self.room_dir, self.workdir)
+
+    # ---- state.json：同目录临时文件 + os.replace 原子写 ----
+
+    def _write_state(self, data: dict) -> None:
+        fd, tmp = tempfile.mkstemp(dir=self.room_dir,
+                                   prefix=".state.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, STATE_FILE_MODE)
+            os.replace(tmp, self.state_path)
+            # rename 本身的持久性：fsync 目录项，崩溃后临时文件不会复活成
+            # state.json、新名字也不会丢失
+            _fsync_dir(self.room_dir)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    # ---- agent cursor / session 映射（ADR-0001 §2.2） ----
+
+    @staticmethod
+    def _validate_agent_entry(name: str, entry: object) -> dict:
+        """校验一条持久化 agent 状态；返回规范化 {"cursor", "session_id"}。
+
+        任一违反都抛 CorruptedStorageError，绝不静默 bootstrap 成默认值
+        （那会丢 cursor、重复投递）：
+        - 必须是 object，且显式包含 cursor 与 session_id 两个字段；
+        - cursor 必须 int、非 bool、>= 0；
+        - session_id 必须 None 或非空 str。
+        """
+        if not isinstance(entry, dict):
+            raise CorruptedStorageError(
+                f"agent {name!r} 的持久化状态不是 object：{entry!r}")
+        if "cursor" not in entry or "session_id" not in entry:
+            raise CorruptedStorageError(
+                f"agent {name!r} 的持久化状态缺少 cursor/session_id 字段")
+        cursor = entry["cursor"]
+        session_id = entry["session_id"]
+        if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+            raise CorruptedStorageError(
+                f"agent {name!r} 的持久化 cursor 非法：{cursor!r}")
+        if session_id is not None \
+                and (not isinstance(session_id, str) or not session_id):
+            raise CorruptedStorageError(
+                f"agent {name!r} 的持久化 session_id 非法：{session_id!r}")
+        return {"cursor": cursor, "session_id": session_id}
+
+    def get_agent_state(self, name: str) -> dict:
+        """返回 {"cursor": int, "session_id": str | None}；未记录时为默认值。
+
+        key 存在但内容损坏时抛 CorruptedStorageError——损坏状态绝不静默
+        重置成默认值（那会丢 cursor、重复投递）。
+        """
+        if name not in self._state["agents"]:
+            return {"cursor": 0, "session_id": None}
+        return self._validate_agent_entry(name, self._state["agents"][name])
+
+    def set_agent_state(self, name: str, *, cursor: int | None = None,
+                        session_id: str | None = None) -> None:
+        """持久化某 stateful agent 的 cursor / ACP session_id（原子写）。
+
+        copy-on-write：先构造新 state 再落盘，只有原子写成功后才提交到
+        内存可见状态。写盘失败时内存和磁盘都保持旧值，绝不伪装成功。
+        """
+        new_entry = self.get_agent_state(name)
+        if cursor is not None:
+            if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+                raise ValueError(f"cursor 必须是非负 int：{cursor!r}")
+            new_entry["cursor"] = cursor
+        if session_id is not None:
+            new_entry["session_id"] = session_id
+        new_state = {**self._state,
+                     "agents": {**self._state["agents"], name: new_entry}}
+        self._write_state(new_state)
+        self._state = new_state
+
+    # ---- timeline ----
+
+    def append(self, speaker: str, text: str,
+               command_id: str | None = None) -> TimelineRecord:
+        """append 一条记录并 flush + fsync；seq 只在写盘成功后推进。"""
+        if not speaker:
+            raise ValueError("speaker 不能为空")
+        if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
+            raise LimitExceededError(
+                f"文本超过上限 {MAX_TEXT_BYTES} 字节："
+                f"{len(text.encode('utf-8'))}")
+        record = TimelineRecord(seq=self._next_seq, speaker=speaker, text=text,
+                                created_at=_utc_now_iso(), command_id=command_id)
+        line = json.dumps(record.to_dict(), ensure_ascii=False)
+        if len(line.encode("utf-8")) > MAX_RECORD_BYTES:
+            raise LimitExceededError(
+                f"单条记录超过上限 {MAX_RECORD_BYTES} 字节")
+        fd = os.open(self.timeline_path, os.O_APPEND | os.O_WRONLY)
+        try:
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            # 写失败不伪装成功：seq 不推进，下次 append 重用同一 seq
+            raise
+        self._next_seq += 1
+        return record
+
+    def read(self, after_seq: int = 0,
+             limit: int = DEFAULT_READ_LIMIT) -> dict:
+        """有界读取：after_seq 之后最多 limit 条（默认 50，最大 200）。
+
+        返回 {"items": [TimelineRecord], "has_more": bool,
+        "next_after_seq": int}。
+        """
+        if not isinstance(after_seq, int) or isinstance(after_seq, bool) \
+                or after_seq < 0:
+            raise ValueError(f"after_seq 必须是非负 int：{after_seq!r}")
+        limit = max(1, min(int(limit), MAX_READ_LIMIT))
+        records = [r for r in self._load_timeline() if r.seq > after_seq]
+        items = records[:limit]
+        return {
+            "items": items,
+            "has_more": len(records) > len(items),
+            "next_after_seq": items[-1].seq if items else after_seq,
+        }

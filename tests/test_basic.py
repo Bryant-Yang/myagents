@@ -43,7 +43,7 @@ class FakeHost(FakeAdapter):
 
 
 def make_orch() -> Orchestrator:
-    orch = Orchestrator(workdir=".")
+    orch = Orchestrator(workdir=".", persistent=False)
     orch.adapters = {n: FakeAdapter(n) for n in ("kimi", "opencode", "codex")}
     orch.host = FakeHost()
     orch.adapters["host"] = orch.host
@@ -329,8 +329,7 @@ def test_tui() -> None:
     from main import ChatApp
 
     async def run() -> None:
-        app = ChatApp(workdir=".")
-        app.orch = make_orch()  # 换成假 agent，不发真实请求
+        app = ChatApp(workdir=".", orchestrator=make_orch())  # 假 agent，不发真实请求
         async with app.run_test() as pilot:
             await pilot.pause()
             box = app.query_one(Input)

@@ -24,7 +24,7 @@ from acp.client import AcpClient, AcpError
 from adapters.base import AgentEvent
 from adapters.codex_adapter import CodexAdapter
 from adapters.opencode_adapter import OpenCodeAdapter
-from orchestrator import AGENTS, Message, Orchestrator
+from orchestrator import AGENTS, Orchestrator
 
 SERVER = str(Path(__file__).parent / "fake_acp_server.py")
 STATE = "/tmp/myagents_fake_acp_state_phase2"
@@ -99,7 +99,7 @@ class FakeHost(FakeJsonl):
 
 def make_orch(**adapters) -> Orchestrator:
     """真实 Orchestrator + 假 adapter；未指定的工人用 FakeJsonl 占位。"""
-    orch = Orchestrator(workdir="/tmp")
+    orch = Orchestrator(workdir="/tmp", persistent=False)
     for name in ("kimi", "opencode", "codex"):
         orch.adapters[name] = adapters.get(name, FakeJsonl(name))
     orch.host = FakeHost()
@@ -114,7 +114,7 @@ def test_agent_specs() -> None:
     assert AGENTS["codex"].transport == "jsonl"
     assert AGENTS["opencode"].transport == "jsonl"
 
-    orch = Orchestrator("/tmp")
+    orch = Orchestrator("/tmp", persistent=False)
     kimi = orch.adapters["kimi"]
     assert isinstance(kimi, AcpAdapter)
     assert kimi._cmd == ["kimi", "acp"]
@@ -307,9 +307,7 @@ async def _wait_for(pilot, cond, timeout: float = 10) -> None:
 
 def _make_tui_app(kimi_adapter) -> "object":
     from main import ChatApp
-    app = ChatApp(workdir="/tmp")
-    app.orch = make_orch(kimi=kimi_adapter)
-    return app
+    return ChatApp(workdir="/tmp", orchestrator=make_orch(kimi=kimi_adapter))
 
 
 def test_tui_permission_select() -> None:
@@ -473,8 +471,8 @@ def test_bootstrap_bounded() -> None:
     kimi = StatefulFake("kimi")
     orch = make_orch(kimi=kimi)  # history_limit 默认 12
     for i in range(30):
-        orch.history.append(Message("user", f"老消息{i}"))
-        orch.history.append(Message("codex", f"旧回复{i}"))
+        orch._append_message("user", f"老消息{i}")
+        orch._append_message("codex", f"旧回复{i}")
     noop = lambda n, e: None
 
     asyncio.run(orch.dispatch("@kimi 现在呢", noop))

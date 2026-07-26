@@ -44,7 +44,9 @@ hub-and-spoke 方式维护统一时间线，以 ACP 作为有状态 coding agent
 ## 4. 工作要求
 
 - 改协议、权限、并发或进程生命周期前，先读
-  [`docs/acp-migration.md`](docs/acp-migration.md)。
+  [`docs/acp-migration.md`](docs/acp-migration.md)；改持久化、恢复或
+  lease 前，先读
+  [`docs/adr/0001-persistent-room-command-bus-mcp.md`](docs/adr/0001-persistent-room-command-bus-mcp.md)。
 - 新增 agent 时实现统一 `AgentAdapter`，在 `AGENT_SPECS` 注册；不要把
   name-specific 逻辑散进编排器。
 - 权限处理器返回值必须绑定本次 `params.options` 校验；异常、空值或未知

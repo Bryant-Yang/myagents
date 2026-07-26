@@ -27,6 +27,8 @@ from textual.widgets import Button, Footer, Input, Label, RichLog
 
 from orchestrator import Orchestrator
 from adapters.base import AgentEvent
+from control import CommandBus, ControlServer
+from storage.store import WorkdirMismatchError, normalize_workdir
 
 # 每个发言者的显示颜色
 _COLORS = {"user": "yellow", "kimi": "cyan", "opencode": "green",
@@ -82,9 +84,26 @@ class ChatApp(App):
     #perm-dialog Button { width: 100%; margin-top: 1; }
     """
 
-    def __init__(self, workdir: str) -> None:
+    def __init__(self, workdir: str, persistent: bool = True, *,
+                 orchestrator: Orchestrator | None = None) -> None:
         super().__init__()
-        self.orch = Orchestrator(workdir)
+        if orchestrator is not None:
+            # 注入的 orchestrator 必须属于同一房间，不能静默换房
+            if normalize_workdir(orchestrator.workdir) \
+                    != normalize_workdir(workdir):
+                raise WorkdirMismatchError(
+                    f"orchestrator 属于 {orchestrator.workdir!r}，"
+                    f"与 workdir {workdir!r} 不一致")
+            self.orch = orchestrator
+        else:
+            self.orch = Orchestrator(workdir, persistent=persistent)
+        # 唯一命令入口：TUI 输入和未来外部控制统一经 CommandBus FIFO 派发；
+        # bus 不拥有 orch（aclose 只停自己的 worker）
+        self.bus = CommandBus(self.orch, self._on_agent_event)
+        self.control_server = (
+            ControlServer(self.orch, self.bus)
+            if self.orch.store is not None else None
+        )
         # 等待用户决策的权限 Future：退出时必须全部按 cancelled 收尾，
         # 不留挂起的 Future（adapter 侧的 prompt 才不会傻等）。
         self._permission_futures: set[asyncio.Future] = set()
@@ -94,19 +113,32 @@ class ChatApp(App):
         yield Input(placeholder="@kimi @opencode 点名派发；不带 @ 由 host 路由；Ctrl+C 退出")
         yield Footer()
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self.title = "myagents"
         # TUI 权限决策器注入所有 ACP adapter；未注入时 ACP 一律 deny
         self.orch.set_permission_handler(self._acp_permission)
+        self.bus.start()
+        if self.control_server is not None:
+            await self.control_server.start()
+        # 恢复显示：按 seq 顺序渲染持久化历史（只渲染，不 append）
+        restored = sorted(self.orch.history, key=lambda m: m.seq)
+        for message in restored:
+            self._write(message.speaker, message.text)
+        if restored:
+            self._system(f"已恢复 {len(restored)} 条历史消息")
         agents = " ".join(f"@{s.name}({s.transport.upper()})" for s in self.orch.specs)
         self._system(f"聊天室已就绪：{agents} @host；不带 @ 的消息由 host 路由；"
                      f"工作目录：{self.orch.workdir}")
         self.query_one(Input).focus()
 
     async def on_unmount(self) -> None:
-        # 先放行等待中的权限请求（cancelled），再统一回收 adapter——
-        # 顺序反过来会死锁：aclose 等的锁可能被等权限的 prompt 持有。
+        # 先放行等待中的权限请求（cancelled），再停 bus worker（取消进行
+        # 中的 dispatch），最后统一回收 adapter——顺序反过来会死锁：
+        # aclose 等的锁可能被等权限的 prompt 持有。bus 不拥有 orch。
         self._cancel_pending_permissions()
+        if self.control_server is not None:
+            await self.control_server.aclose()
+        await self.bus.aclose()
         await self.orch.aclose()
 
     # ---- ACP 权限决策 ----
@@ -156,19 +188,43 @@ class ChatApp(App):
         event.input.value = ""
         if not text:
             return
-        self._write("user", text)
+        # 不预先显示用户文本/思考状态：等 orchestrator 持久确认
+        # （committed 事件）后再显示；append 失败时什么都不出现。
+        self._dispatch_from_ui(text)
 
-        targets = self.orch.parse_mentions(text)
-        if targets:
-            for name in targets:
-                self._system(f"{name} 思考中…")
-        else:
-            self._system("host 路由中…")
+    def _dispatch_from_ui(self, text: str) -> None:
+        """经 CommandBus 提交（唯一入口，不再直接 orch.dispatch）。
+
+        提交/容量/closed 异常与执行期失败（如持久化错误 → 命令 failed）
+        都显示为红色 system 错误；bus FIFO 串行执行，事件经 event_sink
+        回到 _on_agent_event。
+        """
+        async def runner() -> None:
+            try:
+                snap = await self.bus.submit(text)
+            except Exception as exc:
+                self._write("system", f"派发失败：{exc}", "bold red")
+                return
+            while True:  # agent 长任务可能超过单次 wait 上限，等到 terminal
+                result = await self.bus.wait(snap.command_id)
+                if not result["timed_out"]:
+                    break
+            if result["status"] == "failed":
+                self._write("system", f"派发失败：{result['error']}", "bold red")
         # run_worker：agent 调用是长任务，不能阻塞 UI
-        self.run_worker(self.orch.dispatch(text, self._on_agent_event))
+        self.run_worker(runner())
 
     def _on_agent_event(self, name: str, ev: AgentEvent) -> None:
-        if ev.kind == "text":
+        if ev.kind == "committed" and name == "user":
+            # 用户消息已持久确认：此时才显示文本和派发状态
+            self._write("user", ev.text)
+            targets = self.orch.parse_mentions(ev.text)
+            if targets:
+                for target in targets:
+                    self._system(f"{target} 思考中…")
+            else:
+                self._system("host 路由中…")
+        elif ev.kind == "text":
             self._write(name, ev.text)
         elif ev.kind == "info":
             self._system(f"{name}: {ev.text}")

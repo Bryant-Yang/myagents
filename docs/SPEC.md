@@ -14,7 +14,8 @@
 | M0 | 完成 | Textual TUI、显式 @ 路由、host、JSONL adapter |
 | M1 | 完成 | 通用 ACP client/adapter 与 fake server contract tests |
 | M2 | 完成 | Kimi ACP 接入、增量 history、权限 UI、统一回收、真实 E2E |
-| M3 | 规划 | history/session 恢复与受控外部入口 |
+| M2.5 | 完成 | 持久房间（timeline/state/seq cursor）、ACP session 恢复、owner lease、持久确认时序 |
+| M3 | 完成 | 内部 command bus、私有 Unix 控制 socket、MCP stdio 外部入口（五个 `myagents_*` 工具） |
 
 ## 1. 角色
 
@@ -84,3 +85,123 @@
 - **人工验收边界**：真实 Kimi cancel 响应时延和长任务中的不可逆工具副作用尚未
   验证。
 - **里程碑**：M1–M2。
+
+### UC-ROOM-001 持久房间与重启恢复
+
+- **角色 / 触发**：用户在同一 workdir 重启 TUI，或第二个进程试图打开同一
+  房间。
+- **前置条件**：房间状态位于
+  `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id>`，不污染
+  workdir。
+- **主流程**：timeline 以单调 `seq` append-only 落盘；`state.json` 保存
+  每个 stateful agent 的 seq cursor 与 ACP `session_id`（原子写）；TUI
+  启动按 seq 恢复显示历史；persistent Orchestrator 构造末尾获取
+  owner.lock（flock 非阻塞）单写者 lease，`aclose()` 释放。
+- **异常分支**：timeline/state 损坏、schema 不支持、workdir 不匹配、
+  cursor 越过 timeline、agent entry 缺字段或非法值，全部 fail loudly，
+  不静默覆盖或 bootstrap 成默认值；lease 冲突抛 `RoomBusyError`（含
+  持有者 PID 提示），进程异常退出由 OS 释放 flock，stale owner.lock
+  不阻塞下次获取；用户消息 append 失败则 TUI 不显示该消息并显示持久化
+  错误；`aclose()` 后新 dispatch 与排队中的 delivery 一律抛
+  `OrchestratorClosedError`，不再写 timeline、不再 start/load/prompt。
+- **验收**：重启后 seq 续接、历史按序恢复显示且 timeline 不重复 append；
+  同进程/跨进程第二 writer 被拒；checkpoint/append 写失败不假提交。
+- **独立证据来源**：`tests/test_storage.py`（timeline/state/lease/权限/
+  fail loudly）、`tests/test_m25.py`（重启恢复、lease 冲突与跨进程、
+  TUI 恢复显示、持久确认时序、close 排队保护）。
+- **人工验收边界**：真实桌面环境中两个 TUI 实例竞争同一房间的交互体验
+  尚未验收。
+- **里程碑**：M2.5。
+
+### UC-ACP-002 ACP session 恢复与原子 checkpoint
+
+- **角色 / 触发**：TUI 重启或 adapter 进程重建后，用户再次 `@` 同一个
+  ACP agent。
+- **前置条件**：`state.json` 已记录该 agent 的 seq cursor 与
+  `session_id`；adapter 暴露 `stream_prepared` restore 原语。
+- **主流程**：`session/load` 命中记录的 session（restored）或复用活跃
+  session 时保留 cursor，继续纯增量；cursor/session_id 的 checkpoint 在
+  prompt 前一次性原子落盘，成功后才更新内存 cursor；prompt 成功后先持久
+  推进 `delivered_upto` 再更新内存。
+- **异常分支**：load 失败或 agent 不声明 loadSession 时回退新 session，
+  cursor 归零并按 `history_limit` 有界 bootstrap（不沿用旧 cursor 静默
+  跳过 history），实际新 session id 落盘；checkpoint 写失败穿透
+  dispatch（零 prompt、adapter reset、内存/磁盘不假提交），不伪装成
+  agent 调用失败；prompt 失败 cursor 不推进，下轮补发。
+- **验收**：load 成功后 prompt 不含旧内容；回退路径 bootstrap 有界；
+  同一房间只有一个 writer 持有 session。
+- **独立证据来源**：`tests/test_m25.py` 真实 `AcpAdapter` + fake ACP
+  server 的 load 成功/失败/无 capability/重连/checkpoint 失败/prompt
+  失败用例；`tests/test_acp.py` 的 `stream_prepared` restore 契约测试。
+- **真实验收证据**：`scripts/e2e-m3-real.py` 已于 2026-07-26 用真实
+  `kimi acp` 完成两次独立 TUI/ACP 生命周期，第二轮复用同一 session id，
+  timeline 无重复且退出无残留。长会话 compaction 后的 restore 行为
+  仍未验收。
+- **里程碑**：M2.5。
+
+### UC-CTRL-001 外部命令注入（command bus + MCP stdio）
+
+- **角色 / 触发**：本机另一个 coding agent（MCP host）经
+  `myagents_mcp.py` stdio bridge 向运行中的 TUI 房间提交消息、查询
+  状态、读取时间线。
+- **前置条件**：TUI 已运行并持有目标房间；bridge 以显式 `--workdir`
+  启动（必填），`--state-root` 仅测试注入；bridge 只读 endpoint 发现
+  并每次实际连接验证，绝不创建 Orchestrator/TUI、不获取 lease、不直写
+  timeline、不自动拉起 TUI。
+- **主流程**：`myagents_get_room` 返回房间/workdir/PID/agent transport；
+  `myagents_send_message` 提交消息并立即返回 `command_id`（可选
+  `request_id` 幂等去重）；命令按 FIFO 经同一个 CommandBus 进入同一个
+  `Orchestrator.dispatch`，与 TUI 输入共享单写者；
+  `myagents_get_command` / `myagents_wait_command`（≤30s，超时不取消）
+  观察 queued → running → terminal；agent 最终回复落盘后进入共享时间线
+  并实时显示在 TUI；`myagents_read_timeline` 按
+  `after_seq`/`limit`（≤200）分页，不越界、不丢 seq。
+- **异常分支**：TUI 未运行、endpoint stale/损坏/权限非 0600/房间不
+  匹配，全部 fail closed 并返回含启动命令的可操作 tool error；未知
+  method、非法字段、超上限请求返回稳定错误码（`INVALID_REQUEST` /
+  `INVALID_PARAMS` / `METHOD_NOT_FOUND` / `NOT_FOUND` / `CAPACITY` /
+  `BUS_CLOSED`），不泄漏 traceback；外部消息触发工具权限时仍在 TUI
+  弹窗由用户决策，bridge 无 `auto` 放行入口；control/validation 错误
+  不会使 MCP server 崩溃。
+- **验收**：五方法语义正确；同房间并发 submit 按 FIFO 顺序执行且相同
+  `request_id` 不重复执行；官方 Python MCP SDK（`mcp>=1.27,<2`）经
+  stdio 完成 initialize/list_tools/call_tool，stdout 无非协议输出；
+  stdin EOF 后 bridge 进程 rc=0 干净退出；TUI 正常退出后无 socket、
+  endpoint、MCP 或 agent 残留进程。
+- **独立证据来源**：`tests/test_m3_bus.py`（FIFO、request_id 永久幂等、
+  容量硬上限、close 兜底 cancelled）、`tests/test_m3_control.py`
+  （五方法 roundtrip、0600/close 清理、stale 恢复与活跃不抢占、稳定
+  错误码、start 失败无泄漏、AF_UNIX 超长路径可操作错误、Textual pilot
+  外部命令实时可见、外部权限仍由 TUI 决策）、`tests/test_m3_mcp.py`（官方 SDK stdio
+  list/call、注解、structuredContent、tool error 映射、干净退出）。
+- **真实验收证据**：`scripts/e2e-m3-real.py` 已于 2026-07-26 通过：
+  临时工作区内两次启动 TUI + 真实 `kimi acp`，由独立 MCP client 各
+  提交一条无工具消息；第二轮恢复同一 session id，4 条 timeline 记录
+  连续且 command_id 关联正确，退出后无 endpoint/socket/agent 残留。
+  该脚本调用真实模型，不放进默认快速 gate。
+- **里程碑**：M3。
+
+### UC-CTRL-002 控制 socket 安全与生命周期
+
+- **角色 / 触发**：TUI 启动/退出，或第二个进程试图占用同一房间的
+  控制 socket。
+- **前置条件**：socket/endpoint 固定在房间目录内，均为 0600；
+  `endpoint.json` 经同目录临时文件 + `os.replace` + fsync 原子写，
+  只登记 protocol version、PID、room_id、规范化 workdir、socket path。
+- **主流程**：启动时若 socket 已存在，先实际连接验证——有监听者抛
+  `ControlBusyError`（不抢占、不删除属主文件），确认无监听者才清理
+  stale socket/endpoint；关闭时停止接收、取消全部 client handler
+  （含等待中的 `command.wait`），只按 inode 删除自己创建的
+  socket/endpoint，无 task/文件残留。
+- **异常分支**：`start()` 中途失败（如 chmod 失败）不泄漏仍在监听的
+  server，清理后可干净重试；macOS AF_UNIX 路径超约 104 字节时报
+  可操作错误（提示缩短 `XDG_STATE_HOME`），不创建任何文件；连接验证
+  遇非 stale 类 errno 一律 fail closed。
+- **验收**：活跃 socket 任何情况下不被第二 server unlink/抢占；
+  endpoint/socket 0600 与原子性成立；close 后文件与 task 无残留；
+  client 发现路径不创建状态目录。
+- **独立证据来源**：`tests/test_m3_control.py` 对应用例；
+  `tests/test_m25.py` 的 lease 跨进程冲突用例（owner.lock 兜底）。
+- **人工验收边界**：两个真实桌面 TUI 实例竞争同一房间的交互体验尚未
+  验收。
+- **里程碑**：M3。

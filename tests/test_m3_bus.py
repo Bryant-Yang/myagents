@@ -1,0 +1,583 @@
+"""CommandBus 纯总线测试：FakeOrch，不接真实 agent、不接 gate。
+
+运行：.venv/bin/python tests/test_m3_bus.py
+"""
+
+import asyncio
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from control import (CommandBus, CommandBusClosedError, CommandBusError,
+                     CommandCapacityError, CommandNotFoundError,
+                     CommandStatus, CommandValidationError)
+from adapters.base import AgentEvent
+
+
+class FakeOrch:
+    """duck-typed orch：记录 dispatch 顺序，可用 gate 卡住、可注入异常。"""
+
+    def __init__(self) -> None:
+        self.calls = []       # (message, command_id)，按 dispatch 开始顺序
+        self.log = []         # "start:msg" / "end:msg"，验证串行
+        self.gate: asyncio.Event | None = None
+        self.fail_with: BaseException | None = None
+        self.closed = False
+
+    async def dispatch(self, message, on_event, command_id=None):
+        self.calls.append((message, command_id))
+        self.log.append(f"start:{message}")
+        on_event("fake", ("text", message))
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            if self.fail_with is not None:
+                raise self.fail_with
+            on_event("fake", ("done", message))
+        finally:
+            self.log.append(f"end:{message}")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _Raises:
+    """极简 with 断言（与 tests/test_basic.py 同款，避免 pytest 依赖）。"""
+
+    def __init__(self, exc_type):
+        self.exc_type = exc_type
+        self.exc = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, t, v, tb):
+        if t is None:
+            raise AssertionError(f"未抛出 {self.exc_type.__name__}")
+        if issubclass(t, self.exc_type):
+            self.exc = v
+            return True
+        return False
+
+
+def _parse(ts: str) -> datetime:
+    assert ts.endswith("Z"), f"时间戳缺 Z 后缀：{ts}"
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def make_bus(orch: FakeOrch, **kwargs) -> CommandBus:
+    bus = CommandBus(orch, **kwargs)
+    bus.start()
+    return bus
+
+
+def test_validation() -> None:
+    async def run() -> None:
+        orch = FakeOrch()
+        bus = CommandBus(orch)
+        # start 前 submit 拒绝
+        with _Raises(CommandBusError):
+            await bus.submit("hi")
+        bus.start()
+        bus.start()  # 重复安全
+        assert bus._worker_task is not None
+        first_task = bus._worker_task
+        bus.start()
+        assert bus._worker_task is first_task  # 没有新建 worker
+
+        for bad in ("", "   ", 123):
+            with _Raises(CommandValidationError):
+                await bus.submit(bad)
+        with _Raises(CommandValidationError):
+            await bus.submit("a" * (64 * 1024) + "x")       # 超 64KiB
+        big_ok = await bus.submit("a" * (64 * 1024))         # 恰好 64KiB 放行
+        assert big_ok.status is CommandStatus.QUEUED
+        for bad in ("", "r" * 129, 42):
+            with _Raises(CommandValidationError):
+                await bus.submit("m", request_id=bad)
+        ok = await bus.submit("m", request_id="r" * 128)     # 恰好 128 字符放行
+        assert ok.request_id == "r" * 128
+
+        with _Raises(CommandNotFoundError):
+            bus.get(str(uuid.uuid4()))
+        for bad in (-1, 31, "1", True):
+            with _Raises(CommandValidationError):
+                await bus.wait(big_ok.command_id, timeout=bad)
+
+        with _Raises(CommandValidationError):
+            CommandBus(orch, max_commands=0)
+        for bad in (True, False):                     # bool 不是合法 int
+            with _Raises(CommandValidationError):
+                CommandBus(orch, max_commands=bad)
+        await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  参数校验（message/request_id/timeout/max_commands/start 幂等）")
+
+
+def test_fifo_serial_and_timestamps() -> None:
+    async def run() -> None:
+        orch = FakeOrch()
+        bus = make_bus(orch)
+        snaps = [await bus.submit(f"m{i}") for i in range(3)]
+        # 入队即返回：queued，时间只有 created_at
+        for snap in snaps:
+            assert snap.status is CommandStatus.QUEUED
+            assert snap.started_at is None and snap.finished_at is None
+            uuid.UUID(snap.command_id)  # command_id 是合法 UUID
+            _parse(snap.created_at)
+        for i, snap in enumerate(snaps):
+            result = await bus.wait(snap.command_id, timeout=5)
+            assert result["timed_out"] is False
+            assert result["status"] == "completed"
+        # FIFO + 串行：start/end 严格交替且按提交顺序
+        assert [c[0] for c in orch.calls] == ["m0", "m1", "m2"]
+        assert orch.log == ["start:m0", "end:m0",
+                            "start:m1", "end:m1",
+                            "start:m2", "end:m2"]
+        # command_id 透传给 orch.dispatch
+        assert [c[1] for c in orch.calls] == [s.command_id for s in snaps]
+        # 时间戳单调：created <= started <= finished
+        final = bus.get(snaps[0].command_id)
+        assert final.status is CommandStatus.COMPLETED
+        created, started, finished = (_parse(final.created_at),
+                                      _parse(final.started_at),
+                                      _parse(final.finished_at))
+        assert created <= started <= finished
+        assert final.error is None
+        # to_dict 形状
+        d = final.to_dict()
+        assert set(d) == {"command_id", "request_id", "message", "status",
+                          "created_at", "started_at", "finished_at", "error"}
+        assert d["status"] == "completed"
+        await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  FIFO 串行 + 状态时间戳 + to_dict")
+
+
+def test_dispatch_failure() -> None:
+    async def run() -> None:
+        orch = FakeOrch()
+        bus = make_bus(orch)
+        orch.fail_with = RuntimeError("炸了")
+        snap = await bus.submit("会失败")
+        result = await bus.wait(snap.command_id, timeout=5)
+        assert result["status"] == "failed" and result["timed_out"] is False
+        assert "RuntimeError" in result["error"] and "炸了" in result["error"]
+        assert result["finished_at"] is not None
+        # 失败后 worker 还活着，后续命令照常执行
+        orch.fail_with = None
+        snap2 = await bus.submit("恢复正常")
+        assert (await bus.wait(snap2.command_id, timeout=5))["status"] == "completed"
+
+        # orch 自发抛 CancelledError：命令记 cancelled，worker 不死
+        orch.fail_with = asyncio.CancelledError()
+        snap3 = await bus.submit("被取消")
+        result3 = await bus.wait(snap3.command_id, timeout=5)
+        assert result3["status"] == "cancelled"
+        orch.fail_with = None
+        snap4 = await bus.submit("还活着")
+        assert (await bus.wait(snap4.command_id, timeout=5))["status"] == "completed"
+        await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  dispatch 异常 → failed；自发 CancelledError → cancelled 且 worker 存活")
+
+
+def test_wait_timeout_and_terminal_immediate() -> None:
+    async def run() -> None:
+        orch = FakeOrch()
+        orch.gate = asyncio.Event()
+        bus = make_bus(orch)
+        snap = await bus.submit("卡住")
+        # 超时：timed_out=True，状态仍 running，命令不被取消
+        result = await bus.wait(snap.command_id, timeout=0.1)
+        assert result["timed_out"] is True and result["status"] == "running"
+        assert bus.get(snap.command_id).status is CommandStatus.RUNNING
+        # timeout=0 对 running 命令立即超时
+        assert (await bus.wait(snap.command_id, timeout=0))["timed_out"] is True
+        # 放行后 wait 成功
+        orch.gate.set()
+        result = await bus.wait(snap.command_id, timeout=5)
+        assert result["timed_out"] is False and result["status"] == "completed"
+        # terminal 后 wait 立即返回，timeout 再小也不超时
+        result = await bus.wait(snap.command_id, timeout=0)
+        assert result["timed_out"] is False and result["status"] == "completed"
+        with _Raises(CommandNotFoundError):
+            await bus.wait(str(uuid.uuid4()), timeout=0)
+        await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  wait 超时（不取消命令）/ 成功 / terminal 立即返回")
+
+
+def test_request_id_idempotency() -> None:
+    async def run() -> None:
+        orch = FakeOrch()
+        orch.gate = asyncio.Event()
+        bus = make_bus(orch)
+        running = await bus.submit("第一条", request_id="r-run")
+        queued = await bus.submit("第二条", request_id="r-queue")
+        await asyncio.sleep(0)  # 让 worker 把第一条拿到 running
+        # running 状态重复提交：返回原记录，不重复入队
+        dup = await bus.submit("篡改内容", request_id="r-run")
+        assert dup.command_id == running.command_id
+        assert dup.message == "第一条" and dup.status is CommandStatus.RUNNING
+        # queued 状态重复提交
+        dup = await bus.submit("篡改内容", request_id="r-queue")
+        assert dup.command_id == queued.command_id
+        assert dup.message == "第二条" and dup.status is CommandStatus.QUEUED
+        assert len(orch.calls) == 1
+        orch.gate.set()
+        await bus.wait(running.command_id, timeout=5)
+        await bus.wait(queued.command_id, timeout=5)
+        # terminal 状态重复提交：仍返回原记录
+        dup = await bus.submit("又篡改", request_id="r-run")
+        assert dup.command_id == running.command_id
+        assert dup.status is CommandStatus.COMPLETED
+        assert len(orch.calls) == 2  # 全程只真正 dispatch 了两次
+        await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  request_id 三状态（queued/running/terminal）永久幂等")
+
+
+def test_event_sink_forwarding() -> None:
+    async def run() -> None:
+        orch = FakeOrch()
+        events = []
+        bus = make_bus(orch, event_sink=lambda n, e: events.append((n, e)))
+        snap = await bus.submit("hello")
+        await bus.wait(snap.command_id, timeout=5)
+        # event_sink 原样收到 (name, event)
+        assert events == [("fake", ("text", "hello")),
+                          ("fake", ("done", "hello"))]
+        # 无 sink 也能正常跑
+        bus2 = make_bus(FakeOrch())
+        snap2 = await bus2.submit("no sink")
+        await bus2.wait(snap2.command_id, timeout=5)
+        await bus.aclose()
+        await bus2.aclose()
+
+    asyncio.run(run())
+    print("ok  event_sink 原样转发")
+
+
+def test_close_cancels_active_and_queued() -> None:
+    async def run() -> None:
+        orch = FakeOrch()
+        orch.gate = asyncio.Event()
+        bus = make_bus(orch)
+        active = await bus.submit("active")
+        queued = await bus.submit("queued")
+        await asyncio.sleep(0)  # worker 取走 active
+        assert bus.get(active.command_id).status is CommandStatus.RUNNING
+        assert bus.get(queued.command_id).status is CommandStatus.QUEUED
+        # 一个正在 wait queued 的等待者，close 后应被唤醒
+        waiter = asyncio.create_task(bus.wait(queued.command_id, timeout=30))
+        await asyncio.sleep(0)
+        await bus.aclose()
+        await bus.aclose()  # 幂等
+        result = await waiter
+        assert result["status"] == "cancelled" and result["timed_out"] is False
+        # active 与 queued 都 terminal cancelled，finished_at 补齐
+        a, q = bus.get(active.command_id), bus.get(queued.command_id)
+        assert a.status is CommandStatus.CANCELLED and a.finished_at is not None
+        assert q.status is CommandStatus.CANCELLED and q.finished_at is not None
+        assert a.started_at is not None      # active 曾开始
+        assert q.started_at is None          # queued 从未开始
+        # 无 task 泄漏
+        assert bus._worker_task is None
+        pending = [t for t in asyncio.all_tasks()
+                   if t is not asyncio.current_task() and not t.done()]
+        assert pending == [], f"残留 task：{pending}"
+        # bus 不拥有 orch：aclose 不关闭 orch
+        assert orch.closed is False
+        await orch.aclose()
+
+    asyncio.run(run())
+    print("ok  aclose 取消 active+queued（timestamps + notify + 幂等 + 无泄漏）")
+
+
+def test_closed_rejects() -> None:
+    async def run() -> None:
+        orch = FakeOrch()
+        bus = make_bus(orch)
+        snap = await bus.submit("先完成")
+        await bus.wait(snap.command_id, timeout=5)
+        await bus.aclose()
+        with _Raises(CommandBusClosedError):
+            await bus.submit("拒绝")
+        with _Raises(CommandBusClosedError):
+            bus.start()
+        # 已 terminal 的记录 close 后仍可查可等
+        assert bus.get(snap.command_id).status is CommandStatus.COMPLETED
+        assert (await bus.wait(snap.command_id, timeout=0))["status"] == "completed"
+
+    asyncio.run(run())
+    print("ok  close 后拒绝 submit/start，历史记录仍可查")
+
+
+def test_eviction_policy() -> None:
+    async def run() -> None:
+        # 无 request_id：最老 terminal 清理到 max_commands
+        orch = FakeOrch()
+        bus = make_bus(orch, max_commands=2)
+        ids = []
+        for i in range(4):
+            snap = await bus.submit(f"m{i}")
+            await bus.wait(snap.command_id, timeout=5)
+            ids.append(snap.command_id)
+        assert len(bus._commands) == 2
+        with _Raises(CommandNotFoundError):
+            bus.get(ids[0])
+        with _Raises(CommandNotFoundError):
+            bus.get(ids[1])
+        assert bus.get(ids[2]).status is CommandStatus.COMPLETED
+        assert bus.get(ids[3]).status is CommandStatus.COMPLETED
+        await bus.aclose()
+
+        # 带 request_id 的 terminal 永不清理：占满容量时新命令被拒绝（硬上限）
+        orch2 = FakeOrch()
+        bus2 = make_bus(orch2, max_commands=1)
+        snap = await bus2.submit("k0", request_id="keep-0")
+        await bus2.wait(snap.command_id, timeout=5)
+        assert len(bus2._commands) == 1
+        # keyed terminal 不可清理，容量满 → CommandCapacityError，绝不超限
+        with _Raises(CommandCapacityError):
+            await bus2.submit("k1", request_id="keep-1")
+        with _Raises(CommandCapacityError):
+            await bus2.submit("k1")  # 无 request_id 同样拒绝
+        assert len(bus2._commands) == 1
+        # 满容量下已有 request_id 仍幂等返回原记录
+        dup = await bus2.submit("又篡改", request_id="keep-0")
+        assert dup.command_id == snap.command_id
+        assert dup.status is CommandStatus.COMPLETED
+        assert len(orch2.calls) == 1
+        await bus2.aclose()
+
+    asyncio.run(run())
+    print("ok  清理策略 + 硬上限（keyed terminal 占满拒绝，满容量下 request_id 幂等）")
+
+
+def test_hard_capacity_active_queued() -> None:
+    """active/queued 占满容量时拒绝；terminal 后可清理记录腾出空间。"""
+
+    async def run() -> None:
+        orch = FakeOrch()
+        orch.gate = asyncio.Event()
+        bus = make_bus(orch, max_commands=2)
+        running = await bus.submit("m0")
+        queued = await bus.submit("m1")
+        await asyncio.sleep(0)  # worker 取走 m0
+        assert bus.get(running.command_id).status is CommandStatus.RUNNING
+        # 两条都不可清理（running + queued），容量满 → 拒绝
+        with _Raises(CommandCapacityError):
+            await bus.submit("m2")
+        assert len(bus._commands) == 2
+        # 放行执行完：最老无 request_id terminal 被清理，容量腾出
+        orch.gate.set()
+        await bus.wait(running.command_id, timeout=5)
+        await bus.wait(queued.command_id, timeout=5)
+        snap = await bus.submit("m2")
+        assert (await bus.wait(snap.command_id, timeout=5))["status"] == "completed"
+        assert len(bus._commands) <= 2
+        await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  硬上限（active/queued 占满拒绝；terminal 清理后恢复）")
+
+
+def test_cancel_window_and_worker_restart() -> None:
+    """精确制造 queue.get() 后、RUNNING transition 前的取消窗口。"""
+
+    async def run() -> None:
+        orch = FakeOrch()
+        bus = make_bus(orch)
+        # 占住 cond 锁：worker 的 RUNNING transition 必被卡在锁外，
+        # 即精确停在 queue.get() 之后、transition 之前的窗口
+        await bus._cond.acquire()
+        try:
+            snap = await bus.submit("窗口")
+            queued = await bus.submit("排队")
+            worker = bus._worker_task
+            for _ in range(1000):  # 等 worker 取走命令并卡在窗口
+                if bus._active is not None:
+                    break
+                await asyncio.sleep(0)
+            assert bus._active is not None, "worker 未进入窗口"
+            # 窗口内：命令已取走但还没 transition，仍是 queued
+            assert bus.get(snap.command_id).status is CommandStatus.QUEUED
+            worker.cancel()
+        finally:
+            bus._cond.release()
+        with _Raises(asyncio.CancelledError):
+            await worker
+        # active（窗口中被取消）与剩余 queued 都转 cancelled，无 ghost
+        for s, started in ((snap, False), (queued, False)):
+            final = bus.get(s.command_id)
+            assert final.status is CommandStatus.CANCELLED
+            assert final.finished_at is not None
+            assert (final.started_at is not None) is started
+        assert bus._active is None
+        # worker 死后 submit 拒绝：不能接受无消费者命令
+        with _Raises(CommandBusError):
+            await bus.submit("没人消费")
+        # 显式 start() 可恢复
+        bus.start()
+        snap2 = await bus.submit("复活")
+        assert (await bus.wait(snap2.command_id, timeout=5))["status"] == "completed"
+        assert orch.calls[-1][0] == "复活"
+        # 正常 aclose 后 start/submit 仍拒绝
+        await bus.aclose()
+        with _Raises(CommandBusClosedError):
+            bus.start()
+        with _Raises(CommandBusClosedError):
+            await bus.submit("拒绝")
+
+    asyncio.run(run())
+    print("ok  取消窗口（active+queued 兜底 cancelled）+ worker 死后拒绝/start 恢复")
+
+
+# ---- 集成：CommandBus ↔ 真实 Orchestrator / TUI ----
+
+
+class FakeAgentAdapter:
+    """假工人 agent（JSONL 语义）：记录 prompt，吐固定回复。"""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.prompts: list[str] = []
+
+    async def stream(self, prompt: str, workdir: str):
+        self.prompts.append(prompt)
+        yield AgentEvent("text", f"{self.name} 回复{len(self.prompts)}")
+        yield AgentEvent("done")
+
+    async def aclose(self) -> None:
+        pass
+
+
+class FakeHostAdapter(FakeAgentAdapter):
+    """假主持人：decide 固定路由到 kimi。"""
+
+    def __init__(self) -> None:
+        super().__init__("host")
+
+    async def decide(self, transcript: str, workdir: str):
+        return (["kimi"], "测试路由")
+
+
+def make_fake_orch():
+    """真实 Orchestrator（内存模式）+ 全 fake agent。"""
+    from orchestrator import Orchestrator
+
+    orch = Orchestrator(workdir=".", persistent=False)
+    for n in ("kimi", "opencode", "codex"):
+        orch.adapters[n] = FakeAgentAdapter(n)
+    orch.host = FakeHostAdapter()
+    orch.adapters["host"] = orch.host
+    return orch
+
+
+def test_bus_orchestrator_integration() -> None:
+    """real Orchestrator + fake agent 经 CommandBus 连发两条：
+    FIFO 串行；每轮 user/agent timeline 带同一个 command_id，两轮不同。"""
+
+    async def run() -> None:
+        orch = make_fake_orch()
+        events = []
+        bus = CommandBus(orch, lambda n, e: events.append((n, e)))
+        bus.start()
+        s1 = await bus.submit("@kimi 第一条")
+        s2 = await bus.submit("@kimi 第二条")
+        r1 = await bus.wait(s1.command_id, timeout=5)
+        r2 = await bus.wait(s2.command_id, timeout=5)
+        assert r1["status"] == r2["status"] == "completed"
+        # FIFO：第一轮 user+agent 完整落 timeline 后才第二轮
+        assert [(m.speaker, m.command_id) for m in orch.history] == [
+            ("user", s1.command_id), ("kimi", s1.command_id),
+            ("user", s2.command_id), ("kimi", s2.command_id)]
+        assert s1.command_id != s2.command_id
+        # user committed 事件 meta：保留 seq，加入 command_id
+        committed = [e for _, e in events if e.kind == "committed"]
+        assert [e.meta["command_id"] for e in committed] == [
+            s1.command_id, s2.command_id]
+        assert all(isinstance(e.meta["seq"], int) and e.meta["seq"] > 0
+                   for e in committed)
+        # 串行证据：第二轮 prompt 能看到第一轮的回复
+        kimi = orch.adapters["kimi"]
+        assert len(kimi.prompts) == 2
+        assert "kimi 回复1" not in kimi.prompts[0]
+        assert "kimi 回复1" in kimi.prompts[1]
+        await bus.aclose()
+        await orch.aclose()
+
+    asyncio.run(run())
+    print("ok  集成：Orchestrator 经 bus FIFO + 每轮 timeline 带对应 command_id")
+
+
+def test_tui_bus_integration() -> None:
+    """Textual pilot 快速提交两条：都经 app.bus 串行执行并显示；
+    退出后 bus 与 orch 都关闭。"""
+    from textual.widgets import Input, RichLog
+    from main import ChatApp
+
+    async def run() -> None:
+        orch = make_fake_orch()
+        app = ChatApp(workdir=".", orchestrator=orch)
+        assert isinstance(app.bus, CommandBus)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            box = app.query_one(Input)
+            box.value = "@kimi 甲"
+            await pilot.press("enter")
+            box.value = "@kimi 乙"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            kimi = orch.adapters["kimi"]
+            # 两条都经 app.bus：user/agent timeline 带 command_id，
+            # 且对应命令在 bus 里 completed
+            assert [(m.speaker,) for m in orch.history] == [
+                ("user",), ("kimi",), ("user",), ("kimi",)]
+            ids = [m.command_id for m in orch.history]
+            assert all(cid is not None for cid in ids)
+            assert ids[0] == ids[1] and ids[2] == ids[3] and ids[0] != ids[2]
+            for cid in (ids[0], ids[2]):
+                assert app.bus.get(cid).status is CommandStatus.COMPLETED
+            # 串行执行：第二轮 prompt 含第一轮回复
+            assert len(kimi.prompts) == 2
+            assert "kimi 回复1" in kimi.prompts[1]
+            # 都显示了
+            text = "\n".join(str(line.text)
+                             for line in app.query_one(RichLog).lines)
+            assert "[user] @kimi 甲" in text and "[user] @kimi 乙" in text
+            assert "[kimi] kimi 回复1" in text and "[kimi] kimi 回复2" in text
+        # 退出后：bus 与 orch 都关闭（bus 不拥有 orch，但 TUI 负责两个都关）
+        assert app.bus._closed is True
+        assert orch._closed is True
+
+    asyncio.run(run())
+    print("ok  集成：TUI 经 bus 快速连发两条（FIFO + 显示 + 退出双关闭）")
+
+
+if __name__ == "__main__":
+    test_validation()
+    test_fifo_serial_and_timestamps()
+    test_dispatch_failure()
+    test_wait_timeout_and_terminal_immediate()
+    test_request_id_idempotency()
+    test_event_sink_forwarding()
+    test_close_cancels_active_and_queued()
+    test_closed_rejects()
+    test_eviction_policy()
+    test_hard_capacity_active_queued()
+    test_cancel_window_and_worker_restart()
+    test_bus_orchestrator_integration()
+    test_tui_bus_integration()
+    print("\n全部通过")
