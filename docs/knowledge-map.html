@@ -1,0 +1,626 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent 编排知识地图 · myagents</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..900;1,9..144,300..900&family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #0E1424;
+    --panel: #161E33;
+    --panel-2: #1B2440;
+    --hairline: #26314E;
+    --text: #E8E4D8;
+    --dim: #8B93A8;
+    --c-l1: #E8A33D;  /* 基础层 琥珀 */
+    --c-l2: #4FC3C8;  /* 编排层 青 */
+    --c-l3: #9B8CF2;  /* 协议层 紫 */
+    --c-l4: #E86A5E;  /* 安全层 珊瑚 */
+    --c-l5: #8FBF9F;  /* 项目层 鼠尾草绿 */
+    --c-l6: #7E9CC8;  /* 模型层 石灰蓝 */
+    --c-kimi: #4FC3C8;
+    --c-opencode: #8FBF9F;
+    --c-user: #E8A33D;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--ink);
+    color: var(--text);
+    font-family: "Inter", system-ui, sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--c-l1); color: var(--ink); }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; text-align: left; }
+  :focus-visible { outline: 2px solid var(--c-l1); outline-offset: 3px; border-radius: 4px; }
+
+  .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---------- 英雄区 ---------- */
+  .hero { padding: 72px 0 56px; border-bottom: 1px solid var(--hairline); }
+  .eyebrow {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12px; letter-spacing: .22em;
+    color: var(--dim); text-transform: uppercase;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .eyebrow::before { content: ""; width: 32px; height: 1px; background: var(--c-l1); }
+  h1 {
+    font-family: "Fraunces", serif;
+    font-weight: 560; font-size: clamp(2.6rem, 6vw, 4.6rem);
+    line-height: 1.04; letter-spacing: -0.01em;
+    margin: 22px 0 18px;
+  }
+  h1 em { font-style: italic; color: var(--c-l1); font-weight: 480; }
+  .lede { max-width: 560px; color: var(--dim); font-size: 17px; }
+  .lede strong { color: var(--text); font-weight: 500; }
+
+  .hero-grid {
+    display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    gap: 48px; align-items: center; margin-top: 8px;
+  }
+  .hero-grid > * { min-width: 0; }
+  @media (max-width: 900px) { .hero-grid { grid-template-columns: 1fr; } }
+
+  /* ---------- 迷你聊天室 demo ---------- */
+  .demo-window {
+    background: var(--panel);
+    border: 1px solid var(--hairline);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 24px 60px -24px rgba(0,0,0,.6);
+  }
+  .demo-titlebar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px; border-bottom: 1px solid var(--hairline);
+    font-family: "IBM Plex Mono", monospace; font-size: 12px; color: var(--dim);
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--hairline); }
+  .dot:nth-child(1) { background: #E86A5E; } .dot:nth-child(2) { background: #E8A33D; } .dot:nth-child(3) { background: #8FBF9F; }
+  .demo-title { margin-left: 8px; }
+  .demo-body {
+    padding: 16px 18px; min-height: 300px;
+    font-size: 13.5px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .dl { opacity: 0; transform: translateY(4px); transition: opacity .3s, transform .3s; }
+  .dl.show { opacity: 1; transform: none; }
+  .dl-user { font-family: "IBM Plex Mono", monospace; color: var(--c-user); }
+  .dl-user::before { content: "> "; color: var(--dim); }
+  .dl-user .caret { display: inline-block; width: 7px; height: 14px; background: var(--c-user); vertical-align: -2px; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .dl-sys { color: var(--dim); font-size: 12.5px; font-family: "IBM Plex Mono", monospace; }
+  .dl-json {
+    font-family: "IBM Plex Mono", monospace; font-size: 12px;
+    color: var(--dim); background: var(--ink);
+    border-left: 2px solid var(--ac, var(--hairline));
+    padding: 6px 10px; border-radius: 0 6px 6px 0;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .dl-json b { color: var(--ac); font-weight: 500; }
+  .dl-reply { display: flex; gap: 8px; align-items: baseline; }
+  .dl-reply .tag {
+    font-family: "IBM Plex Mono", monospace; font-size: 11px;
+    color: var(--ac); border: 1px solid var(--ac);
+    padding: 1px 7px; border-radius: 99px; flex-shrink: 0;
+  }
+  .demo-caption {
+    margin-top: 12px; font-size: 12.5px; color: var(--dim);
+    font-family: "IBM Plex Mono", monospace;
+  }
+  .demo-caption a { color: var(--c-l2); text-decoration: none; border-bottom: 1px dotted var(--c-l2); }
+
+  /* ---------- 图例 & 筛选 ---------- */
+  .mapbar {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    padding: 22px 0; position: sticky; top: 0; z-index: 20;
+    background: color-mix(in srgb, var(--ink) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--hairline);
+  }
+  .chip {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-family: "IBM Plex Mono", monospace; font-size: 12px;
+    color: var(--dim); padding: 4px 10px;
+    border: 1px solid var(--hairline); border-radius: 99px;
+  }
+  .chip i { width: 8px; height: 8px; border-radius: 2px; background: var(--c); }
+  .chip:hover { color: var(--text); border-color: var(--c); }
+  .filter {
+    margin-left: auto; background: var(--panel); border: 1px solid var(--hairline);
+    border-radius: 8px; color: var(--text);
+    font-family: "IBM Plex Mono", monospace; font-size: 13px;
+    padding: 7px 12px; width: 200px;
+  }
+  .filter::placeholder { color: var(--dim); }
+
+  /* ---------- 层带 ---------- */
+  .map { position: relative; }
+  #edges { position: absolute; inset: 0; z-index: 0; pointer-events: none; }
+  #edges line { stroke: var(--hairline); stroke-width: 1; opacity: .55; transition: stroke .2s, opacity .2s; }
+  #edges line.hot { stroke: var(--hc, var(--text)); opacity: 1; stroke-width: 1.5; }
+  #edges line.dim { opacity: .08; }
+
+  .bands { position: relative; z-index: 1; }
+  .band {
+    display: grid; grid-template-columns: 200px 1fr; gap: 28px;
+    padding: 36px 0; border-bottom: 1px solid var(--hairline);
+  }
+  @media (max-width: 760px) { .band { grid-template-columns: 1fr; gap: 16px; } }
+  .band > * { min-width: 0; }
+  .band-head { position: sticky; top: 84px; align-self: start; }
+  @media (max-width: 760px) { .band-head { position: static; } }
+  .band-no {
+    font-family: "IBM Plex Mono", monospace; font-size: 11px;
+    letter-spacing: .2em; color: var(--c); margin-bottom: 8px;
+  }
+  .band-head h2 {
+    font-family: "Fraunces", serif; font-weight: 560; font-size: 26px; line-height: 1.15;
+  }
+  .band-sub { color: var(--dim); font-size: 13.5px; margin-top: 6px; }
+  .band-count {
+    display: inline-block; margin-top: 12px;
+    font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--dim);
+    border: 1px solid var(--hairline); border-radius: 99px; padding: 2px 9px;
+  }
+  .band-nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+
+  /* ---------- 节点卡 ---------- */
+  .node {
+    background: var(--panel); border: 1px solid var(--hairline);
+    border-radius: 10px; padding: 14px 16px;
+    display: flex; flex-direction: column; gap: 5px;
+    transition: border-color .2s, transform .2s, opacity .25s, background .2s;
+  }
+  .node::before {
+    content: ""; width: 22px; height: 2px; background: var(--c); border-radius: 2px;
+    transition: width .25s;
+  }
+  .node:hover { border-color: var(--c); transform: translateY(-2px); background: var(--panel-2); }
+  .node:hover::before { width: 100%; }
+  .node.hot { border-color: var(--c); box-shadow: 0 0 0 1px var(--c) inset; }
+  .node.dim { opacity: .18; }
+  .n-name { font-weight: 600; font-size: 15px; display: flex; align-items: baseline; gap: 8px; }
+  .n-en { font-family: "IBM Plex Mono", monospace; font-size: 10.5px; letter-spacing: .12em; color: var(--c); text-transform: uppercase; }
+  .n-def { font-size: 13px; color: var(--dim); line-height: 1.5; }
+
+  /* ---------- 详情抽屉 ---------- */
+  .drawer {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+    background: var(--panel); border-top: 1px solid var(--hairline);
+    transform: translateY(102%); transition: transform .35s cubic-bezier(.2,.9,.25,1);
+    box-shadow: 0 -24px 60px rgba(0,0,0,.5);
+  }
+  .drawer.open { transform: none; }
+  .drawer-inner { max-width: 880px; margin: 0 auto; padding: 26px 24px 30px; }
+  .drawer-top { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .drawer-top h3 { font-family: "Fraunces", serif; font-weight: 560; font-size: 27px; }
+  .d-en { font-family: "IBM Plex Mono", monospace; font-size: 12px; letter-spacing: .14em; color: var(--c); text-transform: uppercase; }
+  .d-layer { margin-left: auto; font-family: "IBM Plex Mono", monospace; font-size: 11.5px; color: var(--c); border: 1px solid var(--c); padding: 2px 10px; border-radius: 99px; }
+  .d-close { font-family: "IBM Plex Mono", monospace; color: var(--dim); font-size: 12px; border: 1px solid var(--hairline); border-radius: 6px; padding: 4px 10px; }
+  .d-close:hover { color: var(--text); border-color: var(--text); }
+  .d-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 18px; }
+  @media (max-width: 700px) { .d-grid { grid-template-columns: 1fr; } }
+  .d-label { font-family: "IBM Plex Mono", monospace; font-size: 11px; letter-spacing: .18em; color: var(--dim); text-transform: uppercase; margin-bottom: 6px; }
+  .d-body { font-size: 14.5px; line-height: 1.65; }
+  .d-code {
+    grid-column: 1 / -1;
+    background: var(--ink); border: 1px solid var(--hairline); border-radius: 8px;
+    padding: 10px 14px; font-family: "IBM Plex Mono", monospace; font-size: 12.5px;
+    color: var(--c-l2); overflow-x: auto; white-space: nowrap;
+  }
+  .d-code span { color: var(--dim); }
+  .d-rel { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .d-rel .d-label { margin: 0 6px 0 0; }
+  .rel-chip {
+    font-size: 12.5px; border: 1px solid var(--hairline); border-radius: 99px;
+    padding: 3px 12px; color: var(--dim);
+  }
+  .rel-chip:hover { color: var(--text); border-color: var(--cc, var(--text)); }
+  .scrim { position: fixed; inset: 0; z-index: 40; background: rgba(6,9,18,.55); opacity: 0; pointer-events: none; transition: opacity .3s; }
+  .scrim.open { opacity: 1; pointer-events: auto; }
+
+  footer { padding: 44px 0 60px; color: var(--dim); font-size: 13px; }
+  footer .mono { font-size: 12px; }
+  footer a { color: var(--c-l2); text-decoration: none; border-bottom: 1px dotted var(--c-l2); }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <div class="eyebrow">myagents field guide</div>
+      <h1>Agent <em>编排</em>，<br>一张图看懂。</h1>
+      <p class="lede">这是从真实小产品 <strong>myagents</strong>（终端多 agent 聊天室）里拆出的
+        <strong>23 个概念</strong>，分六层。点任意节点，看它的定义、为什么重要、
+        以及它住在代码的哪个文件里。右侧是产品本体，正在自动演示一次双 agent 派发。</p>
+      <p class="demo-caption">对应源码：<a href="../README.md">myagents/README.md</a> · <a href="concepts.md">docs/concepts.md</a></p>
+    </div>
+    <div>
+      <div class="demo-window" aria-label="myagents 产品演示">
+        <div class="demo-titlebar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="demo-title">myagents — live demo</span></div>
+        <div class="demo-body" id="demoBody"></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="mapbar">
+  <div class="wrap" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+    <button class="chip" data-layer="l1" style="--c:var(--c-l1)"><i></i>L1 基础层</button>
+    <button class="chip" data-layer="l2" style="--c:var(--c-l2)"><i></i>L2 编排层</button>
+    <button class="chip" data-layer="l3" style="--c:var(--c-l3)"><i></i>L3 协议层</button>
+    <button class="chip" data-layer="l4" style="--c:var(--c-l4)"><i></i>L4 安全与验收</button>
+    <button class="chip" data-layer="l5" style="--c:var(--c-l5)"><i></i>L5 现有项目</button>
+    <button class="chip" data-layer="l6" style="--c:var(--c-l6)"><i></i>L6 模型常识</button>
+    <input class="filter" id="filter" type="search" placeholder="筛选概念…" aria-label="筛选概念">
+  </div>
+</div>
+
+<main class="map" id="map">
+  <svg id="edges" aria-hidden="true"></svg>
+  <div class="bands wrap" id="bands"></div>
+</main>
+
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="false" aria-label="概念详情">
+  <div class="drawer-inner" id="drawerInner"></div>
+</aside>
+
+<footer>
+  <div class="wrap">
+    <p>myagents —— 终端多 agent 聊天室 · 学习项目</p>
+    <p class="mono" style="margin-top:8px">adapters/base.py · orchestrator.py · main.py ｜ 本图与代码同步维护，新增概念请同步 docs/concepts.md</p>
+  </div>
+</footer>
+
+<script>
+"use strict";
+
+/* ================= 数据：22 个概念，6 层 ================= */
+const LAYERS = [
+  { id: "l1", no: "L1", name: "基础层", sub: "怎么驱动一个 agent", color: "var(--c-l1)" },
+  { id: "l2", no: "L2", name: "编排层", sub: "怎么让多个 agent 协作", color: "var(--c-l2)" },
+  { id: "l3", no: "L3", name: "协议层", sub: "agent 之间的标准接口", color: "var(--c-l3)" },
+  { id: "l4", no: "L4", name: "安全与验收", sub: "怎么管住 agent 的手", color: "var(--c-l4)" },
+  { id: "l5", no: "L5", name: "现有项目", sub: "同赛道值得读的源码", color: "var(--c-l5)" },
+  { id: "l6", no: "L6", name: "模型常识", sub: "编排绕不开的底层约束", color: "var(--c-l6)" },
+];
+
+/* def: 卡片上一句话 · why: 为什么重要 · code: 在 myagents（或世界）里的位置 */
+const NODES = [
+  // L1 基础层
+  { id: "headless", layer: "l1", zh: "无头模式", en: "Headless Mode",
+    def: "一条命令进去，结果打到 stdout，不带人机界面。",
+    why: "这是一切程序化编排的前提。kimi -p、claude -p、codex exec、opencode run 都是；不能无头调用的 agent，只能靠 tmux / expect 硬糊。",
+    code: "adapters/kimi_adapter.py <span>— kimi -p \"…\" --output-format stream-json</span>" },
+  { id: "jsonl", layer: "l1", zh: "JSONL 事件流", en: "Streaming Events",
+    def: "stdout 每行一个 JSON：正文片段、工具调用、结束、token 用量。",
+    why: "agent 干活要几分钟，逐行解析才能实时展示进度——用户不用对着空白终端猜它死没死。",
+    code: "adapters/base.py <span>— stream_jsonl() 逐行产出子进程 stdout</span>" },
+  { id: "adapter", layer: "l1", zh: "Adapter 模式", en: "Adapter Pattern",
+    def: "每家 CLI 包一层，对外暴露统一的 stream() 接口。",
+    why: "编排器只依赖接口，不依赖任何具体 CLI。新增一个 agent 的成本 = 写一个类 + 注册一行。",
+    code: "adapters/base.py <span>— AgentAdapter 协议 + AgentEvent</span>" },
+  { id: "session", layer: "l1", zh: "会话恢复", en: "Session Resume",
+    def: "带上次返回的 session id 调用，延续 agent 的记忆。",
+    why: "省 token、保持上下文。代价是各家会话语义不一致（kimi -S / opencode --session / claude --resume / codex exec resume）。",
+    code: "adapters/*_adapter.py <span>— 构造参数 use_resume，MVP 默认关闭</span>" },
+
+  // L2 编排层
+  { id: "orchestrator", layer: "l2", zh: "编排器", en: "Orchestrator",
+    def: "决定谁收到什么上下文、什么时候跑、结果贴回哪里。",
+    why: "多 agent 系统的大脑。本项目的 orchestrator.py 就是它的最小形态：路由、组装上下文、并发派发、异常兜底。",
+    code: "orchestrator.py <span>— class Orchestrator</span>" },
+  { id: "hub", layer: "l2", zh: "中心辐射", en: "Hub-and-Spoke",
+    def: "agent 之间从不直接对话，全部由编排器中转。",
+    why: "避免了 agent 互相 @ 的死循环，上下文也只有一处需要管理。对等互联（peer-to-peer）灵活但难收拾，初学先把中心辐射做扎实。",
+    code: "orchestrator.py <span>— dispatch()：消息先进 history，再发给目标</span>" },
+  { id: "supervisor", layer: "l2", zh: "Supervisor 主持人", en: "Supervisor Agent",
+    def: "中心节点也是个 agent：无 @ 时由它读懂消息、决定派发给谁。",
+    why: "规则路由（正则提 @）便宜确定，但听不懂语义；主持人用语义分派，还能总结和仲裁。代价是每条无 @ 消息多一次 LLM 调用——所以显式 @ 永远优先。对应 AutoGen GroupChat Manager、LangGraph supervisor。",
+    code: "host.py <span>— decide() LLM 路由 + MODERATOR_TEMPLATE</span>" },
+  { id: "transcript", layer: "l2", zh: "Transcript 转发", en: "Transcript Forwarding",
+    def: "把最近 N 条对话记录塞进 prompt，让 agent 看到之前聊了什么。",
+    why: "最朴素的上下文共享，简单可靠；代价是 token 随对话变长线性膨胀，超长要截断或摘要。",
+    code: "orchestrator.py <span>— _PROMPT_TEMPLATE + _transcript()</span>" },
+  { id: "fanout", layer: "l2", zh: "扇出 / 扇入", en: "Fan-out / Fan-in",
+    def: "一条消息并发派给多个 agent，各自独立执行，结果陆续收回。",
+    why: "并行比对多个 agent 的方案，等待时间取最长者而非总和。对比级联（pipeline）：A 的输出喂给 B，解决分工接力。",
+    code: "orchestrator.py <span>— asyncio.gather(*(_run_one(t) for t in targets))</span>" },
+  { id: "steering", layer: "l2", zh: "运行中插话", en: "Steering",
+    def: "agent 还在干活时追加新指令：「方向变了，别改那个文件」。",
+    why: "比杀掉重跑高级。需要 agent 侧有注入消息的通道——pi 的 getSteeringMessages、ACP 的 session/update 都是。",
+    code: "myagents 路线图 · 二期能力" },
+  { id: "subagent", layer: "l2", zh: "子代理", en: "Subagent",
+    def: "一个 agent 内部分裂出的临时 worker：委托子任务，收回结论。",
+    why: "与多 agent 编排是同构问题——一个在进程内、一个跨进程。你正在用的 kimi 的 Agent 工具、claude 的 Task 工具都是。",
+    code: "kimi 的 Agent 工具即是 <span>— 本页面的 pi 勘察就是 subagent 干的</span>" },
+
+  // L3 协议层
+  { id: "mcp", layer: "l3", zh: "MCP", en: "Model Context Protocol",
+    def: "把工具和数据源标准化地暴露给 agent（Anthropic 主导）。",
+    why: "解决「agent 用什么工具」，粒度细：我给你三个工具——读邮件、查日历、发消息。agent 是 MCP client。",
+    code: "kimi 支持 mcp__* 工具 <span>— 可配置消费外部 MCP server</span>" },
+  { id: "acp", layer: "l3", zh: "ACP", en: "Agent Client Protocol",
+    def: "把 agent 本身标准化成服务：会话、prompt、中断、流式进展（Zed 主导）。",
+    why: "解决「怎么驱动另一个 agent」——正是本项目的整合方向：三个 adapter 可以换成一个 ACP client，还自带会话状态。",
+    code: "kimi acp <span>已内置；claude code、codex 有适配器</span>" },
+  { id: "a2a", layer: "l3", zh: "A2A", en: "Agent2Agent",
+    def: "Google 的 agent 对 agent 任务委托协议。",
+    why: "面向企业内部跨系统的 agent 协作。做终端工具时用不上，知道名字即可。",
+    code: "<span>—</span>" },
+
+  // L4 安全与验收
+  { id: "sandbox", layer: "l4", zh: "沙箱 / 权限模式", en: "Sandbox & Permissions",
+    def: "限制 agent 能动什么：只读、仅工作区、完全放行。",
+    why: "评审类任务给只读，干活才给写权限。codex --sandbox read-only 是范本；kimi / opencode 无头模式默认放开，更要自己把关。",
+    code: "codex --sandbox read-only <span>｜ claude --allowedTools</span>" },
+  { id: "worktree", layer: "l4", zh: "Worktree 隔离", en: "Git Worktree",
+    def: "git worktree 给每个 agent 独立工作目录和分支，完事再合并。",
+    why: "多个 agent 并行改同一个仓库时的标准解法——不互相踩，diff 各自清晰。",
+    code: "git worktree add ../wt-agent-a <span>｜ claude-squad、Vibe Kanban 都这么干</span>" },
+  { id: "gitdisc", layer: "l4", zh: "git 验收纪律", en: "Git Discipline",
+    def: "agent 跑完用 git diff 验收；只提交自己改的文件。",
+    why: "无头模式默认放开写权限，diff 是最后一道闸。配套纪律：git add 用显式路径、禁 git add -A / reset --hard。",
+    code: "借自 ../pi 的 AGENTS.md <span>— 多 agent 并行协作专章</span>" },
+
+  // L5 现有项目
+  { id: "squad", layer: "l5", zh: "claude-squad", en: "smtg-ai/claude-squad",
+    def: "tmux 里同时管理多个真终端 agent，每个配独立 worktree。",
+    why: "「真终端流派」：agent 的完整交互能力都在，保真度高。对照本项目「无头调用流派」：消息可路由、可复制、可持久化，可编程性强。",
+    code: "github.com/smtg-ai/claude-squad" },
+  { id: "vibe", layer: "l5", zh: "Vibe Kanban", en: "BloopAI/vibe-kanban",
+    def: "看板式多 agent 任务编排：每张卡片一个任务，指派给某个 agent。",
+    why: "「工单流转」视角的编排：重点不在聊天，而在 diff 视图里验收、合并。支持 claude code、codex、gemini、opencode 等。",
+    code: "github.com/BloopAI/vibe-kanban" },
+  { id: "pi", layer: "l5", zh: "Pi Harness", en: "earendil-works/pi",
+    def: "自扩展 coding agent + 多 provider 抽象 + 多实例 RPC 编排器。",
+    why: "本项目的直接参照：统一 stream() 接口形态、stdio 上的 JSONL RPC、append-only 的会话存储、运行中插话的 steering 队列。",
+    code: "../pi <span>— packages/ai · packages/server · docs/rpc.md</span>" },
+
+  // L6 模型常识
+  { id: "ctxwin", layer: "l6", zh: "上下文窗口 / Token", en: "Context Window",
+    def: "每次调用能「看到」的文本总量有限，按 token 计费。",
+    why: "transcript 转发方案下，对话越长每次调用越贵——所以 session resume 和上下文裁剪是必修课，不是优化项。",
+    code: "opencode 的 step_finish 事件 <span>— 每次调用带 token 统计</span>" },
+  { id: "compaction", layer: "l6", zh: "上下文压缩", en: "Compaction",
+    def: "逼近窗口上限时，把旧历史总结成摘要替换原文。",
+    why: "保住近期细节，丢掉远期废话。各家 CLI 内部都在做；编排层转发 transcript 时同样需要做。",
+    code: "myagents 路线图 · 二期 <span>｜ pi 的 transformContext 钩子</span>" },
+  { id: "agentloop", layer: "l6", zh: "代理循环", en: "Agentic Loop",
+    def: "模型输出 → 调工具 → 拿结果 → 再输出……直到给出最终答复。",
+    why: "这是 agent 的基本工作方式。无头模式把整个循环跑完；你看到的 JSONL 事件流，就是这个循环留下的轨迹。",
+    code: "任一 adapter 的事件流 <span>— text / tool / step_finish</span>" },
+];
+
+/* 关联（无向），hover 节点时高亮 */
+const LINKS = [
+  ["headless","jsonl"],["headless","adapter"],["jsonl","agentloop"],
+  ["adapter","orchestrator"],["adapter","acp"],["adapter","pi"],
+  ["session","transcript"],["session","compaction"],
+  ["orchestrator","hub"],["orchestrator","fanout"],["orchestrator","subagent"],
+  ["orchestrator","supervisor"],["supervisor","hub"],["supervisor","steering"],
+  ["hub","transcript"],["transcript","ctxwin"],["ctxwin","compaction"],
+  ["steering","acp"],["steering","subagent"],["mcp","acp"],
+  ["sandbox","gitdisc"],["worktree","gitdisc"],["worktree","squad"],["worktree","vibe"],
+  ["fanout","squad"],["jsonl","pi"],
+];
+
+const layerOf = id => NODES.find(n => n.id === id).layer;
+const layerColor = lid => LAYERS.find(l => l.id === lid).color;
+
+/* ================= 渲染层带与节点 ================= */
+const bandsEl = document.getElementById("bands");
+for (const layer of LAYERS) {
+  const nodes = NODES.filter(n => n.layer === layer.id);
+  const band = document.createElement("section");
+  band.className = "band";
+  band.dataset.layer = layer.id;
+  band.style.setProperty("--c", layer.color);
+  band.innerHTML = `
+    <div class="band-head">
+      <div class="band-no">${layer.no} / ${layer.name}</div>
+      <h2>${layer.name}</h2>
+      <p class="band-sub">${layer.sub}</p>
+      <span class="band-count">${nodes.length} 个概念</span>
+    </div>
+    <div class="band-nodes"></div>`;
+  const grid = band.querySelector(".band-nodes");
+  for (const n of nodes) {
+    const btn = document.createElement("button");
+    btn.className = "node";
+    btn.dataset.id = n.id;
+    btn.style.setProperty("--c", layer.color);
+    btn.setAttribute("aria-label", n.zh);
+    btn.innerHTML = `
+      <span class="n-en">${n.en}</span>
+      <span class="n-name">${n.zh}</span>
+      <span class="n-def">${n.def}</span>`;
+    grid.appendChild(btn);
+  }
+  bandsEl.appendChild(band);
+}
+
+/* ================= 跨层连线 ================= */
+const mapEl = document.getElementById("map");
+const svg = document.getElementById("edges");
+function drawEdges() {
+  const mapRect = mapEl.getBoundingClientRect();
+  svg.setAttribute("width", mapRect.width);
+  svg.setAttribute("height", mapRect.height);
+  svg.innerHTML = "";
+  for (const [a, b] of LINKS) {
+    const ea = mapEl.querySelector(`[data-id="${a}"]`);
+    const eb = mapEl.querySelector(`[data-id="${b}"]`);
+    if (!ea || !eb) continue;
+    const ra = ea.getBoundingClientRect(), rb = eb.getBoundingClientRect();
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", ra.left + ra.width / 2 - mapRect.left);
+    line.setAttribute("y1", ra.top + ra.height / 2 - mapRect.top);
+    line.setAttribute("x2", rb.left + rb.width / 2 - mapRect.left);
+    line.setAttribute("y2", rb.top + rb.height / 2 - mapRect.top);
+    line.dataset.a = a; line.dataset.b = b;
+    svg.appendChild(line);
+  }
+}
+let resizeTimer;
+window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(drawEdges, 120); });
+window.addEventListener("load", drawEdges);
+setTimeout(drawEdges, 400); // 字体加载后再校正一次
+
+/* hover 高亮关联节点与连线 */
+const nodeEls = [...document.querySelectorAll(".node")];
+function setHot(id) {
+  const related = new Set([id]);
+  for (const [a, b] of LINKS) {
+    if (a === id) related.add(b);
+    if (b === id) related.add(a);
+  }
+  for (const el of nodeEls) el.classList.toggle("hot", related.has(el.dataset.id) && el.dataset.id !== id);
+  for (const line of svg.children) {
+    const hot = line.dataset.a === id || line.dataset.b === id;
+    line.classList.toggle("hot", hot);
+    line.classList.toggle("dim", !hot);
+    if (hot) line.style.setProperty("--hc", layerColor(layerOf(id)));
+  }
+}
+function clearHot() {
+  for (const el of nodeEls) el.classList.remove("hot");
+  for (const line of svg.children) line.classList.remove("hot", "dim");
+}
+for (const el of nodeEls) {
+  el.addEventListener("mouseenter", () => setHot(el.dataset.id));
+  el.addEventListener("mouseleave", clearHot);
+  el.addEventListener("focus", () => setHot(el.dataset.id));
+  el.addEventListener("blur", clearHot);
+}
+
+/* ================= 详情抽屉 ================= */
+const drawer = document.getElementById("drawer");
+const drawerInner = document.getElementById("drawerInner");
+const scrim = document.getElementById("scrim");
+let lastFocused = null;
+
+function openNode(id) {
+  const n = NODES.find(x => x.id === id);
+  if (!n) return;
+  const layer = LAYERS.find(l => l.id === n.layer);
+  const relIds = [...new Set(LINKS.flatMap(([a, b]) => a === id ? [b] : b === id ? [a] : []))];
+  drawerInner.innerHTML = `
+    <div class="drawer-top" style="--c:${layer.color}">
+      <h3>${n.zh}</h3><span class="d-en">${n.en}</span>
+      <span class="d-layer">${layer.no} ${layer.name}</span>
+      <button class="d-close" id="dClose">ESC 关闭</button>
+    </div>
+    <div class="d-grid">
+      <div><div class="d-label">是什么</div><p class="d-body">${n.def}</p></div>
+      <div><div class="d-label">为什么重要</div><p class="d-body">${n.why}</p></div>
+      <div class="d-code">${n.code}</div>
+      <div class="d-rel"><span class="d-label">关联</span>
+        ${relIds.map(r => {
+          const rn = NODES.find(x => x.id === r);
+          return `<button class="rel-chip" data-open="${r}" style="--cc:${layerColor(rn.layer)}">${rn.zh}</button>`;
+        }).join("")}
+      </div>
+    </div>`;
+  drawer.classList.add("open");
+  scrim.classList.add("open");
+  document.getElementById("dClose").addEventListener("click", closeDrawer);
+  for (const chip of drawerInner.querySelectorAll("[data-open]"))
+    chip.addEventListener("click", () => openNode(chip.dataset.open));
+}
+function closeDrawer() {
+  drawer.classList.remove("open");
+  scrim.classList.remove("open");
+  if (lastFocused) lastFocused.focus();
+}
+for (const el of nodeEls) el.addEventListener("click", () => { lastFocused = el; openNode(el.dataset.id); });
+scrim.addEventListener("click", closeDrawer);
+window.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+
+/* ================= 图例 & 筛选 ================= */
+for (const chip of document.querySelectorAll(".chip")) {
+  chip.addEventListener("click", () => {
+    document.querySelector(`.band[data-layer="${chip.dataset.layer}"]`)
+      .scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+}
+document.getElementById("filter").addEventListener("input", e => {
+  const q = e.target.value.trim().toLowerCase();
+  for (const el of nodeEls) {
+    const n = NODES.find(x => x.id === el.dataset.id);
+    const hit = !q || (n.zh + n.en + n.def).toLowerCase().includes(q);
+    el.classList.toggle("dim", !hit);
+  }
+});
+
+/* ================= 英雄区 demo：自动循环的双 agent 派发 ================= */
+const demoBody = document.getElementById("demoBody");
+const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const AGENT_COLOR = { kimi: "var(--c-kimi)", opencode: "var(--c-opencode)" };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function demoLine(cls, html, ac) {
+  const div = document.createElement("div");
+  div.className = "dl " + cls;
+  if (ac) div.style.setProperty("--ac", ac);
+  div.innerHTML = html;
+  demoBody.appendChild(div);
+  requestAnimationFrame(() => div.classList.add("show"));
+  return div;
+}
+const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+
+async function runDemo() {
+  demoBody.innerHTML = "";
+  // 用户输入（打字机）
+  const userText = "@kimi @opencode 用一句话介绍你自己";
+  const userLine = demoLine("dl-user", '<span class="typed"></span><span class="caret"></span>');
+  const typed = userLine.querySelector(".typed");
+  for (const ch of userText) { typed.textContent += ch; await sleep(reduced ? 0 : 34); }
+  userLine.querySelector(".caret").remove();
+  await sleep(reduced ? 0 : 350);
+
+  demoLine("dl-sys", "→ 并发扇出：kimi · opencode");
+  await sleep(reduced ? 0 : 500);
+
+  // 两个 agent 的 JSONL 事件交错到达
+  const events = [
+    ["kimi",     '{"role":"assistant","content":"我是 Kimi，月之暗面的编程助手。"}'],
+    ["opencode", '{"type":"text","part":{"text":"我是 OpenCode，终端里的开源 agent。"}}'],
+    ["opencode", '{"type":"step_finish","part":{"tokens":{"total":15840}}}'],
+    ["kimi",     '{"role":"meta","type":"session.resume_hint","session_id":"session_fe14…"}'],
+  ];
+  for (const [agent, json] of events) {
+    demoLine("dl-json", `<b>${agent}</b> ${esc(json)}`, AGENT_COLOR[agent]);
+    await sleep(reduced ? 0 : 520);
+  }
+  await sleep(reduced ? 0 : 300);
+
+  demoLine("dl-reply", '<span class="tag">kimi</span><span>我是 Kimi，月之暗面的编程助手。</span>', AGENT_COLOR.kimi);
+  await sleep(reduced ? 0 : 400);
+  demoLine("dl-reply", '<span class="tag">opencode</span><span>我是 OpenCode，终端里的开源 agent。</span>', AGENT_COLOR.opencode);
+  await sleep(reduced ? 0 : 400);
+  demoLine("dl-sys", "✓ 回复已写入共享时间线（hub-and-spoke）");
+
+  if (reduced) return; // 减少动态：定格最终画面，不循环
+  await sleep(3800);
+  for (const el of demoBody.children) el.classList.remove("show");
+  await sleep(400);
+  runDemo();
+}
+runDemo();
+</script>
+</body>
+</html>
