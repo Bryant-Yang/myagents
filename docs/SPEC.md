@@ -2,7 +2,7 @@
 
 <!-- harness:behaviour-evidence=canonical-source -->
 
-> 作者：Bryant Yang　最近更新：2026-07-26
+> 作者：Bryant Yang　最近更新：2026-07-27
 >
 > 本文是关键用户行为与独立证据的唯一事实源。工程边界见
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -15,13 +15,16 @@
 | M1 | 完成 | 通用 ACP client/adapter 与 fake server contract tests |
 | M2 | 完成 | Kimi ACP 接入、增量 history、权限 UI、统一回收、真实 E2E |
 | M2.5 | 完成 | 持久房间（timeline/state/seq cursor）、ACP session 恢复、owner lease、持久确认时序 |
-| M3 | 完成 | 内部 command bus、私有 Unix 控制 socket、MCP stdio 外部入口（五个 `myagents_*` 工具） |
+| M3 | 完成 | 内部 command bus、私有 Unix 控制 socket、MCP stdio 外部入口 |
+| M3.1 | 完成 | 持久执行事件、heartbeat、权限/工具上下文、精确取消（七个 MCP 工具） |
+| M4 | 完成 | Codex app-server 长连接、thread/turn 事件、取消、审批与 JSONL fallback |
 
 ## 1. 角色
 
 - **用户**：在统一 TUI 点名 agent、批准/拒绝权限并验收结果。
 - **worker agent**：通过 ACP 或 JSONL adapter 接收任务并流式返回事件。
-- **host**：仅在无显式 @ 时进行语义路由，或被 `@host` 点名做总结/仲裁。
+- **host**：无显式 @ 时用一次调用直接回答或进行 worker 路由；也可被
+  `@host` 点名做总结/仲裁。
 - **Orchestrator**：唯一消息中心，维护共享 history、投递顺序与生命周期。
 
 ## 2. 关键行为用例
@@ -77,8 +80,8 @@
 - **前置条件**：子进程使用独立进程组，adapter 拥有 session。
 - **主流程**：发送 cancel；等待原 prompt 结束；TUI 先收尾权限 Future，再
   `aclose`；SIGTERM 超时后 SIGKILL。
-- **异常分支**：cancel 不确认则连接作废并在下轮重建；断线使 pending request
-  立即失败。
+- **异常分支**：prompt 连续 120 秒无任何 ACP 事件则自动 cancel；cancel
+  不确认则连接作废并在下轮重建；断线使 pending request 立即失败。
 - **验收**：下一轮不与旧 prompt 重叠；fake 子孙进程和 ACP server 均无残留。
 - **独立证据来源**：接入 Harness 前已有的 basic/ACP/Phase 2 生命周期测试；
   2026-07-26 两次真实 Kimi TUI E2E 退出后 `pgrep -fl '^kimi acp$'` 为空。
@@ -163,14 +166,14 @@
   `BUS_CLOSED`），不泄漏 traceback；外部消息触发工具权限时仍在 TUI
   弹窗由用户决策，bridge 无 `auto` 放行入口；control/validation 错误
   不会使 MCP server 崩溃。
-- **验收**：五方法语义正确；同房间并发 submit 按 FIFO 顺序执行且相同
+- **验收**：七方法语义正确；同房间并发 submit 按 FIFO 顺序执行且相同
   `request_id` 不重复执行；官方 Python MCP SDK（`mcp>=1.27,<2`）经
   stdio 完成 initialize/list_tools/call_tool，stdout 无非协议输出；
   stdin EOF 后 bridge 进程 rc=0 干净退出；TUI 正常退出后无 socket、
   endpoint、MCP 或 agent 残留进程。
 - **独立证据来源**：`tests/test_m3_bus.py`（FIFO、request_id 永久幂等、
   容量硬上限、close 兜底 cancelled）、`tests/test_m3_control.py`
-  （五方法 roundtrip、0600/close 清理、stale 恢复与活跃不抢占、稳定
+  （七方法 roundtrip、0600/close 清理、stale 恢复与活跃不抢占、稳定
   错误码、start 失败无泄漏、AF_UNIX 超长路径可操作错误、Textual pilot
   外部命令实时可见、外部权限仍由 TUI 决策）、`tests/test_m3_mcp.py`（官方 SDK stdio
   list/call、注解、structuredContent、tool error 映射、干净退出）。
@@ -180,6 +183,60 @@
   连续且 command_id 关联正确，退出后无 endpoint/socket/agent 残留。
   该脚本调用真实模型，不放进默认快速 gate。
 - **里程碑**：M3。
+
+### UC-OBS-001 执行进度、权限上下文与重启证据
+
+- **角色 / 触发**：TUI 或外部 MCP host 提交一个长任务。
+- **主流程**：queued/running、ACP 阶段、工具、权限、partial、heartbeat
+  与 terminal 事件写入独立 `events.jsonl`；TUI 实时显示安全摘要。
+- **安全分支**：thought 正文不显示；常见凭据字段隐藏；执行事件不进入
+  agent 对话 history。
+- **重启分支**：最后事件非 terminal 的 command 显示为上次中断及最后状态。
+- **验收**：`events.read` 可分页读取；旧房间安全补建；损坏日志 fail loudly。
+- **证据**：`tests/test_storage.py`、`tests/test_acp.py`、
+  `tests/test_phase2.py`、`tests/test_m3_control.py`、`tests/test_m3_mcp.py`。
+- **里程碑**：M3.1。
+
+### UC-CANCEL-001 精确取消
+
+- **角色 / 触发**：用户按 `Ctrl+X`，或外部 host 调用 cancel。
+- **主流程**：queued 直接取消；running 仅取消该 dispatch；terminal 幂等。
+- **异常分支**：取消确认超过 30 秒返回明确失败，不把未知状态报成成功。
+- **验收**：取消后 CommandBus worker 继续执行下一条；无 ghost task。
+- **证据**：`tests/test_m3_bus.py`、`tests/test_m3_control.py`、
+  `tests/test_m3_mcp.py`。
+- **里程碑**：M3.1。
+
+### UC-CODEX-001 Codex 原生长连接
+
+- **角色 / 触发**：用户连续点名 `@codex`，或多次发送无 mention 消息给
+  Codex host。
+- **前置条件**：本机 Codex CLI 支持 `codex app-server`；adapter 独占其进程。
+- **主流程**：一次 initialize 后建立 thread；worker 的连续 turn 复用同一
+  app-server PID/thread 并按 cursor 接收增量；host 复用暖进程、每次建立干净
+  thread，以免 transcript 快照在原生历史中重复。
+- **配置边界**：不发送 model、effort、config、collaboration mode、plugin 或
+  MCP 覆盖，不修改 Codex 全局配置；仅传 cwd 与 host/worker 既有 sandbox。
+- **事件分支**：agent message delta 流式进入正文；command/file/MCP item
+  进入脱敏 tool/status；approval 进入统一权限 UI且无处理器默认拒绝；
+  reasoning 正文不显示；`turn/completed` 后才产生 done。
+- **取消/故障分支**：取消发 `turn/interrupt` 并等待 terminal；断线使 pending
+  立即失败；initialize/thread prepare 失败可退到 JSONL，一旦发送
+  `turn/start` 就禁止自动重放；已发送后的结果不确定、terminal 失败/中断和
+  用户取消都先形成持久 no-replay 边界，再公开失败/取消。服务端明确拒绝或
+  确认未发送的失败保持可重试；即使旧 thread 无法恢复，新 thread 也不
+  bootstrap 已投递的旧输入。明确接受的 turn 在任何正文/工具/权限 event
+  sink 回调前先持久化该边界。
+- **验收**：fake server 证明两轮同 PID/thread、无 `jsonrpc` header、默认
+  配置字段未被覆盖、取消不重叠、断线失败、close 无残留。
+- **独立证据来源**：`tests/fake_codex_app_server.py` +
+  `tests/test_codex_app_server.py`。
+- **真实验收证据**：2026-07-27 在临时目录执行两组真实 Codex 探针，均未
+  覆盖 model/effort/plugin/MCP：直接 adapter 两轮分别 18.0s/4.6s，
+  同 PID/thread；真实 Orchestrator 连续两次 `@codex` 分别得到
+  `SELF_ONE`/`SELF_TWO`，同 PID/thread；两组 `aclose()` 后对应 PID 均
+  不存在。app-server 为实验接口，真实模型探针不进入普通快速 gate。
+- **里程碑**：M4。
 
 ### UC-CTRL-002 控制 socket 安全与生命周期
 

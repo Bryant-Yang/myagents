@@ -331,6 +331,25 @@ class ControlServer:
                 "has_more": page["has_more"],
                 "next_after_seq": page["next_after_seq"],
             }
+        if method == "events.read":
+            _validate_keys(
+                params, required=set(), optional={"after_seq", "limit"})
+            after_seq = params.get("after_seq", 0)
+            limit = params.get("limit", DEFAULT_READ_LIMIT)
+            if (isinstance(after_seq, bool)
+                    or not isinstance(after_seq, int) or after_seq < 0):
+                raise _InvalidParams("after_seq 必须是非负整数")
+            if (isinstance(limit, bool) or not isinstance(limit, int)
+                    or not 1 <= limit <= MAX_READ_LIMIT):
+                raise _InvalidParams(
+                    f"limit 必须是 1..{MAX_READ_LIMIT} 的整数")
+            page = self._store.read_events(
+                after_seq=after_seq, limit=limit)
+            return {
+                "items": [item.to_dict() for item in page["items"]],
+                "has_more": page["has_more"],
+                "next_after_seq": page["next_after_seq"],
+            }
         if method == "command.submit":
             _validate_keys(
                 params, required={"message"}, optional={"request_id"})
@@ -351,6 +370,12 @@ class ControlServer:
             if not isinstance(command_id, str) or not command_id:
                 raise _InvalidParams("command_id 必须是非空字符串")
             return await self._bus.wait(command_id, timeout=timeout)
+        if method == "command.cancel":
+            _validate_keys(params, required={"command_id"})
+            command_id = params["command_id"]
+            if not isinstance(command_id, str) or not command_id:
+                raise _InvalidParams("command_id 必须是非空字符串")
+            return (await self._bus.cancel(command_id)).to_dict()
         raise _InvalidParamsMethod(method)
 
     async def _send(self, writer: asyncio.StreamWriter,

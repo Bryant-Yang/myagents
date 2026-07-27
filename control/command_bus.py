@@ -19,11 +19,14 @@ request_id 的重复提交永远幂等返回原记录，不受容量限制。
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable
+
+from adapters.base import AgentEvent
 
 MAX_MESSAGE_BYTES = 64 * 1024      # message 的 UTF-8 字节上限
 MAX_REQUEST_ID_CHARS = 128         # request_id 的字符上限
@@ -61,6 +64,10 @@ class CommandValidationError(CommandBusError):
 
 class CommandCapacityError(CommandBusError):
     """容量硬上限：清理后仍满（keyed terminal 或 active/queued 占满）。"""
+
+
+class _ExecutionEventPersistenceError(CommandBusError):
+    """events.jsonl 写入失败。"""
 
 
 def _utc_now() -> str:
@@ -141,19 +148,30 @@ class CommandBus:
     """
 
     def __init__(self, orch: Any, event_sink: EventSink | None = None,
-                 max_commands: int = 1000) -> None:
+                 max_commands: int = 1000,
+                 heartbeat_interval: float = 10.0) -> None:
         if (isinstance(max_commands, bool)
                 or not isinstance(max_commands, int) or max_commands < 1):
             raise CommandValidationError("max_commands 必须是 >= 1 的整数")
+        if (isinstance(heartbeat_interval, bool)
+                or not isinstance(heartbeat_interval, (int, float))
+                or heartbeat_interval <= 0):
+            raise CommandValidationError("heartbeat_interval 必须是正数")
         self._orch = orch
         self._event_sink = event_sink
         self._max_commands = max_commands
+        self._heartbeat_interval = float(heartbeat_interval)
         self._commands: dict[str, _Command] = {}      # command_id → 记录（保序）
         self._by_request_id: dict[str, str] = {}      # request_id → command_id，永不清理
         self._queue: asyncio.Queue[_Command] | None = None
         self._cond: asyncio.Condition | None = None
         self._worker_task: asyncio.Task | None = None
         self._active: _Command | None = None          # worker 已取走、未 terminal 的命令
+        self._dispatch_task: asyncio.Task | None = None
+        self._cancel_requested: set[str] = set()
+        self._last_activity = 0.0
+        self._partial_buffers: dict[tuple[str, str], str] = {}
+        self._partial_persisted_at: dict[tuple[str, str], float] = {}
         self._closed = False
 
     # ---- 生命周期 ----
@@ -222,6 +240,8 @@ class CommandBus:
         cmd = _Command(command_id=str(uuid.uuid4()), request_id=request_id,
                        message=message, status=CommandStatus.QUEUED,
                        created_at=_utc_now())
+        self._append_execution_event(
+            cmd.command_id, "system", "queued", "命令已进入队列")
         self._commands[cmd.command_id] = cmd
         if request_id is not None:
             self._by_request_id[request_id] = cmd.command_id
@@ -230,6 +250,37 @@ class CommandBus:
 
     def get(self, command_id: str) -> CommandSnapshot:
         """按 command_id 查快照；不存在抛 CommandNotFoundError。"""
+        return self._lookup(command_id).snapshot()
+
+    def active(self) -> CommandSnapshot | None:
+        """返回当前 running 命令；没有则为 None。"""
+        if self._active is None \
+                or self._active.status in TERMINAL_STATUSES:
+            return None
+        return self._active.snapshot()
+
+    async def cancel(self, command_id: str) -> CommandSnapshot:
+        """精确取消 queued/running 命令；terminal 命令幂等返回。"""
+        cmd = self._lookup(command_id)
+        if cmd.status in TERMINAL_STATUSES:
+            return cmd.snapshot()
+        self._cancel_requested.add(command_id)
+        if cmd.status is CommandStatus.QUEUED:
+            await self._transition(
+                cmd, CommandStatus.CANCELLED, error="用户取消")
+            return cmd.snapshot()
+        if self._event_sink is not None:
+            # 同步通知 TUI 先结束权限等待；否则 ACP server 可能正阻塞在
+            # request_permission，收不到随后发出的 session/cancel。
+            self._event_sink("system", AgentEvent(
+                "cancel_requested", "正在取消当前任务…",
+                {"command_id": command_id}))
+        task = self._dispatch_task
+        if self._active is cmd and task is not None and not task.done():
+            task.cancel()
+        result = await self.wait(command_id, timeout=MAX_WAIT_TIMEOUT)
+        if result["timed_out"]:
+            raise CommandBusError(f"取消命令超时：{command_id}")
         return self._lookup(command_id).snapshot()
 
     async def wait(self, command_id: str, timeout: float = MAX_WAIT_TIMEOUT
@@ -277,6 +328,8 @@ class CommandBus:
         try:
             while True:
                 cmd = await self._queue.get()
+                if cmd.status in TERMINAL_STATUSES:
+                    continue
                 self._active = cmd
                 try:
                     await self._run_one(cmd)
@@ -294,7 +347,9 @@ class CommandBus:
                 pending.append(orphan)
             while True:
                 try:
-                    pending.append(self._queue.get_nowait())
+                    queued = self._queue.get_nowait()
+                    if queued.status not in TERMINAL_STATUSES:
+                        pending.append(queued)
                 except asyncio.QueueEmpty:
                     break
             if pending:
@@ -305,34 +360,117 @@ class CommandBus:
                         cmd.finished_at = now
                         cmd.error = reason
                     self._cond.notify_all()
+                for cmd in pending:
+                    try:
+                        self._flush_partial(cmd.command_id)
+                        self._append_execution_event(
+                            cmd.command_id, "system", "cancelled", reason)
+                    except Exception as exc:
+                        self._report_event_persistence_error(
+                            cmd.command_id, exc)
                 self._evict()
 
     async def _run_one(self, cmd: _Command) -> None:
-        await self._transition(cmd, CommandStatus.RUNNING)
         sink = self._event_sink
+        loop = asyncio.get_running_loop()
+        self._last_activity = loop.time()
 
         def on_event(name: str, event: Any) -> None:
+            self._last_activity = loop.time()
+            if isinstance(event, AgentEvent):
+                event = AgentEvent(
+                    event.kind, event.text,
+                    {**event.meta, "command_id": cmd.command_id})
+                self._persist_agent_event(cmd.command_id, name, event)
             if sink is not None:
                 sink(name, event)
 
+        heartbeat: asyncio.Task | None = None
         try:
-            await self._orch.dispatch(cmd.message, on_event,
-                                      command_id=cmd.command_id)
+            await self._transition(cmd, CommandStatus.RUNNING)
+            if cmd.command_id in self._cancel_requested:
+                await self._safe_terminal(
+                    cmd, CommandStatus.CANCELLED, error="用户取消")
+                return
+            heartbeat = asyncio.create_task(
+                self._heartbeat(cmd),
+                name=f"command-heartbeat-{cmd.command_id}")
+            self._dispatch_task = asyncio.create_task(
+                self._orch.dispatch(
+                    cmd.message, on_event, command_id=cmd.command_id),
+                name=f"command-dispatch-{cmd.command_id}")
+            if cmd.command_id in self._cancel_requested:
+                self._dispatch_task.cancel()
+            await self._dispatch_task
         except asyncio.CancelledError:
-            await self._transition(cmd, CommandStatus.CANCELLED,
-                                   error="已取消")
+            await self._safe_terminal(
+                cmd, CommandStatus.CANCELLED, error="已取消")
             if asyncio.current_task().cancelling():
                 # bus 自己在关闭：继续向上传播，让 worker 退出
                 raise
             # orch 自发抛 CancelledError：命令记 cancelled，worker 活下去
         except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_CHARS]
-            await self._transition(cmd, CommandStatus.FAILED, error=error)
+            if isinstance(exc, _ExecutionEventPersistenceError):
+                error = str(exc)[:_MAX_ERROR_CHARS]
+                self._report_event_persistence_error(
+                    cmd.command_id, exc)
+            else:
+                error = f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_CHARS]
+            await self._safe_terminal(
+                cmd, CommandStatus.FAILED, error=error)
         else:
-            await self._transition(cmd, CommandStatus.COMPLETED)
+            await self._safe_terminal(cmd, CommandStatus.COMPLETED)
+        finally:
+            self._cancel_requested.discard(cmd.command_id)
+            self._dispatch_task = None
+            if heartbeat is not None:
+                heartbeat.cancel()
+                try:
+                    await heartbeat
+                except asyncio.CancelledError:
+                    # 正常回收 heartbeat 会在当前 worker 未被取消时抛；
+                    # 若此刻是 aclose 取消 worker，不能吞掉父 task 的取消。
+                    if asyncio.current_task().cancelling():
+                        raise
+                except Exception as exc:
+                    self._report_event_persistence_error(
+                        cmd.command_id, exc)
+
+    async def _heartbeat(self, cmd: _Command) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            due = self._last_activity + self._heartbeat_interval
+            await asyncio.sleep(max(0.0, due - loop.time()))
+            silent_for = loop.time() - self._last_activity
+            if silent_for + 0.001 < self._heartbeat_interval:
+                continue
+            event = AgentEvent(
+                "status",
+                f"仍在运行，等待 agent 输出（已静默 {int(silent_for)} 秒）",
+                {"command_id": cmd.command_id})
+            self._append_execution_event(
+                cmd.command_id, "system", "status", event.text)
+            if self._event_sink is not None:
+                self._event_sink("system", event)
+            # heartbeat 本身成为新的可见活动，下一次正好在一个 interval 后，
+            # 不受固定轮询相位影响。
+            self._last_activity = loop.time()
 
     async def _transition(self, cmd: _Command, status: CommandStatus,
                           error: str | None = None) -> None:
+        text = {
+            CommandStatus.RUNNING: "开始执行",
+            CommandStatus.COMPLETED: "执行完成",
+            CommandStatus.FAILED: error or "执行失败",
+            CommandStatus.CANCELLED: error or "执行已取消",
+        }.get(status)
+        if status in TERMINAL_STATUSES:
+            self._flush_partial(cmd.command_id)
+        # 先持久化再公开状态，防止 waiter 看到一个没有 durable event 的
+        # terminal 命令。
+        if text is not None:
+            self._append_execution_event(
+                cmd.command_id, "system", status.value, text)
         async with self._cond:
             now = _utc_now()
             if status is CommandStatus.RUNNING:
@@ -344,6 +482,111 @@ class CommandBus:
             self._cond.notify_all()
         if status in TERMINAL_STATUSES:
             self._evict()
+
+    async def _safe_terminal(
+            self, cmd: _Command, status: CommandStatus,
+            error: str | None = None) -> None:
+        """terminal event 落盘失败时仍唤醒 waiter，且唯一 worker 继续服务。"""
+        try:
+            await self._transition(cmd, status, error=error)
+            return
+        except Exception as exc:
+            storage_error = (
+                f"执行事件持久化失败：{type(exc).__name__}: {exc}"
+            )[:_MAX_ERROR_CHARS]
+            fallback_status = (
+                CommandStatus.CANCELLED
+                if status is CommandStatus.CANCELLED
+                else CommandStatus.FAILED)
+            async with self._cond:
+                now = _utc_now()
+                cmd.status = fallback_status
+                cmd.finished_at = now
+                cmd.error = error or storage_error
+                self._cond.notify_all()
+            self._report_event_persistence_error(
+                cmd.command_id, exc)
+            self._evict()
+
+    def _report_event_persistence_error(
+            self, command_id: str, exc: Exception) -> None:
+        if self._event_sink is None:
+            return
+        detail = (
+            str(exc) if isinstance(exc, _ExecutionEventPersistenceError)
+            else f"执行事件持久化失败：{type(exc).__name__}: {exc}")
+        self._event_sink("system", AgentEvent(
+            "error", detail,
+            {"command_id": command_id}))
+
+    def _persist_agent_event(
+            self, command_id: str, agent: str, event: AgentEvent) -> None:
+        kind_map = {
+            "text": "partial",
+            "status": "status",
+            "tool": "tool",
+            "permission": "permission",
+            "info": "status",
+            "error": "status",
+        }
+        kind = kind_map.get(event.kind)
+        if kind is None or not event.text:
+            return
+        text = event.text if event.kind != "error" else f"错误：{event.text}"
+        if kind == "tool":
+            command = event.meta.get("command")
+            if isinstance(command, str) and command:
+                text = f"{text}\n{command}"
+        if kind == "partial":
+            key = (command_id, agent)
+            buffered = self._partial_buffers.get(key, "")
+            combined = (buffered + text)[-8192:]
+            self._partial_buffers[key] = combined
+            now = time.monotonic()
+            last = self._partial_persisted_at.get(key, 0.0)
+            if now - last < 1.0:
+                return
+            self._flush_partial(command_id, agent)
+            self._partial_persisted_at[key] = now
+            return
+        self._append_execution_event(command_id, agent, kind, text)
+
+    def _flush_partial(
+            self, command_id: str, agent: str | None = None) -> None:
+        keys = (
+            [(command_id, agent)]
+            if agent is not None
+            else [
+                key for key in (
+                    self._partial_buffers.keys()
+                    | self._partial_persisted_at.keys()
+                )
+                if key[0] == command_id
+            ]
+        )
+        for key in keys:
+            text = self._partial_buffers.pop(key, None)
+            if text:
+                self._append_execution_event(
+                    key[0], key[1], "partial", text)
+            self._partial_persisted_at.pop(key, None)
+
+    def _append_execution_event(
+            self, command_id: str, agent: str, kind: str, text: str) -> None:
+        store = getattr(self._orch, "store", None)
+        if store is None or not hasattr(store, "append_event"):
+            return
+        # RoomStore 的单条上限为 64 KiB；按 UTF-8 安全截断，避免异常输出
+        # 反过来摧毁命令生命周期。
+        raw = text.encode("utf-8")
+        if len(raw) > 64 * 1024:
+            text = raw[:64 * 1024].decode("utf-8", errors="ignore")
+        try:
+            store.append_event(
+                command_id=command_id, agent=agent, kind=kind, text=text)
+        except Exception as exc:
+            raise _ExecutionEventPersistenceError(
+                f"执行事件持久化失败：{type(exc).__name__}: {exc}") from exc
 
     # ---- 内部工具 ----
 

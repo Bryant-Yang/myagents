@@ -14,6 +14,8 @@ required=(
   docs/git-commit-conventions.md
   docs/adr/README.md
   docs/adr/0001-persistent-room-command-bus-mcp.md
+  docs/adr/0002-durable-execution-observability.md
+  docs/adr/0003-codex-app-server-transport.md
   scripts/check-redlines.sh
 )
 
@@ -47,6 +49,8 @@ docs = [
     root / "docs/git-commit-conventions.md",
     root / "docs/adr/README.md",
     root / "docs/adr/0001-persistent-room-command-bus-mcp.md",
+    root / "docs/adr/0002-durable-execution-observability.md",
+    root / "docs/adr/0003-codex-app-server-transport.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -79,7 +83,7 @@ fi
 
 .venv/bin/python -m py_compile \
   main.py myagents_mcp.py orchestrator.py host.py \
-  acp/*.py adapters/*.py control/*.py storage/*.py tests/*.py \
+  acp/*.py codex_app_server/*.py adapters/*.py control/*.py storage/*.py tests/*.py \
   scripts/e2e-m3-real.py
 .venv/bin/python tests/test_basic.py
 .venv/bin/python tests/test_acp.py
@@ -89,5 +93,6 @@ fi
 .venv/bin/python tests/test_m3_bus.py
 .venv/bin/python tests/test_m3_control.py
 .venv/bin/python tests/test_m3_mcp.py
+.venv/bin/python tests/test_codex_app_server.py
 
 echo "✓ myagents Harness 全部通过"

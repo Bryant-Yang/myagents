@@ -160,6 +160,11 @@ class ControlClient:
         return await self.call(
             "timeline.read", {"after_seq": after_seq, "limit": limit})
 
+    async def read_events(self, after_seq: int = 0,
+                          limit: int = 50) -> dict[str, Any]:
+        return await self.call(
+            "events.read", {"after_seq": after_seq, "limit": limit})
+
     async def submit(self, message: str,
                      request_id: str | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {"message": message}
@@ -174,3 +179,7 @@ class ControlClient:
                            timeout: float = 30.0) -> dict[str, Any]:
         return await self.call(
             "command.wait", {"command_id": command_id, "timeout": timeout})
+
+    async def cancel_command(self, command_id: str) -> dict[str, Any]:
+        return await self.call(
+            "command.cancel", {"command_id": command_id})

@@ -115,10 +115,19 @@ def main() -> None:
                       "error": {"code": -32000, "message": "prompt boom"}})
                 continue
             if "perm" in text:
+                permission_title = (
+                    "API_TOKEN=secret-value 写文件"
+                    if "secret-title" in text else "写文件"
+                )
                 send({"jsonrpc": "2.0", "id": 900,
                       "method": "session/request_permission",
                       "params": {"sessionId": sid,
-                                 "toolCall": {"title": "写文件"},
+                                 "toolCall": {
+                                     "title": permission_title,
+                                     "rawInput": {
+                                         "path": "examples/demo.txt",
+                                         "command": "printf demo > examples/demo.txt",
+                                     }},
                                  "options": [
                                      {"optionId": "allow", "kind": "allow_once",
                                       "name": "允许一次"},
@@ -134,6 +143,26 @@ def main() -> None:
                 PENDING["rid"] = rid
                 PENDING["mode"] = "never" if "never" in text else "slow"
                 continue  # 挂起，等 session/cancel
+            if "observe" in text:
+                tool_title = (
+                    "API_TOKEN=secret-value 检查 JavaScript"
+                    if "secret-title" in text else "检查 JavaScript"
+                )
+                send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": sid, "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tool-1",
+                        "title": tool_title,
+                        "kind": "execute",
+                        "rawInput": {
+                            "command": "API_TOKEN=secret-value node --check demo.js"
+                        }}}})
+                send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": sid, "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "tool-1",
+                        "status": "in_progress",
+                        "title": tool_title}}})
             if "perm" not in text:
                 send({"jsonrpc": "2.0", "method": "session/update", "params": {
                     "sessionId": sid, "update": {

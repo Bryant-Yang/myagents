@@ -8,6 +8,8 @@
 - **fail loudly**：schema 不支持、timeline/state 损坏、workdir 不匹配都抛
   异常，绝不静默覆盖旧数据；写失败不伪装成功（seq 只在 fsync 后推进，
   内存可见的 agent 状态只在原子写成功后提交）。
+- **执行可观测性**：events.jsonl 独立记录命令生命周期、工具、权限和心跳，
+  不进入 agent 对话上下文；M3 旧房间在合法 state/timeline 校验后安全补建。
 """
 
 from __future__ import annotations
@@ -29,6 +31,10 @@ DEFAULT_READ_LIMIT = 50
 MAX_READ_LIMIT = 200
 MAX_TEXT_BYTES = 64 * 1024      # 单条消息文本上限（UTF-8 字节）
 MAX_RECORD_BYTES = 128 * 1024   # 单条 JSONL 记录上限（UTF-8 字节）
+EXECUTION_EVENT_KINDS = frozenset({
+    "queued", "running", "status", "tool", "permission", "partial",
+    "completed", "failed", "cancelled",
+})
 
 ROOM_DIR_MODE = 0o700
 STATE_FILE_MODE = 0o600
@@ -155,6 +161,60 @@ class TimelineRecord:
                               created_at=created_at, command_id=command_id)
 
 
+@dataclass(frozen=True)
+class ExecutionEventRecord:
+    """不进入对话上下文的执行事件。"""
+
+    seq: int
+    command_id: str
+    agent: str
+    kind: str
+    text: str
+    created_at: str
+
+    def to_dict(self) -> dict:
+        return {
+            "seq": self.seq,
+            "command_id": self.command_id,
+            "agent": self.agent,
+            "kind": self.kind,
+            "text": self.text,
+            "created_at": self.created_at,
+        }
+
+    @staticmethod
+    def from_dict(data: object, *, line_no: int) -> "ExecutionEventRecord":
+        if not isinstance(data, dict):
+            raise CorruptedStorageError(
+                f"events 第 {line_no} 行不是 JSON object")
+        expected = {
+            "seq", "command_id", "agent", "kind", "text", "created_at"}
+        if set(data) != expected:
+            raise CorruptedStorageError(
+                f"events 第 {line_no} 行字段不完整或含未知字段")
+        seq = data["seq"]
+        command_id = data["command_id"]
+        agent = data["agent"]
+        kind = data["kind"]
+        text = data["text"]
+        created_at = data["created_at"]
+        if (not isinstance(seq, int) or isinstance(seq, bool) or seq <= 0
+                or not isinstance(command_id, str) or not command_id
+                or not isinstance(agent, str) or not agent
+                or kind not in EXECUTION_EVENT_KINDS
+                or not isinstance(text, str)
+                or not isinstance(created_at, str)
+                or not _is_utc_iso(created_at)):
+            raise CorruptedStorageError(
+                f"events 第 {line_no} 行字段非法")
+        if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
+            raise CorruptedStorageError(
+                f"events 第 {line_no} 行 text 超过上限 {MAX_TEXT_BYTES} 字节")
+        return ExecutionEventRecord(
+            seq=seq, command_id=command_id, agent=agent, kind=kind,
+            text=text, created_at=created_at)
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -241,7 +301,7 @@ def _fsync_dir(path: Path) -> None:
 
 
 class RoomStore:
-    """一个房间的持久化存储：timeline.jsonl（append-only）+ state.json（原子写）。"""
+    """房间存储：对话 timeline、执行 events 与原子 state。"""
 
     def __init__(self, workdir: str | Path,
                  state_root: str | Path | None = None) -> None:
@@ -258,9 +318,11 @@ class RoomStore:
         self.room_id = room_id_for(self.workdir)
         self.room_dir = self.state_root / "rooms" / self.room_id
         self.timeline_path = self.room_dir / "timeline.jsonl"
+        self.events_path = self.room_dir / "events.jsonl"
         self.state_path = self.room_dir / "state.json"
         self._state: dict = {}
         self._next_seq = 1
+        self._next_event_seq = 1
         self._open()
 
     # ---- 打开 / 初始化 ----
@@ -278,10 +340,15 @@ class RoomStore:
             if entries:
                 self._load_state()
                 self._next_seq = self._scan_timeline()
-                # 内容校验通过后才动权限：目录和两个状态文件都强制规范值
+                # M3 房间没有 events.jsonl：先验证原状态/时间线，再补建空文件。
+                if not self.events_path.exists():
+                    self._create_empty_events()
+                self._next_event_seq = self._scan_events()
+                # 内容校验通过后才动权限：目录和状态文件都强制规范值
                 os.chmod(self.room_dir, ROOM_DIR_MODE)
                 os.chmod(self.state_path, STATE_FILE_MODE)
                 os.chmod(self.timeline_path, STATE_FILE_MODE)
+                os.chmod(self.events_path, STATE_FILE_MODE)
                 return
             # 空目录：视为未初始化，走新建流程
         self._init_fresh()
@@ -298,11 +365,19 @@ class RoomStore:
         }
         self._write_state(state)
         self._state = state
-        # 创建空 timeline（0600），让权限从第一天就正确
+        # 创建空 append-only 文件（0600），让权限从第一天就正确
         fd = os.open(self.timeline_path,
                      os.O_CREAT | os.O_APPEND | os.O_WRONLY, STATE_FILE_MODE)
         os.close(fd)
         os.chmod(self.timeline_path, STATE_FILE_MODE)
+        self._create_empty_events()
+        _fsync_dir(self.room_dir)
+
+    def _create_empty_events(self) -> None:
+        fd = os.open(self.events_path,
+                     os.O_CREAT | os.O_APPEND | os.O_WRONLY, STATE_FILE_MODE)
+        os.close(fd)
+        os.chmod(self.events_path, STATE_FILE_MODE)
         _fsync_dir(self.room_dir)
 
     def _load_state(self) -> None:
@@ -364,6 +439,38 @@ class RoomStore:
                     raise CorruptedStorageError(
                         f"timeline 第 {line_no} 行不是合法 JSON：{exc}") from exc
                 records.append(TimelineRecord.from_dict(data, line_no=line_no))
+        return records
+
+    def _scan_events(self) -> int:
+        last_seq = 0
+        for record in self._load_events():
+            if record.seq <= last_seq:
+                raise CorruptedStorageError(
+                    f"events seq 非严格递增：{record.seq} 出现在 {last_seq} 之后")
+            last_seq = record.seq
+        return last_seq + 1
+
+    def _load_events(self) -> list[ExecutionEventRecord]:
+        if not self.events_path.is_file():
+            raise CorruptedStorageError(
+                f"缺少 events.jsonl：{self.events_path}")
+        records: list[ExecutionEventRecord] = []
+        with open(self.events_path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                if len(line.encode("utf-8")) > MAX_RECORD_BYTES:
+                    raise CorruptedStorageError(
+                        f"events 第 {line_no} 行超过单条记录上限 "
+                        f"{MAX_RECORD_BYTES} 字节")
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise CorruptedStorageError(
+                        f"events 第 {line_no} 行不是合法 JSON：{exc}") from exc
+                records.append(ExecutionEventRecord.from_dict(
+                    data, line_no=line_no))
         return records
 
     # ---- 单写者 lease ----
@@ -504,3 +611,55 @@ class RoomStore:
             "has_more": len(records) > len(items),
             "next_after_seq": items[-1].seq if items else after_seq,
         }
+
+    # ---- execution events（不进入对话 history）----
+
+    def append_event(self, *, command_id: str, agent: str,
+                     kind: str, text: str) -> ExecutionEventRecord:
+        if not command_id:
+            raise ValueError("command_id 不能为空")
+        if not agent:
+            raise ValueError("agent 不能为空")
+        if kind not in EXECUTION_EVENT_KINDS:
+            raise ValueError(f"未知执行事件 kind：{kind!r}")
+        if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
+            raise LimitExceededError(
+                f"执行事件文本超过上限 {MAX_TEXT_BYTES} 字节")
+        record = ExecutionEventRecord(
+            seq=self._next_event_seq, command_id=command_id,
+            agent=agent, kind=kind, text=text, created_at=_utc_now_iso())
+        line = json.dumps(record.to_dict(), ensure_ascii=False)
+        if len(line.encode("utf-8")) > MAX_RECORD_BYTES:
+            raise LimitExceededError(
+                f"执行事件记录超过上限 {MAX_RECORD_BYTES} 字节")
+        fd = os.open(self.events_path, os.O_APPEND | os.O_WRONLY)
+        try:
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            raise
+        self._next_event_seq += 1
+        return record
+
+    def read_events(self, after_seq: int = 0,
+                    limit: int = DEFAULT_READ_LIMIT) -> dict:
+        if not isinstance(after_seq, int) or isinstance(after_seq, bool) \
+                or after_seq < 0:
+            raise ValueError(f"after_seq 必须是非负 int：{after_seq!r}")
+        limit = max(1, min(int(limit), MAX_READ_LIMIT))
+        records = [r for r in self._load_events() if r.seq > after_seq]
+        items = records[:limit]
+        return {
+            "items": items,
+            "has_more": len(records) > len(items),
+            "next_after_seq": items[-1].seq if items else after_seq,
+        }
+
+    def latest_execution_events(self) -> list[ExecutionEventRecord]:
+        """每个 command 的最后一条事件，按事件 seq 排序。"""
+        latest: dict[str, ExecutionEventRecord] = {}
+        for record in self._load_events():
+            latest[record.command_id] = record
+        return sorted(latest.values(), key=lambda record: record.seq)

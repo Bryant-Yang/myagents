@@ -121,12 +121,23 @@ def test_protocol_roundtrip() -> None:
                 first["command_id"], first["command_id"],
                 second["command_id"], second["command_id"],
             ]
+            events = await room.client.read_events(limit=200)
+            first_events = [
+                item["kind"] for item in events["items"]
+                if item["command_id"] == first["command_id"]]
+            assert first_events[0] == "queued"
+            assert "running" in first_events
+            assert "partial" in first_events
+            assert first_events[-1] == "completed"
+            # terminal cancel 幂等，不改变成功结果。
+            cancelled = await room.client.cancel_command(first["command_id"])
+            assert cancelled["status"] == "completed"
         finally:
             await room.close()
             room.cleanup()
 
     asyncio.run(run())
-    print("ok  control 五方法 + FIFO/idempotency + timeline pagination")
+    print("ok  control 七方法 + FIFO/idempotency + timeline/events + cancel")
 
 
 def test_permissions_cleanup_and_unavailable() -> None:

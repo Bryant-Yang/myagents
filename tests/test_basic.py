@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from adapters.base import AgentEvent, stream_jsonl
-from host import HostAgent
+from host import HostAgent, HostDecision
 from orchestrator import Message, Orchestrator
 
 
@@ -35,7 +35,7 @@ class FakeHost(FakeAdapter):
     def __init__(self) -> None:
         super().__init__("host")
         self.decide_calls = 0
-        self.route = (["kimi"], "测试路由")
+        self.route = HostDecision(["kimi"], "测试路由")
 
     async def decide(self, transcript: str, workdir: str):
         self.decide_calls += 1
@@ -101,14 +101,31 @@ def test_host_routing() -> None:
     print("ok  host 路由（无 @ → 派给 kimi）")
 
 
-def test_host_answers_itself() -> None:
-    """路由结果是 host 时，主持人自己回答（用主持人 prompt）。"""
+def test_host_direct_answer_single_call() -> None:
+    """任意语言的闲聊由 host 在判断调用中直接回答，不写死问候词。"""
     orch = make_orch()
-    orch.host.route = (["host"], "闲聊自己答")
+    orch.host.route = HostDecision([], "host 直接回答", "Hi，我在。")
+    events = []
+    asyncio.run(orch.dispatch("hi", lambda n, e: events.append((n, e))))
+
+    assert orch.host.decide_calls == 1
+    assert orch.host.last_prompt is None  # 没有第二次调用 host.stream()
+    assert [m.speaker for m in orch.history] == ["user", "host"]
+    assert orch.history[-1].text == "Hi，我在。"
+    assert any(n == "host" and e.kind == "text" for n, e in events)
+    assert any(n == "host" and e.kind == "done" for n, e in events)
+    print("ok  host 直接回答（自然语言不写死 + 单次 LLM）")
+
+
+def test_host_answers_itself() -> None:
+    """host 的判断调用直接产出答案，不再做第二次主持人调用。"""
+    orch = make_orch()
+    orch.host.route = HostDecision([], "闲聊自己答", "这是我的看法")
     asyncio.run(orch.dispatch("你怎么看", lambda n, e: None))
     assert [m.speaker for m in orch.history] == ["user", "host"]
-    assert "主持人" in orch.host.last_prompt  # 用了 MODERATOR_TEMPLATE
-    print("ok  host 路由到自己 + 主持人 prompt")
+    assert orch.history[-1].text == "这是我的看法"
+    assert orch.host.decide_calls == 1 and orch.host.last_prompt is None
+    print("ok  host 判断与回答合并为一次调用")
 
 
 def test_at_host_explicit() -> None:
@@ -128,7 +145,7 @@ def test_transcript_snapshot() -> None:
     async def run() -> None:
         async def decide_slow(transcript: str, workdir: str):
             await gate.wait()  # 模拟 codex 路由要几秒钟
-            return (["kimi"], "慢路由")
+            return HostDecision(["kimi"], "慢路由")
         orch.host.decide = decide_slow
 
         t1 = asyncio.create_task(orch.dispatch("第一条消息", lambda n, e: None))
@@ -156,7 +173,7 @@ def test_decide_failure_fallback() -> None:
 
     events = []
     asyncio.run(orch.dispatch("随便一条消息", lambda n, e: events.append((n, e))))
-    assert any(n == "host" and e.kind == "error" and "路由失败" in e.text
+    assert any(n == "host" and e.kind == "error" and "处理失败" in e.text
                for n, e in events)
     # 回退到第一个工人 kimi，而不是可能同样故障的 host
     assert [m.speaker for m in orch.history] == ["user", "kimi"]
@@ -190,14 +207,16 @@ def test_persistent_failure() -> None:
 def test_route_dedupe() -> None:
     """P2 回归：LLM 返回重复/非法目标时按序去重并过滤。"""
     host = HostAgent(workers=["kimi", "opencode"])
-    choices = ["kimi", "opencode", "host"]
-    targets, _ = host._parse('{"targets": ["kimi", "kimi", "nobody"], "reason": "x"}', choices)
-    assert targets == ["kimi"]
-    targets, _ = host._parse('{"targets": ["opencode", "kimi", "opencode"]}', choices)
-    assert targets == ["opencode", "kimi"]
-    targets, reason = host._parse("这不是 JSON", choices)
-    assert targets == ["host"] and "失败" in reason
-    print("ok  路由目标去重 + 非法输入兜底")
+    choices = ["kimi", "opencode"]
+    decision = host._parse(
+        '{"targets": ["kimi", "kimi", "nobody"], "reason": "x"}', choices)
+    assert decision.targets == ["kimi"] and decision.answer is None
+    decision = host._parse(
+        '{"targets": ["opencode", "kimi", "opencode"]}', choices)
+    assert decision.targets == ["opencode", "kimi"]
+    decision = host._parse("这是主持人的直接回答", choices)
+    assert decision.targets == [] and decision.answer == "这是主持人的直接回答"
+    print("ok  路由目标去重 + 非 JSON 作为 host 直接回答")
 
 
 def test_stderr_backpressure() -> None:
@@ -342,7 +361,7 @@ def test_tui() -> None:
             await app.workers.wait_for_complete()
             await pilot.pause()
             lines = "\n".join(str(line.text) for line in app.query_one(RichLog).lines)
-            assert "host 路由中" in lines          # 无 @ → 走 host 路由
+            assert "host 处理中" in lines          # 无 @ → host 判断或回答
             assert "路由 → kimi" in lines          # 路由结果提示
             assert "[kimi] kimi 收到" in lines
 
@@ -350,11 +369,43 @@ def test_tui() -> None:
     print("ok  TUI（Textual pilot）")
 
 
+def test_tui_coalesces_stream_chunks() -> None:
+    """一条流式回复的 token/chunk 不应各占一行。"""
+    from textual.widgets import Input, RichLog
+    from main import ChatApp
+
+    class ChunkAdapter(FakeAdapter):
+        async def stream(self, prompt: str, workdir: str):
+            for chunk in ("我", "来", "处理", "。"):
+                yield AgentEvent("text", chunk)
+            yield AgentEvent("done")
+
+    async def run() -> None:
+        orch = make_orch()
+        orch.adapters["kimi"] = ChunkAdapter("kimi")
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test() as pilot:
+            box = app.query_one(Input)
+            box.value = "@kimi 测试流式显示"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            kimi_lines = [
+                str(line.text) for line in app.query_one(RichLog).lines
+                if str(line.text).startswith("[kimi] ")
+            ]
+            assert kimi_lines == ["[kimi] 我来处理。"], kimi_lines
+
+    asyncio.run(run())
+    print("ok  TUI 合并同一回复的流式 chunk")
+
+
 if __name__ == "__main__":
     test_parse_mentions()
     test_dispatch()
     test_dispatch_multi_and_transcript()
     test_host_routing()
+    test_host_direct_answer_single_call()
     test_host_answers_itself()
     test_at_host_explicit()
     test_transcript_snapshot()
@@ -365,4 +416,5 @@ if __name__ == "__main__":
     test_kill_on_cancel()
     test_bounded_stderr()
     test_tui()
+    test_tui_coalesces_stream_chunks()
     print("\n全部通过")

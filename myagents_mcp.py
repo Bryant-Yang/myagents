@@ -31,6 +31,12 @@ SEND_MESSAGE = ToolAnnotations(
     idempotentHint=False,
     openWorldHint=True,
 )
+CANCEL_COMMAND = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
 
 def build_server(client: ControlClient) -> FastMCP:
@@ -79,6 +85,22 @@ def build_server(client: ControlClient) -> FastMCP:
             "timeline.read", {"after_seq": after_seq, "limit": limit})
 
     @server.tool(
+        name="myagents_read_events",
+        description=(
+            "Read persisted execution events such as running status, tool use, "
+            "permission waits, heartbeats, partial output, and terminal state."
+        ),
+        annotations=READ_ONLY,
+        structured_output=True,
+    )
+    async def read_events(
+        after_seq: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        return await call(
+            "events.read", {"after_seq": after_seq, "limit": limit})
+
+    @server.tool(
         name="myagents_send_message",
         description=(
             "Submit a user message to the running TUI's FIFO command bus. "
@@ -124,6 +146,19 @@ def build_server(client: ControlClient) -> FastMCP:
     ) -> dict[str, Any]:
         return await call(
             "command.wait", {"command_id": command_id, "timeout": timeout})
+
+    @server.tool(
+        name="myagents_cancel_command",
+        description=(
+            "Cancel one queued or running command without stopping the room. "
+            "Cancelling an already-terminal command is idempotent."
+        ),
+        annotations=CANCEL_COMMAND,
+        structured_output=True,
+    )
+    async def cancel_command(command_id: str) -> dict[str, Any]:
+        return await call(
+            "command.cancel", {"command_id": command_id})
 
     return server
 

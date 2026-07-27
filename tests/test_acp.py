@@ -181,6 +181,39 @@ def test_cancel_timeout_rebuild() -> None:
     print("ok  cancel 超时 → 关闭并重建连接")
 
 
+def test_inactivity_timeout_unblocks_next_round() -> None:
+    """ACP 中途无任何事件时应自动取消，不能永久堵住 CommandBus。"""
+    async def run() -> None:
+        reset_state()
+        adapter = AcpAdapter(
+            "fake", [sys.executable, SERVER],
+            inactivity_timeout=0.15, cancel_timeout=0.1,
+        )
+        old_client = adapter._client
+
+        async def consume_stalled() -> None:
+            async for _ in adapter.stream("slow-never task", "/tmp"):
+                pass
+
+        try:
+            await asyncio.wait_for(consume_stalled(), timeout=0.8)
+            raise AssertionError("无活动的流应该超时")
+        except AcpError as exc:
+            assert "无活动" in str(exc), exc
+
+        assert adapter._client is not old_client
+        assert adapter._started is False
+        texts = [
+            ev.text async for ev in adapter.stream("fast round", "/tmp")
+            if ev.kind == "text"
+        ]
+        assert texts == ["PO", "NG"]
+        await adapter.aclose()
+
+    asyncio.run(run())
+    print("ok  ACP 无活动超时 → 自动取消并放行下一轮")
+
+
 def test_close_during_prompt() -> None:
     """P2 生命周期：prompt 进行中 close()，pending 失败且进程无残留。"""
     async def run() -> None:
@@ -314,6 +347,28 @@ def test_adapter_bridge() -> None:
         await adapter.aclose()
     asyncio.run(run())
     print("ok  AcpAdapter 桥接（text 事件 + stopReason）")
+
+
+def test_adapter_observability_without_thought_content() -> None:
+    """ACP 阶段/工具可见，但不把 agent thought 正文当作输出泄露。"""
+    async def run() -> None:
+        adapter = AcpAdapter("fake", [sys.executable, SERVER])
+        events = [
+            event async for event in adapter.stream(
+                "observe secret-title", "/tmp")
+        ]
+        assert any(e.kind == "status" and "分析" in e.text for e in events)
+        tools = [e for e in events if e.kind == "tool"]
+        assert tools and tools[0].text == \
+            "API_TOKEN=[已隐藏] 检查 JavaScript"
+        assert tools[0].meta["command"] == \
+            "API_TOKEN=[已隐藏] node --check demo.js"
+        assert not any("secret-value" in e.text for e in events)
+        assert "secret-value" not in tools[0].meta["command"]
+        assert not any("想想" in e.text for e in events)
+        await adapter.aclose()
+    asyncio.run(run())
+    print("ok  ACP 可观测事件不暴露 thought 正文")
 
 
 def test_restore_load_success() -> None:
@@ -653,12 +708,14 @@ if __name__ == "__main__":
     test_cancel_notification()
     test_cancel_serialization()
     test_cancel_timeout_rebuild()
+    test_inactivity_timeout_unblocks_next_round()
     test_close_during_prompt()
     test_initialize_failure()
     test_session_new_failure_atomic()
     test_double_start_guard()
     test_aclose_serialized_with_stream()
     test_adapter_bridge()
+    test_adapter_observability_without_thought_content()
     test_restore_load_success()
     test_restore_load_error_fallback_new()
     test_restore_unsupported_fallback_new()

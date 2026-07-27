@@ -4,10 +4,11 @@
 - **Hub-and-spoke（中心辐射）**：agent 之间从不直接对话。所有消息先进
   共享时间线（history），@谁就把上下文打包发给谁，回复再贴回时间线。
   这样不会有"两个 agent 互相@死循环"，也只有一个地方需要管上下文。
-- **两种传输，两种上下文策略**（AgentSpec.transport）：
+- **多种传输，两种上下文策略**（AgentSpec.transport）：
   - JSONL adapter：无头调用每次是全新会话，agent 看不到聊天记录，
     把最近 N 条对话记录塞进 prompt 一起发（transcript 快照）。
-  - ACP adapter（`stateful_session`）：session 在 agent 侧保持，编排器
+  - 有状态 adapter（`stateful_session`，ACP 或 app-server）：原生会话
+    在 agent 侧保持，编排器
     只发**增量**——每个 agent 一个 history cursor，记录已交付到哪儿；
     每轮只发 cursor 之后的新消息（跳过 agent 自己的回复，那些本来就在
     它的 ACP session 里；首次 bootstrap 限发最近 N 条）。读 cursor →
@@ -16,8 +17,8 @@
     失败不推进，下一轮补发增量，不丢上下文。
 - **并发扇出（fan-out）**：一条消息 @多个 agent 时并行派发，互不等待。
 - **Supervisor（中心协调者）**：注册表里的 host 是一个由 LLM 扮演的
-  主持人。显式 @ 永远优先；用户没点名时，由 host 做 LLM 路由决定
-  派发给谁（见 host.py）。
+  主持人。显式 @ 永远优先；用户没点名时，host 用一次调用直接回答或
+  决定派发给谁（见 host.py）。
 """
 
 from __future__ import annotations
@@ -28,9 +29,14 @@ from dataclasses import dataclass
 from typing import Callable
 
 from acp.adapter import AcpKimiAdapter, AgentPermissionHandler
-from adapters.base import AgentAdapter, AgentEvent
-from adapters.codex_adapter import CodexAdapter
+from adapters.base import (
+    AgentAdapter,
+    AgentDeliveryCancelledError,
+    AgentDeliveryUncertainError,
+    AgentEvent,
+)
 from adapters.opencode_adapter import OpenCodeAdapter
+from codex_app_server.adapter import CodexAppServerAdapter
 from host import MODERATOR_TEMPLATE, HostAgent
 from storage.store import (MAX_READ_LIMIT, CorruptedStorageError, RoomLease,
                            RoomStore, WorkdirMismatchError, normalize_workdir)
@@ -45,25 +51,26 @@ class AgentSpec:
     """一个工人 agent 的注册信息：名字 + 传输协议 + adapter 工厂。
 
     transport:
-      - "acp"   有状态会话（ACP 协议），编排器发增量上下文
-      - "jsonl" 无头一次性调用，编排器发完整 transcript 快照
+      - "acp"        ACP 有状态会话，编排器发增量上下文
+      - "app-server" Codex 原生有状态 thread，编排器发增量上下文
+      - "jsonl"      无头一次性调用，编排器发完整 transcript 快照
 
     新增 agent = 在这里加一行（写一个 adapter 类）。协议判断只看
     transport / adapter 能力声明，不散落 `if name == ...`。
     """
 
     name: str
-    transport: str  # "acp" | "jsonl"
+    transport: str  # "acp" | "app-server" | "jsonl"
     factory: Callable[[], AgentAdapter]
 
 
 # 工人 agent 注册表：ACP-first，JSONL 保留为 fallback。
 # Kimi 是首个生产 ACP agent（命令 ["kimi", "acp"]）；
-# Codex/OpenCode 继续走 JSONL adapter。
+# Codex 使用官方 app-server 长连接；旧 Codex JSONL adapter 保留为 fallback。
 AGENT_SPECS: tuple[AgentSpec, ...] = (
     AgentSpec("kimi", "acp", AcpKimiAdapter),
     AgentSpec("opencode", "jsonl", OpenCodeAdapter),
-    AgentSpec("codex", "jsonl", CodexAdapter),
+    AgentSpec("codex", "app-server", CodexAppServerAdapter),
 )
 AGENTS: dict[str, AgentSpec] = {spec.name: spec for spec in AGENT_SPECS}
 
@@ -119,6 +126,14 @@ class _CheckpointError(Exception):
     """
 
 
+class _EventCallbackError(Exception):
+    """区分 event sink 与 agent 异常；sink 失败不得被当成 agent 失败吞掉。"""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
+
 class OrchestratorClosedError(Exception):
     """Orchestrator 已关闭：拒绝新的 dispatch 和排队中的 delivery。"""
 
@@ -137,7 +152,8 @@ class Orchestrator:
         # 主持人也注册进 adapters：@host 时和工人走同一条派发路径，
         # 只是 _build_prompt 会给它主持人角色的 prompt。
         # 主持人由 codex 扮演，用 read-only 沙箱：总结/仲裁/路由只需要看，不需要写。
-        self.host = HostAgent(adapter=CodexAdapter(sandbox="read-only"),
+        self.host = HostAgent(adapter=CodexAppServerAdapter(
+                                  sandbox="read-only", reuse_thread=False),
                               workers=[spec.name for spec in specs])
         self.adapters[HOST_NAME] = self.host
         # 持久化：persistent=True 默认按 workdir 打开 RoomStore；调用方也
@@ -315,8 +331,8 @@ class Orchestrator:
                        command_id: str | None = None) -> None:
         """处理一条用户消息：记录 → 路由 → 并发派发 → 收回回复。
 
-        路由规则：**显式 @ 永远优先**；用户没点名时交给 host 做 LLM 路由
-        （它可能派给工人，也可能自己回答）。
+        路由规则：**显式 @ 永远优先**；用户没点名时交给 host 一次处理
+        （它直接回答，或返回需要派发的 worker）。
 
         command_id：调用方（CommandBus）的命令 id；本轮 user 消息和所有
         agent 最终 timeline 记录（正常回复、失败占位、无文本占位）都带它，
@@ -335,7 +351,7 @@ class Orchestrator:
         on_event("user", AgentEvent("committed", user_text,
                                     meta={"seq": committed.seq,
                                           "command_id": command_id}))
-        # 快照（在第一个 await 之前）：等待 host 路由或 agent 启动期间，
+        # 快照（在第一个 await 之前）：等待 host 处理或 agent 启动期间，
         # 用户可能又提交了新消息进 history。JSONL agent 和 host 路由的
         # prompt 必须用快照拼接，否则并发消息会串话（agent 执行错任务）。
         # ACP agent 不走这个快照——它的增量起点（cursor）在 delivery lock
@@ -349,11 +365,25 @@ class Orchestrator:
             # 最高的路径）。绝不回退到 host adapter 本身——路由失败
             # 大概率就是它挂了，再调一次只会伪造出"无文本回复"。
             try:
-                targets, reason = await self.host.decide(snapshot_text, self.workdir)
+                decision = await self.host.decide(
+                    snapshot_text, self.workdir)
             except Exception as exc:
-                on_event(HOST_NAME, AgentEvent("error", f"host 路由失败：{exc}"))
+                on_event(HOST_NAME, AgentEvent("error", f"host 处理失败：{exc}"))
                 targets = [self.specs[0].name]
                 reason = f"路由失败，回退到 {targets[0]}"
+            else:
+                if decision.answer is not None:
+                    # host 在“判断是否路由”的同一次 LLM 调用里已经给出最终
+                    # 回答，直接落时间线；不再二次调用 host adapter。
+                    on_event(HOST_NAME, AgentEvent(
+                        "info", "host 直接回答（单次调用）"))
+                    on_event(HOST_NAME, AgentEvent("text", decision.answer))
+                    self._append_message(
+                        HOST_NAME, decision.answer, command_id=command_id)
+                    on_event(HOST_NAME, AgentEvent(
+                        "done", meta={"hostAnswered": True}))
+                    return
+                targets, reason = decision.targets, decision.reason
             on_event(HOST_NAME, AgentEvent(
                 "info", f"路由 → {'、'.join(targets)}（{reason}）"))
         await asyncio.gather(
@@ -391,13 +421,12 @@ class Orchestrator:
                     # 末尾 seq：1) 失败不推进——下轮从旧 cursor 补发，不丢
                     # 上下文；2) 本轮进行期间到达的新消息没发出去，必须留给
                     # 下一轮；3) 自己的回复靠 speaker 过滤跳过。
+                    # post-submit no-replay 例外已在 _deliver_prepared 的
+                    # 专门异常分支里先持久化，不会走到这里。
                     # 有 store：先落盘（原子写），成功后才更新内存 cursor；
                     # 写失败向 dispatch 传播，内存/磁盘 cursor 都不动，
                     # 下一轮按旧 cursor 补发。
-                    if self.store is not None:
-                        self.store.set_agent_state(name, cursor=delivered_upto)
-                    self._cursors[name] = max(
-                        self._cursors.get(name, 0), delivered_upto)
+                    self._commit_cursor(name, delivered_upto)
         else:
             # 无状态（JSONL）agent：dispatch 瞬间的 transcript 快照
             await self._deliver(name, adapter,
@@ -428,7 +457,9 @@ class Orchestrator:
         delivered: dict[str, int] = {"upto": 0}
 
         def make_prompt(prep) -> str:
-            if prep.fresh and not prep.restored:
+            if (prep.fresh and not prep.restored
+                    and getattr(
+                        adapter, "replay_history_on_fresh_session", True)):
                 chosen = 0
             else:
                 chosen = self._cursors.get(name, 0)
@@ -450,16 +481,35 @@ class Orchestrator:
         try:
             async for ev in adapter.stream_prepared(
                     make_prompt, self.workdir, resume_session_id):
+                if ev.kind == "delivery_committed":
+                    # adapter 已确认用户 turn 被接受。必须先持久化，再公开
+                    # 任何可能触发 events/UI 写入的后续事件。
+                    self._commit_cursor(name, delivered["upto"])
+                    continue
                 if ev.kind == "done":
                     # done 不立即转发：等回复落盘成功后才发（见方法尾）
                     done_meta = ev.meta
                     continue
-                on_event(name, ev)
+                self._emit_adapter_event(on_event, name, ev)
                 if ev.kind == "text":
                     parts.append(ev.text)
+        except _EventCallbackError as exc:
+            raise exc.cause from exc
         except _CheckpointError as exc:
             # checkpoint 失败：发 error event 后原样抛出，不进 history
             on_event(name, AgentEvent("error", str(exc)))
+            raise
+        except AgentDeliveryUncertainError as exc:
+            # turn/start 的应答丢失时服务端可能已开始执行。诚实记录失败，
+            # 先持久 no-replay 边界，再做任何 callback/timeline 写入；否则
+            # 后两者失败会留下旧 cursor，重启后可能重复工具副作用。
+            self._commit_cursor(name, delivered["upto"])
+            failed = str(exc)
+            on_event(name, AgentEvent("error", failed))
+        except AgentDeliveryCancelledError:
+            # 保持 CancelledError 语义交给 CommandBus 标记 cancelled，但先
+            # 固化 turn 已提交后的 no-replay 边界。
+            self._commit_cursor(name, delivered["upto"])
             raise
         except Exception as exc:  # agent 崩溃不拖垮整个聊天室
             failed = str(exc)
@@ -494,9 +544,11 @@ class Orchestrator:
                     # done 不立即转发：等回复落盘成功后才发（见方法尾）
                     done_meta = ev.meta
                     continue
-                on_event(name, ev)
+                self._emit_adapter_event(on_event, name, ev)
                 if ev.kind == "text":
                     parts.append(ev.text)
+        except _EventCallbackError as exc:
+            raise exc.cause from exc
         except Exception as exc:  # agent 崩溃不拖垮整个聊天室
             failed = str(exc)
             on_event(name, AgentEvent("error", failed))
@@ -514,3 +566,18 @@ class Orchestrator:
             # 只有成功轮（append 也已成功，否则上面已抛出）才发 done
             on_event(name, AgentEvent("done", meta=done_meta))
         return failed
+
+    @staticmethod
+    def _emit_adapter_event(
+            on_event: EventCallback, name: str, event: AgentEvent) -> None:
+        try:
+            on_event(name, event)
+        except Exception as exc:
+            raise _EventCallbackError(exc) from exc
+
+    def _commit_cursor(self, name: str, delivered_upto: int) -> None:
+        """先落盘再更新内存；成功轮与 post-submit no-replay 共用。"""
+        if self.store is not None:
+            self.store.set_agent_state(name, cursor=delivered_upto)
+        self._cursors[name] = max(
+            self._cursors.get(name, 0), delivered_upto)

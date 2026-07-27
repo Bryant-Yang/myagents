@@ -581,6 +581,43 @@ def test_lease_non_busy_oserror_not_rewritten():
     print("ok  lease 非 busy OSError 不改写（chmod/flock 原样传播）")
 
 
+def test_execution_event_journal_and_legacy_migration():
+    """执行事件独立持久化；旧房间首次重开时安全补建 events.jsonl。"""
+    tmp, workdir, state_root = make_env()
+    with tmp:
+        store = open_store(workdir, state_root)
+        event = store.append_event(
+            command_id="cmd-1", agent="kimi", kind="tool",
+            text="执行 node --check")
+        assert event.seq == 1
+        assert event.command_id == "cmd-1"
+        assert event.agent == "kimi"
+        assert event.kind == "tool"
+        page = store.read_events()
+        assert [item.to_dict() for item in page["items"]] == [event.to_dict()]
+        assert page["next_after_seq"] == 1 and page["has_more"] is False
+        assert (store.events_path.stat().st_mode & 0o777) == 0o600
+
+        # 模拟 M3 旧房间：只有合法 state/timeline，没有 events.jsonl。
+        store.events_path.unlink()
+        reopened = open_store(workdir, state_root)
+        assert reopened.events_path.is_file()
+        assert reopened.read_events()["items"] == []
+        migrated = reopened.append_event(
+            command_id="cmd-2", agent="system", kind="running",
+            text="开始执行")
+        assert migrated.seq == 1
+
+        # 一旦文件存在，内容损坏必须 fail loudly。
+        reopened.events_path.write_text("{broken\n", encoding="utf-8")
+        try:
+            open_store(workdir, state_root)
+            raise AssertionError("损坏 events.jsonl 应拒绝打开")
+        except CorruptedStorageError:
+            pass
+    print("ok  独立执行事件日志 + 旧房间兼容迁移 + 损坏拒绝")
+
+
 if __name__ == "__main__":
     test_room_identity()
     test_append_and_restart_seq()
@@ -604,4 +641,5 @@ if __name__ == "__main__":
     test_lease_busy_error_includes_pid_hint()
     test_lease_pid_write_failure_releases_lock()
     test_lease_non_busy_oserror_not_rewritten()
+    test_execution_event_journal_and_legacy_migration()
     print("\n全部通过")

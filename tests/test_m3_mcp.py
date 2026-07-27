@@ -79,9 +79,11 @@ def test_official_stdio_client() -> None:
                         assert set(tools) == {
                             "myagents_get_room",
                             "myagents_read_timeline",
+                            "myagents_read_events",
                             "myagents_send_message",
                             "myagents_get_command",
                             "myagents_wait_command",
+                            "myagents_cancel_command",
                         }
                         read_only = tools["myagents_get_room"].annotations
                         assert read_only.readOnlyHint is True
@@ -129,6 +131,20 @@ def test_official_stdio_client() -> None:
                             "user", "kimi"]
                         assert all(item["command_id"] == command_id
                                    for item in records)
+                        events = await session.call_tool(
+                            "myagents_read_events",
+                            {"after_seq": 0, "limit": 50})
+                        kinds = [
+                            item["kind"]
+                            for item in events.structuredContent["items"]
+                            if item["command_id"] == command_id]
+                        assert kinds[0] == "queued"
+                        assert kinds[-1] == "completed"
+                        cancelled = await session.call_tool(
+                            "myagents_cancel_command",
+                            {"command_id": command_id})
+                        assert cancelled.structuredContent[
+                            "status"] == "completed"
 
                         # ControlRemoteError → actionable tool error，server 不崩
                         missing = await session.call_tool(

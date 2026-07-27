@@ -6,7 +6,7 @@
   追加一轮。编排器据此（`stateful_session = True`）改发增量上下文——
   只发自上次派发以来的新消息，不再重复完整 transcript。
 
-两条安全契约（Codex review 立的）：
+三条安全契约（Codex review 立的）：
 1. **权限默认 deny**：未注入 TUI 权限决策器时，session/request_permission
    一律 cancelled，auto 放行必须显式 opt-in。TUI 通过
    `set_permission_handler` 注入异步决策回调，把选择权交给用户。
@@ -14,6 +14,9 @@
    原 prompt 以 cancelled 结束（有限超时）；超时说明连接不可信，关闭
    并标记必须重建。锁只在确认停止或连接关闭后才释放——
    下一轮 prompt 绝不与仍在执行的上一轮重叠。
+3. **无活动必须回收**：prompt 连续一段时间没有任何 ACP 通知或终止响应，
+   视为上游卡死，自动取消本轮；取消也不确认时重建连接，避免永久堵住
+   串行 CommandBus。
 
 会话所有权：一个 AcpAdapter 实例是它 session 的唯一 writer。
 不要把这个 session id 交给别的进程（普通 kimi TUI、另一个 adapter）并发写。
@@ -31,11 +34,12 @@ import contextlib
 from dataclasses import dataclass
 from typing import AsyncIterator, Awaitable, Callable
 
-from adapters.base import AgentEvent
+from adapters.base import AgentEvent, redact_sensitive_text
 
 from .client import AcpClient, AcpError, PermissionHandler
 
 _CANCEL_TIMEOUT = 10  # 等 agent 确认 cancelled 的有限超时（秒）
+_INACTIVITY_TIMEOUT = 120  # prompt 连续无任何 ACP 事件的上限（秒）
 
 # 通用 agent-aware 权限决策器：async (agent_name, params) -> outcome。
 # orchestrator 用它把 TUI 决策注入所有 ACP adapter（通用 runtime 里弹窗必须
@@ -75,14 +79,20 @@ class AcpAdapter:
         cmd: list[str],
         permission: str = "deny",  # 默认拒绝；auto 必须显式 opt-in
         cancel_timeout: float = _CANCEL_TIMEOUT,
+        inactivity_timeout: float = _INACTIVITY_TIMEOUT,
         permission_handler: PermissionHandler | None = None,
     ) -> None:
+        if cancel_timeout <= 0:
+            raise ValueError("cancel_timeout 必须大于 0")
+        if inactivity_timeout <= 0:
+            raise ValueError("inactivity_timeout 必须大于 0")
         self.name = name
         self.session_id: str | None = None
         self._cmd = cmd
         self._permission = permission
         self._permission_handler = permission_handler
         self._cancel_timeout = cancel_timeout
+        self._inactivity_timeout = inactivity_timeout
         self._client = AcpClient(cmd, permission=permission,
                                  permission_handler=permission_handler)
         self._started = False
@@ -215,6 +225,7 @@ class AcpAdapter:
                              prompt: str) -> AsyncIterator[AgentEvent]:
         """锁内执行一轮 prompt 并映射事件；取消契约见 stream_prepared。"""
         updates: asyncio.Queue = asyncio.Queue()
+        seen_status: set[str] = set()
 
         def on_notify(method: str, params: dict) -> None:
             if params.get("sessionId") == session_id:
@@ -225,7 +236,13 @@ class AcpAdapter:
         task.add_done_callback(lambda t: updates.put_nowait(("__done__", t)))
         try:
             while True:
-                method, payload = await updates.get()
+                try:
+                    method, payload = await asyncio.wait_for(
+                        updates.get(), timeout=self._inactivity_timeout)
+                except asyncio.TimeoutError:
+                    raise AcpError(
+                        f"ACP 会话连续 {self._inactivity_timeout:g} 秒无活动，"
+                        "已取消本轮请求") from None
                 if method == "__done__":
                     result = payload.result()  # 失败在此抛出，交给编排器兜底
                     yield AgentEvent("done", meta={
@@ -239,9 +256,48 @@ class AcpAdapter:
                     text = update.get("content", {}).get("text", "")
                     if text:
                         yield AgentEvent("text", text)
+                elif kind == "agent_thought_chunk":
+                    # 不展示 chain-of-thought 正文，只公开安全的阶段状态。
+                    status = "agent 正在分析…"
+                    if status not in seen_status:
+                        seen_status.add(status)
+                        yield AgentEvent("status", status)
                 elif kind == "tool_call":
-                    yield AgentEvent("info", f"tool: {update.get('title', '')}")
-                # thought/plan/commands 等事件 MVP 阶段不展示
+                    title = redact_sensitive_text(
+                        str(update.get("title") or "(未命名工具)"),
+                        limit=500,
+                    )
+                    raw_input = update.get("rawInput")
+                    command = ""
+                    if isinstance(raw_input, dict):
+                        value = raw_input.get("command")
+                        if isinstance(value, str):
+                            command = redact_sensitive_text(value)
+                    yield AgentEvent("tool", title, meta={
+                        "tool_call_id": update.get("toolCallId"),
+                        "tool_kind": update.get("kind"),
+                        "status": update.get("status"),
+                        "command": command,
+                    })
+                elif kind == "tool_call_update":
+                    title = redact_sensitive_text(
+                        str(update.get("title") or "工具调用"),
+                        limit=500,
+                    )
+                    status_value = redact_sensitive_text(
+                        str(update.get("status") or "updated"),
+                        limit=200,
+                    )
+                    yield AgentEvent(
+                        "status", f"{title}：{status_value}",
+                        meta={"tool_call_id": update.get("toolCallId")})
+                elif kind in {
+                        "plan", "available_commands_update",
+                        "current_mode_update", "config_option_update"}:
+                    status = "agent 已更新执行计划"
+                    if status not in seen_status:
+                        seen_status.add(status)
+                        yield AgentEvent("status", status)
         finally:
             if not task.done():
                 # 取消契约：先通知中断，再等确认；锁在整个 finally

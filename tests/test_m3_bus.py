@@ -8,6 +8,7 @@ import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -15,6 +16,8 @@ from control import (CommandBus, CommandBusClosedError, CommandBusError,
                      CommandCapacityError, CommandNotFoundError,
                      CommandStatus, CommandValidationError)
 from adapters.base import AgentEvent
+from host import HostDecision
+from storage.store import RoomStore
 
 
 class FakeOrch:
@@ -26,6 +29,7 @@ class FakeOrch:
         self.gate: asyncio.Event | None = None
         self.fail_with: BaseException | None = None
         self.closed = False
+        self.store = None
 
     async def dispatch(self, message, on_event, command_id=None):
         self.calls.append((message, command_id))
@@ -215,6 +219,163 @@ def test_wait_timeout_and_terminal_immediate() -> None:
     print("ok  wait 超时（不取消命令）/ 成功 / terminal 立即返回")
 
 
+def test_active_cancel_heartbeat_and_worker_survives() -> None:
+    async def run() -> None:
+        orch = FakeOrch()
+        orch.gate = asyncio.Event()
+        events = []
+        bus = make_bus(
+            orch, event_sink=lambda n, e: events.append((n, e)),
+            heartbeat_interval=0.05)
+        first = await bus.submit("长任务")
+        await asyncio.sleep(0.13)
+        active = bus.active()
+        assert active is not None and active.command_id == first.command_id
+        heartbeats = [
+            ev for _, ev in events
+            if isinstance(ev, AgentEvent) and ev.kind == "status"
+            and ev.meta.get("command_id") == first.command_id
+        ]
+        assert heartbeats and "仍在运行" in heartbeats[-1].text
+
+        cancelled = await bus.cancel(first.command_id)
+        assert cancelled.status is CommandStatus.CANCELLED
+        assert bus.active() is None
+
+        # 取消 active 只停本轮 dispatch，不杀 bus worker。
+        orch.gate = None
+        second = await bus.submit("后续任务")
+        result = await bus.wait(second.command_id, timeout=5)
+        assert result["status"] == "completed"
+
+        # queued 命令也可单独取消，永不 dispatch。
+        orch.gate = asyncio.Event()
+        blocker = await bus.submit("阻塞")
+        queued = await bus.submit("排队取消")
+        queued_result = await bus.cancel(queued.command_id)
+        assert queued_result.status is CommandStatus.CANCELLED
+        assert "排队取消" not in [message for message, _ in orch.calls]
+        orch.gate.set()
+        await bus.wait(blocker.command_id, timeout=5)
+        await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  active/queued 精确取消 + 心跳 + worker 继续服务")
+
+
+def test_event_persistence_failure_fails_command_not_worker() -> None:
+    class FlakyStore:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.events = []
+
+        def append_event(self, **event) -> None:
+            self.calls += 1
+            if self.calls == 2:  # 第一条命令的 running event
+                raise OSError("disk full")
+            self.events.append(event)
+
+    async def run() -> None:
+        orch = FakeOrch()
+        orch.store = FlakyStore()
+        events = []
+        bus = make_bus(
+            orch, event_sink=lambda n, e: events.append((n, e)))
+        first = await bus.submit("事件写失败")
+        failed = await bus.wait(first.command_id, timeout=5)
+        assert failed["status"] == "failed"
+        assert "执行事件持久化失败" in failed["error"]
+        assert any(
+            isinstance(event, AgentEvent) and event.kind == "error"
+            for _, event in events)
+
+        second = await bus.submit("worker 继续")
+        assert (await bus.wait(
+            second.command_id, timeout=5))["status"] == "completed"
+        await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  events 写失败 → command failed，worker 继续服务")
+
+
+def test_fanout_partial_events_keep_agent_identity() -> None:
+    """同一 command 的并发 agent 正文必须分别持久化，不能串流归错人。"""
+    class FanoutOrch(FakeOrch):
+        async def dispatch(self, message, on_event, command_id=None):
+            on_event("kimi", AgentEvent("text", "KIMI_1"))
+            on_event("codex", AgentEvent("text", "CODEX_1"))
+            on_event("kimi", AgentEvent("text", "KIMI_2"))
+            on_event("codex", AgentEvent("text", "CODEX_2"))
+            on_event("solo", AgentEvent("text", "SOLO_ONLY"))
+
+    async def run() -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workdir = root / "work"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            orch = FanoutOrch()
+            orch.store = store
+            bus = make_bus(orch)
+            snap = await bus.submit("@kimi @codex fanout")
+            result = await bus.wait(snap.command_id, timeout=5)
+            assert result["status"] == "completed"
+            page = store.read_events(after_seq=0, limit=50)
+            partials: dict[str, str] = {}
+            for event in page["items"]:
+                if event.kind == "partial":
+                    partials[event.agent] = (
+                        partials.get(event.agent, "") + event.text)
+            assert partials == {
+                "kimi": "KIMI_1KIMI_2",
+                "codex": "CODEX_1CODEX_2",
+                "solo": "SOLO_ONLY",
+            }, partials
+            assert not bus._partial_buffers
+            assert not bus._partial_persisted_at
+            await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  fan-out partial 按 agent 独立持久化")
+
+
+def test_orchestrator_does_not_swallow_event_persistence_failure() -> None:
+    """事件 sink 写盘失败必须穿透 Orchestrator，使 command 诚实失败。"""
+    async def run() -> None:
+        from orchestrator import Orchestrator
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workdir = root / "work"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            orch = Orchestrator(str(workdir), store=store)
+            orch.adapters["kimi"] = FakeAgentAdapter("kimi")
+            original_append_event = store.append_event
+
+            def fail_partial(**event) -> None:
+                if event.get("kind") == "partial":
+                    raise OSError("disk full on partial")
+                original_append_event(**event)
+
+            store.append_event = fail_partial  # type: ignore[method-assign]
+            bus = make_bus(orch)
+            snap = await bus.submit("@kimi 触发 partial 写失败")
+            result = await bus.wait(snap.command_id, timeout=5)
+            assert result["status"] == "failed", result
+            assert "执行事件持久化失败" in result["error"]
+            assert not any(
+                event.kind == "completed"
+                for event in store.read_events(0, 50)["items"]
+                if event.command_id == snap.command_id
+            )
+            await bus.aclose()
+            await orch.aclose()
+
+    asyncio.run(run())
+    print("ok  Orchestrator 不吞执行事件持久化失败")
+
+
 def test_request_id_idempotency() -> None:
     async def run() -> None:
         orch = FakeOrch()
@@ -222,7 +383,11 @@ def test_request_id_idempotency() -> None:
         bus = make_bus(orch)
         running = await bus.submit("第一条", request_id="r-run")
         queued = await bus.submit("第二条", request_id="r-queue")
-        await asyncio.sleep(0)  # 让 worker 把第一条拿到 running
+        # dispatch 独立 task 让单命令可精确取消；等它真正进入 FakeOrch。
+        for _ in range(10):
+            if orch.calls:
+                break
+            await asyncio.sleep(0)
         # running 状态重复提交：返回原记录，不重复入队
         dup = await bus.submit("篡改内容", request_id="r-run")
         assert dup.command_id == running.command_id
@@ -469,7 +634,7 @@ class FakeHostAdapter(FakeAgentAdapter):
         super().__init__("host")
 
     async def decide(self, transcript: str, workdir: str):
-        return (["kimi"], "测试路由")
+        return HostDecision(["kimi"], "测试路由")
 
 
 def make_fake_orch():
@@ -571,6 +736,10 @@ if __name__ == "__main__":
     test_fifo_serial_and_timestamps()
     test_dispatch_failure()
     test_wait_timeout_and_terminal_immediate()
+    test_active_cancel_heartbeat_and_worker_survives()
+    test_event_persistence_failure_fails_command_not_worker()
+    test_fanout_partial_events_keep_agent_identity()
+    test_orchestrator_does_not_swallow_event_persistence_failure()
     test_request_id_idempotency()
     test_event_sink_forwarding()
     test_close_cancels_active_and_queued()

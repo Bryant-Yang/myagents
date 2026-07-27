@@ -1,9 +1,10 @@
 # ACP 迁移设计（最小方案）
 
-状态：**Phase 3 已完成**。ACP 不再是 Kimi 专用临时分支，而是
-**TUI↔coding agent 的统一接入协议**：`acp/` 是与具体 agent 无关的通用
-runtime，kimi 是首个验收 agent（命令 `kimi acp`），codex / opencode
-继续走 JSONL fallback。Phase 2.5 落地了共享 history 持久化、ACP
+状态：**Phase 4 已完成**。`AgentAdapter` 是 TUI 与不同 coding agent 的
+统一行为契约；wire protocol 按厂商能力选择：`acp/` 是通用 ACP runtime，
+Kimi 走 `kimi acp`；Codex 走官方 `codex app-server`；OpenCode 与旧 Codex
+adapter 保留 JSONL fallback。app-server 不是 ACP，二者只在 adapter 层统一。
+Phase 2.5 落地了共享 history 持久化、ACP
 session 映射与重启恢复、房间单写者 lease；Phase 3 落地了内部
 command bus（`control/`）、私有 Unix 控制 socket 与 stdio MCP 外部入口
 （`myagents_mcp.py`）——本机其他 agent 可以向运行中的同一房间注入
@@ -47,8 +48,9 @@ orchestrator 管——ACP 只负责传输，不参与"派给谁"的决策。
 orchestrator.py（AgentAdapter 接口不变；AGENT_SPECS 注册表）
    │  AgentSpec(name, transport, factory)
    │    kimi     → acp   → AcpKimiAdapter（首个生产 ACP agent）
-   │    codex    → jsonl → CodexAdapter   ┐
-   │    opencode → jsonl → OpenCodeAdapter ┘ JSONL fallback，永远保留
+   │    codex    → app-server → CodexAppServerAdapter（原生 thread/turn）
+   │    opencode → jsonl      → OpenCodeAdapter
+   │                              CodexAdapter 作为安全 JSONL fallback
    │
    ├─ acp/adapter.py  AcpAdapter（通用：name + cmd 即一个 ACP agent；
    │     │            stateful_session = True 声明"会话在 agent 侧保持"）
@@ -57,7 +59,9 @@ orchestrator.py（AgentAdapter 接口不变；AGENT_SPECS 注册表）
    │   acp/client.py  AcpClient（协议层，与具体 agent 无关）
    │     JSON-RPC 2.0 / NDJSON / id 关联 / 反向请求 / killpg 清理
    │
-   └─ adapters/*_adapter.py  私有 JSONL（fallback）
+   ├─ codex_app_server/  Codex 专用 JSONL-over-stdio client/adapter
+   │                     （不是 ACP；无 jsonrpc header）
+   └─ adapters/*_adapter.py  一次性 JSONL fallback
 ```
 
 新增一个 ACP agent 不需要改编排器：写一行 `AgentSpec` 即可。
@@ -92,7 +96,7 @@ ACP session 是持久上下文，编排器**不再**每轮转发完整 transcrip
 - **cursor 只在该轮成功交付后推进**，且只推进到本轮构造时的快照末尾
   （本轮进行期间到达的新消息留给下一轮）。失败不推进——下一轮从旧
   cursor 补发增量，不丢上下文；也不会退化成全量重发。
-- JSONL fallback 不受影响：仍用 dispatch 瞬间的完整 transcript 快照
+- 无状态 JSONL fallback 不受影响：仍用 dispatch 瞬间的完整 transcript 快照
   （最近 12 条，防并发串话）。
 
 ## 持久化与 session restore（Phase 2.5）
@@ -175,7 +179,7 @@ prompt/session 初始化共用 adapter 的同一把锁，不竞态杀进程。
 ## 可见状态（Phase 2 新增）
 
 - TUI 启动行显示每个 agent 的传输协议：`@kimi(ACP) @opencode(JSONL)
-  @codex(JSONL)`。
+  @codex(APP-SERVER)`。
 - ACP session id 建立后通过 info 事件展示一次（每次建立一次，不刷屏）。
 
 ## 阶段计划
@@ -195,12 +199,14 @@ prompt/session 初始化共用 adapter 的同一把锁，不竞态杀进程。
   `control/command_bus.py` FIFO 单 worker（request_id 永久幂等、容量
   硬上限、close 兜底 cancelled）；`control/server.py` 私有 Unix 控制
   socket（0600、stale 验证后清理、活跃不抢占、稳定错误码）；
-  `myagents_mcp.py` stdio MCP bridge（官方 SDK `mcp>=1.27,<2`，五个
+  `myagents_mcp.py` stdio MCP bridge（官方 SDK `mcp>=1.27,<2`，七个
   `myagents_*` 工具）只连运行中 TUI 的 socket，绝不实例化第二
   Orchestrator、不获取 lease、不绕过 TUI 权限。细节见
   [ADR-0001](adr/0001-persistent-room-command-bus-mcp.md)
-- [ ] **Phase 4**：codex / claude 的 ACP 接入（有官方适配器后），
-  JSONL fallback 逐步收缩为兜底
+- [x] **Phase 4**：Codex 官方 app-server 接入：长驻进程、thread/turn、
+  流式 item、approval、interrupt、恢复和安全 JSONL fallback。详见
+  [ADR-0003](adr/0003-codex-app-server-transport.md)。Claude 尚未注册；
+  后续按其可靠官方协议单独接入，不把厂商协议强行伪装成 ACP。
 - [ ] **Phase 5**：里程碑工作流、review → 修改 → 复核闭环与 steering
 
 A2A 不在当前阶段；Streamable HTTP、远程认证同样不在 M3（M3 是单机

@@ -1,7 +1,7 @@
 """Phase 2 里程碑测试：通用 ACP runtime 接入统一 TUI。
 
 覆盖：
-- AgentSpec 注册：kimi=ACP、codex/opencode=JSONL
+- AgentSpec 注册：kimi=ACP、codex=app-server、opencode=JSONL
 - ACP 增量上下文：不重复完整 transcript、跳过自己回复、失败不丢增量
 - 权限：默认拒绝 / TUI 选择 / 等待可取消
 - 生命周期：TUI 退出统一 aclose，fake ACP 无残留
@@ -22,8 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from acp.adapter import AcpAdapter
 from acp.client import AcpClient, AcpError
 from adapters.base import AgentEvent
-from adapters.codex_adapter import CodexAdapter
 from adapters.opencode_adapter import OpenCodeAdapter
+from codex_app_server.adapter import CodexAppServerAdapter
+from host import HostDecision
 from orchestrator import AGENTS, Orchestrator
 
 SERVER = str(Path(__file__).parent / "fake_acp_server.py")
@@ -91,7 +92,7 @@ class ClosableFake(FakeJsonl):
 class FakeHost(FakeJsonl):
     def __init__(self) -> None:
         super().__init__("host")
-        self.route = (["kimi"], "测试路由")
+        self.route = HostDecision(["kimi"], "测试路由")
 
     async def decide(self, transcript: str, workdir: str):
         return self.route
@@ -111,7 +112,7 @@ def make_orch(**adapters) -> Orchestrator:
 
 def test_agent_specs() -> None:
     assert AGENTS["kimi"].transport == "acp"
-    assert AGENTS["codex"].transport == "jsonl"
+    assert AGENTS["codex"].transport == "app-server"
     assert AGENTS["opencode"].transport == "jsonl"
 
     orch = Orchestrator("/tmp", persistent=False)
@@ -119,10 +120,10 @@ def test_agent_specs() -> None:
     assert isinstance(kimi, AcpAdapter)
     assert kimi._cmd == ["kimi", "acp"]
     assert getattr(kimi, "stateful_session", False) is True
-    assert type(orch.adapters["codex"]) is CodexAdapter
+    assert type(orch.adapters["codex"]) is CodexAppServerAdapter
     assert type(orch.adapters["opencode"]) is OpenCodeAdapter
-    assert not getattr(orch.adapters["codex"], "stateful_session", False)
-    print("ok  AgentSpec 注册（kimi=ACP [kimi acp]，codex/opencode=JSONL）")
+    assert getattr(orch.adapters["codex"], "stateful_session", False) is True
+    print("ok  AgentSpec 注册（kimi=ACP，codex=app-server，opencode=JSONL）")
 
 
 # ---- 2. ACP 增量上下文 ----
@@ -321,13 +322,16 @@ def test_tui_permission_select() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
             box = app.query_one(Input)
-            box.value = "@kimi 需要 perm 一下"
+            box.value = "@kimi 需要 perm secret-title 一下"
             await pilot.press("enter")
             await _wait_for(pilot, lambda: isinstance(app.screen, PermissionScreen))
 
             # 弹窗内容：来源 agent + 工具标题 + agent 提供的 options + 取消
             label = str(app.screen.query_one(Label).render())
             assert "kimi 请求权限" in label and "写文件" in label
+            assert "API_TOKEN=[已隐藏]" in label
+            assert "secret-value" not in label
+            assert "examples/demo.txt" in label and "printf demo" in label
             labels = [str(b.label) for b in app.screen.query(Button)]
             assert "允许一次" in labels and "拒绝" in labels and "取消" in labels
 
@@ -365,6 +369,36 @@ def test_tui_permission_cancel_on_exit() -> None:
     print("ok  权限等待中退出 → cancelled 收尾（无挂起 Future）")
 
 
+def test_tui_permission_cancel_with_ctrl_x() -> None:
+    """权限弹窗期间 Ctrl+X 必须同时结束权限等待和当前 command。"""
+    async def run() -> None:
+        from main import PermissionScreen
+        from textual.widgets import Input
+
+        reset_state()
+        app = _make_tui_app(AcpAdapter("kimi", [sys.executable, SERVER]))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            box = app.query_one(Input)
+            box.value = "@kimi 需要 perm 一下"
+            await pilot.press("enter")
+            await _wait_for(
+                pilot, lambda: isinstance(app.screen, PermissionScreen))
+            active = app.bus.active()
+            assert active is not None
+            await pilot.press("ctrl+x")
+            await _wait_for(
+                pilot,
+                lambda: (not isinstance(app.screen, PermissionScreen)
+                         and app.bus.get(active.command_id).status.value
+                         == "cancelled"))
+            assert app.bus.get(active.command_id).status.value == "cancelled"
+            assert not app._permission_futures
+
+    asyncio.run(run())
+    print("ok  权限等待中 Ctrl+X → permission/command 同时取消")
+
+
 def test_tui_status_and_shutdown() -> None:
     """启动行可见各 agent 传输协议；退出统一 aclose，fake ACP 无残留。"""
     async def run() -> None:
@@ -381,7 +415,7 @@ def test_tui_status_and_shutdown() -> None:
             await pilot.pause()
             lines = _richlog_text(app)
             assert "kimi(ACP)" in lines
-            assert "codex(JSONL)" in lines and "opencode(JSONL)" in lines
+            assert "codex(APP-SERVER)" in lines and "opencode(JSONL)" in lines
             # 跑一轮，让 kimi acp 进程真的起来；session id 应展示一次
             box = app.query_one(Input)
             box.value = "@kimi fast round"
@@ -603,5 +637,6 @@ if __name__ == "__main__":
     test_permission_task_exception_consumed()
     test_tui_permission_select()
     test_tui_permission_cancel_on_exit()
+    test_tui_permission_cancel_with_ctrl_x()
     test_tui_status_and_shutdown()
     print("\nPhase 2 全部通过")

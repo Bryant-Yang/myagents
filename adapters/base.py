@@ -15,9 +15,33 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import signal
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Protocol
+
+
+class AgentDeliveryUncertainError(RuntimeError):
+    """请求可能已被 agent 接受，调用方不得自动重投同一批消息。"""
+
+
+class AgentDeliveryCancelledError(asyncio.CancelledError):
+    """请求已提交后被取消；保持取消语义，同时禁止自动重投。"""
+
+
+_SENSITIVE_ASSIGNMENT = re.compile(
+    r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|APIKEY|"
+    r"AUTHORIZATION|CREDENTIAL|PRIVATE_KEY)[A-Z0-9_]*)=([^\s]+)")
+_BEARER_VALUE = re.compile(r"(?i)\bBearer\s+[^\s'\"]+")
+_OPENAI_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+
+
+def redact_sensitive_text(value: str, *, limit: int = 2000) -> str:
+    """隐藏命令/工具文本中的常见凭据形态并做长度限制。"""
+    text = _SENSITIVE_ASSIGNMENT.sub(r"\1=[已隐藏]", value)
+    text = _BEARER_VALUE.sub("Bearer [已隐藏]", text)
+    text = _OPENAI_KEY.sub("[已隐藏]", text)
+    return text[:limit]
 
 
 @dataclass
@@ -27,6 +51,12 @@ class AgentEvent:
     kind:
       - "text"  : agent 的正文输出（可能分多段到达）
       - "info"  : 元信息（token 用量、session id 等），UI 里灰色显示
+      - "status": 安全的阶段/心跳摘要，不含 chain-of-thought 正文
+      - "tool"  : 工具标题与已脱敏、有界的 meta 上下文
+      - "permission": 权限请求/结果摘要
+      - "cancel_requested": 控制层请求取消，UI 应先结束权限等待
+      - "delivery_committed": 内部投递确认；Orchestrator 在公开任何后续
+        事件前持久化 no-replay cursor，不转发给 UI
       - "error" : 出错（非零退出、stderr 内容）
       - "done"  : 本次调用结束
     """

@@ -1,13 +1,13 @@
 # myagents
 
-ACP-first 的本地多 agent 终端编排器：在一个 Textual TUI 中点名 Kimi、
+原生长连接优先的本地多 agent 终端编排器：在一个 Textual TUI 中点名 Kimi、
 Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5 与 M3 已完成——共享 timeline 持久化、ACP session
+> 当前状态：M2.5、M3、M3.1 与 M4 已完成——共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
-> stdio 外部入口均已落地并通过本地 gate。Kimi 使用真实 ACP 长驻会话；
-> Codex/OpenCode 使用 JSONL 无头模式作为 fallback。真实 Kimi + MCP
+> stdio 外部入口、执行心跳、精确取消与 Codex app-server 长连接均已落地。
+> Kimi 使用 ACP，Codex 使用官方 app-server；JSONL 仅作兼容 fallback。真实 Kimi + MCP
 > 端到端验收是发布前手工证据，见“当前限制”。
 
 ## 为什么做这个项目
@@ -17,7 +17,7 @@ Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并�
 
 - 用户只面对一个 TUI 和一条共享时间线；
 - 显式 `@agent` 决定任务交给谁，无 `@` 时由 host 做语义路由；
-- ACP agent 保持原生 session，编排器只发送增量上下文；
+- 有状态 agent 保持原生 session/thread，编排器只发送增量上下文；
 - JSONL agent 仍可通过 adapter 接入；
 - agent 之间不直接互调，路由、权限和生命周期由中心统一管理。
 
@@ -26,9 +26,11 @@ Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并�
 ## 当前能力
 
 - `@kimi`：通过 `kimi acp` 使用持久 ACP session。
-- `@codex`、`@opencode`：通过各自 JSONL 无头模式运行。
+- `@codex`：通过 `codex app-server` 复用长驻进程与原生 thread。
+- `@opencode`：通过 JSONL 无头模式运行。
 - `@host`：由只读 Codex adapter 扮演主持人，负责总结和仲裁。
-- 无显式 mention：host 输出结构化路由决策，再由 Orchestrator 派发。
+- 无显式 mention：host 用一次调用决定“直接回答”或输出结构化 worker
+  路由；直接回答时不再发起第二次 host 调用。
 - 多 agent fan-out：同一消息可同时点名多个 agent，并发执行。
 - ACP 增量上下文：每个 stateful agent 独立维护 history cursor。
 - 并发顺序保证：同一 ACP agent 严格串行，不同 agent 保持并行。
@@ -45,11 +47,16 @@ Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并�
 - 本机控制 socket：TUI 私有的 Unix socket JSONL 协议（**不是 MCP**）；
   socket/endpoint 0600，活跃房间不被第二个 server 抢占，stale 文件
   只在确认无监听者后清理。
-- MCP stdio bridge：五个 `myagents_*` 工具把本机其他 agent 的 review
+- MCP stdio bridge：七个 `myagents_*` 工具把本机其他 agent 的 review
   注入同一房间；bridge 不创建第二 Orchestrator、不直写 timeline、
   不绕过 TUI 权限。
-- 权限弹窗：显示来源 agent、工具标题和 agent 提供的 options。
+- 可观测执行：独立 events 日志、静默 heartbeat、工具/权限上下文与重启中断提示。
+- 权限弹窗：显示来源 agent、工具标题、命令上下文和 agent 提供的 options。
+- 精确取消：TUI `Ctrl+X` 或 MCP 只取消当前 command，房间继续工作。
 - 权限 fail-closed：无处理器、异常或非法 option 一律拒绝。
+- 流式回复合并：ACP token/chunk 持续更新同一条 TUI 记录，不再一词一行。
+- ACP 卡死回收：连续 120 秒无任何协议事件时取消本轮，必要时重建连接，
+  避免堵住后续 FIFO 命令。
 - 完整进程回收：取消、超时和 TUI 退出都会清理 agent 进程组。
 
 ## 架构
@@ -66,10 +73,12 @@ Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并�
 └─────────────┬─────────────────┬────────────┘
               │                 │
 ┌─────────────▼──────────┐  ┌───▼────────────────────┐
-│ acp/                   │  │ adapters/              │
-│ stateful ACP runtime   │  │ JSONL CLI fallbacks    │
-│ Kimi production path  │  │ Codex / OpenCode       │
+│ acp/                   │  │ codex_app_server/      │
+│ Kimi ACP runtime       │  │ Codex native runtime   │
 └────────────────────────┘  └────────────────────────┘
+              │                 │
+              └────────┬────────┘
+                       │ adapters/ JSONL fallback
 ┌────────────────────────┐  ┌────────────────────────┐
 │ storage/               │  │ control/               │
 │ RoomStore：timeline +  │  │ CommandBus（FIFO）+    │
@@ -83,7 +92,8 @@ Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并�
 ```
 
 核心原则是 **Hub-and-Spoke**：所有消息先进入 Orchestrator，worker agent
-之间不直接通信。ACP 只负责“如何驱动 agent”，不参与“任务应该派给谁”的决策。
+之间不直接通信。ACP/app-server 只负责“如何驱动 agent”，不参与“任务应该
+派给谁”的决策。
 
 ## 环境要求
 
@@ -114,7 +124,7 @@ python3 -m venv .venv
 .venv/bin/python main.py /path/to/project
 ```
 
-每个工作目录对应一个持久房间：timeline、agent cursor/session 映射和
+每个工作目录对应一个持久房间：对话 timeline、执行 events、agent cursor/session 映射和
 owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id>`，
 不会写进目标工作区。同一房间同一时刻只允许一个 TUI 实例写入。
 
@@ -131,7 +141,8 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
 
 1. 显式 `@agent` 永远优先。
 2. 同一条消息中的多个有效 mention 会并发派发。
-3. 不带 mention 时，host 根据最近对话选择 1–2 个 target，或由自己回答。
+3. 不带 mention 时，host 在一次调用中直接回答，或根据最近对话选择
+   1–2 个 worker；自然语言内容不由本地关键词白名单判断。
 4. 单个 agent 失败会写入时间线，不会中断其他 agent。
 
 ## Transport 与上下文
@@ -139,11 +150,11 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
 | Agent | 生产 transport | 上下文策略 | 当前状态 |
 | --- | --- | --- | --- |
 | Kimi | ACP (`kimi acp`) | 持久 session + 增量 history + session 恢复 | 已验证（restore 路径为 fake 证据） |
-| Codex | JSONL (`codex exec --json`) | 有界 transcript 快照 | fallback |
+| Codex | app-server (`codex app-server`) | 持久 thread + 增量 history + thread 恢复 | 已接入；JSONL fallback |
 | OpenCode | JSONL (`opencode run --format json`) | 有界 transcript 快照 | fallback |
 | Claude | 未接入 | 预留 AgentSpec/adapter 扩展点 | 规划中 |
 
-ACP agent 首次接入只收到最近 `history_limit` 条共享记录；后续只收到 cursor
+有状态 agent 首次接入只收到最近 `history_limit` 条共享记录；后续只收到 cursor
 之后的新消息，并过滤它自己的回复。失败时 cursor 不推进，下一轮会补发。
 cursor 是持久化 timeline 的单调 seq：重启后优先 `session/load` 续接旧
 session 并保留 cursor；load 失败或 agent 不支持时回退新 session，cursor
@@ -152,7 +163,8 @@ session 并保留 cursor；load 失败或 agent 不支持时回退新 session，
 ## MCP 外部入口（M3）
 
 本机其他 coding agent（Codex skill、Claude 等 MCP host）可以通过 MCP
-stdio bridge 向**正在运行的** TUI 房间提交消息、读取时间线。前提：
+stdio bridge 向**正在运行的** TUI 房间提交消息、读取时间线和执行进度，
+也可精确取消命令。前提：
 
 - 依赖已安装：`requirements.txt` 固定 `mcp>=1.27,<2`（官方 Python SDK
   稳定 v1）；
@@ -177,15 +189,17 @@ workdir 一致）：
 }
 ```
 
-五个工具：
+七个工具：
 
 | MCP tool | 语义 | 注解 |
 | --- | --- | --- |
 | `myagents_get_room` | 房间、workdir、PID、agent transport | read-only、idempotent、closed-world |
 | `myagents_read_timeline` | 按 `after_seq`/`limit`（≤200）读持久时间线 | read-only、idempotent、closed-world |
+| `myagents_read_events` | 读生命周期、工具、权限、心跳和 terminal 事件 | read-only、idempotent、closed-world |
 | `myagents_send_message` | 提交外部用户消息，立即返回 `command_id` | write、non-idempotent（带 `request_id` 去重）、open-world |
 | `myagents_get_command` | 查 queued/running/completed/failed/cancelled | read-only、idempotent、closed-world |
 | `myagents_wait_command` | 有界等待（≤30s）状态变化，超时不取消任务 | read-only、idempotent、closed-world |
+| `myagents_cancel_command` | 精确取消 queued/running 命令；terminal 幂等 | write、idempotent、closed-world |
 
 最短 send → wait → read 流程：
 
@@ -194,6 +208,8 @@ myagents_send_message(message="@kimi 总结这个模块", request_id="r1")
   → {"command_id": "..."}                    # 立即返回；同 request_id 重试幂等
 myagents_wait_command(command_id=..., timeout=30)
   → {"status": "completed", ...}             # timed_out=true 也不取消任务
+myagents_read_events(after_seq=0, limit=50)
+  → {"items": [...]}                         # 长任务阶段、工具、权限与心跳
 myagents_read_timeline(after_seq=0, limit=50)
   → {"items": [...], "has_more": ..., "next_after_seq": ...}
 ```
@@ -273,6 +289,7 @@ Harness markers/links
 → M3 command bus tests
 → M3 control socket tests
 → M3 MCP stdio tests
+→ M4 Codex app-server contract tests
 ```
 
 也可以单独运行：
@@ -286,6 +303,7 @@ Harness markers/links
 .venv/bin/python tests/test_m3_bus.py
 .venv/bin/python tests/test_m3_control.py
 .venv/bin/python tests/test_m3_mcp.py
+.venv/bin/python tests/test_codex_app_server.py
 ```
 
 普通测试全部使用 fake adapter/fake ACP server，不会调用真实外部 agent。
@@ -303,7 +321,7 @@ myagents/
 ├── acp/                       # 通用 ACP client 与 adapter
 ├── adapters/                  # JSONL adapter 与进程工具
 ├── control/                   # CommandBus + 私有 Unix 控制 socket server/client
-├── storage/                   # RoomStore：timeline/state/owner lease
+├── storage/                   # RoomStore：timeline/events/state/owner lease
 ├── tests/                     # basic / ACP / Phase 2 / storage / M2.5 / M3 tests
 ├── docs/
 │   ├── SPEC.md                # 关键行为与独立证据
@@ -322,6 +340,8 @@ myagents/
 - [HARNESS.md](HARNESS.md)：架构、安全红线和质量门禁。
 - [docs/SPEC.md](docs/SPEC.md)：关键行为及验收证据。
 - [docs/acp-migration.md](docs/acp-migration.md)：ACP 消息、权限、取消和生命周期。
+- [docs/adr/0002-durable-execution-observability.md](docs/adr/0002-durable-execution-observability.md)：执行事件、心跳与取消决策。
+- [docs/adr/0003-codex-app-server-transport.md](docs/adr/0003-codex-app-server-transport.md)：Codex 长连接、默认配置继承和 fallback。
 - [docs/concepts.md](docs/concepts.md)：相关协议与编排模式。
 - [docs/knowledge-map.html](docs/knowledge-map.html)：可交互知识地图。
 
@@ -332,12 +352,17 @@ myagents/
 - [x] M2：Kimi ACP、增量上下文、权限 UI、统一回收、真实 TUI E2E。
 - [x] M2.5：history 持久化与 session 映射/恢复、房间单写者 lease。
 - [x] M3：内部 command bus、私有 Unix 控制 socket、MCP stdio 外部入口。
-- [ ] M4：Codex/Claude 等 agent 的 ACP 接入，JSONL 逐步退为兜底。
+- [x] M3.1：持久执行可观测性、heartbeat、权限上下文与精确取消。
+- [x] M4：Codex 官方 app-server 长连接接入，JSONL 退为安全兜底。
 - [ ] M5：里程碑工作流、review → 修改 → 复核闭环与 steering。
 - [ ] Later：只有出现跨机器、跨组织 agent 协作需求时再评估 A2A。
 
 ## 当前限制
 
+- M4 真实 Codex 两轮探针已于 2026-07-27 通过：直接 adapter 冷/热两轮约
+  18.0s/4.6s，真实 Orchestrator 连续两次 `@codex` 也复用同一
+  app-server PID/thread；退出后无残留。app-server 是实验接口，Codex CLI
+  升级后仍需重跑 contract 与真实探针。
 - 真实 Kimi cancel 时延和长会话 token/内存增长（含 compaction 表现）尚未压测。
 - M3 真实 E2E 已于 2026-07-26 通过
   [`scripts/e2e-m3-real.py`](scripts/e2e-m3-real.py)：两次独立
