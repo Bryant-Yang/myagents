@@ -182,6 +182,7 @@ def test_unavailable_room_is_tool_error() -> None:
                 args=[
                     BRIDGE,
                     "--workdir", str(workdir),
+                    "--session", "review",
                     "--state-root", str(state_root),
                 ],
                 cwd=str(Path(BRIDGE).parent),
@@ -193,6 +194,7 @@ def test_unavailable_room_is_tool_error() -> None:
                     assert result.isError is True
                     text = result.content[0].text
                     assert "main.py" in text and "未发现活跃 TUI" in text
+                    assert "--session review" in text
             assert not state_root.exists()
 
     asyncio.run(run())

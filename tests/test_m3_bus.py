@@ -235,8 +235,13 @@ def test_active_cancel_heartbeat_and_worker_survives() -> None:
             ev for _, ev in events
             if isinstance(ev, AgentEvent) and ev.kind == "status"
             and ev.meta.get("command_id") == first.command_id
+            and ev.meta.get("heartbeat") is True
         ]
         assert heartbeats and "仍在运行" in heartbeats[-1].text
+        elapsed = [ev.meta["silent_seconds"] for ev in heartbeats]
+        assert len(elapsed) >= 2 and elapsed == sorted(elapsed), elapsed
+        assert elapsed[-1] > elapsed[0], elapsed
+        assert len({ev.text for ev in heartbeats}) == len(heartbeats), heartbeats
 
         cancelled = await bus.cancel(first.command_id)
         assert cancelled.status is CommandStatus.CANCELLED
@@ -337,6 +342,122 @@ def test_fanout_partial_events_keep_agent_identity() -> None:
 
     asyncio.run(run())
     print("ok  fan-out partial 按 agent 独立持久化")
+
+
+def test_duplicate_tool_updates_are_forwarded_and_persisted_once() -> None:
+    """adapter 失控重复吐同一工具状态时，bus 仍保护 UI 与 events 日志。"""
+    class ToolSpamOrch(FakeOrch):
+        async def dispatch(self, message, on_event, command_id=None):
+            event = AgentEvent(
+                "tool",
+                "检查 JavaScript",
+                {
+                    "tool_call_id": "tool-1",
+                    "status": "in_progress",
+                    "command": "node --check demo.js",
+                    "update": True,
+                },
+            )
+            for _ in range(200):
+                on_event("kimi", event)
+
+    async def run() -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workdir = root / "work"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            orch = ToolSpamOrch()
+            orch.store = store
+            forwarded = []
+            bus = make_bus(
+                orch, event_sink=lambda name, event: forwarded.append(
+                    (name, event)))
+            snap = await bus.submit("@kimi tool spam")
+            result = await bus.wait(snap.command_id, timeout=5)
+            assert result["status"] == "completed"
+            visible = [
+                event for name, event in forwarded
+                if name == "kimi"
+                and isinstance(event, AgentEvent)
+                and event.kind == "tool"
+            ]
+            persisted = [
+                event for event in store.read_events(0, 50)["items"]
+                if event.command_id == snap.command_id
+                and event.kind == "tool"
+            ]
+            assert len(visible) == 1, len(visible)
+            assert len(persisted) == 1, len(persisted)
+            await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  CommandBus 工具状态防御性去重")
+
+
+def test_activity_only_events_refresh_silence_without_becoming_visible() -> None:
+    """无可见增量的协议活动应压住 heartbeat，但不进入 sink/events。"""
+    class ActivityOrch(FakeOrch):
+        async def dispatch(self, message, on_event, command_id=None):
+            for _ in range(7):
+                await asyncio.sleep(0.02)
+                on_event("kimi", AgentEvent(
+                    "activity", meta={"phase": "tool"}))
+
+    async def run() -> None:
+        forwarded = []
+        bus = CommandBus(
+            ActivityOrch(),
+            event_sink=lambda name, event: forwarded.append((name, event)),
+            heartbeat_interval=0.05,
+        )
+        bus.start()
+        snap = await bus.submit("@kimi activity")
+        result = await bus.wait(snap.command_id, timeout=5)
+        assert result["status"] == "completed"
+        assert not [
+            event for _name, event in forwarded
+            if isinstance(event, AgentEvent)
+            and (event.kind == "activity"
+                 or event.meta.get("heartbeat") is True)
+        ], forwarded
+        await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  activity-only 刷新静默时钟且不进入可见事件")
+
+
+def test_status_dedup_keeps_visible_phase_changes() -> None:
+    """文本相同但可见阶段不同不是重复状态。"""
+    class PhaseOrch(FakeOrch):
+        async def dispatch(self, message, on_event, command_id=None):
+            on_event("kimi", AgentEvent(
+                "status", "仍在运行",
+                {"agent_state": "running", "phase": "分析"}))
+            on_event("kimi", AgentEvent(
+                "status", "仍在运行",
+                {"agent_state": "running", "phase": "实现"}))
+
+    async def run() -> None:
+        forwarded = []
+        bus = make_bus(
+            PhaseOrch(),
+            event_sink=lambda name, event: forwarded.append((name, event)),
+        )
+        snap = await bus.submit("@kimi phases")
+        result = await bus.wait(snap.command_id, timeout=5)
+        assert result["status"] == "completed"
+        phases = [
+            event.meta.get("phase")
+            for name, event in forwarded
+            if name == "kimi" and isinstance(event, AgentEvent)
+            and event.kind == "status"
+        ]
+        assert phases == ["分析", "实现"], phases
+        await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  CommandBus 去重保留可见阶段变化")
 
 
 def test_orchestrator_does_not_swallow_event_persistence_failure() -> None:
@@ -633,7 +754,7 @@ class FakeHostAdapter(FakeAgentAdapter):
     def __init__(self) -> None:
         super().__init__("host")
 
-    async def decide(self, transcript: str, workdir: str):
+    async def decide(self, transcript: str, workdir: str, on_event=None):
         return HostDecision(["kimi"], "测试路由")
 
 
@@ -684,6 +805,42 @@ def test_bus_orchestrator_integration() -> None:
 
     asyncio.run(run())
     print("ok  集成：Orchestrator 经 bus FIFO + 每轮 timeline 带对应 command_id")
+
+
+def test_worker_failure_marks_command_failed_after_fanout() -> None:
+    """任一 worker 失败使 command failed，但其他 fan-out 仍完整收尾。"""
+    class PartialFailAdapter(FakeAgentAdapter):
+        async def stream(self, prompt: str, workdir: str):
+            self.prompts.append(prompt)
+            yield AgentEvent("text", "只完成了一部分")
+            raise RuntimeError("worker boom")
+
+    async def run() -> None:
+        orch = make_fake_orch()
+        orch.adapters["kimi"] = PartialFailAdapter("kimi")
+        bus = CommandBus(orch)
+        bus.start()
+
+        submitted = await bus.submit("@kimi @opencode 并行处理")
+        result = await bus.wait(submitted.command_id, timeout=5)
+        assert result["status"] == "failed"
+        assert "kimi" in result["error"] and "worker boom" in result["error"]
+
+        records = [
+            message for message in orch.history
+            if message.command_id == submitted.command_id
+        ]
+        assert any(message.speaker == "opencode" for message in records)
+        kimi_reply = next(
+            message.text for message in records if message.speaker == "kimi")
+        assert "只完成了一部分" in kimi_reply
+        assert "调用失败" in kimi_reply
+
+        await bus.aclose()
+        await orch.aclose()
+
+    asyncio.run(run())
+    print("ok  worker 失败 → command failed（fan-out 其余目标仍收尾）")
 
 
 def test_tui_bus_integration() -> None:
@@ -739,6 +896,9 @@ if __name__ == "__main__":
     test_active_cancel_heartbeat_and_worker_survives()
     test_event_persistence_failure_fails_command_not_worker()
     test_fanout_partial_events_keep_agent_identity()
+    test_duplicate_tool_updates_are_forwarded_and_persisted_once()
+    test_activity_only_events_refresh_silence_without_becoming_visible()
+    test_status_dedup_keeps_visible_phase_changes()
     test_orchestrator_does_not_swallow_event_persistence_failure()
     test_request_id_idempotency()
     test_event_sink_forwarding()
@@ -748,5 +908,6 @@ if __name__ == "__main__":
     test_hard_capacity_active_queued()
     test_cancel_window_and_worker_restart()
     test_bus_orchestrator_integration()
+    test_worker_failure_marks_command_failed_after_fanout()
     test_tui_bus_integration()
     print("\n全部通过")

@@ -2,11 +2,13 @@
 
 只依赖一个 duck-typed orch（本模块不 import Orchestrator）：
 
-    await orch.dispatch(message, on_event, command_id=command_id)
+    outcome = await orch.dispatch(message, on_event, command_id=command_id)
 
 on_event 签名是 ``on_event(agent_name, event)``；bus 配置的 event_sink
-按同一签名原样收到事件。bus 不拥有 orch——``aclose()`` 只停自己的
-worker、取消自己排队的命令，绝不调用 ``orch.aclose()``。
+按同一签名原样收到事件。outcome 可暴露 ``failures`` 和
+``error_summary()``；任一 worker 失败时 bus 在 fan-out 全部收尾后标记
+command failed。bus 不拥有 orch——``aclose()`` 只停自己的 worker、
+取消自己排队的命令，绝不调用 ``orch.aclose()``。
 
 容量与清理（max_commands）：max_commands 是**硬上限**，记录总数永远
 不超过它。带 request_id 的 terminal 记录**永不自动清理**——这是 bus
@@ -26,7 +28,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable
 
-from adapters.base import AgentEvent
+from adapters.base import AgentEvent, tool_status_label
 
 MAX_MESSAGE_BYTES = 64 * 1024      # message 的 UTF-8 字节上限
 MAX_REQUEST_ID_CHARS = 128         # request_id 的字符上限
@@ -170,8 +172,15 @@ class CommandBus:
         self._dispatch_task: asyncio.Task | None = None
         self._cancel_requested: set[str] = set()
         self._last_activity = 0.0
+        self._last_activity_agent: str | None = None
         self._partial_buffers: dict[tuple[str, str], str] = {}
         self._partial_persisted_at: dict[tuple[str, str], float] = {}
+        # adapter 事件的防御性去重：生产 adapter 应先压缩高频 update，但 bus
+        # 是 UI 与持久日志的最后边界，不能让失控 producer 再次刷爆消费者。
+        self._visible_event_fingerprints: dict[
+            tuple[str, str, str],
+            tuple[str, str, str, str, str, str, str],
+        ] = {}
         self._closed = False
 
     # ---- 生命周期 ----
@@ -258,6 +267,12 @@ class CommandBus:
                 or self._active.status in TERMINAL_STATUSES:
             return None
         return self._active.snapshot()
+
+    def has_pending(self) -> bool:
+        """是否仍有 queued/running 命令；供 TUI 安全切换会话。"""
+        return any(
+            command.status not in TERMINAL_STATUSES
+            for command in self._commands.values())
 
     async def cancel(self, command_id: str) -> CommandSnapshot:
         """精确取消 queued/running 命令；terminal 命令幂等返回。"""
@@ -374,13 +389,23 @@ class CommandBus:
         sink = self._event_sink
         loop = asyncio.get_running_loop()
         self._last_activity = loop.time()
+        self._last_activity_agent = None
 
         def on_event(name: str, event: Any) -> None:
             self._last_activity = loop.time()
+            if name not in {"user", "system"}:
+                self._last_activity_agent = name
             if isinstance(event, AgentEvent):
                 event = AgentEvent(
                     event.kind, event.text,
                     {**event.meta, "command_id": cmd.command_id})
+                if event.kind == "activity":
+                    # adapter 已确认协议仍活跃，但没有新的用户可见状态。
+                    # activity 时钟已在本回调开头刷新；不要持久化或转发。
+                    return
+                if self._is_redundant_visible_event(
+                        cmd.command_id, name, event):
+                    return
                 self._persist_agent_event(cmd.command_id, name, event)
             if sink is not None:
                 sink(name, event)
@@ -401,7 +426,7 @@ class CommandBus:
                 name=f"command-dispatch-{cmd.command_id}")
             if cmd.command_id in self._cancel_requested:
                 self._dispatch_task.cancel()
-            await self._dispatch_task
+            outcome = await self._dispatch_task
         except asyncio.CancelledError:
             await self._safe_terminal(
                 cmd, CommandStatus.CANCELLED, error="已取消")
@@ -419,10 +444,17 @@ class CommandBus:
             await self._safe_terminal(
                 cmd, CommandStatus.FAILED, error=error)
         else:
-            await self._safe_terminal(cmd, CommandStatus.COMPLETED)
+            failures = getattr(outcome, "failures", ())
+            if failures:
+                summary = outcome.error_summary()
+                await self._safe_terminal(
+                    cmd, CommandStatus.FAILED, error=summary)
+            else:
+                await self._safe_terminal(cmd, CommandStatus.COMPLETED)
         finally:
             self._cancel_requested.discard(cmd.command_id)
             self._dispatch_task = None
+            self._clear_visible_event_fingerprints(cmd.command_id)
             if heartbeat is not None:
                 heartbeat.cancel()
                 try:
@@ -439,28 +471,34 @@ class CommandBus:
     async def _heartbeat(self, cmd: _Command) -> None:
         loop = asyncio.get_running_loop()
         while True:
-            due = self._last_activity + self._heartbeat_interval
-            await asyncio.sleep(max(0.0, due - loop.time()))
+            await asyncio.sleep(self._heartbeat_interval)
             silent_for = loop.time() - self._last_activity
             if silent_for + 0.001 < self._heartbeat_interval:
                 continue
+            elapsed = round(silent_for, 3)
+            display_elapsed = (
+                f"{elapsed:.2f}" if elapsed < 1 else str(int(elapsed)))
+            phase = self._last_activity_agent or "任务"
             event = AgentEvent(
                 "status",
-                f"仍在运行，等待 agent 输出（已静默 {int(silent_for)} 秒）",
-                {"command_id": cmd.command_id})
+                f"{phase} 仍在运行，等待输出（已等待 {display_elapsed} 秒）",
+                {
+                    "command_id": cmd.command_id,
+                    "heartbeat": True,
+                    "silent_seconds": elapsed,
+                    "phase": phase,
+                })
             self._append_execution_event(
                 cmd.command_id, "system", "status", event.text)
             if self._event_sink is not None:
                 self._event_sink("system", event)
-            # heartbeat 本身成为新的可见活动，下一次正好在一个 interval 后，
-            # 不受固定轮询相位影响。
-            self._last_activity = loop.time()
 
     async def _transition(self, cmd: _Command, status: CommandStatus,
                           error: str | None = None) -> None:
         text = {
             CommandStatus.RUNNING: "开始执行",
-            CommandStatus.COMPLETED: "执行完成",
+            # completed 只表示本轮调用正常结束，不声称自然语言任务已验收。
+            CommandStatus.COMPLETED: "本轮调用结束",
             CommandStatus.FAILED: error or "执行失败",
             CommandStatus.CANCELLED: error or "执行已取消",
         }.get(status)
@@ -534,6 +572,9 @@ class CommandBus:
             return
         text = event.text if event.kind != "error" else f"错误：{event.text}"
         if kind == "tool":
+            status = tool_status_label(event.meta.get("status"))
+            if status:
+                text = f"{text} · {status}"
             command = event.meta.get("command")
             if isinstance(command, str) and command:
                 text = f"{text}\n{command}"
@@ -550,6 +591,44 @@ class CommandBus:
             self._partial_persisted_at[key] = now
             return
         self._append_execution_event(command_id, agent, kind, text)
+
+    def _is_redundant_visible_event(
+            self, command_id: str, agent: str, event: AgentEvent) -> bool:
+        """相同可见状态只转发/持久化一次，但仍由调用方刷新 activity 时钟。
+
+        tool_call_id 是首选 identity；协议缺 ID 时使用标题，使完全不可区分的
+        匿名 update 合并。普通 status/info 各自只有一条“当前状态”通道，
+        文本或关键 meta 变化时仍会通过。
+        """
+        if event.kind not in {"tool", "status", "info"}:
+            return False
+        if event.meta.get("heartbeat") is True:
+            return False
+        tool_call_id = event.meta.get("tool_call_id")
+        if event.kind == "tool" or tool_call_id is not None:
+            identity = f"tool:{tool_call_id or event.text}"
+        else:
+            identity = event.kind
+        key = (command_id, agent, identity)
+        fingerprint = (
+            event.kind,
+            event.text,
+            str(event.meta.get("status") or ""),
+            str(event.meta.get("command") or ""),
+            str(event.meta.get("agent_state") or ""),
+            str(event.meta.get("phase") or ""),
+            str(event.meta.get("tool_kind") or ""),
+        )
+        if self._visible_event_fingerprints.get(key) == fingerprint:
+            return True
+        self._visible_event_fingerprints[key] = fingerprint
+        return False
+
+    def _clear_visible_event_fingerprints(self, command_id: str) -> None:
+        for key in [
+                key for key in self._visible_event_fingerprints
+                if key[0] == command_id]:
+            del self._visible_event_fingerprints[key]
 
     def _flush_partial(
             self, command_id: str, agent: str | None = None) -> None:

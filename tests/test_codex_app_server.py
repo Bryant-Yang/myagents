@@ -719,6 +719,13 @@ def test_adapter_event_mapping() -> None:
         assert "PO" in texts and "NG" in texts, texts  # delta → text
         tools = [e for e in events if e.kind in ("tool", "status")]
         assert tools, "command/file/tool item 没有映射出 tool/status 事件"
+        completed_tools = [
+            e for e in events
+            if e.kind == "tool" and e.meta.get("status") == "completed"
+        ]
+        assert {e.text for e in completed_tools} == {
+            "命令执行", "文件变更", "fs/read_file"
+        }, completed_tools
         assert any(e.kind == "done" for e in events), "turn/completed 没有映射出 done"
         # reasoning 正文不暴露；命令里的凭据必须被脱敏
         blob = " ".join(
@@ -760,6 +767,27 @@ def test_adapter_approval_events_are_denied_and_redacted() -> None:
         assert '"decision": "decline"' in approval
     run(body())
     print("ok  adapter 审批默认拒绝且可见事件脱敏")
+
+
+def test_agent_aware_permission_handler_knows_adapter_mirrors_events() -> None:
+    """TUI handler 可避免与 Codex synthetic permission 事件重复记录。"""
+    async def body() -> None:
+        seen = []
+
+        async def handler(name: str, params: dict) -> dict:
+            seen.append((name, params))
+            return {"outcome": "cancelled"}
+
+        adapter = CodexAppServerAdapter(CMD)
+        adapter.set_permission_handler(handler)
+        assert adapter._client._permission_handler is not None
+        await adapter._client._permission_handler({"toolCall": {}})
+        await adapter.aclose()
+        assert seen[0][0] == "codex"
+        assert seen[0][1]["_myagents_mirrors_permission_events"] is True
+
+    run(body())
+    print("ok  Codex agent-aware 权限 handler 标记事件镜像")
 
 
 def test_additional_permissions_use_shared_handler_and_fail_closed() -> None:
@@ -870,7 +898,10 @@ def test_adapter_two_streams_reuse_thread_and_pid() -> None:
             json.loads(e.split(":", 1)[1])
             for e in events if e.startswith("thread-params:")]
         assert thread_params == [{
-            "cwd": "/tmp", "sandbox": "workspace-write"}]
+            "approvalPolicy": "on-request",
+            "cwd": "/tmp",
+            "sandbox": "workspace-write",
+        }]
         assert_no_violation()
     run(body())
     print("ok  adapter 两轮 stream 复用 thread 与进程")
@@ -884,6 +915,7 @@ def test_ephemeral_clean_threads_reuse_pid_without_persisting_host_history(
         adapter = CodexAppServerAdapter(
             CMD,
             sandbox="read-only",
+            approval_policy="never",
             reuse_thread=False,
             ephemeral_thread=True,
         )
@@ -903,6 +935,7 @@ def test_ephemeral_clean_threads_reuse_pid_without_persisting_host_history(
             for e in events if e.startswith("thread-params:")
         ]
         assert thread_params == [{
+            "approvalPolicy": "never",
             "cwd": "/tmp",
             "ephemeral": True,
             "sandbox": "read-only",
@@ -1075,6 +1108,7 @@ if __name__ == "__main__":
     test_invalid_frame_fails_immediately_and_reaps_process()
     test_adapter_event_mapping()
     test_adapter_approval_events_are_denied_and_redacted()
+    test_agent_aware_permission_handler_knows_adapter_mirrors_events()
     test_additional_permissions_use_shared_handler_and_fail_closed()
     test_human_approval_wait_does_not_trigger_agent_inactivity_timeout()
     test_invalid_terminal_status_fails_and_rebuilds()

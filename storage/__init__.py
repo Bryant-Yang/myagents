@@ -2,9 +2,11 @@
 
 from storage.store import (
     APP_NAME,
+    DEFAULT_SESSION_NAME,
     DEFAULT_READ_LIMIT,
     MAX_READ_LIMIT,
     MAX_RECORD_BYTES,
+    MAX_SESSION_NAME_CHARS,
     MAX_TEXT_BYTES,
     ROOM_DIR_MODE,
     STATE_FILE_MODE,
@@ -20,14 +22,17 @@ from storage.store import (
     WorkdirMismatchError,
     default_state_root,
     normalize_workdir,
+    normalize_session_name,
     room_id_for,
 )
 
 __all__ = [
     "APP_NAME",
+    "DEFAULT_SESSION_NAME",
     "DEFAULT_READ_LIMIT",
     "MAX_READ_LIMIT",
     "MAX_RECORD_BYTES",
+    "MAX_SESSION_NAME_CHARS",
     "MAX_TEXT_BYTES",
     "ROOM_DIR_MODE",
     "STATE_FILE_MODE",
@@ -43,5 +48,6 @@ __all__ = [
     "WorkdirMismatchError",
     "default_state_root",
     "normalize_workdir",
+    "normalize_session_name",
     "room_id_for",
 ]

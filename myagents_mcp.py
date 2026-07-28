@@ -170,6 +170,9 @@ def parse_args() -> argparse.Namespace:
         "--workdir", required=True,
         help="Exact workdir used to start the target myagents TUI")
     parser.add_argument(
+        "--session", default="default",
+        help="Named myagents conversation session (default: default)")
+    parser.add_argument(
         "--state-root", type=Path,
         help="Override myagents state root (primarily for isolated tests)")
     return parser.parse_args()
@@ -177,7 +180,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    client = ControlClient(args.workdir, state_root=args.state_root)
+    client = ControlClient(
+        args.workdir,
+        state_root=args.state_root,
+        session_name=args.session,
+    )
     build_server(client).run(transport="stdio")
 
 

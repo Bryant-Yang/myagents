@@ -37,7 +37,7 @@ class FakeHost(FakeAdapter):
         self.decide_calls = 0
         self.route = HostDecision(["kimi"], "测试路由")
 
-    async def decide(self, transcript: str, workdir: str):
+    async def decide(self, transcript: str, workdir: str, on_event=None):
         self.decide_calls += 1
         return self.route
 
@@ -91,6 +91,11 @@ def test_dispatch_multi_and_transcript() -> None:
 def test_host_routing() -> None:
     """无 @ 消息 → host 路由到预设目标。"""
     orch = make_orch()
+    orch.host.route = HostDecision(
+        ["kimi"],
+        "测试路由",
+        tasks={"kimi": "自行构思一个极简小游戏并直接实现，不要等待用户补充方案。"},
+    )
     events = []
     asyncio.run(orch.dispatch("帮我看看这段代码", lambda n, e: events.append((n, e))))
     assert orch.host.decide_calls == 1
@@ -98,7 +103,33 @@ def test_host_routing() -> None:
     assert any(n == "host" and e.kind == "info" and "路由" in e.text for n, e in events)
     # kimi 被派发并回复
     assert [m.speaker for m in orch.history] == ["user", "kimi"]
-    print("ok  host 路由（无 @ → 派给 kimi）")
+    prompt = orch.adapters["kimi"].last_prompt
+    assert "主持人本轮明确委托" in prompt
+    assert "自行构思一个极简小游戏并直接实现" in prompt
+    assert "不要把任务退回给主持人或用户" in prompt
+    print("ok  host 路由（无 @ → 携带明确任务派给 kimi）")
+
+
+def test_host_routing_assignment_reaches_stateful_agent_and_has_fallback() -> None:
+    """真实 Kimi 所在的 stateful 路径也收到 assignment；旧 host JSON 不丢任务。"""
+    class StatefulFakeAdapter(FakeAdapter):
+        stateful_session = True
+
+    orch = make_orch()
+    orch.adapters["kimi"] = StatefulFakeAdapter("kimi")
+    orch.host.route = HostDecision(["kimi"], "旧格式未提供 tasks")
+
+    asyncio.run(orch.dispatch(
+        "你构思一个极简小游戏，让 kimi 实现",
+        lambda n, e: None,
+    ))
+
+    prompt = orch.adapters["kimi"].last_prompt
+    assert "主持人本轮明确委托" in prompt
+    assert "构思、规划、实现或验证" in prompt
+    assert "你构思一个极简小游戏，让 kimi 实现" in prompt
+    assert "不要把任务退回给主持人或用户" in prompt
+    print("ok  stateful 委托透传 + host 旧格式任务回退")
 
 
 def test_host_direct_answer_single_call() -> None:
@@ -143,7 +174,7 @@ def test_transcript_snapshot() -> None:
     gate = asyncio.Event()
 
     async def run() -> None:
-        async def decide_slow(transcript: str, workdir: str):
+        async def decide_slow(transcript: str, workdir: str, on_event=None):
             await gate.wait()  # 模拟 codex 路由要几秒钟
             return HostDecision(["kimi"], "慢路由")
         orch.host.decide = decide_slow
@@ -167,7 +198,7 @@ def test_decide_failure_fallback() -> None:
     """P2 回归：host 路由抛异常 → error 事件 + 确定性回退到第一个工人。"""
     orch = make_orch()
 
-    async def boom(transcript: str, workdir: str):
+    async def boom(transcript: str, workdir: str, on_event=None):
         raise RuntimeError("codex 挂了")
     orch.host.decide = boom
 
@@ -184,7 +215,7 @@ def test_persistent_failure() -> None:
     """P2 契约回归：路由和工人持续故障时，history 诚实记录"调用失败"。"""
     orch = make_orch()
 
-    async def boom(transcript: str, workdir: str):
+    async def boom(transcript: str, workdir: str, on_event=None):
         raise RuntimeError("codex 挂了")
     orch.host.decide = boom
 
@@ -205,18 +236,70 @@ def test_persistent_failure() -> None:
 
 
 def test_route_dedupe() -> None:
-    """P2 回归：LLM 返回重复/非法目标时按序去重并过滤。"""
+    """P2 回归：目标去重；只保留目标对应的有界明确任务。"""
     host = HostAgent(workers=["kimi", "opencode"])
     choices = ["kimi", "opencode"]
     decision = host._parse(
-        '{"targets": ["kimi", "kimi", "nobody"], "reason": "x"}', choices)
+        '{"targets": ["kimi", "kimi", "nobody"], "reason": "x",'
+        ' "tasks": {"kimi": "直接实现小游戏", "nobody": "忽略"}}',
+        choices)
     assert decision.targets == ["kimi"] and decision.answer is None
+    assert decision.tasks == {"kimi": "直接实现小游戏"}
     decision = host._parse(
         '{"targets": ["opencode", "kimi", "opencode"]}', choices)
     assert decision.targets == ["opencode", "kimi"]
+    assert decision.tasks == {}
     decision = host._parse("这是主持人的直接回答", choices)
     assert decision.targets == [] and decision.answer == "这是主持人的直接回答"
-    print("ok  路由目标去重 + 非 JSON 作为 host 直接回答")
+    assert "禁止调用工具" in host._build_route_prompt("对话", choices)
+    print("ok  路由目标去重 + 明确任务解析 + host 路由禁用工具")
+
+
+def test_host_decide_surfaces_safe_progress_events() -> None:
+    """host 路由期间的安全阶段/工具事件不能在后台被吞掉。"""
+    class RoutingAdapter:
+        session_id = None
+
+        async def stream(self, prompt: str, workdir: str):
+            yield AgentEvent("status", "正在分析")
+            yield AgentEvent("tool", "不应调用但必须可见")
+            yield AgentEvent(
+                "text",
+                '{"targets":["kimi"],"reason":"实现",'
+                '"tasks":{"kimi":"直接实现并验证"}}',
+            )
+            yield AgentEvent("done")
+
+    host = HostAgent(adapter=RoutingAdapter(), workers=["kimi"])
+    progress = []
+    decision = asyncio.run(host.decide(
+        "[user] 做一个游戏", ".", progress.append))
+    assert [event.kind for event in progress] == ["status", "tool"]
+    assert decision.tasks == {"kimi": "直接实现并验证"}
+    print("ok  host 路由安全进度可见（不再后台吞事件）")
+
+
+def test_host_progress_sink_failure_propagates() -> None:
+    """host 进度写盘失败必须停止派发，不能伪装成路由失败继续执行。"""
+    class ProgressHost(FakeHost):
+        async def decide(self, transcript: str, workdir: str, on_event=None):
+            assert on_event is not None
+            on_event(AgentEvent("status", "内部进度"))
+            return HostDecision(["kimi"], "不应继续")
+
+    orch = make_orch()
+    orch.host = ProgressHost()
+    orch.adapters["host"] = orch.host
+
+    def sink(name: str, event: AgentEvent) -> None:
+        if name == "host" and event.text == "内部进度":
+            raise OSError("events disk full")
+
+    with _Raises(OSError):
+        asyncio.run(orch.dispatch("执行任务", sink))
+    assert orch.adapters["kimi"].last_prompt is None
+    assert [message.speaker for message in orch.history] == ["user"]
+    print("ok  host 进度 sink 失败穿透（不继续派发）")
 
 
 def test_stderr_backpressure() -> None:
@@ -352,7 +435,7 @@ def test_tui() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
             box = app.query_one(Input)
-            box.value = "不带@的消息"
+            box.value = "不点名的消息"
             await pilot.press("enter")
             await pilot.pause()
             box.value = "@kimi 你好"
@@ -400,11 +483,170 @@ def test_tui_coalesces_stream_chunks() -> None:
     print("ok  TUI 合并同一回复的流式 chunk")
 
 
+def test_tui_coalesces_heartbeat_and_avoids_false_success_copy() -> None:
+    """同一命令的 heartbeat 只占一行；done 只表示本轮响应结束。"""
+    from textual.widgets import RichLog
+    from main import ChatApp
+
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=make_orch())
+        async with app.run_test() as pilot:
+            meta = {"command_id": "cmd-1", "heartbeat": True}
+            app._on_agent_event(
+                "system", AgentEvent("status", "host 正在路由（已等待 10 秒）", meta))
+            app._on_agent_event(
+                "system", AgentEvent("status", "host 正在路由（已等待 20 秒）", meta))
+            app._on_agent_event("kimi", AgentEvent(
+                "done", meta={"command_id": "cmd-1"}))
+            await pilot.pause()
+            lines = [
+                str(line.text) for line in app.query_one(RichLog).lines
+            ]
+            heartbeat_lines = [
+                line for line in lines if "正在路由（已等待" in line
+            ]
+            assert heartbeat_lines == [
+                "[system] host 正在路由（已等待 20 秒）"
+            ], heartbeat_lines
+            assert "[system] kimi 本轮响应结束" in lines
+            assert "[system] kimi 完成" not in lines
+
+    asyncio.run(run())
+    print("ok  TUI 合并 heartbeat + done 不伪装任务成功")
+
+
+def test_tui_updates_one_line_per_tool() -> None:
+    """同一 command/tool 的状态迁移原位更新，重复 in_progress 不刷屏。"""
+    from textual.widgets import RichLog
+    from main import ChatApp
+
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=make_orch())
+        async with app.run_test() as pilot:
+            render_count = 0
+            original_render = app._render_display_lines
+
+            def counted_render() -> None:
+                nonlocal render_count
+                render_count += 1
+                original_render()
+
+            app._render_display_lines = counted_render
+            base = {
+                "command_id": "cmd-tool",
+                "tool_call_id": "tool-1",
+                "command": "node --check demo.js",
+            }
+            app._on_agent_event(
+                "kimi", AgentEvent("tool", "检查 JavaScript", dict(base)))
+            for _ in range(50):
+                app._on_agent_event(
+                    "kimi",
+                    AgentEvent(
+                        "tool", "检查 JavaScript",
+                        {**base, "status": "in_progress", "update": True},
+                    ),
+                )
+            app._on_agent_event(
+                "kimi",
+                AgentEvent(
+                    "tool", "检查 JavaScript",
+                    {**base, "status": "completed", "update": True},
+                ),
+            )
+            await pilot.pause()
+            logical = [
+                text for _speaker, text, _style in app._display_lines
+                if "检查 JavaScript" in text
+            ]
+            assert len(logical) == 1, logical
+            assert "node --check demo.js" not in logical[0], logical
+            assert "/details" in logical[0], logical
+            assert render_count == 3, render_count
+            app.action_toggle_details()
+            logical = [
+                text for _speaker, text, _style in app._display_lines
+                if "检查 JavaScript" in text
+            ]
+            assert "node --check demo.js" in logical[0], logical
+            lines = [
+                str(line.text) for line in app.query_one(RichLog).lines
+                if "检查 JavaScript" in str(line.text)
+            ]
+            assert len(lines) == 1, lines
+            assert "已完成" in lines[0], lines
+            assert render_count == 4, render_count
+            app._on_agent_event(
+                "kimi", AgentEvent(
+                    "done", meta={"command_id": "cmd-tool"}))
+            assert not [
+                key for key in app._tool_line_index
+                if key[0] == "cmd-tool"
+            ]
+            assert not [
+                key for key in app._tool_line_fingerprint
+                if key[0] == "cmd-tool"
+            ]
+
+    asyncio.run(run())
+    print("ok  TUI 工具状态原位更新")
+
+
+def test_main_loop_reopens_requested_session() -> None:
+    """Ctrl+N 的 App result 使顶层循环重建会话；普通退出停止循环。"""
+    from main import NewSessionRequest, parse_args, run_chat_loop
+
+    calls = []
+    results = [NewSessionRequest("fresh"), None]
+
+    class FakeApp:
+        def __init__(self, workdir: str, *, session_name: str) -> None:
+            calls.append((workdir, session_name))
+
+        def run(self):
+            return results.pop(0)
+
+    args = parse_args(["--session", "review", "/tmp"])
+    assert (args.workdir, args.session) == ("/tmp", "review")
+    run_chat_loop("/tmp", "default", app_factory=FakeApp)
+    assert calls == [
+        ("/tmp", "default"),
+        ("/tmp", "fresh"),
+    ]
+    print("ok  顶层 App 循环切换会话 + --session 解析")
+
+
+def test_cli_room_busy_is_actionable_without_traceback() -> None:
+    """重复打开同一会话时，CLI 给出短提示与可执行替代方案。"""
+    from main import run_cli
+    from storage.store import RoomBusyError
+
+    def busy_runner(workdir: str, session_name: str) -> None:
+        raise RoomBusyError("房间已被其他进程持有（owner PID=123）")
+
+    try:
+        run_cli(
+            ["--session", "default", "/tmp/project with spaces"],
+            runner=busy_runner,
+        )
+        raise AssertionError("RoomBusyError 应转换为干净的 CLI 退出")
+    except SystemExit as exc:
+        message = str(exc)
+        assert "Traceback" not in message
+        assert "会话 'default' 已在另一个 TUI 中运行" in message
+        assert "owner PID=123" in message
+        assert "uv run main.py --session <新名称> '/tmp/project with spaces'" \
+            in message
+
+    print("ok  CLI 房间冲突短提示（无 traceback + 可执行替代方案）")
+
+
 if __name__ == "__main__":
     test_parse_mentions()
     test_dispatch()
     test_dispatch_multi_and_transcript()
     test_host_routing()
+    test_host_routing_assignment_reaches_stateful_agent_and_has_fallback()
     test_host_direct_answer_single_call()
     test_host_answers_itself()
     test_at_host_explicit()
@@ -412,9 +654,15 @@ if __name__ == "__main__":
     test_decide_failure_fallback()
     test_persistent_failure()
     test_route_dedupe()
+    test_host_decide_surfaces_safe_progress_events()
+    test_host_progress_sink_failure_propagates()
     test_stderr_backpressure()
     test_kill_on_cancel()
     test_bounded_stderr()
     test_tui()
     test_tui_coalesces_stream_chunks()
+    test_tui_coalesces_heartbeat_and_avoids_false_success_copy()
+    test_tui_updates_one_line_per_tool()
+    test_main_loop_reopens_requested_session()
+    test_cli_room_busy_is_actionable_without_traceback()
     print("\n全部通过")

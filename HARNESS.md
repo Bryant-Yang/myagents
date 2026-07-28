@@ -87,15 +87,27 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 
 - 显式 `@agent` 永远优先；无 `@` 时 host 单次调用直接回答或返回 worker
   路由，本地代码不维护自然语言关键词白名单。
+- host 路由结果包含每个 target 的一次性明确任务；Orchestrator 将任务直接
+  加入该 worker 本轮 prompt，不写入共享 timeline。任务必须消解“你/让某人”
+  等角色关系；旧格式或缺失任务使用原始用户请求生成执行型回退指令，不能只把
+  `reason` 展示给用户后丢失委托语义。
+- host 路由是纯分类与任务改写步骤，prompt 明确禁止调用工具、文件、命令、
+  网络或 skill；保持 Codex 默认配置继承，不用配置覆盖换取速度。底层若仍
+  产生安全的 status/tool/permission 事件，必须透传到执行日志与 TUI，不能
+  在 `decide()` 内静默吞掉。
 - JSONL adapter 收 dispatch 时刻的有界 transcript 快照。
 - stateful ACP adapter 在每-agent delivery lock 内读取 cursor、构造增量、
-  完成 stream 后推进 cursor；失败不得推进。
+  完成 stream 后推进 cursor。prompt 提交前或上游明确拒绝的失败不推进、
+  允许下轮补发；prompt 已提交后的静默超时属于结果不确定，必须先持久化
+  no-replay cursor 再公开失败，不能自动重放。
 - 首次 ACP bootstrap 最多发送 `history_limit` 条共享历史。
 
 ### 4.2 权限
 
 - `AcpClient`、`AcpAdapter`、`AcpKimiAdapter` 默认权限都是 `deny`。
 - TUI 异步决定权限并显示来源 agent。
+- `session/request_permission` 到权限结果发回前属于人工等待，不计入 ACP
+  inactivity timeout；read loop、取消和关闭仍保持可响应。
 - `selected.optionId` 必须非空且属于本次 `params.options`；否则 cancelled。
 - `auto` 只允许明确授权的测试、运维或一次性外部调用使用。
 
@@ -103,15 +115,24 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 
 - 每个 ACP adapter 是其 session 的唯一 writer。
 - 同一 ACP agent 的 prompt 串行；不同 agent 可以并发 fan-out。
-- prompt 连续 120 秒无任何 ACP 通知或终止响应时自动取消本轮。
+- 不在等待人工权限且没有活跃工具时，prompt 连续 120 秒无任何 ACP 通知或
+  终止响应才自动取消；活跃工具使用独立 15 分钟 watchdog。两类超时都是提交后
+  结果不确定，按 no-replay 失败处理。
 - cancel 后必须等待原 prompt 停止；超时则关闭并重建连接。
 - 子进程使用独立进程组；退出时 SIGTERM，超时再 SIGKILL。
 - TUI unmount 先取消权限 Future，再调用 `Orchestrator.aclose()`。
 
 ### 4.4 持久化与恢复（M2.5）
 
+- 房间身份由 `(规范化 workdir, session_name)` 决定；`default` 保持历史
+  room_id 兼容。命名会话的 timeline/events/cursor/原生 agent session 完全
+  隔离；`Ctrl+N` 和精确输入 `/new` 是同一个本地新会话动作，命令不得写入
+  timeline、不得交给 host/worker。它们只能在无 queued/running command 和
+  权限等待时请求切换，且必须先完成旧 App 的标准关闭顺序再构造新
+  Orchestrator（ADR-0005）。
 - RoomStore timeline 记录带单调 `seq`；cursor 是 seq 而非 list 下标，
-  只在成功交付后先落盘再更新内存，失败不推进、不假提交。
+  成功交付后先落盘再更新内存；明确未提交的失败不推进，已提交但结果不确定的
+  失败建立 no-replay 边界，不假提交成功，也不重复执行。
 - cursor/session_id 的 checkpoint 在 ACP prompt 前一次性原子落盘
   （`stream_prepared` 的 make_prompt hook）；checkpoint 失败穿透 dispatch，
   绝不伪装成 agent 调用失败。
@@ -138,7 +159,8 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
   活跃房间抛 `ControlBusyError`，绝不抢占或误删属主文件；未知 method、
   非法字段与超限返回稳定错误码，不泄漏 traceback。
 - `ControlClient` 纯发现：不构造 RoomStore、不创建/删除状态；lstat
-  拒绝 symlink、强制 0600、校验 room_id/workdir/socket_path 匹配后，
+  拒绝 symlink、强制 0600、按 workdir/session_name 计算 room_id 并校验
+  room_id/workdir/socket_path 匹配后，
   每次调用仍实际连接验证。
 - MCP bridge 七个 `myagents_*` 工具只翻译到上述 socket 协议；
   `ControlClientError` 一律转为可操作 tool error，不使 server 崩溃；
@@ -153,7 +175,19 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
   permission、partial 与 terminal 事件；绝不进入 agent history。
 - ACP thought 正文不可见，只映射安全阶段；工具与权限上下文有界展示，
   常见凭据字段隐藏。
-- CommandBus 静默 10 秒发 heartbeat；active/queued 可精确取消，
+- 工具生命周期按 `(command_id, agent, tool_call_id)` 合并；协议缺少 ID 时
+  使用脱敏标题作为可见 identity。adapter 继承初始工具标题并只产出状态迁移，
+  CommandBus 对完全相同的 status/tool 做防御性去重，但重复协议活动仍刷新
+  静默计时。TUI 对同一工具原位显示“进行中/已完成/失败”，终态后清理索引；
+  `events.jsonl` 只持久化有信息增量的工具状态，不能被高频
+  `in_progress` 刷爆。
+- CommandBus 静默 10 秒发 heartbeat，静默时长保持累计且 heartbeat 自身不
+  重置活动时钟；TUI 对同一 command 的 heartbeat 原位更新而不是不断追加。
+  `completed` 只表示本轮调用正常结束，TUI 使用“本轮响应结束”，不声称用户
+  任务已经验收。fan-out 要等待全部 target 收尾；任一 worker 失败时 command
+  终态为 `failed`，即使其他 worker 已正常回复，失败 worker 的 partial 也必须
+  明确标注调用失败。固定任务区必须保留各 agent 阶段和终态；混合成功/失败
+  显示“部分完成”。工具命令默认折叠，仅由 `/details` 显式切换。active/queued 可精确取消，
   terminal cancel 幂等，取消不得杀死 worker。
 - TUI `Ctrl+X`、control `command.cancel`、MCP
   `myagents_cancel_command` 共用一个取消原语；外部可通过
@@ -167,12 +201,14 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
   Codex worker 连续轮次复用持久 thread，host 复用暖进程但每次建立干净的
   ephemeral thread，内部路由不得写入 Codex 历史。
 - 启动与请求不得覆盖 model、effort、config、collaboration mode、plugin 或
-  MCP；只传协议必需字段、cwd、既有 host/worker sandbox 安全边界，以及 host
-  专用的 `ephemeral: true`，且不写 `~/.codex/config.toml`。
+  MCP；只传协议必需字段、cwd、既有 host/worker sandbox 与 approval-policy
+  安全边界，以及 host 专用的 `ephemeral: true`，且不写
+  `~/.codex/config.toml`。
 - `turn/completed` 是完成权威信号；取消发送 `turn/interrupt` 并等 terminal，
   未确认则关闭重建，下一轮不得与旧 turn 重叠。
-- approval 无处理器默认 decline；tool/command 元数据必须有界脱敏，reasoning
-  正文不可显示。
+- worker thread 使用 `workspace-write + on-request`，越界操作进入统一权限
+  UI；host thread 使用 `read-only + never`。approval 无处理器默认 decline；
+  tool/command 元数据必须有界脱敏，reasoning 正文不可显示。
 - 仅在 initialize/thread prepare（尚未发送用户 turn）失败时允许 JSONL
   fallback；一旦发送 `turn/start` 就禁止自动重放，避免响应丢失时重复工具副作用。
 - `turn/start` 已发送后的结果不确定、terminal 失败/中断或用户取消，都先把

@@ -5,6 +5,7 @@
 """
 
 import json
+import hashlib
 import os
 import stat
 import sys
@@ -14,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from storage import (
+    DEFAULT_SESSION_NAME,
     DEFAULT_READ_LIMIT,
     MAX_READ_LIMIT,
     MAX_RECORD_BYTES,
@@ -25,6 +27,7 @@ from storage import (
     SchemaVersionError,
     WorkdirMismatchError,
     normalize_workdir,
+    normalize_session_name,
     room_id_for,
 )
 
@@ -59,6 +62,62 @@ def test_room_identity():
         # room dir 在 state_root 下，不在 workdir 下
         assert str(store.room_dir).startswith(str(state_root.resolve()))
     print("ok  room 身份与稳定 room_id")
+
+
+def test_named_session_identity_isolation_and_validation():
+    """同一 workdir 的命名会话完全隔离；default 保持旧 room_id。"""
+    tmp, workdir, state_root = make_env()
+    with tmp:
+        normalized = normalize_workdir(workdir)
+        legacy_id = hashlib.sha256(
+            normalized.encode("utf-8")).hexdigest()[:16]
+        default = RoomStore(workdir, state_root=state_root)
+        alpha = RoomStore(
+            workdir, state_root=state_root, session_name="alpha")
+        beta = RoomStore(
+            workdir, state_root=state_root, session_name="beta")
+
+        assert default.session_name == DEFAULT_SESSION_NAME
+        assert default.room_id == legacy_id
+        assert room_id_for(normalized) == legacy_id
+        assert room_id_for(normalized, DEFAULT_SESSION_NAME) == legacy_id
+        assert len({default.room_id, alpha.room_id, beta.room_id}) == 3
+        assert RoomStore.session_exists(
+            workdir, "alpha", state_root=state_root)
+        assert not RoomStore.session_exists(
+            workdir, "missing", state_root=state_root)
+
+        alpha.append("user", "alpha only")
+        alpha.set_agent_state("kimi", cursor=1, session_id="alpha-session")
+        beta.append("user", "beta only")
+        assert [item.text for item in alpha.read()["items"]] == ["alpha only"]
+        assert [item.text for item in beta.read()["items"]] == ["beta only"]
+        assert default.read()["items"] == []
+
+        reopened = RoomStore(
+            workdir, state_root=state_root, session_name="alpha")
+        assert reopened.get_agent_state("kimi") == {
+            "cursor": 1, "session_id": "alpha-session"}
+        state = json.loads(reopened.state_path.read_text(encoding="utf-8"))
+        assert state["session_name"] == "alpha"
+
+        for bad in ("", "   ", ".", "..", "a/b", "a\\b", "bad\nname",
+                    "x" * 65):
+            try:
+                normalize_session_name(bad)
+                raise AssertionError(f"非法 session name 应拒绝：{bad!r}")
+            except ValueError:
+                pass
+
+        state["session_name"] = "beta"
+        reopened.state_path.write_text(
+            json.dumps(state), encoding="utf-8")
+        try:
+            RoomStore(workdir, state_root=state_root, session_name="alpha")
+            raise AssertionError("state 中 session_name 不匹配应拒绝")
+        except CorruptedStorageError:
+            pass
+    print("ok  命名会话身份隔离 + default 兼容 + 名称校验")
 
 
 def test_append_and_restart_seq():
@@ -620,6 +679,7 @@ def test_execution_event_journal_and_legacy_migration():
 
 if __name__ == "__main__":
     test_room_identity()
+    test_named_session_identity_isolation_and_validation()
     test_append_and_restart_seq()
     test_pagination()
     test_size_limits()

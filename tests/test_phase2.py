@@ -94,7 +94,7 @@ class FakeHost(FakeJsonl):
         super().__init__("host")
         self.route = HostDecision(["kimi"], "测试路由")
 
-    async def decide(self, transcript: str, workdir: str):
+    async def decide(self, transcript: str, workdir: str, on_event=None):
         return self.route
 
 

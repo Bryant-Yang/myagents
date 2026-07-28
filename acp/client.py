@@ -32,6 +32,9 @@ from adapters.base import BoundedLog, read_lines
 
 # 通知回调：(method, params) -> None
 NotifyCallback = Callable[[str, dict], None]
+# 权限生命周期回调：(phase, request_id, params) -> None。
+# adapter 用它暂停 agent inactivity timeout；不承载授权结果。
+PermissionActivityCallback = Callable[[str, int, dict], None]
 # 权限决策：params -> ACP outcome，如 {"outcome": "selected", "optionId": "allow"}
 # TUI 注入的处理器是 async 的（要等用户选择）；内置 policy 是同步的。
 PermissionHandler = Callable[[dict], Union[dict, Awaitable[dict]]]
@@ -104,6 +107,7 @@ class AcpClient:
         self.cmd = cmd
         self.cwd = cwd
         self.on_notification: NotifyCallback | None = None
+        self.on_permission_activity: PermissionActivityCallback | None = None
         self._permission = permission
         # TUI 注入的权限决策器；None 时用内置 policy（deny/auto）
         self._permission_handler: PermissionHandler | None = permission_handler
@@ -292,6 +296,9 @@ class AcpClient:
         if msg["method"] == "session/request_permission":
             # 权限决策可能等用户很久：独立 task 应答，不阻塞 read loop
             #（否则同 session 的 session/update 全部饿死）。
+            if self.on_permission_activity is not None:
+                self.on_permission_activity(
+                    "requested", rid, msg.get("params", {}))
             task = asyncio.create_task(
                 self._answer_permission(rid, msg.get("params", {})))
             self._permission_tasks.add(task)
@@ -304,22 +311,27 @@ class AcpClient:
     async def _answer_permission(self, rid: int, params: dict) -> None:
         """调权限决策器并回响应。任何失败/取消/畸形结果都兜底 cancelled：
         不替用户授权，也不让 agent 挂等一个永远不会来的响应。"""
-        handler = self._permission_handler or self._default_permission
         try:
-            outcome = handler(params)
-            if inspect.isawaitable(outcome):
-                outcome = await outcome
-            outcome = _validate_outcome(outcome, params)
-        except asyncio.CancelledError:
-            # close() 取消等待中的决策：尽量回 cancelled 再退出
-            with contextlib.suppress(Exception):
-                await self._send({"jsonrpc": "2.0", "id": rid, "result": {
-                    "outcome": {"outcome": "cancelled"}}})
-            raise
-        except Exception:
-            outcome = {"outcome": "cancelled"}
-        await self._send({"jsonrpc": "2.0", "id": rid,
-                          "result": {"outcome": outcome}})
+            handler = self._permission_handler or self._default_permission
+            try:
+                outcome = handler(params)
+                if inspect.isawaitable(outcome):
+                    outcome = await outcome
+                outcome = _validate_outcome(outcome, params)
+            except asyncio.CancelledError:
+                # close() 取消等待中的决策：尽量回 cancelled 再退出
+                with contextlib.suppress(Exception):
+                    await self._send({"jsonrpc": "2.0", "id": rid, "result": {
+                        "outcome": {"outcome": "cancelled"}}})
+                raise
+            except Exception:
+                outcome = {"outcome": "cancelled"}
+            await self._send({"jsonrpc": "2.0", "id": rid,
+                              "result": {"outcome": outcome}})
+        finally:
+            callback = self.on_permission_activity
+            if callback is not None:
+                callback("resolved", rid, params)
 
     def _on_permission_task_done(self, task: asyncio.Task) -> None:
         """权限应答 task 收尾：移除注册并消费非取消异常。

@@ -157,12 +157,39 @@ def main() -> None:
                         "rawInput": {
                             "command": "API_TOKEN=secret-value node --check demo.js"
                         }}}})
-                send({"jsonrpc": "2.0", "method": "session/update", "params": {
-                    "sessionId": sid, "update": {
+                repeat = 200 if "tool-spam" in text else 1
+                for _ in range(repeat):
+                    update = {
                         "sessionUpdate": "tool_call_update",
                         "toolCallId": "tool-1",
                         "status": "in_progress",
-                        "title": tool_title}}})
+                    }
+                    # 真实 Kimi 的高频 update 经常不重复 title；adapter 应从
+                    # tool_call 初始事件继承，而不是退化成“工具调用”。
+                    if "tool-spam" not in text:
+                        update["title"] = tool_title
+                    send({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {"sessionId": sid, "update": update},
+                    })
+                if "tool-pause" in text:
+                    # 模拟真实 Kimi 启动工程子代理后，父 ACP 会话长时间没有
+                    # token/update，但工具本身仍然处于活跃状态。
+                    time.sleep(0.15)
+                if "tool-spam" in text or "tool-pause" in text:
+                    send({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": sid,
+                            "update": {
+                                "sessionUpdate": "tool_call_update",
+                                "toolCallId": "tool-1",
+                                "status": "completed",
+                            },
+                        },
+                    })
             if "perm" not in text:
                 send({"jsonrpc": "2.0", "method": "session/update", "params": {
                     "sessionId": sid, "update": {

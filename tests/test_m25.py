@@ -468,6 +468,55 @@ def test_acp_prompt_failure_keeps_cursor() -> None:
     print("ok  ACP prompt 失败（cursor 不推进 + session id 已落盘）")
 
 
+def test_acp_inactivity_timeout_commits_no_replay_cursor() -> None:
+    """prompt 已开始后的静默超时属于结果不确定：失败可见，但不得重投。"""
+    room = _Room()
+    _set_fake_env(room)
+
+    async def run() -> None:
+        adapter = AcpAdapter(
+            "kimi",
+            [sys.executable, SERVER],
+            inactivity_timeout=0.08,
+            cancel_timeout=0.05,
+        )
+        orch = room.make_orch(kimi=adapter)
+        events = []
+        outcome = await orch.dispatch(
+            "@kimi slow-never task",
+            lambda name, event: events.append((name, event)),
+        )
+        assert outcome.failures and outcome.failures[0].agent == "kimi"
+        assert "无活动" in outcome.failures[0].error
+        assert any(event.kind == "error" for _, event in events)
+
+        # user seq=1 已经送入原生 ACP session；结果不确定时固化 no-replay。
+        state = room.open_store().get_agent_state("kimi")
+        assert state["cursor"] == 1
+        assert orch._cursors["kimi"] == 1
+        assert "开始了" in orch.history[-1].text
+        assert "调用失败" in orch.history[-1].text
+
+        # 下一轮不得再次发送 slow-never；否则工具副作用可能重复。
+        outcome2 = await orch.dispatch(
+            "@kimi fast round", lambda _name, _event: None)
+        assert not outcome2.failures
+        raw = _fake_state_raw(room)
+        assert raw.count("prompt:") == 2
+        assert "slow-never task" in raw
+        latest_prompt = raw[raw.rindex("prompt:"):]
+        assert "slow-never task" not in latest_prompt
+        assert "fast round" in latest_prompt
+        await orch.aclose()
+
+    try:
+        asyncio.run(run())
+    finally:
+        _clear_fake_env()
+        room.cleanup()
+    print("ok  ACP inactivity 超时固化 no-replay cursor")
+
+
 # ---- TUI 恢复显示 ----
 
 def test_tui_restore_display() -> None:
@@ -510,6 +559,96 @@ def test_tui_restore_display() -> None:
     finally:
         room.cleanup()
     print("ok  TUI 恢复显示（按 seq 渲染 + 不重复 append）")
+
+
+def test_tui_ctrl_n_requests_fresh_named_session() -> None:
+    """Ctrl+N 生成切换请求；同名和 active command 不允许覆盖/切换。"""
+    from textual.widgets import Input, RichLog
+    from main import ChatApp, NewSessionRequest, NewSessionScreen
+
+    room = _Room()
+    # 预建同名会话，验证 /new 不会把已有历史当成“新”会话覆盖。
+    existing = RoomStore(
+        room.workdir, state_root=room.state_root, session_name="existing")
+    existing.append("user", "保留我")
+
+    async def run() -> None:
+        orch = Orchestrator(room.workdir, store=room.open_store())
+        app = ChatApp(workdir=room.workdir, orchestrator=orch)
+        exits: list[NewSessionRequest] = []
+        app.exit = lambda result=None, **_: exits.append(result)  # type: ignore
+
+        async with app.run_test() as pilot:
+            await pilot.press("ctrl+n")
+            assert isinstance(app.screen, NewSessionScreen)
+            field = app.screen.query_one(Input)
+            field.value = "fresh"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert exits == [NewSessionRequest("fresh")]
+
+            # 已存在名称只报错，不发第二个切换请求。
+            await pilot.press("ctrl+n")
+            assert isinstance(app.screen, NewSessionScreen)
+            app.screen.query_one(Input).value = "existing"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert exits == [NewSessionRequest("fresh")]
+            rendered = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines)
+            assert "会话已存在" in rendered
+
+            # 活跃任务期间甚至不打开弹窗。
+            app.bus.has_pending = lambda: True  # type: ignore[method-assign]
+            await pilot.press("ctrl+n")
+            await pilot.pause()
+            assert not isinstance(app.screen, NewSessionScreen)
+            rendered = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines)
+            assert "先完成或取消当前任务" in rendered
+
+    try:
+        asyncio.run(run())
+        assert [item.text for item in existing.read()["items"]] == ["保留我"]
+        assert not RoomStore.session_exists(
+            room.workdir, "fresh", state_root=room.state_root)
+    finally:
+        room.cleanup()
+    print("ok  TUI Ctrl+N 新会话请求（同名/active 安全拒绝）")
+
+
+def test_tui_slash_new_is_local_command() -> None:
+    """`/new` 与 Ctrl+N 同义，绝不写 timeline 或交给 host。"""
+    from textual.widgets import Input
+    from main import ChatApp, NewSessionScreen
+
+    room = _Room()
+
+    class GuardHost(FakeJsonl):
+        async def decide(self, transcript: str, workdir: str, on_event=None):
+            raise AssertionError("/new 不得到达 host")
+
+    async def run() -> None:
+        orch = room.make_orch(kimi=StatefulFake("kimi"))
+        host = GuardHost("host")
+        orch.host = host
+        orch.adapters["host"] = host
+        app = ChatApp(workdir=room.workdir, orchestrator=orch)
+
+        async with app.run_test() as pilot:
+            box = app.query_one(Input)
+            box.value = "/new"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, NewSessionScreen)
+            assert orch.history == []
+
+    try:
+        asyncio.run(run())
+        assert room.open_store().read()["items"] == []
+    finally:
+        room.cleanup()
+    print("ok  TUI /new 本地命令（不进 timeline、不调用 host）")
 
 
 # ---- 持久确认时序与 close 竞态 ----
@@ -761,7 +900,10 @@ if __name__ == "__main__":
     test_acp_reconnect_load_keeps_cursor()
     test_acp_checkpoint_failure_no_commit()
     test_acp_prompt_failure_keeps_cursor()
+    test_acp_inactivity_timeout_commits_no_replay_cursor()
     test_tui_restore_display()
+    test_tui_ctrl_n_requests_fresh_named_session()
+    test_tui_slash_new_is_local_command()
     test_tui_user_append_failure_shows_error()
     test_agent_reply_append_failure_no_done()
     test_queued_dispatch_aborted_on_close()

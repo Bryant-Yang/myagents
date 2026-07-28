@@ -13,8 +13,9 @@
     每轮只发 cursor 之后的新消息（跳过 agent 自己的回复，那些本来就在
     它的 ACP session 里；首次 bootstrap 限发最近 N 条）。读 cursor →
     选增量 → stream → 推进 cursor 在每-agent delivery lock 内原子完成，
-    同一 agent 的并发 dispatch 严格串行；cursor 只在成功交付后推进，
-    失败不推进，下一轮补发增量，不丢上下文。
+    同一 agent 的并发 dispatch 严格串行。成功交付后推进 cursor；提交前
+    或服务端明确拒绝的失败不推进，下一轮补发；提交后结果不确定的失败先
+    建立 no-replay cursor，防止重复执行工具任务。
 - **并发扇出（fan-out）**：一条消息 @多个 agent 时并行派发，互不等待。
 - **Supervisor（中心协调者）**：注册表里的 host 是一个由 LLM 扮演的
   主持人。显式 @ 永远优先；用户没点名时，host 用一次调用直接回答或
@@ -38,8 +39,16 @@ from adapters.base import (
 from adapters.opencode_adapter import OpenCodeAdapter
 from codex_app_server.adapter import CodexAppServerAdapter
 from host import MODERATOR_TEMPLATE, HostAgent
-from storage.store import (MAX_READ_LIMIT, CorruptedStorageError, RoomLease,
-                           RoomStore, WorkdirMismatchError, normalize_workdir)
+from storage.store import (
+    DEFAULT_SESSION_NAME,
+    MAX_READ_LIMIT,
+    CorruptedStorageError,
+    RoomLease,
+    RoomStore,
+    WorkdirMismatchError,
+    normalize_session_name,
+    normalize_workdir,
+)
 
 HOST_NAME = "host"
 
@@ -64,6 +73,26 @@ class AgentSpec:
     factory: Callable[[], AgentAdapter]
 
 
+@dataclass(frozen=True)
+class AgentFailure:
+    """一轮 fan-out 中某个 worker 的终态失败。"""
+
+    agent: str
+    error: str
+
+
+@dataclass(frozen=True)
+class DispatchOutcome:
+    """Orchestrator 调度结果；所有 worker 都收尾后再汇总失败。"""
+
+    failures: tuple[AgentFailure, ...] = ()
+
+    def error_summary(self) -> str:
+        return "；".join(
+            f"{failure.agent}: {failure.error}"
+            for failure in self.failures)
+
+
 # 工人 agent 注册表：ACP-first，JSONL 保留为 fallback。
 # Kimi 是首个生产 ACP agent（命令 ["kimi", "acp"]）；
 # Codex 使用官方 app-server 长连接；旧 Codex JSONL adapter 保留为 fallback。
@@ -82,6 +111,7 @@ _PROMPT_TEMPLATE = """\
 
 {transcript}
 
+{assignment}
 请作为 {name}，针对用户最新的消息给出回复或执行其中的任务。
 要求：直接输出内容，不要自我介绍，不要复述上面的记录。
 如需读写文件、运行命令，都在当前目录内进行。
@@ -96,6 +126,7 @@ _ACP_PROMPT_TEMPLATE = """\
 
 {transcript}
 
+{assignment}
 请作为 {name}，针对最新的消息给出回复或执行其中的任务。
 要求：直接输出内容，不要自我介绍，不要复述上面的记录。
 如需读写文件、运行命令，都在当前目录内进行。
@@ -142,8 +173,10 @@ class Orchestrator:
     def __init__(self, workdir: str, history_limit: int = 12,
                  specs: tuple[AgentSpec, ...] = AGENT_SPECS, *,
                  store: RoomStore | None = None,
-                 persistent: bool = True) -> None:
+                 persistent: bool = True,
+                 session_name: str = DEFAULT_SESSION_NAME) -> None:
         self.workdir = workdir
+        self.session_name = normalize_session_name(session_name)
         self.history_limit = history_limit
         self.specs = specs
         self.adapters: dict[str, AgentAdapter] = {
@@ -154,22 +187,28 @@ class Orchestrator:
         # 主持人由 codex 扮演，用 read-only 沙箱：总结/仲裁/路由只需要看，不需要写。
         self.host = HostAgent(adapter=CodexAppServerAdapter(
                                   sandbox="read-only",
+                                  approval_policy="never",
                                   reuse_thread=False,
                                   ephemeral_thread=True),
                               workers=[spec.name for spec in specs])
         self.adapters[HOST_NAME] = self.host
-        # 持久化：persistent=True 默认按 workdir 打开 RoomStore；调用方也
-        # 可注入自己的 store（必须属于同一 workdir，fail loudly 不静默换房）。
+        # 持久化：persistent=True 默认按 workdir/session 打开 RoomStore；
+        # 调用方也可注入自己的 store（必须属于同一房间，fail loudly）。
         # persistent=False 用于测试/一次性场景，不触碰任何磁盘状态。
         if not persistent and store is not None:
             raise ValueError("persistent=False 时不接受 store 参数")
         self.store: RoomStore | None = None
         if persistent:
             if store is None:
-                store = RoomStore(workdir)
+                store = RoomStore(
+                    workdir, session_name=self.session_name)
             elif store.workdir != normalize_workdir(workdir):
                 raise WorkdirMismatchError(
                     f"store 属于 {store.workdir!r}，与 workdir {workdir!r} 不一致")
+            elif store.session_name != self.session_name:
+                raise WorkdirMismatchError(
+                    f"store 属于会话 {store.session_name!r}，"
+                    f"与请求会话 {self.session_name!r} 不一致")
             self.store = store
         self.history: list[Message] = []
         # 无 store 时的内存 seq 分配起点；有 store 时 seq 来自 timeline。
@@ -186,8 +225,9 @@ class Orchestrator:
                 after_seq = page["next_after_seq"]
                 if not page["has_more"]:
                     break
-        # 每个有状态（ACP）agent 的 history cursor：已交付到 timeline 的哪个
-        # seq（持久化序号，不是 list 下标）。只增不减；只在成功交付后推进。
+        # 每个有状态（ACP）agent 的 history cursor：不应自动重放到 timeline
+        # 的哪个 seq（持久化序号，不是 list 下标）。只增不减；成功交付或
+        # post-submit 结果不确定时推进，明确未提交的失败保持旧值。
         # 有 store 时从 state.json 恢复；cursor 超出当前 timeline 最大 seq
         # 说明状态与历史脱节，fail loudly——静默跳过会丢上下文。
         self._cursors: dict[str, int] = {}
@@ -317,20 +357,44 @@ class Orchestrator:
             msgs = [m for m in snapshot if m.speaker != name][-1:]
         return msgs, snapshot_end_seq
 
-    def _build_prompt(self, agent_name: str, messages: list[Message]) -> str:
+    def _build_prompt(
+            self, agent_name: str, messages: list[Message],
+            assignment: str | None = None) -> str:
         transcript = self._format(messages)
         if agent_name == HOST_NAME:
             template = MODERATOR_TEMPLATE
+            return template.format(name=agent_name, transcript=transcript)
         elif getattr(self.adapters[agent_name], "stateful_session", False):
             template = _ACP_PROMPT_TEMPLATE
         else:
             template = _PROMPT_TEMPLATE
-        return template.format(name=agent_name, transcript=transcript)
+        assignment_block = ""
+        if assignment:
+            assignment_block = (
+                "主持人本轮明确委托：\n"
+                f"{assignment.strip()[:4000]}\n"
+                "请直接执行完整任务；除非存在无法自行解决的真实阻塞，"
+                "不要把任务退回给主持人或用户，也不要只给候选方案等待确认。\n"
+            )
+        return template.format(
+            name=agent_name,
+            transcript=transcript,
+            assignment=assignment_block,
+        )
+
+    @staticmethod
+    def _fallback_assignment(user_text: str) -> str:
+        """host 旧格式/畸形 tasks 的安全退化：仍给 worker 明确执行语义。"""
+        return (
+            "直接完成用户最新请求。若请求同时包含构思、规划、实现或验证，"
+            "这些步骤都由你完成，不要等待主持人另发方案。\n"
+            f"用户原始请求：{user_text[:3000]}"
+        )
 
     # ---- 派发 ----
 
     async def dispatch(self, user_text: str, on_event: EventCallback,
-                       command_id: str | None = None) -> None:
+                       command_id: str | None = None) -> DispatchOutcome:
         """处理一条用户消息：记录 → 路由 → 并发派发 → 收回回复。
 
         路由规则：**显式 @ 永远优先**；用户没点名时交给 host 一次处理
@@ -345,6 +409,9 @@ class Orchestrator:
         meta={"seq": ..., "command_id": ...}))`——
         UI 据此再显示用户文本，append 失败时什么都不显示。
         closed 后拒绝 dispatch，不写 timeline。
+
+        返回所有 target 收尾后的 DispatchOutcome；单个 worker 失败不取消
+        其他 target，由调用方据 failures 决定 command 终态。
         """
         if self._closed:
             raise OrchestratorClosedError("Orchestrator 已关闭，拒绝 dispatch")
@@ -361,14 +428,29 @@ class Orchestrator:
         snapshot = list(self.history)
         snapshot_text = self._format(snapshot[-self.history_limit:])
         targets = self.parse_mentions(user_text)
-        if not targets:
+        routed_by_host = not targets
+        assignments: dict[str, str] = {}
+        if routed_by_host:
             # decide 不在 _run_one 的异常保护里，自己兜底。契约：
             # 路由失败 → error 事件 + 确定性回退到第一个工人（可用性
             # 最高的路径）。绝不回退到 host adapter 本身——路由失败
             # 大概率就是它挂了，再调一次只会伪造出"无文本回复"。
+            on_event(HOST_NAME, AgentEvent(
+                "status",
+                "正在路由",
+                meta={"agent_state": "running", "phase": "路由"},
+            ))
             try:
                 decision = await self.host.decide(
-                    snapshot_text, self.workdir)
+                    snapshot_text,
+                    self.workdir,
+                    lambda event: self._emit_adapter_event(
+                        on_event, HOST_NAME, event),
+                )
+            except _EventCallbackError as exc:
+                # host 进度事件与 worker 事件使用同一持久化失败契约：
+                # sink 失败必须穿透，不能伪装成路由失败后继续派发。
+                raise exc.cause from exc
             except Exception as exc:
                 on_event(HOST_NAME, AgentEvent("error", f"host 处理失败：{exc}"))
                 targets = [self.specs[0].name]
@@ -378,24 +460,56 @@ class Orchestrator:
                     # host 在“判断是否路由”的同一次 LLM 调用里已经给出最终
                     # 回答，直接落时间线；不再二次调用 host adapter。
                     on_event(HOST_NAME, AgentEvent(
-                        "info", "host 直接回答（单次调用）"))
+                        "info",
+                        "host 直接回答（单次调用）",
+                        meta={"phase": "直接回答"},
+                    ))
                     on_event(HOST_NAME, AgentEvent("text", decision.answer))
                     self._append_message(
                         HOST_NAME, decision.answer, command_id=command_id)
                     on_event(HOST_NAME, AgentEvent(
                         "done", meta={"hostAnswered": True}))
-                    return
+                    return DispatchOutcome()
                 targets, reason = decision.targets, decision.reason
+                assignments = {
+                    name: decision.tasks.get(name)
+                    or self._fallback_assignment(user_text)
+                    for name in targets
+                }
             on_event(HOST_NAME, AgentEvent(
-                "info", f"路由 → {'、'.join(targets)}（{reason}）"))
-        await asyncio.gather(
-            *(self._run_one(name, on_event, snapshot, command_id)
+                "info",
+                f"路由 → {'、'.join(targets)}（{reason}）",
+                meta={
+                    "route_targets": list(targets),
+                    "phase": "路由完成",
+                },
+            ))
+            for name in targets:
+                assignments.setdefault(
+                    name, self._fallback_assignment(user_text))
+        for name in targets:
+            on_event(name, AgentEvent(
+                "status",
+                "已接收任务，准备执行",
+                meta={"agent_state": "running", "phase": "准备执行"},
+            ))
+        results = await asyncio.gather(
+            *(self._run_one(
+                name, on_event, snapshot, command_id,
+                assignments.get(name))
               for name in targets)
         )
+        failures = tuple(
+            AgentFailure(name, error)
+            for name, error in zip(targets, results)
+            if error is not None
+        )
+        return DispatchOutcome(failures)
 
     async def _run_one(self, name: str, on_event: EventCallback,
                        snapshot: list[Message],
-                       command_id: str | None = None) -> None:
+                       command_id: str | None = None,
+                       assignment: str | None = None) -> str | None:
         adapter = self.adapters[name]
         if getattr(adapter, "stateful_session", False):
             # P1 契约：读 cursor → 选增量 → stream 完整执行 → 推进 cursor
@@ -412,16 +526,17 @@ class Orchestrator:
                     # ACP restore 原语：prepare 与 prompt 同一锁生命周期，
                     # checkpoint（cursor/session_id）在 prompt 前原子提交。
                     failed, delivered_upto = await self._deliver_prepared(
-                        name, adapter, on_event, command_id)
+                        name, adapter, on_event, command_id, assignment)
                 else:
                     # 无 stream_prepared 的 stateful fake：纯内存 seq 路径
                     messages, delivered_upto = self._messages_for(name)
                     failed = await self._deliver(name, adapter, messages,
-                                                 on_event, command_id)
+                                                 on_event, command_id,
+                                                 assignment)
                 if failed is None:
                     # 成功交付后才推进 cursor，且只推进到本轮构造时的快照
-                    # 末尾 seq：1) 失败不推进——下轮从旧 cursor 补发，不丢
-                    # 上下文；2) 本轮进行期间到达的新消息没发出去，必须留给
+                    # 末尾 seq：1) 明确未提交的失败不推进——下轮从旧 cursor
+                    # 补发，不丢上下文；2) 本轮进行期间到达的新消息没发出去，必须留给
                     # 下一轮；3) 自己的回复靠 speaker 过滤跳过。
                     # post-submit no-replay 例外已在 _deliver_prepared 的
                     # 专门异常分支里先持久化，不会走到这里。
@@ -429,15 +544,17 @@ class Orchestrator:
                     # 写失败向 dispatch 传播，内存/磁盘 cursor 都不动，
                     # 下一轮按旧 cursor 补发。
                     self._commit_cursor(name, delivered_upto)
+                return failed
         else:
             # 无状态（JSONL）agent：dispatch 瞬间的 transcript 快照
-            await self._deliver(name, adapter,
-                                snapshot[-self.history_limit:], on_event,
-                                command_id)
+            return await self._deliver(
+                name, adapter, snapshot[-self.history_limit:], on_event,
+                command_id, assignment)
 
     async def _deliver_prepared(self, name: str, adapter: AgentAdapter,
                                 on_event: EventCallback,
-                                command_id: str | None = None
+                                command_id: str | None = None,
+                                assignment: str | None = None
                                 ) -> tuple[str | None, int]:
         """ACP 路径：session prepare 与 prompt 在 adapter writer lock 内
         原子完成；返回（失败信息, 交付目标 seq）。
@@ -475,7 +592,7 @@ class Orchestrator:
             self._cursors[name] = chosen
             messages, upto = self._messages_for(name)
             delivered["upto"] = upto
-            return self._build_prompt(name, messages)
+            return self._build_prompt(name, messages, assignment)
 
         parts: list[str] = []
         failed: str | None = None
@@ -520,6 +637,8 @@ class Orchestrator:
         # "无文本回复"只留给调用成功但真没说话的情况。
         reply = "".join(parts).strip()
         if reply:
+            if failed is not None:
+                reply += f"\n\n（调用失败：{failed[:120]}）"
             self._append_message(name, reply, command_id=command_id)
         elif failed is not None:
             self._append_message(name, f"（调用失败：{failed[:120]}）",
@@ -534,9 +653,10 @@ class Orchestrator:
     async def _deliver(self, name: str, adapter: AgentAdapter,
                        messages: list[Message],
                        on_event: EventCallback,
-                       command_id: str | None = None) -> str | None:
+                       command_id: str | None = None,
+                       assignment: str | None = None) -> str | None:
         """执行一轮并把结果写回 history；返回失败信息（None = 成功）。"""
-        prompt = self._build_prompt(name, messages)
+        prompt = self._build_prompt(name, messages, assignment)
         parts: list[str] = []
         failed: str | None = None
         done_meta: dict = {}
@@ -558,6 +678,8 @@ class Orchestrator:
         # "无文本回复"只留给调用成功但真没说话的情况。
         reply = "".join(parts).strip()
         if reply:
+            if failed is not None:
+                reply += f"\n\n（调用失败：{failed[:120]}）"
             self._append_message(name, reply, command_id=command_id)
         elif failed is not None:
             self._append_message(name, f"（调用失败：{failed[:120]}）",

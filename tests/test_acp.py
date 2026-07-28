@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from acp.adapter import AcpAdapter
 from acp.client import AcpClient, AcpError
+from adapters.base import AgentDeliveryUncertainError
 
 SERVER = str(Path(__file__).parent / "fake_acp_server.py")
 STATE = "/tmp/myagents_fake_acp_state"
@@ -116,6 +117,39 @@ def test_permission_auto_optin() -> None:
     print("ok  权限 auto 需显式 opt-in")
 
 
+def test_permission_wait_pauses_inactivity_timeout() -> None:
+    """等待人类权限选择不是 agent 静默；等待时间可超过 inactivity 阈值。"""
+    async def run() -> None:
+        reset_state()
+
+        async def slow_human(_params: dict) -> dict:
+            await asyncio.sleep(0.2)
+            return {"outcome": "selected", "optionId": "allow"}
+
+        adapter = AcpAdapter(
+            "fake",
+            [sys.executable, SERVER],
+            inactivity_timeout=0.05,
+            cancel_timeout=0.05,
+            permission_handler=slow_human,
+        )
+        texts = [
+            event.text
+            async for event in adapter.stream("需要 perm 一下", "/tmp")
+            if event.kind == "text"
+        ]
+        assert texts == ["PO", "NG"]
+        permission = [
+            item for item in state_events()
+            if item.startswith("permission:")
+        ][0]
+        assert '"outcome": "selected"' in permission
+        await adapter.aclose()
+
+    asyncio.run(run())
+    print("ok  人类权限等待暂停 ACP inactivity timeout")
+
+
 def test_cancel_notification() -> None:
     async def run() -> None:
         reset_state()
@@ -198,7 +232,7 @@ def test_inactivity_timeout_unblocks_next_round() -> None:
         try:
             await asyncio.wait_for(consume_stalled(), timeout=0.8)
             raise AssertionError("无活动的流应该超时")
-        except AcpError as exc:
+        except AgentDeliveryUncertainError as exc:
             assert "无活动" in str(exc), exc
 
         assert adapter._client is not old_client
@@ -369,6 +403,59 @@ def test_adapter_observability_without_thought_content() -> None:
         await adapter.aclose()
     asyncio.run(run())
     print("ok  ACP 可观测事件不暴露 thought 正文")
+
+
+def test_tool_update_spam_is_coalesced_and_keeps_context() -> None:
+    """同一工具的重复状态没有信息增量；只保留状态迁移并继承初始标题。"""
+    async def run() -> None:
+        adapter = AcpAdapter("fake", [sys.executable, SERVER])
+        events = [
+            event async for event in adapter.stream(
+                "observe tool-spam", "/tmp")
+        ]
+        tools = [event for event in events if event.kind == "tool"]
+        assert [event.meta.get("status") for event in tools] == [
+            None, "in_progress", "completed"
+        ], [(event.kind, event.text, event.meta) for event in events]
+        assert all(event.text == "检查 JavaScript" for event in tools), tools
+        assert all(
+            event.meta.get("tool_call_id") == "tool-1" for event in tools)
+        assert not [
+            event for event in events
+            if event.kind == "status"
+            and event.meta.get("tool_call_id") == "tool-1"
+        ], events
+        assert len([
+            event for event in events if event.kind == "activity"
+        ]) == 199
+        await adapter.aclose()
+
+    asyncio.run(run())
+    print("ok  ACP 工具状态去重 + 标题继承")
+
+
+def test_active_tool_uses_separate_inactivity_watchdog() -> None:
+    """长工具静默可超过普通 120s 等价阈值，但仍受独立 watchdog 约束。"""
+    async def run() -> None:
+        adapter = AcpAdapter(
+            "fake",
+            [sys.executable, SERVER],
+            inactivity_timeout=0.05,
+            tool_inactivity_timeout=0.4,
+        )
+        events = [
+            event async for event in adapter.stream(
+                "observe tool-pause", "/tmp")
+        ]
+        tools = [event for event in events if event.kind == "tool"]
+        assert [event.meta.get("status") for event in tools] == [
+            None, "in_progress", "completed"
+        ], tools
+        assert events[-1].kind == "done"
+        await adapter.aclose()
+
+    asyncio.run(run())
+    print("ok  ACP 活跃长工具使用独立 inactivity watchdog")
 
 
 def test_restore_load_success() -> None:
@@ -705,6 +792,7 @@ if __name__ == "__main__":
     test_prompt_streaming()
     test_permission_default_deny()
     test_permission_auto_optin()
+    test_permission_wait_pauses_inactivity_timeout()
     test_cancel_notification()
     test_cancel_serialization()
     test_cancel_timeout_rebuild()
@@ -716,6 +804,8 @@ if __name__ == "__main__":
     test_aclose_serialized_with_stream()
     test_adapter_bridge()
     test_adapter_observability_without_thought_content()
+    test_tool_update_spam_is_coalesced_and_keeps_context()
+    test_active_tool_uses_separate_inactivity_watchdog()
     test_restore_load_success()
     test_restore_load_error_fallback_new()
     test_restore_unsupported_fallback_new()

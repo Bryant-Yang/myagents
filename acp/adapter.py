@@ -15,8 +15,9 @@
    并标记必须重建。锁只在确认停止或连接关闭后才释放——
    下一轮 prompt 绝不与仍在执行的上一轮重叠。
 3. **无活动必须回收**：prompt 连续一段时间没有任何 ACP 通知或终止响应，
-   视为上游卡死，自动取消本轮；取消也不确认时重建连接，避免永久堵住
-   串行 CommandBus。
+   且当前不在等待人类权限时，视为上游卡死，自动取消本轮；取消也不确认
+   时重建连接，避免永久堵住串行 CommandBus。prompt 已提交后的超时属于
+   结果不确定，必须形成 no-replay 边界。
 
 会话所有权：一个 AcpAdapter 实例是它 session 的唯一 writer。
 不要把这个 session id 交给别的进程（普通 kimi TUI、另一个 adapter）并发写。
@@ -34,12 +35,21 @@ import contextlib
 from dataclasses import dataclass
 from typing import AsyncIterator, Awaitable, Callable
 
-from adapters.base import AgentEvent, redact_sensitive_text
+from adapters.base import (
+    AgentDeliveryUncertainError,
+    AgentEvent,
+    redact_sensitive_text,
+)
 
 from .client import AcpClient, AcpError, PermissionHandler
 
 _CANCEL_TIMEOUT = 10  # 等 agent 确认 cancelled 的有限超时（秒）
 _INACTIVITY_TIMEOUT = 120  # prompt 连续无任何 ACP 事件的上限（秒）
+_TOOL_INACTIVITY_TIMEOUT = 900  # 活跃工具允许更长的无输出窗口（秒）
+_TERMINAL_TOOL_STATUSES = {
+    "completed", "succeeded", "success", "failed", "error",
+    "declined", "cancelled", "canceled",
+}
 
 # 通用 agent-aware 权限决策器：async (agent_name, params) -> outcome。
 # orchestrator 用它把 TUI 决策注入所有 ACP adapter（通用 runtime 里弹窗必须
@@ -80,12 +90,15 @@ class AcpAdapter:
         permission: str = "deny",  # 默认拒绝；auto 必须显式 opt-in
         cancel_timeout: float = _CANCEL_TIMEOUT,
         inactivity_timeout: float = _INACTIVITY_TIMEOUT,
+        tool_inactivity_timeout: float = _TOOL_INACTIVITY_TIMEOUT,
         permission_handler: PermissionHandler | None = None,
     ) -> None:
         if cancel_timeout <= 0:
             raise ValueError("cancel_timeout 必须大于 0")
         if inactivity_timeout <= 0:
             raise ValueError("inactivity_timeout 必须大于 0")
+        if tool_inactivity_timeout <= 0:
+            raise ValueError("tool_inactivity_timeout 必须大于 0")
         self.name = name
         self.session_id: str | None = None
         self._cmd = cmd
@@ -93,6 +106,7 @@ class AcpAdapter:
         self._permission_handler = permission_handler
         self._cancel_timeout = cancel_timeout
         self._inactivity_timeout = inactivity_timeout
+        self._tool_inactivity_timeout = tool_inactivity_timeout
         self._client = AcpClient(cmd, permission=permission,
                                  permission_handler=permission_handler)
         self._started = False
@@ -226,23 +240,58 @@ class AcpAdapter:
         """锁内执行一轮 prompt 并映射事件；取消契约见 stream_prepared。"""
         updates: asyncio.Queue = asyncio.Queue()
         seen_status: set[str] = set()
+        pending_permissions: set[int] = set()
+        tool_contexts: dict[str, dict[str, str]] = {}
+        tool_fingerprints: dict[str, tuple[str, str, str, str]] = {}
+        active_tools: set[str] = set()
+        last_tool_key: str | None = None
 
         def on_notify(method: str, params: dict) -> None:
             if params.get("sessionId") == session_id:
                 updates.put_nowait((method, params))
 
+        def on_permission_activity(
+                phase: str, request_id: int, params: dict) -> None:
+            if params.get("sessionId") == session_id:
+                updates.put_nowait((
+                    "__permission_activity__",
+                    {"phase": phase, "request_id": request_id},
+                ))
+
         self._client.on_notification = on_notify
+        self._client.on_permission_activity = on_permission_activity
         task = asyncio.create_task(self._client.prompt(session_id, prompt))
         task.add_done_callback(lambda t: updates.put_nowait(("__done__", t)))
         try:
             while True:
                 try:
-                    method, payload = await asyncio.wait_for(
-                        updates.get(), timeout=self._inactivity_timeout)
+                    if pending_permissions:
+                        # 人类审批时长不属于 agent 静默。取消/关闭仍会直接
+                        # cancel 本协程，不会因无 timeout 而失去退出能力。
+                        method, payload = await updates.get()
+                    else:
+                        timeout = (
+                            self._tool_inactivity_timeout
+                            if active_tools else self._inactivity_timeout
+                        )
+                        method, payload = await asyncio.wait_for(
+                            updates.get(), timeout=timeout)
                 except asyncio.TimeoutError:
-                    raise AcpError(
-                        f"ACP 会话连续 {self._inactivity_timeout:g} 秒无活动，"
+                    timeout = (
+                        self._tool_inactivity_timeout
+                        if active_tools else self._inactivity_timeout
+                    )
+                    scope = "活跃工具" if active_tools else "会话"
+                    raise AgentDeliveryUncertainError(
+                        f"ACP {scope}连续 {timeout:g} 秒无活动，"
                         "已取消本轮请求") from None
+                if method == "__permission_activity__":
+                    request_id = payload["request_id"]
+                    if payload["phase"] == "requested":
+                        pending_permissions.add(request_id)
+                    else:
+                        pending_permissions.discard(request_id)
+                    continue
                 if method == "__done__":
                     result = payload.result()  # 失败在此抛出，交给编排器兜底
                     yield AgentEvent("done", meta={
@@ -273,24 +322,80 @@ class AcpAdapter:
                         value = raw_input.get("command")
                         if isinstance(value, str):
                             command = redact_sensitive_text(value)
+                    tool_call_id = update.get("toolCallId")
+                    tool_key = str(tool_call_id or title)
+                    last_tool_key = tool_key
+                    tool_kind = str(update.get("kind") or "")
+                    status_value = str(update.get("status") or "")
+                    if status_value.lower() in _TERMINAL_TOOL_STATUSES:
+                        active_tools.discard(tool_key)
+                    else:
+                        active_tools.add(tool_key)
+                    tool_contexts[tool_key] = {
+                        "title": title,
+                        "command": command,
+                        "kind": tool_kind,
+                    }
+                    tool_fingerprints[tool_key] = (
+                        title, status_value, command, tool_kind)
                     yield AgentEvent("tool", title, meta={
-                        "tool_call_id": update.get("toolCallId"),
-                        "tool_kind": update.get("kind"),
+                        "tool_call_id": tool_call_id,
+                        "tool_kind": tool_kind or None,
                         "status": update.get("status"),
                         "command": command,
                     })
                 elif kind == "tool_call_update":
+                    tool_call_id = update.get("toolCallId")
+                    fallback_key = str(
+                        tool_call_id or update.get("title")
+                        or last_tool_key or "工具调用")
+                    previous = tool_contexts.get(fallback_key, {})
                     title = redact_sensitive_text(
-                        str(update.get("title") or "工具调用"),
+                        str(update.get("title")
+                            or previous.get("title")
+                            or "工具调用"),
                         limit=500,
                     )
+                    command = previous.get("command", "")
+                    raw_input = update.get("rawInput")
+                    if isinstance(raw_input, dict):
+                        value = raw_input.get("command")
+                        if isinstance(value, str):
+                            command = redact_sensitive_text(value)
+                    tool_kind = str(
+                        update.get("kind") or previous.get("kind") or "")
                     status_value = redact_sensitive_text(
                         str(update.get("status") or "updated"),
                         limit=200,
                     )
-                    yield AgentEvent(
-                        "status", f"{title}：{status_value}",
-                        meta={"tool_call_id": update.get("toolCallId")})
+                    if status_value.lower() in _TERMINAL_TOOL_STATUSES:
+                        active_tools.discard(fallback_key)
+                    else:
+                        active_tools.add(fallback_key)
+                    fingerprint = (
+                        title, status_value, command, tool_kind)
+                    # Kimi 可能在一次工具调用中高频发送完全相同的
+                    # in_progress update。它们证明连接活着，但对消费者没有
+                    # 新信息；只保留可见状态迁移。
+                    if tool_fingerprints.get(fallback_key) == fingerprint:
+                        yield AgentEvent("activity", meta={
+                            "tool_call_id": tool_call_id,
+                            "phase": "tool",
+                        })
+                        continue
+                    tool_fingerprints[fallback_key] = fingerprint
+                    tool_contexts[fallback_key] = {
+                        "title": title,
+                        "command": command,
+                        "kind": tool_kind,
+                    }
+                    yield AgentEvent("tool", title, meta={
+                        "tool_call_id": tool_call_id,
+                        "tool_kind": tool_kind or None,
+                        "status": update.get("status") or "updated",
+                        "command": command,
+                        "update": True,
+                    })
                 elif kind in {
                         "plan", "available_commands_update",
                         "current_mode_update", "config_option_update"}:
@@ -299,6 +404,8 @@ class AcpAdapter:
                         seen_status.add(status)
                         yield AgentEvent("status", status)
         finally:
+            if self._client.on_permission_activity is on_permission_activity:
+                self._client.on_permission_activity = None
             if not task.done():
                 # 取消契约：先通知中断，再等确认；锁在整个 finally
                 # 期间一直持有，下一轮不会提前开始。

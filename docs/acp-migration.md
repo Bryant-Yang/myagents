@@ -93,9 +93,11 @@ ACP session 是持久上下文，编排器**不再**每轮转发完整 transcrip
   推进 cursor 是原子单元，在该 agent 的 delivery lock 内完成，prompt
   拿到锁之后才构造。同一 agent 的并发 dispatch 严格串行（不重复、
   顺序保持）；不同 agent 持不同的锁，并行扇出不受影响。
-- **cursor 只在该轮成功交付后推进**，且只推进到本轮构造时的快照末尾
-  （本轮进行期间到达的新消息留给下一轮）。失败不推进——下一轮从旧
-  cursor 补发增量，不丢上下文；也不会退化成全量重发。
+- **cursor 成功交付后推进**，且只推进到本轮构造时的快照末尾（本轮进行期间
+  到达的新消息留给下一轮）。prompt 提交前或服务端明确拒绝的失败不推进，
+  下一轮从旧 cursor 补发；prompt 已提交后的 inactivity timeout 等结果不确定
+  失败必须先提交同一快照末尾的 no-replay cursor，再公开失败，避免工具任务
+  被重复执行。
 - 无状态 JSONL fallback 不受影响：仍用 dispatch 瞬间的完整 transcript 快照
   （最近 12 条，防并发串话）。
 
@@ -113,7 +115,8 @@ RoomStore（`storage/store.py`）把房间状态落盘到
   都在构造阶段抛 `CorruptedStorageError`）。
 - **seq cursor**：cursor 从 list 下标改为持久 timeline seq。`_messages_for`
   按 `m.seq > cursor` 选增量，cursor=0 才走 `history_limit` bootstrap；
-  成功交付后先 `set_agent_state` 落盘再更新内存。
+  成功交付或提交后结果不确定的 no-replay 边界，都先 `set_agent_state`
+  落盘再更新内存；明确未提交的失败保持旧 cursor。
 - **checkpoint-before-prompt**：ACP 轮次走
   `stream_prepared(make_prompt, workdir, resume_session_id)`——prepare
   （start/load/new）与 prompt 在同一 writer lock 生命周期内。make_prompt
@@ -156,7 +159,8 @@ client 声明 `fs/terminal` 能力为 false（不代理文件/终端）。
    抛异常，一律按 cancelled 回应（`_validate_outcome`），绝不向 agent
    发无效 outcome。
 
-等待用户决策期间不阻塞 read loop（独立 task 应答）；等待可取消——
+等待用户决策期间不阻塞 read loop（独立 task 应答），并暂停 adapter 的
+agent inactivity timeout；权限结果发回后重新开始普通静默计时。等待仍可取消——
 TUI 退出时所有挂起的权限 Future 按 cancelled 收尾（`on_unmount` →
 `_cancel_pending_permissions` → `orch.aclose()`，顺序不能反：aclose
 等的锁可能被等权限的 prompt 持有），不留挂起 Future 或 `kimi acp`
@@ -170,6 +174,12 @@ TUI 退出时所有挂起的权限 Future 按 cancelled 收尾（`on_unmount` �
 （下轮 stream 重新 start + session/new）。adapter 的锁只在确认停止或
 连接关闭后释放——下一轮 prompt 绝不与仍在执行的上一轮重叠。
 
+不在等待人工权限且没有活跃工具时，prompt 连续 120 秒无 ACP 通知或终止响应
+会触发 inactivity cancel；工具已创建且尚未进入终态时改用独立 15 分钟
+watchdog，避免工程子代理和长命令被普通分析阈值误杀。由于 prompt 已经提交，
+这不是安全重试点：
+Orchestrator 必须先持久化 no-replay cursor，再记录调用失败。
+
 ## 生命周期（Phase 2 新增）
 
 TUI 退出时 `Orchestrator.aclose()` 统一关闭所有支持 `aclose()` 的
@@ -181,6 +191,13 @@ prompt/session 初始化共用 adapter 的同一把锁，不竞态杀进程。
 - TUI 启动行显示每个 agent 的传输协议：`@kimi(ACP) @opencode(JSONL)
   @codex(APP-SERVER)`。
 - ACP session id 建立后通过 info 事件展示一次（每次建立一次，不刷屏）。
+- `tool_call` 保存脱敏后的 title/command；后续 `tool_call_update` 按
+  `toolCallId` 继承上下文，只在 title/status/command/kind 的可见指纹变化时
+  产出事件。完全相同的高频 `in_progress` 仍被视为协议活动，但不进入 TUI
+  或持久日志；TUI 将同一工具的状态迁移原位更新，命令详情默认折叠并通过
+  `/details` 切换。
+- 固定任务区显示 command 总状态、累计耗时及每个 agent 的阶段/终态；
+  fan-out 中既有成功又有失败时显示“部分完成”，不抹掉成功 agent 的事实。
 
 ## 阶段计划
 

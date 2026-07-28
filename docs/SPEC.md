@@ -2,7 +2,7 @@
 
 <!-- harness:behaviour-evidence=canonical-source -->
 
-> 作者：Bryant Yang　最近更新：2026-07-27
+> 作者：Bryant Yang　最近更新：2026-07-28
 >
 > 本文是关键用户行为与独立证据的唯一事实源。工程边界见
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -18,6 +18,7 @@
 | M3 | 完成 | 内部 command bus、私有 Unix 控制 socket、MCP stdio 外部入口 |
 | M3.1 | 完成 | 持久执行事件、heartbeat、权限/工具上下文、精确取消（七个 MCP 工具） |
 | M4 | 完成 | Codex app-server 长连接、thread/turn 事件、取消、审批与 JSONL fallback |
+| M4.2 | 完成 | 同一项目独立会话、默认房间兼容、TUI 安全切换与外部 selector |
 
 ## 1. 角色
 
@@ -36,12 +37,34 @@
 - **主流程**：消息写入 history；显式 targets 去重；不同 agent 并发处理；回复
   回到共享时间线。
 - **异常分支**：未知 mention 被忽略；单个 agent 失败编码为 error/history，
-  不拖垮其他 target。
-- **验收**：显式 @ 绕过 host；多个 target 各执行一次；并发消息使用正确快照。
-- **独立证据来源**：接入 Harness 前已存在的 `tests/test_basic.py`
-  路由、fan-out、快照和失败回退测试。
+  不拖垮其他 target；所有 target 收尾后，Orchestrator 用 `DispatchOutcome`
+  汇总失败，CommandBus 将本轮标为 `failed`。失败前已有 partial 时，时间线
+  必须明确标注“调用失败”，不能伪装成正常答复。
+- **验收**：显式 @ 绕过 host；多个 target 各执行一次；并发消息使用正确快照；
+  任一 worker 失败时 command 失败，但其他 worker 仍完成。
+- **独立证据来源**：`tests/test_basic.py` 的路由、fan-out、快照和失败回退测试；
+  `tests/test_m3_bus.py` 的 fan-out 失败终态测试。
 - **人工验收边界**：TUI 中多段流式回复的可读性与交错体验由用户验收。
 - **里程碑**：M0。
+
+### UC-ROUTE-002 host 明确委托
+
+- **角色 / 触发**：用户未使用 `@`，但最新消息需要 worker 执行，例如“你构思
+  一个小游戏，让 Kimi 实现”。
+- **主流程**：host 在一次纯路由调用中选择 target，并为每个 target 生成完整、
+  可执行的 `task`；Orchestrator 将该 task 作为一次性 assignment 注入 worker
+  本轮 prompt，不写入共享 timeline。
+- **异常分支**：host 返回旧格式或遗漏 task 时，Orchestrator 用原始用户请求
+  生成执行型回退指令；worker 仍需自行完成构思、实现与验证，不能等待 host
+  再发方案。路由阶段禁止工具、文件、命令、网络和 skill；底层若仍产生安全
+  status/tool/permission 事件，实时进入 TUI 与执行日志，不得静默吞掉。
+- **验收**：JSONL 与 stateful/ACP 两条投递路径均收到明确 assignment；非法
+  target 的 task 被过滤；host 直接回答路径不产生 assignment。
+- **独立证据来源**：`tests/test_basic.py` 的明确任务解析、stateful 透传、
+  旧格式回退、路由 prompt 和 host 进度事件透传测试。
+- **人工验收边界**：真实模型对开放式任务的完成质量仍由用户验收；自动化测试
+  只证明委托没有在协议层丢失。
+- **里程碑**：M4。
 
 ### UC-ACP-001 有状态增量上下文
 
@@ -49,8 +72,9 @@
 - **前置条件**：adapter 声明 `stateful_session=True`。
 - **主流程**：首次仅 bootstrap 最近 `history_limit` 条；后续只发 cursor 后的新
   消息并过滤 agent 自己回复；成功后推进 cursor。
-- **异常分支**：失败不推进 cursor；同 agent 并发 dispatch 在 delivery lock 内
-  串行；不同 agent 仍可并行。
+- **异常分支**：prompt 提交前或服务端明确拒绝的失败不推进 cursor；提交后
+  静默超时等结果不确定失败先持久化 no-replay cursor，再公开失败。同 agent
+  并发 dispatch 在 delivery lock 内串行；不同 agent 仍可并行。
 - **验收**：不重复旧消息、不丢跨 agent 消息、不乱序、首次发送有界。
 - **独立证据来源**：`tests/test_phase2.py` fake stateful adapter；Codex 在实现后
   独立构造过并发复现，确认修复前第二轮重复 first、修复后回归通过。
@@ -65,8 +89,10 @@
   本次 options 内非空 optionId。
 - **异常分支**：无处理器、取消、异常、None、空或未知 optionId 全部 cancelled。
 - **验收**：等待用户时 read loop 不阻塞；合法 allow/reject 能回传；畸形结果
-  fail-closed。
+  fail-closed；权限请求到结果发回期间暂停 agent inactivity timeout，用户等待
+  超过该 timeout 也不会误判 agent 卡死。
 - **独立证据来源**：`tests/fake_acp_server.py` + ACP/Phase 2 contract tests；
+  `tests/test_acp.py::test_permission_wait_pauses_inactivity_timeout`；
   2026-07-26 在临时目录用真实 Kimi Code CLI 0.29.1 + Textual TUI 验证实际
   `allow_once / allow_always / reject_once` options，选择 `allow_once` 后探针
   文件内容正确；严格 optionId 成员校验落地后再次真实复验通过。
@@ -80,9 +106,11 @@
 - **前置条件**：子进程使用独立进程组，adapter 拥有 session。
 - **主流程**：发送 cancel；等待原 prompt 结束；TUI 先收尾权限 Future，再
   `aclose`；SIGTERM 超时后 SIGKILL。
-- **异常分支**：prompt 连续 120 秒无任何 ACP 事件则自动 cancel；cancel
-  不确认则连接作废并在下轮重建；断线使 pending request 立即失败。
-- **验收**：下一轮不与旧 prompt 重叠；fake 子孙进程和 ACP server 均无残留。
+- **异常分支**：不在等待人工权限时，prompt 连续 120 秒无任何 ACP 事件才自动
+  cancel；该轮已提交，先建立 no-replay 边界再公开失败。cancel 不确认则连接
+  作废并在下轮重建；断线使 pending request 立即失败。
+- **验收**：人工权限等待不会触发 inactivity timeout；下一轮不与旧 prompt
+  重叠；fake 子孙进程和 ACP server 均无残留。
 - **独立证据来源**：接入 Harness 前已有的 basic/ACP/Phase 2 生命周期测试；
   2026-07-26 两次真实 Kimi TUI E2E 退出后 `pgrep -fl '^kimi acp$'` 为空。
 - **人工验收边界**：真实 Kimi cancel 响应时延和长任务中的不可逆工具副作用尚未
@@ -103,7 +131,8 @@
 - **异常分支**：timeline/state 损坏、schema 不支持、workdir 不匹配、
   cursor 越过 timeline、agent entry 缺字段或非法值，全部 fail loudly，
   不静默覆盖或 bootstrap 成默认值；lease 冲突抛 `RoomBusyError`（含
-  持有者 PID 提示），进程异常退出由 OS 释放 flock，stale owner.lock
+  持有者 PID 提示）；CLI 将该冲突转换为无 traceback 的短提示，并给出关闭
+  旧 TUI 或使用新 `--session` 的命令。进程异常退出由 OS 释放 flock，stale owner.lock
   不阻塞下次获取；用户消息 append 失败则 TUI 不显示该消息并显示持久化
   错误；`aclose()` 后新 dispatch 与排队中的 delivery 一律抛
   `OrchestratorClosedError`，不再写 timeline、不再 start/load/prompt。
@@ -111,10 +140,42 @@
   同进程/跨进程第二 writer 被拒；checkpoint/append 写失败不假提交。
 - **独立证据来源**：`tests/test_storage.py`（timeline/state/lease/权限/
   fail loudly）、`tests/test_m25.py`（重启恢复、lease 冲突与跨进程、
-  TUI 恢复显示、持久确认时序、close 排队保护）。
+  TUI 恢复显示、持久确认时序、close 排队保护）、`tests/test_basic.py`
+  （CLI 冲突提示）。
 - **人工验收边界**：真实桌面环境中两个 TUI 实例竞争同一房间的交互体验
   尚未验收。
 - **里程碑**：M2.5。
+
+### UC-SESSION-001 同一项目独立会话
+
+- **角色 / 触发**：用户在空闲 TUI 按 `Ctrl+N`、精确输入 `/new`，或启动时
+  传入 `--session NAME`。
+- **前置条件**：当前没有 queued/running command 或权限等待；会话名合法且
+  新建时尚不存在。
+- **主流程**：房间身份由 `(规范化 workdir, session_name)` 决定；当前 App
+  返回 `NewSessionRequest` 并按标准顺序关闭 control server、CommandBus、
+  adapters 和 lease；同一进程随后构造新 App。新会话拥有独立 timeline、
+  events、cursor 与原生 agent session。`--session NAME` 可恢复同名会话。
+- **兼容分支**：`default` 沿用旧 `sha256(workdir)[:16]` room_id；旧
+  `state.json` 缺少 `session_name` 时只在默认房间兼容读取。
+- **异常分支**：非法名称、命名房间 state 不匹配、同名新建、活跃任务或权限
+  等待全部明确拒绝；不删除、不覆盖旧会话，也不在同一 Orchestrator 上清空
+  history/cursor。除精确 `/new` 外的普通文本（如 `hi`）不做本地语义猜测。
+- **外部入口**：ControlClient 与 MCP bridge 使用同一可选 session selector；
+  `room.get` 返回实际 `session_name`，default client 不误连命名会话。
+- **验收**：默认 room_id 与现有状态兼容；命名会话互相隔离且同名可恢复；
+  `Ctrl+N` 与精确 `/new` 只产生安全切换请求，`/new` 不持久化、不路由；
+  顶层循环在旧 App 退出后重建目标会话。
+- **自动化证据**：`tests/test_storage.py`（身份/隔离/名称与 state 校验）、
+  `tests/test_m25.py`（Ctrl+N、同名/active 拒绝）、`tests/test_basic.py`
+  （顶层重建循环/CLI）、`tests/test_m3_control.py` 与 `tests/test_m3_mcp.py`
+  （命名会话发现与 bridge selector）。
+- **独立兼容证据**：实现前已存在的默认房间
+  `c249bb5584b575a2` 仍由规范化 workdir 的旧哈希得到；现有 timeline/state
+  未迁移、未重写。
+- **人工验收边界**：真实 TUI 中 Ctrl+N 后的视觉连续性、命名体验和真实
+  Kimi/Codex 新 session 由用户验收；会话列表、删除和重命名不在本用例。
+- **里程碑**：M4.2。
 
 ### UC-ACP-002 ACP session 恢复与原子 checkpoint
 
@@ -130,12 +191,15 @@
   cursor 归零并按 `history_limit` 有界 bootstrap（不沿用旧 cursor 静默
   跳过 history），实际新 session id 落盘；checkpoint 写失败穿透
   dispatch（零 prompt、adapter reset、内存/磁盘不假提交），不伪装成
-  agent 调用失败；prompt 失败 cursor 不推进，下轮补发。
+  agent 调用失败；prompt 提交前或明确拒绝的失败 cursor 不推进、下轮补发；
+  prompt 已提交后的 inactivity timeout 属于结果不确定，先持久化 no-replay
+  cursor，再返回失败。
 - **验收**：load 成功后 prompt 不含旧内容；回退路径 bootstrap 有界；
   同一房间只有一个 writer 持有 session。
 - **独立证据来源**：`tests/test_m25.py` 真实 `AcpAdapter` + fake ACP
   server 的 load 成功/失败/无 capability/重连/checkpoint 失败/prompt
-  失败用例；`tests/test_acp.py` 的 `stream_prepared` restore 契约测试。
+  失败和 inactivity no-replay 用例；`tests/test_acp.py` 的
+  `stream_prepared` restore 与 timeout 契约测试。
 - **真实验收证据**：`scripts/e2e-m3-real.py` 已于 2026-07-26 用真实
   `kimi acp` 完成两次独立 TUI/ACP 生命周期，第二轮复用同一 session id，
   timeline 无重复且退出无残留。长会话 compaction 后的 restore 行为
@@ -188,19 +252,44 @@
 
 - **角色 / 触发**：TUI 或外部 MCP host 提交一个长任务。
 - **主流程**：queued/running、ACP 阶段、工具、权限、partial、heartbeat
-  与 terminal 事件写入独立 `events.jsonl`；TUI 实时显示安全摘要。
+  与 terminal 事件写入独立 `events.jsonl`；heartbeat 显示当前阶段和累计
+  静默时长，TUI 对同一 command 原位更新；工具事件按
+  `(command_id, agent, tool_call_id)` 聚合，缺 ID 时使用脱敏标题作为可见
+  identity；同一状态不重复转发或持久化，状态迁移与其他安全摘要实时显示。
+  固定任务区显示 command 状态、耗时和每个 agent 的当前阶段。
 - **安全分支**：thought 正文不显示；常见凭据字段隐藏；执行事件不进入
   agent 对话 history。
+- **高频分支**：adapter 继承初始 tool title/command 并压缩重复 update；
+  CommandBus 再做 producer-independent 防御性去重。重复 update 仍刷新
+  activity 时钟，但 activity-only 事件不进入 UI/events，不会误触发
+  heartbeat/inactivity；TUI 只在可见状态变化时
+  重绘同一逻辑工具项，命令详情默认折叠、由 `/details` 切换，命令终态后清理
+  内存索引。活跃工具使用 15 分钟独立 watchdog，普通分析仍使用 120 秒阈值。
 - **重启分支**：最后事件非 terminal 的 command 显示为上次中断及最后状态。
-- **验收**：`events.read` 可分页读取；旧房间安全补建；损坏日志 fail loudly。
+- **完成语义**：`completed` 只表示本轮调用正常结束，不等同于用户任务验收；
+  TUI 显示“本轮响应结束”，不显示“agent 完成”。fan-out 任一 worker
+  失败时本轮是 `failed`，即使其他 worker 已经正常回复；固定任务区保留各
+  agent 终态并把混合成功/失败显示为“部分完成”。
+- **验收**：`events.read` 可分页读取；heartbeat 累计且界面不刷行；200 条相同
+  tool update 在 ACP 层压成“创建/进行中/完成”三个状态，在防御性 bus
+  fixture 中只转发并持久化一次，TUI 只占一个逻辑项且只重绘状态迁移；旧房间
+  安全补建；损坏日志 fail loudly。
 - **证据**：`tests/test_storage.py`、`tests/test_acp.py`、
-  `tests/test_phase2.py`、`tests/test_m3_control.py`、`tests/test_m3_mcp.py`。
+  `tests/test_phase2.py`、`tests/test_basic.py`、`tests/test_tui_status.py`、
+  `tests/test_m3_bus.py`、
+  `tests/test_m3_control.py`、`tests/test_m3_mcp.py`。
+- **真实回放证据**：2026-07-28 命名房间 `99a294ef32695cef` 的同一 command
+  在约半分钟内产生 4,886 条完全相同的 `工具调用：in_progress`；最小 fake
+  trace 在修复前稳定复现 ACP 200 条、CommandBus 200 条、TUI 51 行，修复后
+  分层回归通过。历史事件保持 append-only，不回写清理。
 - **里程碑**：M3.1。
 
 ### UC-CANCEL-001 精确取消
 
 - **角色 / 触发**：用户按 `Ctrl+X`，或外部 host 调用 cancel。
 - **主流程**：queued 直接取消；running 仅取消该 dispatch；terminal 幂等。
+- **可见状态**：`cancel_requested` 仅显示“正在取消”，在 CommandBus 确认
+  terminal 前保持运行态与工具状态。
 - **异常分支**：取消确认超过 30 秒返回明确失败，不把未知状态报成成功。
 - **验收**：取消后 CommandBus worker 继续执行下一条；无 ghost task。
 - **证据**：`tests/test_m3_bus.py`、`tests/test_m3_control.py`、
@@ -217,8 +306,10 @@
   的 ephemeral thread，以免 transcript 快照在原生历史中重复，同时不把内部
   路由提示词写入 Codex 历史。
 - **配置边界**：不发送 model、effort、config、collaboration mode、plugin 或
-  MCP 覆盖，不修改 Codex 全局配置；仅传 cwd、host/worker 既有 sandbox，以及
-  host 专用的 `ephemeral: true`。
+  MCP 覆盖，不修改 Codex 全局配置；仅传 cwd、既有 sandbox、approval policy，
+  以及 host 专用的 `ephemeral: true`。worker 为
+  `workspace-write + on-request`，越界操作进入统一权限 UI；host 为
+  `read-only + never`。
 - **事件分支**：agent message delta 流式进入正文；command/file/MCP item
   进入脱敏 tool/status；approval 进入统一权限 UI且无处理器默认拒绝；
   reasoning 正文不显示；`turn/completed` 后才产生 done。

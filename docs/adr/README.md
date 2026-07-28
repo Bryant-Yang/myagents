@@ -10,3 +10,4 @@
 | [0002](0002-durable-execution-observability.md) | Accepted | M3.1 持久执行事件、心跳、权限上下文与精确取消 |
 | [0003](0003-codex-app-server-transport.md) | Accepted | M4 Codex app-server 长连接、默认配置继承与安全 fallback |
 | [0004](0004-ephemeral-codex-host-threads.md) | Accepted | M4.1 Codex host 使用不落盘的 ephemeral thread |
+| [0005](0005-project-conversation-sessions.md) | Accepted | M4.2 同一项目的独立命名会话与安全切换 |

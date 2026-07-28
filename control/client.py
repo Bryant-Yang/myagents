@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import shlex
 import stat
 import uuid
 from pathlib import Path
@@ -16,7 +17,13 @@ from control.server import (
     MAX_RESPONSE_BYTES,
     PROTOCOL_VERSION,
 )
-from storage.store import default_state_root, normalize_workdir, room_id_for
+from storage.store import (
+    DEFAULT_SESSION_NAME,
+    default_state_root,
+    normalize_session_name,
+    normalize_workdir,
+    room_id_for,
+)
 
 
 class ControlClientError(Exception):
@@ -38,21 +45,28 @@ class ControlRemoteError(ControlClientError):
 
 class ControlClient:
     def __init__(self, workdir: str | Path,
-                 state_root: str | Path | None = None) -> None:
+                 state_root: str | Path | None = None, *,
+                 session_name: str = DEFAULT_SESSION_NAME) -> None:
         self.workdir = normalize_workdir(workdir)
+        self.session_name = normalize_session_name(session_name)
         self.state_root = (
             Path(state_root).expanduser().resolve()
             if state_root is not None else default_state_root()
         )
-        self.room_id = room_id_for(self.workdir)
+        self.room_id = room_id_for(self.workdir, self.session_name)
         self.room_dir = self.state_root / "rooms" / self.room_id
         self.endpoint_path = self.room_dir / "endpoint.json"
         self.socket_path = self.room_dir / "control.sock"
 
     def _hint(self) -> str:
+        session_arg = (
+            "" if self.session_name == DEFAULT_SESSION_NAME
+            else f" --session {shlex.quote(self.session_name)}"
+        )
         return (
             "请先启动该房间 TUI："
-            f".venv/bin/python main.py {self.workdir}"
+            f".venv/bin/python main.py{session_arg} "
+            f"{shlex.quote(self.workdir)}"
         )
 
     def _read_endpoint(self) -> dict[str, Any]:

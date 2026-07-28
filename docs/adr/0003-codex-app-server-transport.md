@@ -47,10 +47,15 @@ app-server 启动命令不得添加 `--model`、`-c` 或 reasoning/plugin/MCP �
 `collaborationMode` 等覆盖字段。模型、推理强度、plugin 和 MCP 全部继承用户
 现有 Codex 默认配置。
 
-允许发送的运行时字段仅限协议必需数据、`cwd` 与已经存在的产品安全边界：
-host 使用 `read-only`，worker 使用 `workspace-write`。这些 sandbox 值只作用于
-该 thread，不写入 `~/.codex/config.toml`。host 的 `thread/start` 另按
-ADR-0004 发送 `ephemeral: true`，不适用于 worker。
+允许发送的运行时字段仅限协议必需数据、`cwd` 与产品安全边界：
+
+- worker 使用 `sandbox=workspace-write` 与 `approvalPolicy=on-request`，
+  工作区外 Git 元数据、本地 socket 等越界操作必须进入统一权限 UI；
+- host 使用 `sandbox=read-only` 与 `approvalPolicy=never`，路由与直接回答
+  不申请写权限。
+
+这些字段只作用于该 thread，不写入 `~/.codex/config.toml`。host 的
+`thread/start` 另按 ADR-0004 发送 `ephemeral: true`，不适用于 worker。
 
 ### 2.4 事件映射
 
@@ -107,6 +112,7 @@ ADR-0004 发送 `ephemeral: true`，不适用于 worker。
 2. 验证正文、tool、permission、completed/failed 映射。
 3. 验证默认拒绝 approval、取消确认、断线 pending 失败和 close 无残留。
 4. 请求抓包证明无 model/effort/config/plugin/MCP 覆盖。
+   同时证明 worker/host 分别发送 `on-request` / `never`。
 5. 真实 Codex 临时目录 E2E 连续两轮共用一个 app-server PID/thread，退出后无
    残留；真实模型测试不进入默认快速 gate。
 6. JSONL fallback 单独保留回归证据，且禁止对已发送 `turn/start` 自动重放。

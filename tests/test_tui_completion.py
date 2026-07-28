@@ -1,0 +1,166 @@
+"""输入候选的纯解析与 Textual 交互验收。"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
+
+from main import ChatApp, ComposerInput
+from test_basic import make_orch
+from tui_completion import (
+    completion_context,
+    local_command_for,
+    unknown_mentions,
+)
+
+
+AGENTS = (
+    ("kimi", "ACP"),
+    ("opencode", "JSONL"),
+    ("codex", "APP-SERVER"),
+    ("host", "MODERATOR"),
+)
+
+
+def test_completion_parser_and_command_boundary() -> None:
+    mention = completion_context("@co", 3, AGENTS)
+    assert mention is not None
+    assert [item.value for item in mention.items] == ["@codex"]
+
+    multi = completion_context("@kimi @", 7, AGENTS)
+    assert multi is not None
+    assert "@kimi" not in [item.value for item in multi.items]
+    assert [item.value for item in multi.items] == [
+        "@opencode", "@codex", "@host"]
+
+    slash = completion_context("/ca", 3, AGENTS)
+    assert slash is not None
+    assert [item.value for item in slash.items] == ["/cancel"]
+    assert completion_context("请看 /ca", 6, AGENTS) is None
+
+    assert local_command_for("/new") is not None
+    assert local_command_for(" /new ") is not None
+    assert local_command_for("/new task") is None
+    assert local_command_for("/unknown") is None
+
+    assert unknown_mentions(
+        "@kimi @ghost @ghost @codex", (name for name, _ in AGENTS)
+    ) == ("ghost",)
+    assert unknown_mentions(
+        "mail@ghost", (name for name, _ in AGENTS)
+    ) == ("ghost",)
+    print("ok  候选解析（筛选/多目标/命令边界/未知 agent）")
+
+
+def test_agent_completion_keyboard_and_focus() -> None:
+    async def run() -> None:
+        orch = make_orch()
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test() as pilot:
+            box = app.query_one("#composer", ComposerInput)
+            assert box.has_focus
+
+            await pilot.press("@")
+            await pilot.pause()
+            assert app._completion is not None
+            assert [item.value for item in app._completion.items] == [
+                "@kimi", "@opencode", "@codex", "@host"]
+
+            # ↑ 从首项循环到末项；↓ 回首项后再选第二项。
+            await pilot.press("up")
+            await pilot.pause()
+            assert app._completion_index == 3
+            await pilot.press("down")
+            await pilot.pause()
+            assert app._completion_index == 0
+
+            # ↓ + Enter 只补全第二项，不提交。
+            await pilot.press("down", "enter")
+            await pilot.pause()
+            assert box.value == "@opencode "
+            assert orch.history == []
+            assert box.has_focus
+
+            # 第二个 mention 按前缀筛选，Tab 补全且保留第一个目标。
+            await pilot.press("@", "c", "o", "tab")
+            await pilot.pause()
+            assert box.value == "@opencode @codex "
+            assert app._completion is None
+            assert orch.history == []
+
+            # Esc 关闭候选，不挪走输入焦点。
+            await pilot.press("@")
+            await pilot.pause()
+            assert app._completion is not None
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app._completion is None
+            assert box.has_focus
+
+            # 光标离开活动 token 后，Enter 不得使用过期位置强行补全。
+            box.value = "@co"
+            box.cursor_position = len(box.value)
+            await pilot.pause()
+            assert app._completion is not None
+            await pilot.press("home", "enter")
+            await pilot.pause()
+            assert box.value == "@co"
+            assert app._completion is None
+            assert orch.history == []
+
+    asyncio.run(run())
+    print("ok  @agent 键盘导航/补全/多目标/Esc/焦点")
+
+
+def test_slash_commands_unknown_agent_and_submit_behaviour() -> None:
+    async def run() -> None:
+        orch = make_orch()
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test() as pilot:
+            box = app.query_one("#composer", ComposerInput)
+
+            # 第一次 Enter 补全，第二次 Enter 才执行本地命令。
+            box.value = "/ag"
+            box.cursor_position = len(box.value)
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert box.value == "/agents"
+            assert orch.history == []
+            await pilot.press("enter")
+            await pilot.pause()
+            assert box.value == ""
+            assert orch.history == []
+
+            # 未知 agent 阻止提交并保留草稿，方便原地修正。
+            box.value = "@ghost 请处理"
+            box.cursor_position = len(box.value)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert box.value == "@ghost 请处理"
+            assert orch.history == []
+            assert box.has_focus
+
+            # 带参数的 slash 文本不是本地命令，仍进入正常派发路径。
+            box.value = "/new task"
+            box.cursor_position = len(box.value)
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert orch.history[0].speaker == "user"
+            assert orch.history[0].text == "/new task"
+
+    asyncio.run(run())
+    print("ok  /command 补全/本地执行/未知 agent/命令误判")
+
+
+if __name__ == "__main__":
+    test_completion_parser_and_command_boundary()
+    test_agent_completion_keyboard_and_focus()
+    test_slash_commands_unknown_agent_and_submit_behaviour()
+    print("\nTUI completion 全部通过")

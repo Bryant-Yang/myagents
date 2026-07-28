@@ -4,9 +4,9 @@
 Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1 与 M4 已完成——共享 timeline 与执行 events 持久化、ACP session
+> 当前状态：M2.5、M3、M3.1、M4 与 M4.2 已完成——共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
-> stdio 外部入口、执行心跳、精确取消与 Codex app-server 长连接均已落地。
+> stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
 > Kimi 使用 ACP，Codex 使用官方 app-server；JSONL 仅作兼容 fallback。真实 Kimi + MCP
 > 端到端验收是发布前手工证据，见“当前限制”。
 
@@ -36,6 +36,8 @@ Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并�
 - 并发顺序保证：同一 ACP agent 严格串行，不同 agent 保持并行。
 - 持久时间线：房间 timeline/state 落盘（单调 seq、UTC 时间戳），TUI 重启
   后恢复显示历史。
+- 独立会话：同一工作目录可通过 `Ctrl+N` 或精确输入 `/new` 新建完全隔离的
+  timeline、events、cursor 与原生 agent session；默认会话继续兼容已有历史。
 - ACP session 恢复：重启后优先 `session/load` 续接旧 session，保留已持久化
   cursor；load 失败或不支持时回退新 session 并有界 bootstrap。
 - 原子 checkpoint：cursor/session_id 在 prompt 前一次性落盘，失败不伪装
@@ -50,13 +52,21 @@ Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并�
 - MCP stdio bridge：七个 `myagents_*` 工具把本机其他 agent 的 review
   注入同一房间；bridge 不创建第二 Orchestrator、不直写 timeline、
   不绕过 TUI 权限。
-- 可观测执行：独立 events 日志、静默 heartbeat、工具/权限上下文与重启中断提示。
+- 可观测执行：独立 events 日志、累计且原位更新的静默 heartbeat、工具/权限
+  上下文与重启中断提示；固定任务区持续显示总状态、耗时和各 agent 阶段，
+  部分 agent 成功、部分失败时明确显示“部分完成”。
+- 工具状态聚合：同一工具的高频 `in_progress` 只保留一次，标题与命令上下文
+  延续到终态；TUI 原位更新为“进行中/已完成/失败”，命令详情默认折叠，
+  输入 `/details` 切换显示，执行日志仍完整记录状态迁移。
+- 明确委托：host 路由同时给每个 worker 生成完整 task，消解“你/让 Kimi”
+  等角色关系，并直接注入本轮 prompt，不再只显示路由理由。
 - 权限弹窗：显示来源 agent、工具标题、命令上下文和 agent 提供的 options。
 - 精确取消：TUI `Ctrl+X` 或 MCP 只取消当前 command，房间继续工作。
 - 权限 fail-closed：无处理器、异常或非法 option 一律拒绝。
 - 流式回复合并：ACP token/chunk 持续更新同一条 TUI 记录，不再一词一行。
-- ACP 卡死回收：连续 120 秒无任何协议事件时取消本轮，必要时重建连接，
-  避免堵住后续 FIFO 命令。
+- ACP 卡死回收：普通分析连续 120 秒无协议事件才取消；已进入工具生命周期后
+  使用独立 15 分钟无活动上限，避免工程子代理或长命令被普通静默阈值误杀。
+  必要时重建连接，并将已提交轮次标为 no-replay，避免重复执行。
 - 完整进程回收：取消、超时和 TUI 退出都会清理 agent 进程组。
 
 ## 架构
@@ -124,9 +134,16 @@ python3 -m venv .venv
 .venv/bin/python main.py /path/to/project
 ```
 
-每个工作目录对应一个持久房间：对话 timeline、执行 events、agent cursor/session 映射和
+按名称恢复同一项目中的独立会话：
+
+```bash
+.venv/bin/python main.py --session game-review /path/to/project
+```
+
+每个 `(工作目录, 会话名)` 对应一个持久房间：对话 timeline、执行 events、agent cursor/session 映射和
 owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id>`，
-不会写进目标工作区。同一房间同一时刻只允许一个 TUI 实例写入。
+不会写进目标工作区。未指定名称时使用兼容旧历史的 `default` 会话；同一房间
+同一时刻只允许一个 TUI 实例写入。
 
 ## 使用方式
 
@@ -137,13 +154,19 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
 @host 总结上面两个方案的分歧
 ```
 
+空闲时按 `Ctrl+N` 或精确输入 `/new` 可新建会话：输入名称，或留空自动命名。
+`/new` 是本地命令，不会写入时间线，也不会发送给 host 或 worker。已有名称
+不会被覆盖；恢复已有会话请退出后使用 `--session NAME`。任务正在排队、运行
+或等待权限时，必须先完成或按 `Ctrl+X` 取消后再切换。
+
 路由规则：
 
 1. 显式 `@agent` 永远优先。
 2. 同一条消息中的多个有效 mention 会并发派发。
 3. 不带 mention 时，host 在一次调用中直接回答，或根据最近对话选择
    1–2 个 worker；自然语言内容不由本地关键词白名单判断。
-4. 单个 agent 失败会写入时间线，不会中断其他 agent。
+4. 单个 agent 失败会写入时间线，不会中断其他 agent；fan-out 全部收尾后，
+   只要任一 worker 失败，该 command 终态就是 `failed`。
 
 ## Transport 与上下文
 
@@ -155,7 +178,9 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
 | Claude | 未接入 | 预留 AgentSpec/adapter 扩展点 | 规划中 |
 
 有状态 agent 首次接入只收到最近 `history_limit` 条共享记录；后续只收到 cursor
-之后的新消息，并过滤它自己的回复。失败时 cursor 不推进，下一轮会补发。
+之后的新消息，并过滤它自己的回复。提交前明确失败时 cursor 不推进、下轮补发；
+提交后静默超时等结果不确定失败会先建立 no-replay cursor，防止工具任务被重复
+执行。
 cursor 是持久化 timeline 的单调 seq：重启后优先 `session/load` 续接旧
 session 并保留 cursor；load 失败或 agent 不支持时回退新 session，cursor
 归零并按 `history_limit` 有界 bootstrap。
@@ -173,7 +198,7 @@ stdio bridge 向**正在运行的** TUI 房间提交消息、读取时间线和�
   Orchestrator**。
 
 MCP host 的 stdio 配置示例（`--workdir` 必填，必须与目标 TUI 的
-workdir 一致）：
+workdir 一致；命名会话还必须传同名 `--session`）：
 
 ```json
 {
@@ -182,7 +207,8 @@ workdir 一致）：
       "command": "/abs/path/myagents/.venv/bin/python",
       "args": [
         "/abs/path/myagents/myagents_mcp.py",
-        "--workdir", "/path/to/project"
+        "--workdir", "/path/to/project",
+        "--session", "game-review"
       ]
     }
   }
@@ -238,12 +264,14 @@ Kimi ACP 的权限请求会进入 TUI 弹窗。默认策略是 `deny`：
 - 一个房间同一时刻只有一个写入进程：owner.lock（flock）冲突时第二个
   TUI 实例启动即失败，不会抢占或静默共用状态。
 
-Codex/OpenCode 的 JSONL 无头模式可能直接执行工具。建议始终让 agent 在 Git
-仓库或隔离 worktree 中工作，并在交付前检查 diff。
+Codex worker 使用 `workspace-write + on-request`：超出沙箱的 Git 元数据、
+本地 socket 等操作必须进入同一 TUI 权限弹窗；只读 host 使用
+`read-only + never`，不会为路由申请写权限。JSONL fallback/OpenCode 仍可能
+直接执行工具，建议在 Git 仓库或隔离 worktree 中工作，并在交付前检查 diff。
 
 ## 状态目录、恢复与排障
 
-每个 workdir 的房间状态位于
+每个 `(workdir, session_name)` 的房间状态位于
 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id>`
 （目录 0700、文件 0600、`state.json`/`endpoint.json` 原子写），绝不写进
 目标工作区。TUI 重启后恢复时间线显示、agent seq cursor 和 ACP session
@@ -259,7 +287,8 @@ Codex/OpenCode 的 JSONL 无头模式可能直接执行工具。建议始终让 
   连接验证无监听者，确认 stale 后自动清理恢复。
 - **"房间已有活跃 control server"**：另一个 TUI 正在占用该房间，不会
   被抢占；owner.lock（flock）冲突同样使第二个 TUI 启动即失败并提示
-  持有者 PID。
+  持有者 PID，但不会打印 Python traceback。关闭旧 TUI，或使用
+  `uv run main.py --session <新名称> <workdir>` 打开独立会话。
 - **"control socket 路径过长"**：macOS AF_UNIX 路径上限约 104 字节。
   用更短的 `XDG_STATE_HOME`（如 `XDG_STATE_HOME=/tmp/mya-state`）重启
   TUI。
@@ -354,6 +383,7 @@ myagents/
 - [x] M3：内部 command bus、私有 Unix 控制 socket、MCP stdio 外部入口。
 - [x] M3.1：持久执行可观测性、heartbeat、权限上下文与精确取消。
 - [x] M4：Codex 官方 app-server 长连接接入，JSONL 退为安全兜底。
+- [x] M4.2：同一项目独立会话、默认历史兼容、TUI 安全切换与外部 selector。
 - [ ] M5：里程碑工作流、review → 修改 → 复核闭环与 steering。
 - [ ] Later：只有出现跨机器、跨组织 agent 协作需求时再评估 A2A。
 
@@ -370,3 +400,5 @@ myagents/
   endpoint/socket/agent 残留。该脚本调用真实模型，不放进默认快速 gate。
 - 独立 ACP client 写入已有 Kimi session 不会让已打开的 native Kimi TUI
   实时刷新；一个前端应独占该 session。
+- 当前只支持新建会话和用 `--session NAME` 恢复；TUI 内的会话列表、删除和
+  重命名尚未实现。

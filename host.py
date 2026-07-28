@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
-from typing import AsyncIterator
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Callable
 
 from adapters.base import AgentAdapter, AgentEvent
 from adapters.kimi_adapter import KimiAdapter
@@ -36,11 +36,16 @@ _ROUTE_TEMPLATE = """\
 请直接处理用户最新的消息，只能二选一：
 1. 需要写代码、改文件、跑命令或调研具体技术问题：只输出一行 JSON，
    不要输出其他文字：
-   {{"targets": ["{first_worker}"], "reason": "一句话理由"}}
+   {{"targets": ["{first_worker}"], "reason": "一句话理由",
+     "tasks": {{"{first_worker}": "直接交给该 agent 的完整、可执行任务"}}}}
    targets 从 [{choices}] 中选 1~2 个。
+   tasks 必须为每个 target 提供一条完整指令，直接对该 agent 说话，并消解
+   原消息中的“你”“让某人做”等角色关系。任务同时包含构思、实现、验证时，
+   把这些步骤全部写进指令；除非存在真实阻塞，不要让 agent 再向用户确认方案。
 2. 你自己可以处理（包括问候、闲聊、一般讨论、总结、比较和仲裁）：
    直接输出给用户的最终回答，不要输出 JSON，不要自我介绍或复述记录。
 
+这是纯路由与任务改写步骤：禁止调用工具、命令、文件、网络或 skill。
 拿不准时直接回答。
 """
 
@@ -67,6 +72,7 @@ class HostDecision:
     targets: list[str]
     reason: str
     answer: str | None = None
+    tasks: dict[str, str] = field(default_factory=dict)
 
 
 class HostAgent:
@@ -83,20 +89,32 @@ class HostAgent:
     def session_id(self) -> str | None:  # 满足 AgentAdapter 协议
         return self.adapter.session_id
 
-    async def decide(self, transcript: str, workdir: str) -> HostDecision:
-        """一次 LLM 调用返回 worker 路由，或 host 的直接回答。"""
+    async def decide(
+            self, transcript: str, workdir: str,
+            on_event: Callable[[AgentEvent], None] | None = None,
+    ) -> HostDecision:
+        """一次 LLM 调用返回路由/回答，并公开安全的非正文进度事件。"""
         choices = self.workers
-        prompt = _ROUTE_TEMPLATE.format(
-            workers="、".join(self.workers),
-            first_worker=self.workers[0] if self.workers else "host",
-            choices=", ".join(choices),
-            transcript=transcript,
-        )
+        prompt = self._build_route_prompt(transcript, choices)
         buf: list[str] = []
         async for ev in self.adapter.stream(prompt, workdir):
             if ev.kind == "text":
                 buf.append(ev.text)
+            elif ev.kind not in {"done", "delivery_committed"}:
+                if on_event is not None:
+                    on_event(ev)
         return self._parse("".join(buf), choices)
+
+    def _build_route_prompt(
+            self, transcript: str, choices: list[str] | None = None) -> str:
+        """构造纯路由 prompt；保留为可直接测试的协议边界。"""
+        selected = self.workers if choices is None else choices
+        return _ROUTE_TEMPLATE.format(
+            workers="、".join(self.workers),
+            first_worker=selected[0] if selected else "host",
+            choices=", ".join(selected),
+            transcript=transcript,
+        )
 
     def _parse(self, raw: str, choices: list[str]) -> HostDecision:
         """有效路由 JSON 才派发；其余非空输出就是 host 的最终回答。"""
@@ -113,9 +131,17 @@ class HostAgent:
                         targets.append(t)
                 reason = str(data.get("reason", ""))[:80]
                 if targets:
+                    raw_tasks = data.get("tasks", {})
+                    tasks: dict[str, str] = {}
+                    if isinstance(raw_tasks, dict):
+                        for target in targets[:2]:
+                            task = raw_tasks.get(target)
+                            if isinstance(task, str) and task.strip():
+                                tasks[target] = task.strip()[:4000]
                     return HostDecision(
-                        targets[:2], reason or "主持人判断")
-            except (json.JSONDecodeError, AttributeError):
+                        targets[:2], reason or "主持人判断",
+                        tasks=tasks)
+            except (json.JSONDecodeError, AttributeError, TypeError):
                 pass
         if raw:
             return HostDecision([], "host 直接回答", raw)

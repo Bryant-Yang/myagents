@@ -1,8 +1,8 @@
 """房间持久化存储（ADR-0001 §2.1、§2.2）。
 
 关键概念：
-- **房间身份**：规范化绝对 workdir 决定稳定 `room_id`（SHA-256 截断，
-  不包含可逆路径）；默认 room 名为 workdir 的 basename。
+- **房间身份**：规范化绝对 workdir 与 session_name 决定稳定 `room_id`
+  （SHA-256 截断，不包含可逆路径）；default 会话保持旧 workdir-only 哈希。
 - **状态位置**：默认 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id>`，
   测试可注入临时 `state_root`。状态绝不写进目标 workdir。
 - **fail loudly**：schema 不支持、timeline/state 损坏、workdir 不匹配都抛
@@ -20,12 +20,15 @@ import hashlib
 import json
 import os
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 APP_NAME = "myagents"
 STATE_SCHEMA_VERSION = 1
+DEFAULT_SESSION_NAME = "default"
+MAX_SESSION_NAME_CHARS = 64
 
 DEFAULT_READ_LIMIT = 50
 MAX_READ_LIMIT = 200
@@ -75,9 +78,33 @@ def normalize_workdir(workdir: str | Path) -> str:
     return str(resolved)
 
 
-def room_id_for(normalized_workdir: str) -> str:
-    """由规范化 workdir 派生稳定 room_id（不可逆，不含完整路径）。"""
-    return hashlib.sha256(normalized_workdir.encode("utf-8")).hexdigest()[:16]
+def normalize_session_name(session_name: str) -> str:
+    """规范会话名；名称只进 state/hash，不直接成为文件路径。"""
+    if not isinstance(session_name, str):
+        raise ValueError("session_name 必须是字符串")
+    name = session_name.strip()
+    if not name:
+        raise ValueError("session_name 不能为空")
+    if len(name) > MAX_SESSION_NAME_CHARS:
+        raise ValueError(
+            f"session_name 不能超过 {MAX_SESSION_NAME_CHARS} 个字符")
+    if name in {".", ".."} or "/" in name or "\\" in name:
+        raise ValueError("session_name 不能是 .、.. 或包含路径分隔符")
+    if any(unicodedata.category(char).startswith("C") for char in name):
+        raise ValueError("session_name 不能包含控制或不可见格式字符")
+    return name
+
+
+def room_id_for(
+        normalized_workdir: str,
+        session_name: str = DEFAULT_SESSION_NAME) -> str:
+    """由 workdir + 会话名派生稳定 room_id；default 保持旧哈希兼容。"""
+    name = normalize_session_name(session_name)
+    if name == DEFAULT_SESSION_NAME:
+        material = normalized_workdir
+    else:
+        material = f"{normalized_workdir}\0myagents-session\0{name}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
 def default_state_root() -> Path:
@@ -304,8 +331,10 @@ class RoomStore:
     """房间存储：对话 timeline、执行 events 与原子 state。"""
 
     def __init__(self, workdir: str | Path,
-                 state_root: str | Path | None = None) -> None:
+                 state_root: str | Path | None = None, *,
+                 session_name: str = DEFAULT_SESSION_NAME) -> None:
         self.workdir = normalize_workdir(workdir)
+        self.session_name = normalize_session_name(session_name)
         self.room_name = Path(self.workdir).name
         self.state_root = (Path(state_root).expanduser().resolve()
                            if state_root is not None else default_state_root())
@@ -315,7 +344,7 @@ class RoomStore:
             raise StorageError(
                 f"state_root 不能等于 workdir 或位于其子目录内："
                 f"{self.state_root}（workdir={self.workdir}）")
-        self.room_id = room_id_for(self.workdir)
+        self.room_id = room_id_for(self.workdir, self.session_name)
         self.room_dir = self.state_root / "rooms" / self.room_id
         self.timeline_path = self.room_dir / "timeline.jsonl"
         self.events_path = self.room_dir / "events.jsonl"
@@ -324,6 +353,18 @@ class RoomStore:
         self._next_seq = 1
         self._next_event_seq = 1
         self._open()
+
+    @classmethod
+    def session_exists(
+            cls, workdir: str | Path, session_name: str,
+            state_root: str | Path | None = None) -> bool:
+        """只检查命名房间路径是否存在，不创建状态或获取 lease。"""
+        normalized_workdir = normalize_workdir(workdir)
+        normalized_session = normalize_session_name(session_name)
+        root = (Path(state_root).expanduser().resolve()
+                if state_root is not None else default_state_root())
+        room_id = room_id_for(normalized_workdir, normalized_session)
+        return (root / "rooms" / room_id).exists()
 
     # ---- 打开 / 初始化 ----
 
@@ -361,6 +402,7 @@ class RoomStore:
             "room_id": self.room_id,
             "room_name": self.room_name,
             "workdir": self.workdir,
+            "session_name": self.session_name,
             "agents": {},
         }
         self._write_state(state)
@@ -401,6 +443,12 @@ class RoomStore:
             raise WorkdirMismatchError(
                 f"房间记录的 workdir 是 {data.get('workdir')!r}，"
                 f"与本次打开的 {self.workdir!r} 不一致")
+        recorded_session = data.get(
+            "session_name", DEFAULT_SESSION_NAME)
+        if recorded_session != self.session_name:
+            raise CorruptedStorageError(
+                f"房间记录的 session_name 是 {recorded_session!r}，"
+                f"与本次打开的 {self.session_name!r} 不一致")
         if not isinstance(data.get("agents"), dict):
             raise CorruptedStorageError("state.json 缺少合法的 agents 映射")
         # 打开时全量校验 agents entry：损坏状态在构造阶段立即 fail loudly，

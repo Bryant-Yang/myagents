@@ -17,6 +17,7 @@ required=(
   docs/adr/0002-durable-execution-observability.md
   docs/adr/0003-codex-app-server-transport.md
   docs/adr/0004-ephemeral-codex-host-threads.md
+  docs/adr/0005-project-conversation-sessions.md
   scripts/check-redlines.sh
 )
 
@@ -53,6 +54,7 @@ docs = [
     root / "docs/adr/0002-durable-execution-observability.md",
     root / "docs/adr/0003-codex-app-server-transport.md",
     root / "docs/adr/0004-ephemeral-codex-host-threads.md",
+    root / "docs/adr/0005-project-conversation-sessions.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -88,6 +90,8 @@ fi
   acp/*.py codex_app_server/*.py adapters/*.py control/*.py storage/*.py tests/*.py \
   scripts/e2e-m3-real.py
 .venv/bin/python tests/test_basic.py
+.venv/bin/python tests/test_tui_completion.py
+.venv/bin/python tests/test_tui_status.py
 .venv/bin/python tests/test_acp.py
 .venv/bin/python tests/test_phase2.py
 .venv/bin/python tests/test_storage.py

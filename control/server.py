@@ -307,6 +307,7 @@ class ControlServer:
                 "pid": os.getpid(),
                 "room_id": self._store.room_id,
                 "room_name": self._store.room_name,
+                "session_name": self._store.session_name,
                 "workdir": self._store.workdir,
                 "agents": [
                     {"name": spec.name, "transport": spec.transport}

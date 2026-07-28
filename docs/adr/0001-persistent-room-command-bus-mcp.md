@@ -1,5 +1,10 @@
 # ADR-0001：持久房间、单写者 command bus 与本机 MCP 入口
 
+> 房间身份在 2026-07-28 由
+> [ADR-0005](0005-project-conversation-sessions.md) 扩展为
+> `(workdir, session_name)`；本 ADR 中只按 workdir 描述的条款适用于
+> `session_name="default"` 的兼容房间。
+
 - 状态：Accepted
 - 日期：2026-07-26
 - Owner：Bryant Yang
@@ -36,8 +41,9 @@ session 出现多个 writer，TUI 看不到外部消息，权限请求也可能�
 - 时间线记录包含单调递增 `seq`、`speaker`、`text`、UTC `created_at`，
   以及可选的 `command_id`；文本与单条记录均有明确大小上限。
 - 用户消息、agent 最终回复、调用失败都先 append 并 flush，再向调用方确认。
-- cursor 表示“该 agent 已成功交付到哪个 timeline `seq`”，不再依赖易漂移的
-  list 下标。cursor 只在对应 ACP prompt 成功后持久化。
+- cursor 表示“该 agent 不应自动重放到哪个 timeline `seq`”，不再依赖易漂移
+  的 list 下标。prompt 成功后推进；提交前或服务端明确拒绝的失败保持旧值；
+  prompt 已提交后若结果不确定，则先持久化 no-replay cursor 再公开失败。
 - `state.json` 保存每个 stateful agent 的 cursor 和 ACP `session_id`。写入
   失败不得伪装成功；不会把仅存在于内存的 cursor 当成已提交状态。
 - 读取时间线必须有 `after_seq` + `limit` 边界，默认 50，最大 200，并返回
@@ -78,6 +84,8 @@ adapter/session，也不能直接写 timeline。
   房间内实现幂等去重。
 - command 按提交顺序进入队列。一个 command 可在 Orchestrator 内 fan-out；
   不允许两个 command 并发修改共享 history。
+- fan-out 等待全部 target 收尾；任一 worker 失败时 command 终态为 `failed`，
+  但不取消其他 target。失败 worker 的 partial 必须在 timeline 明确标注失败。
 - command 状态与时间线写入使用同一事件循环；TUI 更新通过线程安全/事件循环安全
   callback 进入 RichLog。
 - 权限请求仍由当前 TUI 决策；MCP 与 socket 都没有 `auto` 放行入口。
@@ -148,6 +156,8 @@ M3 只支持显式 `--workdir` 选择一个本地房间。TUI 未运行、endpoi
    socket、endpoint、MCP 或 agent 残留进程。
 6. MCP 工具可由官方 SDK client 通过 stdio list/call；stdout 无非协议输出。
 7. M0–M2、JSONL fallback、红线门禁全部无回归。
+8. fan-out 任一 worker 失败时其他 target 仍完成，但 command 终态为 `failed`；
+   已提交后结果不确定的 ACP timeout 建立 no-replay cursor。
 
 ## 5. 必需证据
 

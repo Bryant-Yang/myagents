@@ -53,6 +53,7 @@ class CodexAppServerAdapter:
         *,
         command: list[str] | None = None,
         sandbox: str | None = "workspace-write",
+        approval_policy: str = "on-request",
         permission_handler: PermissionHandler | None = None,
         reuse_thread: bool = True,
         ephemeral_thread: bool = False,
@@ -66,11 +67,14 @@ class CodexAppServerAdapter:
             raise ValueError("cmd 和 command 只能指定一个")
         if cancel_timeout <= 0 or inactivity_timeout <= 0:
             raise ValueError("timeout 必须大于 0")
+        if approval_policy not in {"untrusted", "on-request", "never"}:
+            raise ValueError(f"未知 approval_policy：{approval_policy!r}")
         if ephemeral_thread and reuse_thread:
             raise ValueError(
                 "ephemeral_thread=True 要求 reuse_thread=False")
         self.session_id: str | None = None
         self.sandbox = sandbox
+        self.approval_policy = approval_policy
         self.reuse_thread = reuse_thread
         self.ephemeral_thread = ephemeral_thread
         custom_command = command is not None or cmd is not None
@@ -112,7 +116,13 @@ class CodexAppServerAdapter:
         if handler is None:
             self._permission_handler = None
         else:
-            self._permission_handler = lambda params: handler(self.name, params)
+            self._permission_handler = lambda params: handler(
+                self.name,
+                {
+                    **params,
+                    "_myagents_mirrors_permission_events": True,
+                },
+            )
         self._client.set_permission_handler(self._permission_handler)
 
     async def _reset(self) -> None:
@@ -154,7 +164,11 @@ class CodexAppServerAdapter:
             if resume_session_id:
                 try:
                     self.session_id = await self._client.thread_resume(
-                        resume_session_id, workdir, sandbox=self.sandbox)
+                        resume_session_id,
+                        workdir,
+                        sandbox=self.sandbox,
+                        approval_policy=self.approval_policy,
+                    )
                     restored = True
                 except CodexAppServerError:
                     load_failed = True
@@ -162,6 +176,7 @@ class CodexAppServerAdapter:
                 self.session_id = await self._client.thread_start(
                     workdir,
                     sandbox=self.sandbox,
+                    approval_policy=self.approval_policy,
                     ephemeral=True if self.ephemeral_thread else None,
                 )
         except BaseException:
@@ -474,9 +489,17 @@ class CodexAppServerAdapter:
             "dynamicToolCall", "webSearch", "imageGeneration",
         }:
             status = item.get("status") or "completed"
-            return AgentEvent(
-                "status", f"{kind}：{status}",
-                meta={"tool_call_id": item.get("id")})
+            started = CodexAppServerAdapter._tool_started(params)
+            if started is not None and started.kind == "tool":
+                return AgentEvent(
+                    "tool",
+                    started.text,
+                    meta={
+                        **started.meta,
+                        "status": status,
+                        "update": True,
+                    },
+                )
         return None
 
     @staticmethod

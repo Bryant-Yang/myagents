@@ -140,6 +140,43 @@ def test_protocol_roundtrip() -> None:
     print("ok  control 七方法 + FIFO/idempotency + timeline/events + cancel")
 
 
+def test_named_session_control_discovery() -> None:
+    """ControlClient 必须显式选择正确命名会话，不能误连 default。"""
+    async def run() -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "work"
+            state_root = root / "state"
+            workdir.mkdir()
+            store = RoomStore(
+                workdir, state_root=state_root, session_name="review")
+            orch = Orchestrator(
+                str(workdir), store=store, session_name="review")
+            bus = CommandBus(orch)
+            server = ControlServer(orch, bus)
+            named = ControlClient(
+                workdir, state_root=state_root, session_name="review")
+            default = ControlClient(workdir, state_root=state_root)
+            try:
+                bus.start()
+                await server.start()
+                info = await named.get_room()
+                assert info["session_name"] == "review"
+                assert info["room_id"] == store.room_id
+                try:
+                    await default.get_room()
+                    raise AssertionError("default client 不应误连命名会话")
+                except ControlUnavailableError:
+                    pass
+            finally:
+                await server.aclose()
+                await bus.aclose()
+                await orch.aclose()
+
+    asyncio.run(run())
+    print("ok  命名会话 control 发现（default 不误连）")
+
+
 def test_permissions_cleanup_and_unavailable() -> None:
     async def run() -> None:
         room = Room()
@@ -426,13 +463,18 @@ def test_external_permission_stays_in_tui() -> None:
                     await pilot.pause()
                     command = await client.submit("@kimi 需要 perm 一下")
                     await wait_until(
-                        pilot, lambda: isinstance(app.screen, PermissionScreen))
+                        pilot,
+                        lambda: (
+                            isinstance(app.screen, PermissionScreen)
+                            and len(app.screen.query("#perm-opt-0")) == 1
+                        ),
+                    )
                     # The external bridge has no permission bypass: the active
                     # TUI owns the decision and returns the selected option.
                     await pilot.click("#perm-opt-0")
                     result = await client.wait_command(
                         command["command_id"], timeout=10)
-                    assert result["status"] == "completed"
+                    assert result["status"] == "completed", result
                     await wait_until(
                         pilot,
                         lambda: not isinstance(app.screen, PermissionScreen))
@@ -452,6 +494,7 @@ def test_external_permission_stays_in_tui() -> None:
 
 if __name__ == "__main__":
     test_protocol_roundtrip()
+    test_named_session_control_discovery()
     test_permissions_cleanup_and_unavailable()
     test_stale_recovery_and_active_refusal()
     test_protocol_errors_and_recovery()

@@ -34,6 +34,20 @@ _SENSITIVE_ASSIGNMENT = re.compile(
     r"AUTHORIZATION|CREDENTIAL|PRIVATE_KEY)[A-Z0-9_]*)=([^\s]+)")
 _BEARER_VALUE = re.compile(r"(?i)\bBearer\s+[^\s'\"]+")
 _OPENAI_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+_TOOL_STATUS_LABELS = {
+    "pending": "等待中",
+    "queued": "等待中",
+    "in_progress": "进行中",
+    "running": "进行中",
+    "completed": "已完成",
+    "succeeded": "已完成",
+    "success": "已完成",
+    "failed": "失败",
+    "error": "失败",
+    "declined": "已拒绝",
+    "cancelled": "已取消",
+    "canceled": "已取消",
+}
 
 
 def redact_sensitive_text(value: str, *, limit: int = 2000) -> str:
@@ -44,6 +58,17 @@ def redact_sensitive_text(value: str, *, limit: int = 2000) -> str:
     return text[:limit]
 
 
+def tool_status_label(value: object) -> str:
+    """把常见协议状态转为稳定、简短的用户文案；未知值保留原意。"""
+    if value is None:
+        return ""
+    status = str(value).strip()
+    if not status:
+        return ""
+    return _TOOL_STATUS_LABELS.get(
+        status.lower(), status.replace("_", " "))
+
+
 @dataclass
 class AgentEvent:
     """agent 执行过程中吐出的一个事件。
@@ -52,8 +77,11 @@ class AgentEvent:
       - "text"  : agent 的正文输出（可能分多段到达）
       - "info"  : 元信息（token 用量、session id 等），UI 里灰色显示
       - "status": 安全的阶段/心跳摘要，不含 chain-of-thought 正文
-      - "tool"  : 工具标题与已脱敏、有界的 meta 上下文
+      - "tool"  : 工具标题与已脱敏、有界的 meta 上下文；同一
+        tool_call_id 的生命周期通过 meta.status 原位更新
       - "permission": 权限请求/结果摘要
+      - "activity": 无可见增量的协议活动；只刷新 CommandBus 静默时钟，
+        不进入 UI 或持久事件
       - "cancel_requested": 控制层请求取消，UI 应先结束权限等待
       - "delivery_committed": 内部投递确认；Orchestrator 在公开任何后续
         事件前持久化 no-replay cursor，不转发给 UI

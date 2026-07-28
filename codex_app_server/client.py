@@ -210,11 +210,14 @@ class CodexAppServerClient:
         workdir: str,
         *,
         sandbox: str | None = None,
+        approval_policy: str | None = None,
         ephemeral: bool | None = None,
     ) -> str:
         params: dict[str, Any] = {"cwd": workdir}
         if sandbox is not None:
             params["sandbox"] = sandbox
+        if approval_policy is not None:
+            params["approvalPolicy"] = approval_policy
         if ephemeral is not None:
             params["ephemeral"] = ephemeral
         result = await self.request("thread/start", params)
@@ -226,10 +229,13 @@ class CodexAppServerClient:
         workdir: str,
         *,
         sandbox: str | None = None,
+        approval_policy: str | None = None,
     ) -> str:
         params: dict[str, Any] = {"threadId": thread_id, "cwd": workdir}
         if sandbox is not None:
             params["sandbox"] = sandbox
+        if approval_policy is not None:
+            params["approvalPolicy"] = approval_policy
         result = await self.request("thread/resume", params)
         return self._thread_id(result, "thread/resume")
 

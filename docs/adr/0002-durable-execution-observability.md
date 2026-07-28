@@ -38,8 +38,37 @@ ACP `agent_thought_chunk` 只映射为“正在分析”等阶段状态，不显
 password、authorization 字段在权限 UI 中隐藏。权限弹窗必须显示工具上下文，
 不再只有模糊标题。
 
-CommandBus 在连续 10 秒没有 agent 事件时发 heartbeat，并持续记录静默时长。
-ACP 连续 120 秒无协议活动仍按既有契约取消并重建不可信连接。
+工具更新是状态流，不是聊天流：
+
+- adapter 以 `tool_call_id` 为 identity，保存初始脱敏 title/command，并只输出
+  可见状态迁移；缺 ID 时使用脱敏标题作为可见 identity；
+- CommandBus 在刷新 activity 时钟后，对完全相同的 status/tool 做第二层去重，
+  防止任一 producer 刷爆 UI 与 `events.jsonl`；
+- adapter 对没有可见增量的重复工具 update 发内部 activity 事件；
+  CommandBus 只刷新静默时钟，不向 UI 转发或持久化；
+- TUI 让同一工具只占一个逻辑项，将协议状态归一为“等待中/进行中/已完成/
+  失败/已拒绝/已取消”并原位更新；命令详情默认折叠，用户通过 `/details`
+  显式切换；
+- 命令终态后清理内存 identity/fingerprint；历史事件保持 append-only，不回写
+  删除旧噪声。
+
+CommandBus 在连续 10 秒没有 agent 事件时发 heartbeat，并持续记录累计静默
+时长。heartbeat 不是 agent 活动，不得重置静默计时；TUI 对同一 command 的
+heartbeat 原位更新，避免每 10 秒追加一条重复记录。heartbeat 同时标明最近
+活动阶段（host 或 worker）。
+
+`completed` 是 CommandBus 的调用终态，只表示本轮 agent/host 调用正常结束，
+不证明自然语言任务已经验收。TUI 对 adapter `done` 显示“本轮响应结束”，不得
+显示“agent 完成”。
+fan-out 中任一 worker 失败时，CommandBus 等其他 target 收尾后将 command
+标为 `failed`；失败前已有 partial 时必须同时标注调用失败。
+TUI 固定任务区独立保留每个 agent 的阶段和终态；总 command 失败但同时存在
+成功与失败 agent 时显示“部分完成”，并在运行期显示累计耗时和取消入口。
+
+ACP 仅在不等待人工权限时应用 inactivity watchdog：没有活跃工具时为 120 秒；
+工具已创建且尚未终止时为 15 分钟。后者用于工程子代理和长命令，任何协议更新
+仍会重置计时。该轮已提交，因此 timeout 必须建立 no-replay cursor，不能
+自动补发。
 
 ### 2.3 精确取消
 
@@ -47,6 +76,8 @@ CommandBus 为每个 active command 持有独立 dispatch task：
 
 - queued command 可直接标记 cancelled，worker 取到后跳过；
 - running command 只取消自己的 dispatch，不杀死 bus worker；
+- cancel_requested 只表示取消已发出，TUI 在 CommandBus 确认 terminal 前保持
+  运行态和工具状态；
 - terminal command 的 cancel 幂等返回原状态；
 - TUI `Ctrl+X` 与 control `command.cancel` 复用同一原语。
 
@@ -69,14 +100,25 @@ MCP bridge 对应新增 `myagents_read_events` 与
 ## 3. 验收
 
 1. ACP thought 正文不可见；阶段、工具标题和命令上下文可见。
-2. 静默任务产生 heartbeat；事件经重启仍可读取。
+2. 静默任务产生累计 heartbeat；同一 command 在 TUI 只占一条状态记录；
+   事件经重启仍可读取。
 3. 权限请求前 TUI 显示工具上下文，请求与结果均写入事件日志。
 4. active/queued 可精确取消，bus worker 继续服务下一条命令。
 5. TUI `Ctrl+X`、control 与 MCP 使用同一取消语义。
 6. M3 旧房间可无损补建事件日志；损坏事件日志拒绝打开。
 7. Codex host 不添加模型、reasoning、plugin、MCP 或自然语言关键词覆盖。
+8. `done/completed` 的用户文案不声称任务已验收。
+9. 人工权限等待超过 inactivity timeout 不误取消；权限结束后恢复普通计时。
+10. fan-out 任一 worker 失败时其他 target 仍收尾，command 终态为 `failed`。
+11. 高频相同 tool update 不重复转发、持久化或重绘；真实状态迁移、工具标题、
+    脱敏命令和终态仍完整可见。
+12. 固定任务区显示每个 agent 的阶段；混合终态显示“部分完成”，terminal 后
+    不再显示取消提示。
+13. 活跃工具超过普通 120 秒阈值不会被误杀；独立工具 watchdog 到期仍按
+    no-replay 失败处理。
 
 ## 4. 后果
 
 执行状态现在可被 TUI 与外部 agent 共同观察和干预，同时不会污染共享对话。
-事件日志会随使用增长；压缩、保留周期与跨机器传输不属于 M3.1。
+事件日志仍会随有信息增量的事件增长；历史压缩、保留周期与跨机器传输不属于
+M3.1。旧版本已写入的重复记录不做破坏性回写。

@@ -23,13 +23,14 @@
 | ID | 目标 | Guide（行动前） | Sensor / 人工确认（行动后） | 失败处置 | Owner |
 | --- | --- | --- | --- | --- | --- |
 | C1 | 通用 agent 接入边界 | HARNESS §3；`acp-migration.md` 架构 | R2–R4；`test_phase2.py` AgentSpec/并发用例 | 阻断并把差异下沉至 adapter/spec | Bryant Yang |
-| C2 | 权限 fail-closed | HARNESS §4.2；`acp-migration.md` 权限策略 | R1；ACP/Phase 2 权限测试；SPEC UC-PERM-001 | 阻断；恢复 deny/合法 option 校验后复验 | Bryant Yang |
-| C3 | 增量上下文不重发、不乱序（seq cursor） | HARNESS §4.1、§4.4；`acp-migration.md` 增量契约与持久化契约 | `test_phase2.py` cursor/bootstrap/delivery-lock 用例；`test_m25.py` seq 增量用例 | 不推进 cursor；修复后重跑并发回归 | Bryant Yang |
+| C2 | 权限 fail-closed 且人工等待不误超时 | HARNESS §4.2；`acp-migration.md` 权限策略 | R1；ACP/Phase 2 权限测试；`test_acp.py` permission-wait/inactivity 用例；SPEC UC-PERM-001 | 阻断；恢复 deny/合法 option 校验与人工等待暂停计时后复验 | Bryant Yang |
+| C3 | 增量上下文不重发、不乱序（seq cursor） | HARNESS §4.1、§4.4；`acp-migration.md` 增量契约与持久化契约 | `test_phase2.py` cursor/bootstrap/delivery-lock 用例；`test_m25.py` seq 增量与 timeout no-replay 用例 | 区分明确未提交的可重试失败与提交后不确定的 no-replay；修复后重跑并发回归 | Bryant Yang |
 | C4 | 取消与退出不留进程 | HARNESS §4.3；`acp-migration.md` 取消/生命周期 | basic/ACP/Phase 2 回收测试；SPEC UC-LIFE-001 人工边界 | 阻断交付；清理进程并定位锁/进程组问题 | Bryant Yang |
 | C5 | Harness 入口与引用不漂移 | `AGENTS.md`；`workflow.md` | `scripts/check-harness.sh` 文档/marker/link Sensor | 修正文档或引用；不得复制多份规则 | Bryant Yang |
 | C6 | 关键行为证据可信 | `SPEC.md` | fake fixture + 既有 tests + 授权的真实 E2E/人工验收 | 报告证据缺口，不以新生成测试代替验收 | Bryant Yang |
-| C7 | 持久化、session restore 与单写者 lease | HARNESS §4.4；`acp-migration.md` 持久化与 session restore；ADR-0001 | `test_storage.py`、`test_m25.py`；SPEC UC-ROOM-001/UC-ACP-002 | fail loudly 不假提交；修复后重跑 storage/M2.5 回归 | Bryant Yang |
-| C8 | 外部入口保持单写者、权限不绕过 | HARNESS §4.5；ADR-0001 §2.4–2.6 | `test_m3_bus.py`、`test_m3_control.py`、`test_m3_mcp.py`；SPEC UC-CTRL-001/UC-CTRL-002 | 阻断；bridge 不得创建 Orchestrator/获取 lease/绕过 TUI 权限，修复后重跑 M3 回归 | Bryant Yang |
+| C7 | 持久化、命名会话、session restore 与单写者 lease | HARNESS §4.4；`acp-migration.md` 持久化与 session restore；ADR-0001、ADR-0005 | `test_storage.py`、`test_m25.py`（含本地 `/new` 与 no-replay）；SPEC UC-ROOM-001/UC-SESSION-001/UC-ACP-002 | fail loudly 不假提交；本地命令不入 timeline；会话切换先标准关闭旧 owner；修复后重跑 storage/M2.5 回归 | Bryant Yang |
+| C8 | 外部入口保持单写者、权限不绕过且失败终态真实 | HARNESS §4.5–4.6；ADR-0001 §2.4–2.6 | `test_m3_bus.py`（含 fan-out worker failure）、`test_m3_control.py`、`test_m3_mcp.py`；SPEC UC-CTRL-001/UC-CTRL-002 | 阻断；bridge 不得创建 Orchestrator/获取 lease/绕过 TUI 权限；worker 失败不得报 completed；修复后重跑 M3 回归 | Bryant Yang |
+| C9 | 执行状态有界、可读且不刷屏 | HARNESS §4.6；ADR-0002；`acp-migration.md` 可见状态 | `test_acp.py` tool-spam/long-tool watchdog、`test_m3_bus.py` 防御性去重、`test_basic.py` 工具折叠、`test_tui_status.py` 分 agent 状态；SPEC UC-OBS-001 | 阻断交付；在 adapter/bus/UI 正确边界恢复状态迁移、去重和索引清理，不删除 append-only 历史 | Bryant Yang |
 
 ## 3. 约束等级
 
@@ -50,9 +51,11 @@
 | 权限决策 | [`SPEC.md#uc-perm-001-权限请求与选择`](SPEC.md#uc-perm-001-权限请求与选择) | C2、C6 |
 | 生命周期 | [`SPEC.md#uc-life-001-取消与退出回收`](SPEC.md#uc-life-001-取消与退出回收) | C4、C6 |
 | 持久房间与重启恢复 | [`SPEC.md#uc-room-001-持久房间与重启恢复`](SPEC.md#uc-room-001-持久房间与重启恢复) | C7、C6 |
+| 同一项目独立会话 | [`SPEC.md#uc-session-001-同一项目独立会话`](SPEC.md#uc-session-001-同一项目独立会话) | C7、C4、C6 |
 | ACP session 恢复 | [`SPEC.md#uc-acp-002-acp-session-恢复与原子-checkpoint`](SPEC.md#uc-acp-002-acp-session-恢复与原子-checkpoint) | C7、C3、C6 |
 | 外部命令注入（bus + MCP） | [`SPEC.md#uc-ctrl-001-外部命令注入command-bus--mcp-stdio`](SPEC.md#uc-ctrl-001-外部命令注入command-bus--mcp-stdio) | C8、C6 |
 | 控制 socket 安全与生命周期 | [`SPEC.md#uc-ctrl-002-控制-socket-安全与生命周期`](SPEC.md#uc-ctrl-002-控制-socket-安全与生命周期) | C8、C4 |
+| 有界执行可见性 | [`SPEC.md#uc-obs-001-执行进度权限上下文与重启证据`](SPEC.md#uc-obs-001-执行进度权限上下文与重启证据) | C9、C6 |
 
 ## 5. 反馈生命周期
 
