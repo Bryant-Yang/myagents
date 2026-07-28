@@ -123,6 +123,10 @@ def test_agent_specs() -> None:
     assert type(orch.adapters["codex"]) is CodexAppServerAdapter
     assert type(orch.adapters["opencode"]) is OpenCodeAdapter
     assert getattr(orch.adapters["codex"], "stateful_session", False) is True
+    assert orch.adapters["codex"].ephemeral_thread is False
+    assert isinstance(orch.host.adapter, CodexAppServerAdapter)
+    assert orch.host.adapter.ephemeral_thread is True
+    assert orch.host.adapter._fallback.ephemeral is True
     print("ok  AgentSpec 注册（kimi=ACP，codex=app-server，opencode=JSONL）")
 
 

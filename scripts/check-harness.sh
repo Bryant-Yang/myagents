@@ -16,6 +16,7 @@ required=(
   docs/adr/0001-persistent-room-command-bus-mcp.md
   docs/adr/0002-durable-execution-observability.md
   docs/adr/0003-codex-app-server-transport.md
+  docs/adr/0004-ephemeral-codex-host-threads.md
   scripts/check-redlines.sh
 )
 
@@ -51,6 +52,7 @@ docs = [
     root / "docs/adr/0001-persistent-room-command-bus-mcp.md",
     root / "docs/adr/0002-durable-execution-observability.md",
     root / "docs/adr/0003-codex-app-server-transport.md",
+    root / "docs/adr/0004-ephemeral-codex-host-threads.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")

@@ -1,6 +1,7 @@
 # ADR-0003：Codex app-server 长连接传输
 
-- 状态：Accepted
+- 状态：Accepted（host thread 持久化由
+  [ADR-0004](0004-ephemeral-codex-host-threads.md)补充）
 - 日期：2026-07-27
 - 里程碑：M4
 - 作者：Bryant Yang
@@ -48,7 +49,8 @@ app-server 启动命令不得添加 `--model`、`-c` 或 reasoning/plugin/MCP �
 
 允许发送的运行时字段仅限协议必需数据、`cwd` 与已经存在的产品安全边界：
 host 使用 `read-only`，worker 使用 `workspace-write`。这些 sandbox 值只作用于
-该 thread，不写入 `~/.codex/config.toml`。
+该 thread，不写入 `~/.codex/config.toml`。host 的 `thread/start` 另按
+ADR-0004 发送 `ephemeral: true`，不适用于 worker。
 
 ### 2.4 事件映射
 
@@ -76,6 +78,7 @@ host 使用 `read-only`，worker 使用 `workspace-write`。这些 sandbox 值�
 
 - initialize 或 thread prepare 阶段失败可以回退到 `codex exec --json`；
   此时尚未提交用户 turn，即使空 thread 已在服务端建立也没有工具副作用。
+  host fallback 另按 ADR-0004 增加 `--ephemeral`。
 - 一旦发送 `turn/start` 就不自动回退：响应丢失时无法证明服务端是否已接受并
   开始执行。无论是否已收到流式事件或 approval，都诚实失败并作废连接，下一轮
   再重建，绝不冒险重复工具副作用。

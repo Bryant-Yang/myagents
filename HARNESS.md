@@ -163,11 +163,12 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 
 ### 4.7 Codex app-server（M4）
 
-- 一个 adapter 独占一个 app-server 进程与 thread，同 adapter turn 串行；
-  Codex worker 连续轮次复用 thread，host 复用暖进程但每次建立干净 thread。
+- 一个 adapter 独占一个 app-server 进程与当前 thread，同 adapter turn 串行；
+  Codex worker 连续轮次复用持久 thread，host 复用暖进程但每次建立干净的
+  ephemeral thread，内部路由不得写入 Codex 历史。
 - 启动与请求不得覆盖 model、effort、config、collaboration mode、plugin 或
-  MCP；只传协议必需字段、cwd 与既有 host/worker sandbox 安全边界，且不写
-  `~/.codex/config.toml`。
+  MCP；只传协议必需字段、cwd、既有 host/worker sandbox 安全边界，以及 host
+  专用的 `ephemeral: true`，且不写 `~/.codex/config.toml`。
 - `turn/completed` 是完成权威信号；取消发送 `turn/interrupt` 并等 terminal，
   未确认则关闭重建，下一轮不得与旧 turn 重叠。
 - approval 无处理器默认 decline；tool/command 元数据必须有界脱敏，reasoning

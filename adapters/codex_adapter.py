@@ -31,18 +31,35 @@ from .base import AgentEvent, stream_jsonl
 class CodexAdapter:
     name = "codex"
 
-    def __init__(self, use_resume: bool = False, sandbox: str = "workspace-write") -> None:
+    def __init__(
+        self,
+        use_resume: bool = False,
+        sandbox: str = "workspace-write",
+        *,
+        ephemeral: bool = False,
+    ) -> None:
+        if use_resume and ephemeral:
+            raise ValueError("ephemeral Codex exec 不支持 resume")
         self.session_id: str | None = None
         self.use_resume = use_resume
         self.sandbox = sandbox
+        self.ephemeral = ephemeral
 
     async def stream(self, prompt: str, workdir: str) -> AsyncIterator[AgentEvent]:
         if self.use_resume and self.session_id:
             cmd = ["codex", "exec", "resume", self.session_id, prompt,
                    "--json", "--skip-git-repo-check", "--sandbox", self.sandbox]
         else:
-            cmd = ["codex", "exec", "--cd", workdir, "--sandbox", self.sandbox,
-                   "--skip-git-repo-check", "--json", prompt]
+            cmd = ["codex", "exec"]
+            if self.ephemeral:
+                cmd.append("--ephemeral")
+            cmd.extend([
+                "--cd", workdir,
+                "--sandbox", self.sandbox,
+                "--skip-git-repo-check",
+                "--json",
+                prompt,
+            ])
 
         async for line in stream_jsonl(cmd, workdir):
             try:

@@ -204,8 +204,10 @@ prompt/session 初始化共用 adapter 的同一把锁，不竞态杀进程。
   Orchestrator、不获取 lease、不绕过 TUI 权限。细节见
   [ADR-0001](adr/0001-persistent-room-command-bus-mcp.md)
 - [x] **Phase 4**：Codex 官方 app-server 接入：长驻进程、thread/turn、
-  流式 item、approval、interrupt、恢复和安全 JSONL fallback。详见
-  [ADR-0003](adr/0003-codex-app-server-transport.md)。Claude 尚未注册；
+  流式 item、approval、interrupt、恢复和安全 JSONL fallback；host 使用
+  ephemeral thread，避免内部路由污染 Codex 历史。详见
+  [ADR-0003](adr/0003-codex-app-server-transport.md)与
+  [ADR-0004](adr/0004-ephemeral-codex-host-threads.md)。Claude 尚未注册；
   后续按其可靠官方协议单独接入，不把厂商协议强行伪装成 ACP。
 - [ ] **Phase 5**：里程碑工作流、review → 修改 → 复核闭环与 steering
 

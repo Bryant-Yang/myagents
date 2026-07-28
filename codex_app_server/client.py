@@ -210,10 +210,13 @@ class CodexAppServerClient:
         workdir: str,
         *,
         sandbox: str | None = None,
+        ephemeral: bool | None = None,
     ) -> str:
         params: dict[str, Any] = {"cwd": workdir}
         if sandbox is not None:
             params["sandbox"] = sandbox
+        if ephemeral is not None:
+            params["ephemeral"] = ephemeral
         result = await self.request("thread/start", params)
         return self._thread_id(result, "thread/start")
 

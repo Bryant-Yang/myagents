@@ -45,6 +45,7 @@ from tempfile import TemporaryDirectory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from adapters.base import AgentEvent  # noqa: E402
+from adapters import codex_adapter as codex_jsonl  # noqa: E402
 from codex_app_server.adapter import CodexAppServerAdapter  # noqa: E402
 from codex_app_server.client import (  # noqa: E402
     CodexAppServerClient,
@@ -275,6 +276,46 @@ def test_preturn_failure_uses_explicit_fallback() -> None:
         assert any(e.kind == "done" for e in events)
     run(body())
     print("ok  turn 建立前失败显式使用 JSONL fallback")
+
+
+def test_ephemeral_host_fallback_does_not_persist_exec_session() -> None:
+    """Host app-server 失败时，JSONL fallback 也必须使用 codex exec --ephemeral。"""
+    async def body() -> None:
+        commands: list[tuple[list[str], str]] = []
+        original = codex_jsonl.stream_jsonl
+
+        async def fake_stream_jsonl(cmd: list[str], workdir: str):
+            commands.append((cmd, workdir))
+            yield json.dumps({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "FALLBACK"},
+            })
+            yield json.dumps({"type": "turn.completed", "usage": {}})
+
+        codex_jsonl.stream_jsonl = fake_stream_jsonl
+        adapter = CodexAppServerAdapter(
+            [sys.executable, "-c", "raise SystemExit(7)"],
+            sandbox="read-only",
+            reuse_thread=False,
+            ephemeral_thread=True,
+            fallback_jsonl=True,
+        )
+        try:
+            events = await collect(adapter.stream("host 安全回退", "/tmp"))
+        finally:
+            await adapter.aclose()
+            codex_jsonl.stream_jsonl = original
+
+        assert len(commands) == 1
+        cmd, workdir = commands[0]
+        assert workdir == "/tmp"
+        assert cmd[:2] == ["codex", "exec"]
+        assert "--ephemeral" in cmd
+        assert "--sandbox" in cmd and "read-only" in cmd
+        assert [e.text for e in events if e.kind == "text"] == ["FALLBACK"]
+        assert any(e.kind == "done" for e in events)
+    run(body())
+    print("ok  host JSONL fallback 使用 ephemeral exec")
 
 
 def test_uncertain_turn_start_is_not_replayed_and_connection_rebuilds() -> None:
@@ -835,6 +876,52 @@ def test_adapter_two_streams_reuse_thread_and_pid() -> None:
     print("ok  adapter 两轮 stream 复用 thread 与进程")
 
 
+def test_ephemeral_clean_threads_reuse_pid_without_persisting_host_history(
+        ) -> None:
+    """Host 每轮建干净 thread，但必须标为 ephemeral，避免污染 Codex 历史。"""
+    async def body() -> None:
+        reset_state()
+        adapter = CodexAppServerAdapter(
+            CMD,
+            sandbox="read-only",
+            reuse_thread=False,
+            ephemeral_thread=True,
+        )
+        first = await collect(adapter.stream("第一轮 host 判断", "/tmp"))
+        second = await collect(adapter.stream("第二轮 host 判断", "/tmp"))
+        await adapter.aclose()
+        assert any(e.kind == "done" for e in first)
+        assert any(e.kind == "done" for e in second)
+
+        events = state_events()
+        threads = [e for e in events if e.startswith("thread:")]
+        turns = [e for e in events if e.startswith("turn:")]
+        assert len(threads) == 2 and len(turns) == 2, events
+        assert len({e.rsplit(":", 1)[1] for e in threads + turns}) == 1
+        thread_params = [
+            json.loads(e.split(":", 1)[1])
+            for e in events if e.startswith("thread-params:")
+        ]
+        assert thread_params == [{
+            "cwd": "/tmp",
+            "ephemeral": True,
+            "sandbox": "read-only",
+        }] * 2
+        assert_no_violation()
+    run(body())
+    print("ok  host 干净 thread 不落盘且复用 app-server 进程")
+
+
+def test_ephemeral_thread_rejects_reuse_configuration() -> None:
+    try:
+        CodexAppServerAdapter(CMD, ephemeral_thread=True)
+    except ValueError as exc:
+        assert "reuse_thread=False" in str(exc)
+    else:
+        raise AssertionError("ephemeral thread 不得启用 reuse_thread")
+    print("ok  ephemeral thread 拒绝复用配置")
+
+
 def test_adapter_resumes_thread_after_process_restart() -> None:
     """持久 session id 在新 app-server 进程中通过 thread/resume 恢复。"""
     async def body() -> None:
@@ -977,6 +1064,7 @@ if __name__ == "__main__":
     test_pending_request_fails_on_disconnect()
     test_client_close_is_bounded_when_event_queue_is_full()
     test_preturn_failure_uses_explicit_fallback()
+    test_ephemeral_host_fallback_does_not_persist_exec_session()
     test_uncertain_turn_start_is_not_replayed_and_connection_rebuilds()
     test_orchestrator_does_not_redeliver_uncertain_codex_turn()
     test_orchestrator_does_not_redeliver_post_submit_failure_or_cancel()
@@ -992,6 +1080,8 @@ if __name__ == "__main__":
     test_invalid_terminal_status_fails_and_rebuilds()
     test_server_interrupted_is_regular_failure_not_task_cancellation()
     test_adapter_two_streams_reuse_thread_and_pid()
+    test_ephemeral_clean_threads_reuse_pid_without_persisting_host_history()
+    test_ephemeral_thread_rejects_reuse_configuration()
     test_adapter_resumes_thread_after_process_restart()
     test_adapter_cancel_interrupts_then_allows_next_turn()
     test_aclose_interrupts_active_stream_and_reaps_process()

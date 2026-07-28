@@ -214,9 +214,11 @@
 - **前置条件**：本机 Codex CLI 支持 `codex app-server`；adapter 独占其进程。
 - **主流程**：一次 initialize 后建立 thread；worker 的连续 turn 复用同一
   app-server PID/thread 并按 cursor 接收增量；host 复用暖进程、每次建立干净
-  thread，以免 transcript 快照在原生历史中重复。
+  的 ephemeral thread，以免 transcript 快照在原生历史中重复，同时不把内部
+  路由提示词写入 Codex 历史。
 - **配置边界**：不发送 model、effort、config、collaboration mode、plugin 或
-  MCP 覆盖，不修改 Codex 全局配置；仅传 cwd 与 host/worker 既有 sandbox。
+  MCP 覆盖，不修改 Codex 全局配置；仅传 cwd、host/worker 既有 sandbox，以及
+  host 专用的 `ephemeral: true`。
 - **事件分支**：agent message delta 流式进入正文；command/file/MCP item
   进入脱敏 tool/status；approval 进入统一权限 UI且无处理器默认拒绝；
   reasoning 正文不显示；`turn/completed` 后才产生 done。
@@ -226,9 +228,11 @@
   用户取消都先形成持久 no-replay 边界，再公开失败/取消。服务端明确拒绝或
   确认未发送的失败保持可重试；即使旧 thread 无法恢复，新 thread 也不
   bootstrap 已投递的旧输入。明确接受的 turn 在任何正文/工具/权限 event
-  sink 回调前先持久化该边界。
-- **验收**：fake server 证明两轮同 PID/thread、无 `jsonrpc` header、默认
-  配置字段未被覆盖、取消不重叠、断线失败、close 无残留。
+  sink 回调前先持久化该边界。host 的 JSONL fallback 使用
+  `codex exec --ephemeral`，故障路径也不写入 Codex 历史。
+- **验收**：fake server 证明 worker 两轮同 PID/thread、host 两个 ephemeral
+  thread 共用同一 PID、无 `jsonrpc` header、默认配置字段未被覆盖、取消不
+  重叠、断线失败、close 无残留。
 - **独立证据来源**：`tests/fake_codex_app_server.py` +
   `tests/test_codex_app_server.py`。
 - **真实验收证据**：2026-07-27 在临时目录执行两组真实 Codex 探针，均未

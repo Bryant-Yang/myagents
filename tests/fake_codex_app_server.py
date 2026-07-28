@@ -67,14 +67,14 @@ def turn_obj(turn_id: str, status: str) -> dict:
     return {"id": turn_id, "items": [], "status": status}
 
 
-def thread_obj(cwd: str = "/tmp") -> dict:
+def thread_obj(cwd: str = "/tmp", *, ephemeral: bool = False) -> dict:
     return {
         "id": THREAD_ID,
         "cliVersion": "0.0.0-fake",
         "createdAt": 1,
         "updatedAt": 1,
         "cwd": cwd,
-        "ephemeral": True,
+        "ephemeral": ephemeral,
         "modelProvider": "openai",
         "preview": "",
         "sessionId": "sess_fake_1",
@@ -85,7 +85,10 @@ def thread_obj(cwd: str = "/tmp") -> dict:
 
 
 def send_thread_result(rid, params: dict) -> None:
-    thread = thread_obj(params.get("cwd") or "/tmp")
+    thread = thread_obj(
+        params.get("cwd") or "/tmp",
+        ephemeral=params.get("ephemeral") is True,
+    )
     send({"id": rid, "result": {
         "approvalPolicy": "never",
         "approvalsReviewer": "user",

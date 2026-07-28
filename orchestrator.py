@@ -153,7 +153,9 @@ class Orchestrator:
         # 只是 _build_prompt 会给它主持人角色的 prompt。
         # 主持人由 codex 扮演，用 read-only 沙箱：总结/仲裁/路由只需要看，不需要写。
         self.host = HostAgent(adapter=CodexAppServerAdapter(
-                                  sandbox="read-only", reuse_thread=False),
+                                  sandbox="read-only",
+                                  reuse_thread=False,
+                                  ephemeral_thread=True),
                               workers=[spec.name for spec in specs])
         self.adapters[HOST_NAME] = self.host
         # 持久化：persistent=True 默认按 workdir 打开 RoomStore；调用方也

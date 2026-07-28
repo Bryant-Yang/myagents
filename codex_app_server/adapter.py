@@ -55,6 +55,7 @@ class CodexAppServerAdapter:
         sandbox: str | None = "workspace-write",
         permission_handler: PermissionHandler | None = None,
         reuse_thread: bool = True,
+        ephemeral_thread: bool = False,
         fallback_jsonl: bool | None = None,
         fallback_adapter: AgentAdapter | None = None,
         cancel_timeout: float = 10.0,
@@ -65,9 +66,13 @@ class CodexAppServerAdapter:
             raise ValueError("cmd 和 command 只能指定一个")
         if cancel_timeout <= 0 or inactivity_timeout <= 0:
             raise ValueError("timeout 必须大于 0")
+        if ephemeral_thread and reuse_thread:
+            raise ValueError(
+                "ephemeral_thread=True 要求 reuse_thread=False")
         self.session_id: str | None = None
         self.sandbox = sandbox
         self.reuse_thread = reuse_thread
+        self.ephemeral_thread = ephemeral_thread
         custom_command = command is not None or cmd is not None
         self._command = list(command or cmd or ["codex", "app-server"])
         self._fallback_jsonl = (
@@ -75,7 +80,9 @@ class CodexAppServerAdapter:
             if fallback_jsonl is None else fallback_jsonl)
         fallback_sandbox = sandbox or "workspace-write"
         self._fallback = fallback_adapter or CodexAdapter(
-            sandbox=fallback_sandbox)
+            sandbox=fallback_sandbox,
+            ephemeral=ephemeral_thread,
+        )
         self._permission_handler = permission_handler
         self._cancel_timeout = cancel_timeout
         self._inactivity_timeout = inactivity_timeout
@@ -153,7 +160,10 @@ class CodexAppServerAdapter:
                     load_failed = True
             if not restored:
                 self.session_id = await self._client.thread_start(
-                    workdir, sandbox=self.sandbox)
+                    workdir,
+                    sandbox=self.sandbox,
+                    ephemeral=True if self.ephemeral_thread else None,
+                )
         except BaseException:
             await self._reset()
             raise
