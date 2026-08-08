@@ -38,7 +38,9 @@
 import asyncio
 import json
 import os
+import struct
 import sys
+import zlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -46,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from adapters.base import AgentEvent  # noqa: E402
 from adapters import codex_adapter as codex_jsonl  # noqa: E402
+from clipboard_image import TrustedImage  # noqa: E402
 from codex_app_server.adapter import CodexAppServerAdapter  # noqa: E402
 from codex_app_server.client import (  # noqa: E402
     CodexAppServerClient,
@@ -59,6 +62,23 @@ SERVER = str(Path(__file__).parent / "fake_codex_app_server.py")
 CMD = [sys.executable, SERVER]
 STATE = "/tmp/myagents_fake_codex_app_state"
 TIMEOUT = 15  # 每个用例的整体上限（秒），防 red/green 时挂死
+
+
+def _png_chunk(kind: bytes, payload: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(payload))
+        + kind
+        + payload
+        + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+    )
+
+
+_PNG = (
+    b"\x89PNG\r\n\x1a\n"
+    + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+    + _png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00\xff"))
+    + _png_chunk(b"IEND", b"")
+)
 
 
 def reset_state() -> None:
@@ -176,6 +196,45 @@ def test_handshake_two_turns_same_thread_and_pid() -> None:
         assert_no_violation()  # 含 VIOLATION:jsonrpc（线上必须无 jsonrpc 头）
     run(body())
     print("ok  握手 + 两轮复用同一 thread 与 pid（无 jsonrpc 头）")
+
+
+def test_local_image_uses_fake_wire_contract() -> None:
+    async def body() -> None:
+        reset_state()
+        with TemporaryDirectory() as tmp:
+            attachments = Path(tmp) / "attachments"
+            attachments.mkdir()
+            os.chmod(attachments, 0o700)
+            image = attachments / "image.png"
+            image.write_bytes(_PNG)
+            os.chmod(image, 0o600)
+            trusted = TrustedImage(
+                path=image.resolve(),
+                attachment_root=attachments.resolve(),
+                relative_path=Path("image.png"),
+                data=_PNG,
+            )
+            client = await make_client()
+            try:
+                thread_id = await client.thread_start(tmp)
+                await client.turn_start(
+                    thread_id, "看图", images=(trusted,))
+                await wait_state("turn-params:")
+            finally:
+                await client.aclose()
+            params = json.loads(next(
+                line.split(":", 1)[1]
+                for line in state_events()
+                if line.startswith("turn-params:")
+            ))
+            assert params["input"][1] == {
+                "type": "localImage",
+                "path": str(image.resolve()),
+            }
+        assert_no_violation()
+
+    run(body())
+    print("ok  Codex fake contract 接收 localImage")
 
 
 def test_command_approval_default_deny() -> None:
@@ -1093,6 +1152,7 @@ def test_aclose_is_bounded_when_owner_swallows_cancellation() -> None:
 
 if __name__ == "__main__":
     test_handshake_two_turns_same_thread_and_pid()
+    test_local_image_uses_fake_wire_contract()
     test_command_approval_default_deny()
     test_pending_request_fails_on_disconnect()
     test_client_close_is_bounded_when_event_queue_is_full()

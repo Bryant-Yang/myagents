@@ -9,9 +9,9 @@
 
 | # | 场景 | 先读哪份 | 必守红线 | 产出落点 | DoD |
 | --- | --- | --- | --- | --- | --- |
-| 1 | 改路由、history 或 fan-out | [`SPEC.md`](SPEC.md) 路由/增量用例；`../HARNESS.md` §4.1 | R2、R3 | `orchestrator.py`、`host.py`、对应测试 | 快照与并发顺序测试通过；无 name-specific 协议分支 |
-| 2 | 改 ACP、权限、取消或 session | [`acp-migration.md`](acp-migration.md)；`../HARNESS.md` §4.2–4.3 | R1–R4 | `acp/`、fake server、ACP/Phase 2 测试、协议文档 | fail-closed、串行化、回收测试通过；高风险变化有真实/人工验收计划 |
-| 3 | 新增或迁移 agent | `../HARNESS.md` §1–§3；`acp-migration.md` | R2–R4 | 具体 adapter + `AGENT_SPECS` + tests + README | adapter 接口统一；transport 状态可见；JSONL fallback 无回归 |
+| 1 | 改路由、history、fan-out 或有界讨论 | [`SPEC.md`](SPEC.md) 路由/讨论/增量用例；[`adr/0008-bounded-multi-agent-discussion.md`](adr/0008-bounded-multi-agent-discussion.md)；`../HARNESS.md` §4.1 | R2、R3、R5 | `discussion.py`、`orchestrator.py`、`host.py`、对应测试 | 快照与并发顺序测试通过；讨论有界、不递归；无 name-specific 协议分支 |
+| 2 | 改 ACP、权限、取消、session 或 hybrid fallback | [`acp-migration.md`](acp-migration.md)、[`adr/0006-kimi-hybrid-transport-policy.md`](adr/0006-kimi-hybrid-transport-policy.md)、[`adr/0007-opencode-hybrid-transport-policy.md`](adr/0007-opencode-hybrid-transport-policy.md)；`../HARNESS.md` §4.2–4.3 | R1–R4 | `acp/`、具体 adapter/profile、fake server、ACP/hybrid/Phase 2 测试、协议文档 | fail-closed、串行化、prepare-only、no-replay、回收测试通过；高风险变化有真实/人工验收计划 |
+| 3 | 新增或迁移 agent | `../HARNESS.md` §1–§3；`acp-migration.md` | R2–R4 | 具体 adapter + `AGENT_SPECS` + tests + README | adapter 接口统一；transport 状态可见；JSONL fallback 受能力与提交时机约束 |
 | 4 | 改 TUI 或权限交互 | [`SPEC.md`](SPEC.md) 权限用例；`../HARNESS.md` §4.2–4.3 | R1、R3 | `main.py` + Textual pilot tests | UI 不阻塞；退出无 Future/进程残留；来源 agent 可见 |
 | 5 | 只做 review / 文档 / Harness | 本文件；相关契约；必要时 [`harness-controls.md`](harness-controls.md) | 所有受影响红线 | 对应文档、Sensor 或 review 结论 | 引用无悬空；红线 gate 与相关测试通过 |
 | 6 | 改持久化、恢复、会话身份/切换、lease、command bus、可观测性或 MCP 入口 | [`adr/0001-persistent-room-command-bus-mcp.md`](adr/0001-persistent-room-command-bus-mcp.md)、[`adr/0002-durable-execution-observability.md`](adr/0002-durable-execution-observability.md)、[`adr/0005-project-conversation-sessions.md`](adr/0005-project-conversation-sessions.md)；[`SPEC.md`](SPEC.md) 房间/恢复/会话/控制/可观测用例 | R1–R4、单写者、执行事件不进 history | `storage/`、`control/`、ACP adapter、MCP bridge、TUI、对应测试 | storage/M2.5/M3（bus/control/mcp）测试通过；会话隔离且 default 兼容；工具状态按 identity 只记录迁移并原位更新；取消不杀 worker；MCP 不创建第二 Orchestrator、不获取 lease、不绕过 TUI 权限 |
@@ -26,14 +26,15 @@
 | R1 | 权限默认 deny，生产不得显式 auto |
 | R2 | 通用层不按 agent 名分支 |
 | R3 | 子进程只在 transport 层启动 |
-| R4 | Kimi 生产路径保持 ACP-first |
+| R4 | Kimi/OpenCode 生产保持 ACP-first；JSONL 仅 prepare-only 只读降级 |
+| R5 | `/discuss` 固定 2–3 人、1–3 轮，不由 agent 自主续轮 |
 
 ## 3. 上下文按需载入
 
 | 目的 | 必读 | 按需 |
 | --- | --- | --- |
 | 理解产品与路线 | `README.md`、`docs/SPEC.md` | `docs/concepts.md` |
-| 改 ACP 协议 | `docs/acp-migration.md`、HARNESS §4 | `docs/harness-controls.md` 对应 Control |
+| 改 ACP 协议或 hybrid fallback | `docs/acp-migration.md`、对应 ADR-0006/0007、HARNESS §4 | `docs/harness-controls.md` 对应 Control |
 | 改编排器 | HARNESS §3–§4、SPEC 对应用例 | `host.py` 与 adapter 调用方 |
 | 新增 agent | `AGENTS.md`、HARNESS §1–§3 | 对应 CLI 官方协议文档 |
 | 处理重复失败 | `docs/harness-controls.md` Steering 规则 | 相关 Guide/Sensor 证据 |

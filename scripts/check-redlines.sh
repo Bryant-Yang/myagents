@@ -9,6 +9,7 @@ python3 - <<'PY'
 from __future__ import annotations
 
 import ast
+import json
 import pathlib
 import sys
 
@@ -48,7 +49,8 @@ for path in production:
 
 required_deny_defaults = {
     ROOT / "acp/client.py": {"AcpClient"},
-    ROOT / "acp/adapter.py": {"AcpAdapter", "AcpKimiAdapter"},
+    ROOT / "acp/adapter.py": {
+        "AcpAdapter", "AcpKimiAdapter", "AcpOpenCodeAdapter"},
 }
 for path, classes in required_deny_defaults.items():
     tree = parse(path)
@@ -115,17 +117,194 @@ for path in [ROOT / "main.py", ROOT / "orchestrator.py", ROOT / "host.py"]:
                 fail("R3", path, node,
                      f"上层直接调用 {attr}；改由 ACP/JSONL adapter 执行")
 
-# R4: production Kimi registration remains ACP-first.
+# R4: production Kimi/OpenCode remain ACP-first. JSONL is allowed only behind
+# the prepare-only seam and must use each runtime's checked read-only profile.
 orchestrator = ROOT / "orchestrator.py"
 source = orchestrator.read_text(encoding="utf-8")
 tree = parse(orchestrator)
 for node in ast.walk(tree):
-    if isinstance(node, ast.ImportFrom) and node.module == "adapters.kimi_adapter":
+    if (isinstance(node, ast.ImportFrom)
+            and node.module in {
+                "adapters.kimi_adapter", "adapters.opencode_adapter"}):
         fail("R4", orchestrator, node,
-             "生产 orchestrator 不得导入旧 KimiAdapter JSONL 路径")
-if 'AgentSpec("kimi", "acp", AcpKimiAdapter)' not in source:
+             "生产 orchestrator 不得直接导入 worker JSONL adapter")
+if 'AgentSpec("kimi", "acp+jsonl", AcpKimiAdapter)' not in source:
     errors.append("[R4] orchestrator.py: Kimi 生产注册必须是 "
-                  'AgentSpec("kimi", "acp", AcpKimiAdapter)')
+                  'AgentSpec("kimi", "acp+jsonl", AcpKimiAdapter)')
+if 'AgentSpec("opencode", "acp+jsonl", AcpOpenCodeAdapter)' not in source:
+    errors.append("[R4] orchestrator.py: OpenCode 生产注册必须是 "
+                  'AgentSpec("opencode", "acp+jsonl", '
+                  "AcpOpenCodeAdapter)")
+
+acp_adapter = ROOT / "acp/adapter.py"
+acp_source = acp_adapter.read_text(encoding="utf-8")
+if "KimiAdapter.readonly_fallback()" not in acp_source:
+    errors.append(
+        "[R4] acp/adapter.py: AcpKimiAdapter 必须通过 "
+        "KimiAdapter.readonly_fallback() 构造受限降级")
+if "OpenCodeAdapter.readonly_fallback()" not in acp_source:
+    errors.append(
+        "[R4] acp/adapter.py: AcpOpenCodeAdapter 必须通过 "
+        "OpenCodeAdapter.readonly_fallback() 构造受限降级")
+
+expected_opencode_policy = {
+    "*": "ask",
+    "read": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "lsp": "allow",
+    "todowrite": "allow",
+    "edit": "ask",
+    "bash": "ask",
+    "task": "ask",
+    "skill": "ask",
+    "webfetch": "ask",
+    "websearch": "ask",
+    "external_directory": "ask",
+}
+opencode_policy = None
+for node in parse(acp_adapter).body:
+    if not isinstance(node, ast.Assign):
+        continue
+    if any(isinstance(target, ast.Name)
+           and target.id == "OPENCODE_ACP_PERMISSION_POLICY"
+           for target in node.targets):
+        try:
+            opencode_policy = ast.literal_eval(node.value)
+        except (ValueError, TypeError):
+            opencode_policy = None
+if opencode_policy != expected_opencode_policy:
+    errors.append(
+        "[R4] acp/adapter.py: OPENCODE_ACP_PERMISSION_POLICY 必须保持 "
+        "unknown/risky=ask、read/search=allow")
+
+profile = ROOT / "adapters/kimi_readonly_fallback.md"
+if not profile.is_file():
+    errors.append(
+        "[R4] adapters/kimi_readonly_fallback.md: 缺少 Kimi 只读 fallback profile")
+else:
+    profile_source = profile.read_text(encoding="utf-8")
+    parts = profile_source.split("---", 2)
+    if len(parts) < 3:
+        errors.append(
+            "[R4] adapters/kimi_readonly_fallback.md: 缺少 YAML frontmatter")
+    else:
+        frontmatter = parts[1].splitlines()
+        tools: list[str] = []
+        reading_tools = False
+        subagents_disabled = False
+        for raw in frontmatter:
+            stripped = raw.strip()
+            if stripped == "tools:":
+                reading_tools = True
+                continue
+            if reading_tools and raw.startswith("  - "):
+                tools.append(raw[4:].strip())
+                continue
+            if reading_tools and stripped:
+                reading_tools = False
+            if stripped == "subagents: []":
+                subagents_disabled = True
+        if tools != ["Read", "Grep", "Glob"]:
+            errors.append(
+                "[R4] adapters/kimi_readonly_fallback.md: tools 必须精确为 "
+                "[Read, Grep, Glob]；禁止 Bash/Write/Edit/Skill/Agent/MCP")
+        if not subagents_disabled:
+            errors.append(
+                "[R4] adapters/kimi_readonly_fallback.md: 必须设置 subagents: []")
+
+opencode_profile = ROOT / "adapters/opencode_readonly_fallback.json"
+opencode_jsonl = ROOT / "adapters/opencode_adapter.py"
+opencode_jsonl_source = opencode_jsonl.read_text(encoding="utf-8")
+expected_readonly_permission = {
+    "*": "deny",
+    "read": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+}
+if '"OPENCODE_PERMISSION": json.dumps(' not in opencode_jsonl_source:
+    errors.append(
+        "[R4] adapters/opencode_adapter.py: fallback 必须通过 "
+        "OPENCODE_PERMISSION 运行时覆盖执行 deny-all 白名单")
+if not opencode_profile.is_file():
+    errors.append(
+        "[R4] adapters/opencode_readonly_fallback.json: 缺少 OpenCode "
+        "只读 fallback profile")
+else:
+    try:
+        data = json.loads(opencode_profile.read_text(encoding="utf-8"))
+        readonly = data["agent"]["myagents-readonly-fallback"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        errors.append(
+            "[R4] adapters/opencode_readonly_fallback.json: profile 结构无效")
+    else:
+        if readonly.get("mode") != "primary":
+            errors.append(
+                "[R4] adapters/opencode_readonly_fallback.json: agent mode "
+                "必须是 primary")
+        if readonly.get("permission") != expected_readonly_permission:
+            errors.append(
+                "[R4] adapters/opencode_readonly_fallback.json: permission "
+                "必须精确为 deny-all + read/glob/grep/list allow")
+
+# R5: discussion scheduling is explicit and hard-bounded.  Models produce
+# content only; the orchestrator must not recursively dispatch another command.
+discussion = ROOT / "discussion.py"
+if not discussion.is_file():
+    errors.append("[R5] discussion.py: 缺少有界讨论状态定义")
+else:
+    discussion_tree = parse(discussion)
+    expected_bounds = {
+        "MIN_DISCUSSION_PARTICIPANTS": 2,
+        "MAX_DISCUSSION_PARTICIPANTS": 3,
+        "MIN_DISCUSSION_ROUNDS": 1,
+        "MAX_DISCUSSION_ROUNDS": 3,
+        "MAX_DISCUSSION_TOPIC_CHARS": 3000,
+    }
+    found_bounds: dict[str, object] = {}
+    for node in discussion_tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in expected_bounds:
+                try:
+                    found_bounds[target.id] = ast.literal_eval(node.value)
+                except (ValueError, TypeError):
+                    found_bounds[target.id] = None
+    if found_bounds != expected_bounds:
+        errors.append(
+            "[R5] discussion.py: 讨论边界必须保持 2..3 个参与者、1..3 轮")
+
+discussion_dispatch = None
+for node in ast.walk(tree):
+    if isinstance(node, ast.AsyncFunctionDef) \
+            and node.name == "_dispatch_discussion":
+        discussion_dispatch = node
+        break
+if discussion_dispatch is None:
+    errors.append(
+        "[R5] orchestrator.py: 缺少 _dispatch_discussion 有界状态机")
+else:
+    for node in ast.walk(discussion_dispatch):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        if (isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+                and target.attr == "dispatch"):
+            fail("R5", orchestrator, node,
+                 "讨论状态机不得递归 dispatch；轮次必须在单 command 内推进")
+    called_names = {
+        node.func.id for node in ast.walk(discussion_dispatch)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    if not {"participant_assignment", "moderator_assignment"} \
+            <= called_names:
+        errors.append(
+            "[R5] orchestrator.py: 讨论必须由确定性参与者轮次和终局主持收口")
 
 if errors:
     print("红线检查失败：")
@@ -137,5 +316,6 @@ if errors:
 print("✓ R1 权限默认 fail-closed")
 print("✓ R2 通用层无 agent-name 协议分支")
 print("✓ R3 子进程仅由 transport 层启动")
-print("✓ R4 Kimi 生产路径保持 ACP-first")
+print("✓ R4 Kimi/OpenCode ACP-first + prepare-only 只读 JSONL fallback")
+print("✓ R5 /discuss 参与者/轮次有界且不递归 dispatch")
 PY

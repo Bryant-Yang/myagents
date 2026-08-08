@@ -57,6 +57,10 @@ app-server 启动命令不得添加 `--model`、`-c` 或 reasoning/plugin/MCP �
 这些字段只作用于该 thread，不写入 `~/.codex/config.toml`。host 的
 `thread/start` 另按 ADR-0004 发送 `ephemeral: true`，不适用于 worker。
 
+M4.3 允许 `turn/start.input` 在 text 后追加官方 schema 的
+`{"type":"localImage","path":"..."}`。路径只能来自当前房间私有
+`attachments/` 信任根；模型配置、sandbox 与 approval 仍继承上述边界。
+
 ### 2.4 事件映射
 
 - `item/agentMessage/delta` → `AgentEvent("text")`
@@ -116,6 +120,7 @@ app-server 启动命令不得添加 `--model`、`-c` 或 reasoning/plugin/MCP �
 5. 真实 Codex 临时目录 E2E 连续两轮共用一个 app-server PID/thread，退出后无
    残留；真实模型测试不进入默认快速 gate。
 6. JSONL fallback 单独保留回归证据，且禁止对已发送 `turn/start` 自动重放。
+7. fake app-server 抓包证明图片轮包含 `localImage`，且不新增配置覆盖字段。
 
 ## 4. 后果
 

@@ -21,14 +21,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import inspect
 import json
 import os
 import signal
-from typing import Any, Awaitable, Callable, Union
+from typing import Any, Awaitable, Callable, Mapping, Union
 
 from adapters.base import BoundedLog, read_lines
+from clipboard_image import TrustedImage
 
 # 通知回调：(method, params) -> None
 NotifyCallback = Callable[[str, dict], None]
@@ -44,6 +46,14 @@ _INIT_TIMEOUT = 10  # initialize 握手超时（秒）
 
 class AcpError(Exception):
     """ACP 层的错误：agent 返回 error、进程断开、握手失败等。"""
+
+
+class AcpRequestNotSentError(AcpError):
+    """请求在 stdio drain 完成前失败；调用方可按未提交处理。"""
+
+
+class AcpRemoteError(AcpError):
+    """agent 返回显式 JSON-RPC error；请求已被明确拒绝。"""
 
 
 def _auto_permission(params: dict) -> dict:
@@ -103,6 +113,7 @@ class AcpClient:
         cwd: str = ".",
         permission: str = "deny",  # 默认拒绝；"auto" 必须显式 opt-in
         permission_handler: PermissionHandler | None = None,
+        env_overrides: Mapping[str, str] | None = None,
     ) -> None:
         self.cmd = cmd
         self.cwd = cwd
@@ -111,6 +122,7 @@ class AcpClient:
         self._permission = permission
         # TUI 注入的权限决策器；None 时用内置 policy（deny/auto）
         self._permission_handler: PermissionHandler | None = permission_handler
+        self._env_overrides = dict(env_overrides or {})
         self._proc: asyncio.subprocess.Process | None = None
         self._reader: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
@@ -142,9 +154,14 @@ class AcpClient:
             # 重复 start 会覆盖活进程和 reader/stderr 句柄，留下没人管的
             # 孤儿进程。要重启请先 close()。
             raise AcpError("client 已在运行：先 close() 再 start()")
+        process_env = None
+        if self._env_overrides:
+            process_env = os.environ.copy()
+            process_env.update(self._env_overrides)
         self._proc = await asyncio.create_subprocess_exec(
             *self.cmd,
             cwd=self.cwd,
+            env=process_env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -221,11 +238,23 @@ class AcpClient:
             "sessionId": session_id, "cwd": cwd, "mcpServers": [],
         })
 
-    async def prompt(self, session_id: str, text: str) -> dict:
+    async def prompt(
+        self,
+        session_id: str,
+        text: str,
+        images: tuple[TrustedImage, ...] = (),
+    ) -> dict:
         """发一轮对话；过程中的 session/update 走 on_notification。"""
+        content: list[dict] = [{"type": "text", "text": text}]
+        for image in images:
+            content.append({
+                "type": "image",
+                "mimeType": "image/png",
+                "data": base64.b64encode(image.data).decode("ascii"),
+            })
         return await self.request("session/prompt", {
             "sessionId": session_id,
-            "prompt": [{"type": "text", "text": text}],
+            "prompt": content,
         })
 
     async def cancel(self, session_id: str) -> None:
@@ -245,9 +274,10 @@ class AcpClient:
         try:
             await self._send({"jsonrpc": "2.0", "id": rid, "method": method,
                               "params": params or {}})
-        except Exception:
+        except Exception as exc:
             self._pending.pop(rid, None)
-            raise
+            raise AcpRequestNotSentError(
+                f"{method} 请求未发送：{exc}") from exc
         if timeout is not None:
             return await asyncio.wait_for(fut, timeout)
         return await fut
@@ -279,7 +309,7 @@ class AcpClient:
                     if fut and not fut.done():
                         if "error" in msg:
                             err = msg["error"]
-                            fut.set_exception(AcpError(
+                            fut.set_exception(AcpRemoteError(
                                 f"{err.get('code')}: {err.get('message')}"))
                         else:
                             fut.set_result(msg.get("result", {}))

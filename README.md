@@ -4,10 +4,12 @@
 Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1、M4 与 M4.2 已完成——共享 timeline 与执行 events 持久化、ACP session
+> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.4、M4.5 与 M5.1 已完成；M4.3 图片粘贴实现已完成，
+> 等待真实截图与 agent 视觉结果人工验收。共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
 > stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
-> Kimi 使用 ACP，Codex 使用官方 app-server；JSONL 仅作兼容 fallback。真实 Kimi + MCP
+> Kimi/OpenCode 使用 ACP-first + prepare-only 只读 JSONL fallback，Codex 使用官方
+> app-server；JSONL 不会在已提交任务后跨协议重放。真实 Kimi + MCP
 > 端到端验收是发布前手工证据，见“当前限制”。
 
 ## 为什么做这个项目
@@ -25,13 +27,17 @@ Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并�
 
 ## 当前能力
 
-- `@kimi`：通过 `kimi acp` 使用持久 ACP session。
+- `@kimi`：正常通过 `kimi acp` 使用持久 ACP session；仅在
+  ACP 启动/建 session 失败且尚未提交 prompt 时，进入只读 JSONL 降级。
 - `@codex`：通过 `codex app-server` 复用长驻进程与原生 thread。
-- `@opencode`：通过 JSONL 无头模式运行。
+- `@opencode`：正常通过 `opencode acp` 使用持久 ACP session；未知及
+  有副作用工具进入 TUI 权限，只有 prepare 失败才进入隔离只读 JSONL。
 - `@host`：由只读 Codex adapter 扮演主持人，负责总结和仲裁。
 - 无显式 mention：host 用一次调用决定“直接回答”或输出结构化 worker
   路由；直接回答时不再发起第二次 host 调用。
 - 多 agent fan-out：同一消息可同时点名多个 agent，并发执行。
+- 有界讨论：`/discuss` 在一个 command 内安排 2–3 个指定 worker 做 1–3 轮
+  独立提案与交叉评议，再由 `host` 或另一个未参会 worker 最终仲裁。
 - ACP 增量上下文：每个 stateful agent 独立维护 history cursor。
 - 并发顺序保证：同一 ACP agent 严格串行，不同 agent 保持并行。
 - 持久时间线：房间 timeline/state 落盘（单调 seq、UTC 时间戳），TUI 重启
@@ -84,7 +90,7 @@ Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并�
               │                 │
 ┌─────────────▼──────────┐  ┌───▼────────────────────┐
 │ acp/                   │  │ codex_app_server/      │
-│ Kimi ACP runtime       │  │ Codex native runtime   │
+│ Kimi/OpenCode ACP      │  │ Codex native runtime   │
 └────────────────────────┘  └────────────────────────┘
               │                 │
               └────────┬────────┘
@@ -140,7 +146,8 @@ python3 -m venv .venv
 .venv/bin/python main.py --session game-review /path/to/project
 ```
 
-每个 `(工作目录, 会话名)` 对应一个持久房间：对话 timeline、执行 events、agent cursor/session 映射和
+每个 `(工作目录, 会话名)` 对应一个持久房间：对话 timeline、执行 events、
+图片 attachments、agent cursor/session 映射和
 owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id>`，
 不会写进目标工作区。未指定名称时使用兼容旧历史的 `default` 会话；同一房间
 同一时刻只允许一个 TUI 实例写入。
@@ -152,12 +159,32 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
 @codex review 当前实现，只报告可复现问题
 @kimi @opencode 分别提出一个方案
 @host 总结上面两个方案的分歧
+/discuss @kimi @opencode --rounds 2 --moderator host -- 讨论新增 adapter 的协议选择
 ```
+
+`/discuss` 默认两轮、默认由 `host` 主持。参与者必须是 2–3 个不同 worker，
+主持人不能同时参会；轮次由 Orchestrator 的普通代码推进，agent 不能自行加轮或
+拉人。讨论模式只要求文字观点，不用于并发修改代码。MCP/API 也可把主题写在
+首行参数后的下一行。完整契约见
+[ADR-0008](docs/adr/0008-bounded-multi-agent-discussion.md)。
 
 空闲时按 `Ctrl+N` 或精确输入 `/new` 可新建会话：输入名称，或留空自动命名。
 `/new` 是本地命令，不会写入时间线，也不会发送给 host 或 worker。已有名称
 不会被覆盖；恢复已有会话请退出后使用 `--session NAME`。任务正在排队、运行
 或等待权限时，必须先完成或按 `Ctrl+X` 取消后再切换。
+
+粘贴 macOS 剪贴板中的截图或图片：
+
+1. 快捷方式：先写说明和可选的 `@agent`，再按 `Ctrl+V`；Textual
+   文本剪贴板为空时会尝试粘贴系统图片。
+2. 稳定方式：单独输入 `/paste-image` 并按 Enter，再围绕插入的图片引用
+   补充说明和可选的 `@agent`。
+3. 确认图片引用已经出现在草稿中，再按 Enter 与文字一起发送。
+
+图片必须能由 macOS 剪贴板提供 PNG 表示，单张不超过 20 MiB。文件保存到当前
+房间的私有 `attachments/` 目录（目录 0700、文件 0600），不会写入项目工作区；
+TUI 目前显示附件文件名而不是终端内预览。Kimi ACP 与 Codex app-server 会
+使用各自的原生图片输入发送可信附件，而不是要求 agent 越界读取该绝对路径。
 
 路由规则：
 
@@ -167,14 +194,16 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
    1–2 个 worker；自然语言内容不由本地关键词白名单判断。
 4. 单个 agent 失败会写入时间线，不会中断其他 agent；fan-out 全部收尾后，
    只要任一 worker 失败，该 command 终态就是 `failed`。
+5. `/discuss` 同轮并发、跨轮串行；失败参与者不自动重试，主持人仍总结已有
+   证据，但不能把失败 command 洗成 completed。
 
 ## Transport 与上下文
 
 | Agent | 生产 transport | 上下文策略 | 当前状态 |
 | --- | --- | --- | --- |
-| Kimi | ACP (`kimi acp`) | 持久 session + 增量 history + session 恢复 | 已验证（restore 路径为 fake 证据） |
+| Kimi | ACP + 只读 JSONL (`kimi acp` → `kimi -p`) | 持久 session + 增量 history；只有 prepare 失败才降级 | ACP 已验证；hybrid contract 已验收 |
 | Codex | app-server (`codex app-server`) | 持久 thread + 增量 history + thread 恢复 | 已接入；JSONL fallback |
-| OpenCode | JSONL (`opencode run --format json`) | 有界 transcript 快照 | fallback |
+| OpenCode | ACP + 隔离只读 JSONL (`opencode acp` → `opencode run`) | 持久 session + 增量 history；风险工具 ask；只有 prepare 失败才降级 | ACP/permission 已验证；hybrid contract 已验收 |
 | Claude | 未接入 | 预留 AgentSpec/adapter 扩展点 | 规划中 |
 
 有状态 agent 首次接入只收到最近 `history_limit` 条共享记录；后续只收到 cursor
@@ -184,6 +213,17 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
 cursor 是持久化 timeline 的单调 seq：重启后优先 `session/load` 续接旧
 session 并保留 cursor；load 失败或 agent 不支持时回退新 session，cursor
 归零并按 `history_limit` 有界 bootstrap。
+
+Kimi 的 JSONL 降级是明确的受限模式：内置 agent profile 只允许
+`Read` / `Grep` / `Glob`，禁止写入、命令、Skill、子 agent 和 MCP。
+降级轮可返回定位与阻塞说明，不伪装成已完成的文件变更。
+细节见 [ADR-0006](docs/adr/0006-kimi-hybrid-transport-policy.md)。
+
+OpenCode 正常 ACP 路径额外把默认偏宽的权限收口为 unknown/risky=ask，
+由同一 TUI 决策。JSONL 降级使用 `--pure`、禁用项目配置/Claude 兼容层/
+自动升级，并通过 inline agent 与 runtime permission 双重限制为
+`read` / `glob` / `grep` / `list`。细节见
+[ADR-0007](docs/adr/0007-opencode-hybrid-transport-policy.md)。
 
 ## MCP 外部入口（M3）
 
@@ -254,7 +294,8 @@ myagents_read_timeline(after_seq=0, limit=50)
 
 ## 权限与安全
 
-Kimi ACP 的权限请求会进入 TUI 弹窗。默认策略是 `deny`：
+Kimi/OpenCode ACP 的权限请求会进入 TUI 弹窗。默认策略是 `deny`；
+OpenCode adapter 还会把上游默认偏宽的未知及风险工具收口为 `ask`：
 
 - `auto` 只能由明确授权的 client invocation 显式开启，并在该 client
   生命周期内持续生效；
@@ -266,8 +307,9 @@ Kimi ACP 的权限请求会进入 TUI 弹窗。默认策略是 `deny`：
 
 Codex worker 使用 `workspace-write + on-request`：超出沙箱的 Git 元数据、
 本地 socket 等操作必须进入同一 TUI 权限弹窗；只读 host 使用
-`read-only + never`，不会为路由申请写权限。JSONL fallback/OpenCode 仍可能
-直接执行工具，建议在 Git 仓库或隔离 worktree 中工作，并在交付前检查 diff。
+`read-only + never`，不会为路由申请写权限。Kimi/OpenCode 自动 JSONL
+fallback 都由 runtime 白名单限制为只读；正常 ACP 写入仍需在 TUI 明确批准，
+并建议在 Git 仓库或隔离 worktree 中工作、交付前检查 diff。
 
 ## 状态目录、恢复与排障
 
@@ -371,6 +413,9 @@ myagents/
 - [docs/acp-migration.md](docs/acp-migration.md)：ACP 消息、权限、取消和生命周期。
 - [docs/adr/0002-durable-execution-observability.md](docs/adr/0002-durable-execution-observability.md)：执行事件、心跳与取消决策。
 - [docs/adr/0003-codex-app-server-transport.md](docs/adr/0003-codex-app-server-transport.md)：Codex 长连接、默认配置继承和 fallback。
+- [docs/adr/0006-kimi-hybrid-transport-policy.md](docs/adr/0006-kimi-hybrid-transport-policy.md)：Kimi ACP-first 与只读降级。
+- [docs/adr/0007-opencode-hybrid-transport-policy.md](docs/adr/0007-opencode-hybrid-transport-policy.md)：OpenCode ACP 权限收口与只读降级。
+- [docs/adr/0008-bounded-multi-agent-discussion.md](docs/adr/0008-bounded-multi-agent-discussion.md)：有界讨论状态机与失败收口。
 - [docs/concepts.md](docs/concepts.md)：相关协议与编排模式。
 - [docs/knowledge-map.html](docs/knowledge-map.html)：可交互知识地图。
 
@@ -384,6 +429,10 @@ myagents/
 - [x] M3.1：持久执行可观测性、heartbeat、权限上下文与精确取消。
 - [x] M4：Codex 官方 app-server 长连接接入，JSONL 退为安全兜底。
 - [x] M4.2：同一项目独立会话、默认历史兼容、TUI 安全切换与外部 selector。
+- [ ] M4.3：实现已完成；等待 macOS 真实截图与 agent 视觉结果人工验收。
+- [x] M4.4：Kimi ACP-first + prepare-only 只读 JSONL fallback。
+- [x] M4.5：OpenCode ACP-first + ask-by-default 权限 + 隔离只读 JSONL fallback。
+- [x] M5.1：`/discuss` 指定成员、1–3 轮有界讨论与终局 moderator。
 - [ ] M5：里程碑工作流、review → 修改 → 复核闭环与 steering。
 - [ ] Later：只有出现跨机器、跨组织 agent 协作需求时再评估 A2A。
 
@@ -394,10 +443,19 @@ myagents/
   app-server PID/thread；退出后无残留。app-server 是实验接口，Codex CLI
   升级后仍需重跑 contract 与真实探针。
 - 真实 Kimi cancel 时延和长会话 token/内存增长（含 compaction 表现）尚未压测。
+- Kimi JSONL fallback 只能读取/分析，无法代替 ACP 完成写入任务；
+  真实 fallback 回复质量与 CLI 升级后 schema 漂移仍需受限探针。
+- OpenCode fallback 同样只能读取/分析；`OPENCODE_PERMISSION` 与配置合并
+  seam 属于 CLI 版本边界。1.18.14 的 ACP 回复、`session/load`、Bash deny、
+  真实只读 fallback 和无残留进程已于 2026-08-08 通过；升级后必须重跑
+  capability/permission/profile 探针。
 - M3 真实 E2E 已于 2026-07-26 通过
   [`scripts/e2e-m3-real.py`](scripts/e2e-m3-real.py)：两次独立
   TUI/ACP/MCP 生命周期复用同一 Kimi session，timeline 无重复，退出后无
   endpoint/socket/agent 残留。该脚本调用真实模型，不放进默认快速 gate。
+- M5.1 `/discuss` 已于 2026-08-08 在同一命名房间恢复原 Kimi/OpenCode
+  session，通过 MCP 完成两轮交叉讨论和一次 Codex host 仲裁；6 条新增
+  timeline 连续、第二轮能回应对方首轮、无工具/权限事件且退出无残留。
 - 独立 ACP client 写入已有 Kimi session 不会让已打开的 native Kimi TUI
   实时刷新；一个前端应独占该 session。
 - 当前只支持新建会话和用 `--session NAME` 恢复；TUI 内的会话列表、删除和

@@ -38,8 +38,14 @@ hub-and-spoke 方式维护统一时间线，以 ACP 作为有状态 coding agent
   `AgentSpec` 或具体 adapter。
 - **R3 进程只能由 transport 层启动**：`main.py`、`orchestrator.py`、
   `host.py` 不得直接创建 shell/子进程。
-- **R4 Kimi 生产路径保持 ACP-first**：生产注册表不得重新导入或注册旧
-  `KimiAdapter` JSONL 实现。调整此决策前必须先更新协议设计与验收契约。
+- **R4 Kimi/OpenCode 生产路径保持 ACP-first**：生产注册必须分别由
+  `AcpKimiAdapter` / `AcpOpenCodeAdapter` 构造；JSONL 只能作 ACP
+  prepare 失败前的只读 fallback，并使用各自项目内置工具白名单。
+  禁止直接注册旧 JSONL adapter、放宽写入/命令工具或在 prompt
+  提交后跨协议重放；OpenCode 未知及有副作用工具必须进入 ask。
+- **R5 多智能体讨论必须显式且有界**：`/discuss` 只允许 2–3 个已注册
+  worker、1–3 轮和一个终局 moderator；轮次由普通代码推进，禁止 agent
+  自主递归派发、动态扩员或形成无界对话。
 
 ## 4. 工作要求
 
@@ -53,6 +59,14 @@ hub-and-spoke 方式维护统一时间线，以 ACP 作为有状态 coding agent
   `optionId` 一律 cancelled。
 - ACP session 同一时刻只有一个 writer；不要让独立 native TUI 与 ACP client
   并发写同一 session。
+- Kimi/OpenCode hybrid transport 分别遵守
+  [`ADR-0006`](docs/adr/0006-kimi-hybrid-transport-policy.md) 和
+  [`ADR-0007`](docs/adr/0007-opencode-hybrid-transport-policy.md)；
+  JSONL checkpoint 不是可恢复 ACP session，下一轮必须新建会话。
+- 有界讨论遵守
+  [`ADR-0008`](docs/adr/0008-bounded-multi-agent-discussion.md)：同轮并发、
+  跨轮串行，一条 command 只有一条 user 记录；参与者失败不自动重试，最终
+  moderator 不能掩盖失败终态。
 - 测试必须使用本地 fake server/fixture；普通自动化测试不得调用真实外部 agent。
 - 只修改任务直接需要的文件，不顺手重构；保留用户已有改动。
 

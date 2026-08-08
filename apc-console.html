@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>APC 系统控制台</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #171e2e;
+    --panel-2: #1d2638;
+    --border: #26314a;
+    --text: #e6ecf5;
+    --muted: #8b98ad;
+    --accent: #4c8dff;
+    --ok: #2fbf71;
+    --warn: #e0a63c;
+    --crit: #e05c5c;
+    --radius: 10px;
+  }
+  [data-theme="light"] {
+    --bg: #f3f5f9;
+    --panel: #ffffff;
+    --panel-2: #f6f8fc;
+    --border: #dfe4ee;
+    --text: #1d2638;
+    --muted: #66738a;
+    --accent: #2f6fe0;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+    display: flex; min-height: 100vh; font-size: 14px;
+    transition: background .2s, color .2s;
+  }
+
+  /* ---------- 侧边导航 ---------- */
+  .sidebar {
+    width: 220px; flex-shrink: 0; background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    position: sticky; top: 0; height: 100vh;
+  }
+  .logo {
+    padding: 20px; font-weight: 700; font-size: 16px; letter-spacing: .5px;
+    border-bottom: 1px solid var(--border);
+  }
+  .logo span { color: var(--accent); }
+  .nav { padding: 12px 8px; overflow-y: auto; }
+  .nav-group { font-size: 11px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 1px; padding: 14px 12px 6px; }
+  .nav-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px; border-radius: 8px; cursor: pointer;
+    color: var(--muted); user-select: none;
+  }
+  .nav-item:hover { background: var(--panel-2); color: var(--text); }
+  .nav-item.active { background: var(--accent); color: #fff; }
+  .nav-item .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; opacity: .6; }
+
+  /* ---------- 主区域 ---------- */
+  .main { flex: 1; min-width: 0; padding: 20px 24px 40px; }
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 20px; flex-wrap: wrap;
+  }
+  .topbar h1 { font-size: 20px; }
+  .topbar .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .topbar-actions { display: flex; gap: 10px; align-items: center; }
+  .btn {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 13px;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  /* ---------- 卡片与网格 ---------- */
+  .grid { display: grid; gap: 16px; }
+  .kpis { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+  .row-2 { grid-template-columns: 2fr 1fr; margin-top: 16px; }
+  .row-3 { grid-template-columns: 1fr 1fr 1fr; margin-top: 16px; }
+  @media (max-width: 1100px) { .row-2, .row-3 { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px;
+  }
+  .card h2 { font-size: 14px; font-weight: 600; margin-bottom: 12px; display: flex;
+    justify-content: space-between; align-items: center; }
+  .card h2 .hint { font-size: 12px; color: var(--muted); font-weight: 400; }
+
+  .kpi .label { color: var(--muted); font-size: 13px; }
+  .kpi .value { font-size: 28px; font-weight: 700; margin: 6px 0 4px; }
+  .kpi .delta { font-size: 12px; }
+  .kpi .delta.up { color: var(--ok); }
+  .kpi .delta.down { color: var(--crit); }
+
+  /* ---------- 状态 ---------- */
+  .status-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 0; border-bottom: 1px solid var(--border);
+  }
+  .status-row:last-child { border-bottom: none; }
+  .badge { font-size: 12px; padding: 3px 10px; border-radius: 999px; }
+  .badge.ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+  .badge.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  .badge.crit { background: color-mix(in srgb, var(--crit) 18%, transparent); color: var(--crit); }
+  .pill { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+  .pill.ok { background: var(--ok); } .pill.warn { background: var(--warn); } .pill.crit { background: var(--crit); }
+
+  /* ---------- 模块 ---------- */
+  .module {
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px; margin-bottom: 10px;
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  }
+  .module:last-child { margin-bottom: 0; }
+  .module .name { font-weight: 600; }
+  .module .desc { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .bar { width: 120px; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+
+  /* ---------- 告警 ---------- */
+  .alert {
+    display: flex; gap: 10px; align-items: flex-start;
+    padding: 10px; border-radius: 8px; border: 1px solid var(--border);
+    margin-bottom: 8px; background: var(--panel-2);
+  }
+  .alert .meta { flex: 1; }
+  .alert .title { font-weight: 600; font-size: 13px; }
+  .alert .time { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .alert .close { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 16px; line-height: 1; }
+  .alert .close:hover { color: var(--text); }
+  .alert-filters { display: flex; gap: 6px; margin-bottom: 12px; }
+  .chip {
+    font-size: 12px; padding: 4px 12px; border-radius: 999px; cursor: pointer;
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+  }
+  .chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .empty { color: var(--muted); text-align: center; padding: 24px 0; font-size: 13px; }
+
+  /* ---------- 图表 ---------- */
+  .chart-wrap { position: relative; height: 220px; }
+  canvas { width: 100%; height: 100%; display: block; }
+  .chart-legend { display: flex; gap: 16px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .legend-key { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
+
+  /* ---------- 响应式 ---------- */
+  .menu-toggle { display: none; }
+  @media (max-width: 760px) {
+    .sidebar {
+      position: fixed; z-index: 20; left: 0; top: 0;
+      transform: translateX(-100%); transition: transform .2s;
+    }
+    .sidebar.open { transform: none; }
+    .menu-toggle { display: inline-block; }
+    .main { padding: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ================= 侧边导航 ================= -->
+<aside class="sidebar" id="sidebar">
+  <div class="logo">APC <span>Console</span></div>
+  <nav class="nav">
+    <div class="nav-group">监控</div>
+    <div class="nav-item active" data-section="overview"><span class="dot"></span>总览</div>
+    <div class="nav-item" data-section="alerts"><span class="dot"></span>告警中心</div>
+    <div class="nav-group">管理</div>
+    <div class="nav-item" data-section="modules"><span class="dot"></span>核心模块</div>
+    <div class="nav-item" data-section="status"><span class="dot"></span>系统状态</div>
+    <div class="nav-group">其他</div>
+    <div class="nav-item" data-section="settings"><span class="dot"></span>设置</div>
+  </nav>
+</aside>
+
+<!-- ================= 主区域 ================= -->
+<main class="main">
+  <div class="topbar">
+    <div>
+      <h1>APC 系统控制台 <button class="btn menu-toggle" id="menuToggle">☰</button></h1>
+      <div class="sub">自动化生产控制 · 实时运行监控 · <span id="clock"></span></div>
+    </div>
+    <div class="topbar-actions">
+      <button class="btn" id="themeToggle">切换主题</button>
+      <button class="btn primary" id="refreshBtn">刷新数据</button>
+    </div>
+  </div>
+
+  <!-- 总览指标 -->
+  <section id="section-overview">
+    <div class="grid kpis">
+      <div class="card kpi">
+        <div class="label">在线设备</div>
+        <div class="value" data-kpi="devices">128</div>
+        <div class="delta up">▲ 4 台较昨日</div>
+      </div>
+      <div class="card kpi">
+        <div class="label">任务吞吐（/分钟）</div>
+        <div class="value" data-kpi="throughput">342</div>
+        <div class="delta up">▲ 6.2%</div>
+      </div>
+      <div class="card kpi">
+        <div class="label">平均响应延迟</div>
+        <div class="value" data-kpi="latency">86ms</div>
+        <div class="delta down">▼ 12ms</div>
+      </div>
+      <div class="card kpi">
+        <div class="label">活跃告警</div>
+        <div class="value" data-kpi="alerts">5</div>
+        <div class="delta down">▲ 2 条待处理</div>
+      </div>
+    </div>
+
+    <div class="grid row-2">
+      <!-- 趋势图表 -->
+      <div class="card">
+        <h2>吞吐趋势 <span class="hint">近 24 小时 · 模拟数据</span></h2>
+        <div class="chart-wrap"><canvas id="trendChart"></canvas></div>
+        <div class="chart-legend">
+          <span><span class="legend-key" style="background:var(--accent)"></span>任务量</span>
+          <span><span class="legend-key" style="background:var(--ok)"></span>成功量</span>
+        </div>
+      </div>
+
+      <!-- 系统状态 -->
+      <div class="card" id="section-status">
+        <h2>系统状态</h2>
+        <div class="status-row"><span><span class="pill ok"></span>调度引擎</span><span class="badge ok">正常</span></div>
+        <div class="status-row"><span><span class="pill ok"></span>数据采集网关</span><span class="badge ok">正常</span></div>
+        <div class="status-row"><span><span class="pill warn"></span>边缘节点 B-07</span><span class="badge warn">负载偏高</span></div>
+        <div class="status-row"><span><span class="pill crit"></span>备份服务</span><span class="badge crit">已停止</span></div>
+        <div class="status-row"><span><span class="pill ok"></span>消息队列</span><span class="badge ok">正常</span></div>
+      </div>
+    </div>
+
+    <div class="grid row-2">
+      <!-- 告警列表 -->
+      <div class="card" id="section-alerts">
+        <h2>告警列表 <span class="hint" id="alertCount"></span></h2>
+        <div class="alert-filters">
+          <button class="chip active" data-filter="all">全部</button>
+          <button class="chip" data-filter="crit">严重</button>
+          <button class="chip" data-filter="warn">警告</button>
+          <button class="chip" data-filter="ok">提示</button>
+        </div>
+        <div id="alertList"></div>
+      </div>
+
+      <!-- 核心模块 -->
+      <div class="card" id="section-modules">
+        <h2>核心模块负载</h2>
+        <div class="module">
+          <div><div class="name">工艺路径规划</div><div class="desc">APC-PLAN · v2.4.1</div></div>
+          <div class="bar"><i style="width:62%"></i></div>
+        </div>
+        <div class="module">
+          <div><div class="name">实时闭环控制</div><div class="desc">APC-CTRL · v3.1.0</div></div>
+          <div class="bar"><i style="width:81%"></i></div>
+        </div>
+        <div class="module">
+          <div><div class="name">质量预测模型</div><div class="desc">APC-QP · v1.9.3</div></div>
+          <div class="bar"><i style="width:45%"></i></div>
+        </div>
+        <div class="module">
+          <div><div class="name">能耗优化</div><div class="desc">APC-ECO · v1.2.0</div></div>
+          <div class="bar"><i style="width:28%"></i></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 设置占位 -->
+  <section id="section-settings" class="card" style="display:none; margin-top:16px;">
+    <h2>设置</h2>
+    <p style="color:var(--muted)">此处为设置页面占位：可接入通知渠道、阈值策略、用户权限等配置。</p>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ---------- 时钟 ---------- */
+  function tickClock() {
+    var el = document.getElementById("clock");
+    if (el) el.textContent = new Date().toLocaleString("zh-CN", { hour12: false });
+  }
+  tickClock();
+  setInterval(tickClock, 1000);
+
+  /* ---------- 主题切换 ---------- */
+  document.getElementById("themeToggle").addEventListener("click", function () {
+    var html = document.documentElement;
+    html.dataset.theme = html.dataset.theme === "light" ? "" : "light";
+    drawChart();
+  });
+
+  /* ---------- 导航切换 / 滚动定位 ---------- */
+  var sidebar = document.getElementById("sidebar");
+  document.getElementById("menuToggle").addEventListener("click", function () {
+    sidebar.classList.toggle("open");
+  });
+  document.querySelectorAll(".nav-item").forEach(function (item) {
+    item.addEventListener("click", function () {
+      document.querySelectorAll(".nav-item").forEach(function (i) { i.classList.remove("active"); });
+      item.classList.add("active");
+      sidebar.classList.remove("open");
+      var key = item.dataset.section;
+      var target = document.getElementById("section-" + key);
+      if (key === "settings") {
+        document.getElementById("section-overview").style.display = "none";
+        document.getElementById("section-settings").style.display = "block";
+      } else {
+        document.getElementById("section-overview").style.display = "block";
+        document.getElementById("section-settings").style.display = "none";
+        if (target && key !== "overview") target.scrollIntoView({ behavior: "smooth", block: "start" });
+        else window.scrollTo({ top: 0, behavior: "smooth" });
+      }
+    });
+  });
+
+  /* ---------- 告警数据与渲染 ---------- */
+  var alerts = [
+    { level: "crit", title: "备份服务进程已停止，最近一次成功备份为 14 小时前", time: "10 分钟前" },
+    { level: "warn", title: "边缘节点 B-07 CPU 使用率连续 15 分钟超过 85%", time: "26 分钟前" },
+    { level: "warn", title: "数据采集网关出现 3 次重连抖动", time: "1 小时前" },
+    { level: "ok",   title: "调度引擎已自动切换到新版策略包 v2.4.1", time: "3 小时前" },
+    { level: "ok",   title: "质量预测模型完成例行再训练", time: "昨天 22:10" }
+  ];
+  var levelName = { crit: "严重", warn: "警告", ok: "提示" };
+
+  function renderAlerts(filter) {
+    var list = document.getElementById("alertList");
+    list.innerHTML = "";
+    var shown = alerts.filter(function (a) { return filter === "all" || a.level === filter; });
+    if (!shown.length) {
+      list.innerHTML = '<div class="empty">当前筛选下暂无告警</div>';
+    }
+    shown.forEach(function (a) {
+      var div = document.createElement("div");
+      div.className = "alert";
+      div.innerHTML =
+        '<span class="badge ' + a.level + '">' + levelName[a.level] + '</span>' +
+        '<div class="meta"><div class="title"></div><div class="time">' + a.time + '</div></div>' +
+        '<button class="close" title="关闭">×</button>';
+      div.querySelector(".title").textContent = a.title;
+      div.querySelector(".close").addEventListener("click", function () {
+        alerts.splice(alerts.indexOf(a), 1);
+        renderAlerts(currentFilter);
+      });
+      list.appendChild(div);
+    });
+    document.getElementById("alertCount").textContent = "共 " + shown.length + " 条";
+    var kpi = document.querySelector('[data-kpi="alerts"]');
+    if (kpi) kpi.textContent = alerts.length;
+  }
+  var currentFilter = "all";
+  document.querySelectorAll(".chip").forEach(function (chip) {
+    chip.addEventListener("click", function () {
+      document.querySelectorAll(".chip").forEach(function (c) { c.classList.remove("active"); });
+      chip.classList.add("active");
+      currentFilter = chip.dataset.filter;
+      renderAlerts(currentFilter);
+    });
+  });
+  renderAlerts("all");
+
+  /* ---------- 趋势图表（Canvas 手绘占位） ---------- */
+  var seriesA = [], seriesB = [];
+  function genSeries() {
+    seriesA = []; seriesB = [];
+    for (var i = 0; i < 24; i++) {
+      var v = 200 + Math.sin(i / 3) * 80 + Math.random() * 60;
+      seriesA.push(Math.round(v));
+      seriesB.push(Math.round(v * (0.82 + Math.random() * 0.1)));
+    }
+  }
+  function cssVar(name) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  }
+  function drawChart() {
+    var canvas = document.getElementById("trendChart");
+    var wrap = canvas.parentElement;
+    var dpr = window.devicePixelRatio || 1;
+    canvas.width = wrap.clientWidth * dpr;
+    canvas.height = wrap.clientHeight * dpr;
+    var ctx = canvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+    var w = wrap.clientWidth, h = wrap.clientHeight;
+    var pad = { l: 40, r: 10, t: 10, b: 24 };
+    var max = Math.max.apply(null, seriesA) * 1.15;
+
+    // 网格与 Y 轴刻度
+    ctx.strokeStyle = cssVar("--border");
+    ctx.fillStyle = cssVar("--muted");
+    ctx.font = "11px sans-serif";
+    ctx.lineWidth = 1;
+    for (var g = 0; g <= 4; g++) {
+      var y = pad.t + (h - pad.t - pad.b) * g / 4;
+      ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y); ctx.stroke();
+      ctx.fillText(Math.round(max * (1 - g / 4)), 4, y + 4);
+    }
+    // X 轴小时标签
+    for (var x = 0; x < 24; x += 4) {
+      var px = pad.l + (w - pad.l - pad.r) * x / 23;
+      ctx.fillText(x + ":00", px - 12, h - 8);
+    }
+    function plot(data, color, fill) {
+      ctx.beginPath();
+      data.forEach(function (v, i) {
+        var px = pad.l + (w - pad.l - pad.r) * i / (data.length - 1);
+        var py = pad.t + (h - pad.t - pad.b) * (1 - v / max);
+        i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+      });
+      ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+      if (fill) {
+        ctx.lineTo(pad.l + (w - pad.l - pad.r), h - pad.b);
+        ctx.lineTo(pad.l, h - pad.b);
+        ctx.closePath();
+        ctx.globalAlpha = 0.12; ctx.fillStyle = color; ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    }
+    plot(seriesA, cssVar("--accent"), true);
+    plot(seriesB, cssVar("--ok"), false);
+  }
+  genSeries();
+  drawChart();
+  window.addEventListener("resize", drawChart);
+
+  /* ---------- 模拟刷新 ---------- */
+  document.getElementById("refreshBtn").addEventListener("click", function () {
+    genSeries();
+    drawChart();
+    document.querySelector('[data-kpi="throughput"]').textContent = 300 + Math.round(Math.random() * 120);
+    document.querySelector('[data-kpi="latency"]').textContent = (60 + Math.round(Math.random() * 60)) + "ms";
+  });
+})();
+</script>
+</body>
+</html>

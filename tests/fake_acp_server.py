@@ -8,6 +8,7 @@
 - session/prompt：
   - 有上一轮未完成（pending）→ 记 "VIOLATION:overlap"（配合串行化测试）
   - FAKE_ACP_FAIL_PROMPT=1：直接回 error
+  - 含 "disconnect"：收到请求后直接退出，模拟已发送但响应前断线
   - 含 "perm"：发 session/request_permission 反向请求，同步等应答并记录
   - 含 "slow-never"：发一个 chunk 后挂起，收到 cancel 也只记录、永不完成
   - 含 "slow"：发一个 chunk 后挂起；收到 cancel 后延迟
@@ -37,6 +38,8 @@ FAIL_LOAD = os.environ.get("FAKE_ACP_FAIL_LOAD") == "1"
 FAIL_PROMPT = os.environ.get("FAKE_ACP_FAIL_PROMPT") == "1"
 # initialize 不声明 loadSession capability（模拟不支持 session/load 的 agent）
 NO_LOAD_CAP = os.environ.get("FAKE_ACP_NO_LOAD_CAP") == "1"
+# initialize 将 promptCapabilities.image 置为 False（无原生图片能力）
+NO_IMAGE_CAP = os.environ.get("FAKE_ACP_NO_IMAGE_CAP") == "1"
 
 # 挂起的 prompt：{"rid": 请求 id, "mode": "slow" | "never"}；同时最多一轮
 PENDING: dict = {"rid": None, "mode": None}
@@ -77,7 +80,14 @@ def main() -> None:
                 send({"jsonrpc": "2.0", "id": rid,
                       "error": {"code": -32000, "message": "init boom"}})
             else:
-                caps = {"sessionCapabilities": {"list": {}}}
+                caps = {
+                    "sessionCapabilities": {"list": {}},
+                    "promptCapabilities": {
+                        "image": not NO_IMAGE_CAP,
+                        "audio": False,
+                        "embeddedContext": True,
+                    },
+                }
                 if not NO_LOAD_CAP:
                     caps["loadSession"] = True
                 send({"jsonrpc": "2.0", "id": rid, "result": {
@@ -109,7 +119,15 @@ def main() -> None:
                 log("VIOLATION:overlap")
             text = params["prompt"][0]["text"]
             log("prompt:" + text)
+            log("prompt-types:" + ",".join(
+                str(block.get("type", ""))
+                for block in params.get("prompt", [])
+                if isinstance(block, dict)
+            ))
             sid = params["sessionId"]
+            if "disconnect" in text:
+                log("disconnect:" + text)
+                return
             if FAIL_PROMPT:
                 send({"jsonrpc": "2.0", "id": rid,
                       "error": {"code": -32000, "message": "prompt boom"}})

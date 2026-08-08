@@ -18,6 +18,9 @@ required=(
   docs/adr/0003-codex-app-server-transport.md
   docs/adr/0004-ephemeral-codex-host-threads.md
   docs/adr/0005-project-conversation-sessions.md
+  docs/adr/0006-kimi-hybrid-transport-policy.md
+  docs/adr/0007-opencode-hybrid-transport-policy.md
+  docs/adr/0008-bounded-multi-agent-discussion.md
   scripts/check-redlines.sh
 )
 
@@ -55,6 +58,9 @@ docs = [
     root / "docs/adr/0003-codex-app-server-transport.md",
     root / "docs/adr/0004-ephemeral-codex-host-threads.md",
     root / "docs/adr/0005-project-conversation-sessions.md",
+    root / "docs/adr/0006-kimi-hybrid-transport-policy.md",
+    root / "docs/adr/0007-opencode-hybrid-transport-policy.md",
+    root / "docs/adr/0008-bounded-multi-agent-discussion.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -86,13 +92,17 @@ if [ ! -x .venv/bin/python ]; then
 fi
 
 .venv/bin/python -m py_compile \
-  main.py myagents_mcp.py orchestrator.py host.py \
+  main.py myagents_mcp.py orchestrator.py host.py discussion.py \
   acp/*.py codex_app_server/*.py adapters/*.py control/*.py storage/*.py tests/*.py \
   scripts/e2e-m3-real.py
 .venv/bin/python tests/test_basic.py
 .venv/bin/python tests/test_tui_completion.py
+.venv/bin/python tests/test_discussion.py
 .venv/bin/python tests/test_tui_status.py
+.venv/bin/python tests/test_clipboard_image.py
 .venv/bin/python tests/test_acp.py
+.venv/bin/python tests/test_kimi_hybrid.py
+.venv/bin/python tests/test_opencode_hybrid.py
 .venv/bin/python tests/test_phase2.py
 .venv/bin/python tests/test_storage.py
 .venv/bin/python tests/test_m25.py

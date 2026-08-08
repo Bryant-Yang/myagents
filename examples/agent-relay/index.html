@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Relay</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #05060f; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    font-family: "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  #stage { position: relative; width: 100%; height: 100%; }
+  canvas { display: block; width: 100%; height: 100%; }
+  .overlay {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(5, 6, 15, 0.82);
+    text-align: center; gap: 18px; z-index: 10;
+  }
+  .overlay.hidden { display: none; }
+  .title {
+    font-size: clamp(28px, 6vw, 56px); font-weight: 700; letter-spacing: 6px;
+    color: #7df9ff;
+    text-shadow: 0 0 12px #7df9ff, 0 0 40px #18c6ff, 0 0 80px #18c6ff;
+  }
+  .subtitle { color: #8a93b2; font-size: clamp(12px, 2vw, 16px); line-height: 1.9; }
+  .subtitle .key {
+    color: #ffe066; border: 1px solid #ffe06666; border-radius: 4px;
+    padding: 1px 8px; margin: 0 2px;
+    text-shadow: 0 0 8px #ffe066;
+  }
+  .hint { color: #5ef2b0; font-size: clamp(13px, 2vw, 17px); letter-spacing: 3px;
+    animation: blink 1.2s ease-in-out infinite;
+    text-shadow: 0 0 10px #5ef2b0;
+  }
+  #finalScore { font-size: clamp(20px, 4vw, 34px); color: #ff9de2;
+    text-shadow: 0 0 14px #ff9de2;
+  }
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="game"></canvas>
+
+  <div id="startScreen" class="overlay">
+    <div class="title">AGENT RELAY</div>
+    <div class="subtitle">
+      旋转中央路由器，把彩色消息包路由到对应的 AI agent 节点。<br>
+      <span class="key">A</span>/<span class="key">D</span> 或 <span class="key">←</span>/<span class="key">→</span> 旋转
+      &nbsp;·&nbsp; <span class="key">Space</span> 发送<br>
+      正确路由加分与连击；发错或超时增加过载，过载满即宕机。单局 60 秒。
+    </div>
+    <div class="hint">按 SPACE 开始</div>
+  </div>
+
+  <div id="overScreen" class="overlay hidden">
+    <div class="title" id="overTitle" style="color:#ff5e6c;text-shadow:0 0 12px #ff5e6c,0 0 40px #ff2e4c;">SYSTEM OVERLOAD</div>
+    <div id="finalScore">SCORE 0</div>
+    <div class="hint">按 SPACE 重新开始</div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const startScreen = document.getElementById('startScreen');
+  const overScreen = document.getElementById('overScreen');
+  const overTitle = document.getElementById('overTitle');
+  const finalScore = document.getElementById('finalScore');
+
+  // ---- 常量 ----
+  const ROUND_TIME = 60;          // 单局秒数
+  const OVERLOAD_MAX = 100;
+  const AGENTS = [
+    { name: 'KIMI',   color: '#7df9ff', angle: -Math.PI / 2 },
+    { name: 'CODEX',  color: '#ffe066', angle: 0 },
+    { name: 'CLAUDE', color: '#ff9de2', angle: Math.PI / 2 },
+    { name: 'OPUS',   color: '#5ef2b0', angle: Math.PI },
+  ];
+  const SEND_ARC = Math.PI / 4;   // 命中判定扇区半宽
+  const ROT_SPEED = 3.6;          // 弧度/秒
+
+  // ---- 状态 ----
+  const S = {
+    mode: 'start',                // start | play | over
+    rot: -Math.PI / 2,            // 路由器朝向
+    packets: [],                  // {agent, dist, size}
+    sparks: [],                   // 粒子
+    score: 0, combo: 0, bestCombo: 0,
+    overload: 0,
+    timeLeft: ROUND_TIME,
+    spawnTimer: 0,
+    flash: 0, flashColor: '#fff',
+    t: 0,
+  };
+  const keys = {};
+
+  // ---- 布局（随窗口缩放自适应）----
+  let W = 0, H = 0, CX = 0, CY = 0, R_NODE = 0, R_SPAWN = 0, R_ROUTER = 0;
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    CX = W / 2; CY = H / 2 + 20;
+    const base = Math.min(W, H);
+    R_NODE = base * 0.34;         // agent 节点轨道半径
+    R_SPAWN = base * 0.30;        // 消息包生成半径
+    R_ROUTER = Math.max(34, base * 0.07);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---- 游戏逻辑 ----
+  function spawnInterval() {
+    // 难度随时间递增：2.2s → 0.7s
+    const p = 1 - S.timeLeft / ROUND_TIME;
+    return 2.2 - 1.5 * p;
+  }
+  function packetSpeed() {
+    // 包向内移动速度 px/s，随时间递增
+    const p = 1 - S.timeLeft / ROUND_TIME;
+    return 40 + 90 * p;
+  }
+  function spawnPacket() {
+    const agent = AGENTS[(Math.random() * AGENTS.length) | 0];
+    S.packets.push({ agent, dist: R_SPAWN, size: 9 });
+  }
+  function startGame() {
+    S.mode = 'play';
+    S.rot = -Math.PI / 2;
+    S.packets = []; S.sparks = [];
+    S.score = 0; S.combo = 0; S.bestCombo = 0;
+    S.overload = 0; S.timeLeft = ROUND_TIME;
+    S.spawnTimer = 0.6; S.flash = 0;
+    startScreen.classList.add('hidden');
+    overScreen.classList.add('hidden');
+  }
+  function endGame(reason) {
+    S.mode = 'over';
+    overTitle.textContent = reason === 'overload' ? 'SYSTEM OVERLOAD' : 'ROUND COMPLETE';
+    overTitle.style.color = reason === 'overload' ? '#ff5e6c' : '#5ef2b0';
+    finalScore.innerHTML =
+      `SCORE ${S.score} &nbsp;·&nbsp; BEST COMBO ×${S.bestCombo}`;
+    overScreen.classList.remove('hidden');
+  }
+  function normAngle(a) {
+    while (a > Math.PI) a -= Math.PI * 2;
+    while (a < -Math.PI) a += Math.PI * 2;
+    return a;
+  }
+  function sendPacket() {
+    if (S.mode !== 'play') return;
+    // 取最接近中心的包尝试发送
+    if (!S.packets.length) return;
+    let idx = 0;
+    for (let i = 1; i < S.packets.length; i++)
+      if (S.packets[i].dist < S.packets[idx].dist) idx = i;
+    const p = S.packets[idx];
+    const diff = Math.abs(normAngle(p.agent.angle - S.rot));
+    if (diff <= SEND_ARC / 2) {
+      // 正确路由
+      S.packets.splice(idx, 1);
+      S.combo++;
+      S.bestCombo = Math.max(S.bestCombo, S.combo);
+      S.score += 100 * S.combo;
+      S.overload = Math.max(0, S.overload - 6);
+      burst(p.agent, 16);
+      S.flash = 0.15; S.flashColor = p.agent.color;
+    } else {
+      // 发错方向
+      S.combo = 0;
+      S.overload += 15;
+      S.flash = 0.2; S.flashColor = '#ff5e6c';
+    }
+  }
+  function burst(agent, n) {
+    const x = CX + Math.cos(agent.angle) * R_NODE;
+    const y = CY + Math.sin(agent.angle) * R_NODE;
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2, v = 60 + Math.random() * 160;
+      S.sparks.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v,
+        life: 0.5 + Math.random() * 0.4, color: agent.color });
+    }
+  }
+
+  function update(dt) {
+    S.t += dt;
+    if (S.flash > 0) S.flash -= dt;
+    // 粒子始终更新
+    for (let i = S.sparks.length - 1; i >= 0; i--) {
+      const s = S.sparks[i];
+      s.x += s.vx * dt; s.y += s.vy * dt; s.life -= dt;
+      if (s.life <= 0) S.sparks.splice(i, 1);
+    }
+    if (S.mode !== 'play') return;
+
+    // 旋转
+    if (keys['a'] || keys['arrowleft']) S.rot -= ROT_SPEED * dt;
+    if (keys['d'] || keys['arrowright']) S.rot += ROT_SPEED * dt;
+
+    // 计时与生成
+    S.timeLeft -= dt;
+    if (S.timeLeft <= 0) { S.timeLeft = 0; endGame('time'); return; }
+    S.spawnTimer -= dt;
+    if (S.spawnTimer <= 0) { spawnPacket(); S.spawnTimer = spawnInterval(); }
+
+    // 包向内移动，撞到路由器 = 超时未路由
+    const speed = packetSpeed();
+    for (let i = S.packets.length - 1; i >= 0; i--) {
+      const p = S.packets[i];
+      p.dist -= speed * dt;
+      if (p.dist <= R_ROUTER) {
+        S.packets.splice(i, 1);
+        S.combo = 0;
+        S.overload += 20;
+        S.flash = 0.25; S.flashColor = '#ff5e6c';
+      }
+    }
+    if (S.overload >= OVERLOAD_MAX) { S.overload = OVERLOAD_MAX; endGame('overload'); }
+  }
+
+  // ---- 绘制 ----
+  function neon(fn, color, blur) {
+    ctx.save();
+    ctx.shadowColor = color; ctx.shadowBlur = blur;
+    fn(); ctx.restore();
+  }
+  function draw() {
+    ctx.fillStyle = '#05060f';
+    ctx.fillRect(0, 0, W, H);
+
+    // 扫描线背景
+    ctx.save();
+    ctx.globalAlpha = 0.05; ctx.strokeStyle = '#7df9ff';
+    for (let y = 0; y < H; y += 4) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+    ctx.restore();
+
+    // 轨道
+    ctx.save();
+    ctx.globalAlpha = 0.35; ctx.strokeStyle = '#223055'; ctx.setLineDash([4, 8]);
+    ctx.beginPath(); ctx.arc(CX, CY, R_NODE, 0, Math.PI * 2); ctx.stroke();
+    ctx.restore();
+
+    // agent 节点
+    for (const a of AGENTS) {
+      const x = CX + Math.cos(a.angle) * R_NODE;
+      const y = CY + Math.sin(a.angle) * R_NODE;
+      const pulse = 1 + Math.sin(S.t * 3 + a.angle) * 0.08;
+      neon(() => {
+        ctx.fillStyle = a.color;
+        ctx.beginPath(); ctx.arc(x, y, 12 * pulse, 0, Math.PI * 2); ctx.fill();
+      }, a.color, 18);
+      ctx.fillStyle = a.color;
+      ctx.font = `bold ${Math.max(11, R_ROUTER * 0.32)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.globalAlpha = 0.9;
+      const lx = CX + Math.cos(a.angle) * (R_NODE + 30);
+      const ly = CY + Math.sin(a.angle) * (R_NODE + 30);
+      ctx.fillText(a.name, lx, ly + 4);
+      ctx.globalAlpha = 1;
+    }
+
+    // 消息包
+    for (const p of S.packets) {
+      const x = CX + Math.cos(p.agent.angle) * p.dist;
+      const y = CY + Math.sin(p.agent.angle) * p.dist;
+      neon(() => {
+        ctx.fillStyle = p.agent.color;
+        ctx.beginPath(); ctx.arc(x, y, p.size, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.beginPath(); ctx.arc(x, y, p.size * 0.35, 0, Math.PI * 2); ctx.fill();
+      }, p.agent.color, 16);
+    }
+
+    // 粒子
+    for (const s of S.sparks) {
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, s.life * 1.6);
+      ctx.fillStyle = s.color;
+      ctx.fillRect(s.x - 1.5, s.y - 1.5, 3, 3);
+      ctx.restore();
+    }
+
+    // 路由器本体
+    neon(() => {
+      ctx.strokeStyle = '#e8ecff'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(CX, CY, R_ROUTER, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = '#0a0e20';
+      ctx.beginPath(); ctx.arc(CX, CY, R_ROUTER, 0, Math.PI * 2); ctx.fill();
+    }, '#7df9ff', 14);
+
+    // 朝向指针 + 命中扇区
+    const px = CX + Math.cos(S.rot) * (R_ROUTER + 22);
+    const py = CY + Math.sin(S.rot) * (R_ROUTER + 22);
+    ctx.save();
+    ctx.globalAlpha = 0.10;
+    ctx.fillStyle = '#7df9ff';
+    ctx.beginPath();
+    ctx.moveTo(CX, CY);
+    ctx.arc(CX, CY, R_SPAWN, S.rot - SEND_ARC / 2, S.rot + SEND_ARC / 2);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+    neon(() => {
+      ctx.strokeStyle = '#7df9ff'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(CX, CY); ctx.lineTo(px, py); ctx.stroke();
+      ctx.fillStyle = '#7df9ff';
+      ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI * 2); ctx.fill();
+    }, '#7df9ff', 16);
+
+    // HUD
+    if (S.mode === 'play') {
+      const fs = Math.max(14, Math.min(W, H) * 0.026);
+      ctx.font = `bold ${fs}px monospace`;
+      ctx.textAlign = 'left';
+      neon(() => { ctx.fillStyle = '#7df9ff';
+        ctx.fillText(`SCORE ${S.score}`, 24, 40); }, '#7df9ff', 8);
+      ctx.fillStyle = S.combo > 1 ? '#ffe066' : '#5a648a';
+      ctx.fillText(`COMBO ×${S.combo}`, 24, 40 + fs * 1.6);
+      ctx.textAlign = 'right';
+      ctx.fillStyle = S.timeLeft < 10 ? '#ff5e6c' : '#8a93b2';
+      ctx.fillText(`T-${Math.ceil(S.timeLeft)}s`, W - 24, 40);
+
+      // 过载条
+      const bw = Math.min(320, W * 0.4), bh = 12;
+      const bx = W - 24 - bw, by = 52;
+      ctx.strokeStyle = '#3a4468'; ctx.strokeRect(bx, by, bw, bh);
+      const ratio = S.overload / OVERLOAD_MAX;
+      const oc = ratio > 0.7 ? '#ff5e6c' : ratio > 0.4 ? '#ffe066' : '#ff9de2';
+      neon(() => { ctx.fillStyle = oc; ctx.fillRect(bx, by, bw * ratio, bh); }, oc, 10);
+      ctx.fillStyle = oc; ctx.textAlign = 'right';
+      ctx.fillText('OVERLOAD', bx - 10, by + bh - 1);
+    }
+
+    // 命中/错误闪屏
+    if (S.flash > 0) {
+      ctx.save();
+      ctx.globalAlpha = S.flash * 0.6;
+      ctx.fillStyle = S.flashColor;
+      ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+    }
+  }
+
+  // ---- 主循环 ----
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  // ---- 输入 ----
+  window.addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    if ([' ', 'arrowleft', 'arrowright'].includes(k) || k === 'spacebar') e.preventDefault();
+    if (e.repeat) { keys[k] = true; return; }
+    keys[k] = true;
+    if (k === ' ') {
+      if (S.mode === 'play') sendPacket();
+      else startGame();
+    }
+  });
+  window.addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
+})();
+</script>
+</body>
+</html>

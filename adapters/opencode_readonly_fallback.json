@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "myagents-readonly-fallback": {
+      "description": "Read-only degraded execution when the primary ACP transport cannot start",
+      "mode": "primary",
+      "prompt": "Operate in read-only degraded mode. Read and analyze the current project, including AGENTS.md when present. Do not claim to modify files, run commands, access the network, load skills, or delegate to subagents.",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow"
+      }
+    }
+  }
+}

@@ -2,7 +2,7 @@
 
 <!-- harness:behaviour-evidence=canonical-source -->
 
-> 作者：Bryant Yang　最近更新：2026-07-28
+> 作者：Bryant Yang　最近更新：2026-08-08
 >
 > 本文是关键用户行为与独立证据的唯一事实源。工程边界见
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -19,6 +19,10 @@
 | M3.1 | 完成 | 持久执行事件、heartbeat、权限/工具上下文、精确取消（七个 MCP 工具） |
 | M4 | 完成 | Codex app-server 长连接、thread/turn 事件、取消、审批与 JSONL fallback |
 | M4.2 | 完成 | 同一项目独立会话、默认房间兼容、TUI 安全切换与外部 selector |
+| M4.3 | 实现完成，待人工验收 | macOS 剪贴板 PNG、会话私有附件与草稿引用 |
+| M4.4 | 完成 | Kimi ACP-first、prepare-only 只读 JSONL fallback 与 no-replay |
+| M4.5 | 完成 | OpenCode ACP-first、ask-by-default 权限收口与只读 JSONL fallback |
+| M5.1 | 完成 | `/discuss` 指定成员、1–3 轮有界讨论与终局 moderator |
 
 ## 1. 角色
 
@@ -66,6 +70,47 @@
   只证明委托没有在协议层丢失。
 - **里程碑**：M4。
 
+### UC-DISCUSS-001 指定成员的有界多智能体讨论
+
+- **角色 / 触发**：用户在 TUI 或 MCP 提交
+  `/discuss @agent1 @agent2 [@agent3] [--rounds 1..3]
+  [--moderator host|agent] -- 主题`；MCP/API 也可在首行参数后换行提供主题。
+- **前置条件**：参与者是 `AGENT_SPECS` 中 2–3 个不同 worker；默认两轮、
+  默认 moderator 为 `host`，主持人不能同时参会。
+- **输入边界**：主题必须非空且不超过 3000 个字符；参数和主题在任何 timeline
+  写入前完成确定性校验。
+- **主流程**：整个讨论只占一个 CommandBus command 并写一条 user timeline；
+  第一轮参与者并发独立提案，后续轮等待前轮全部收尾后并发交叉评议，最后
+  moderator 单次仲裁。轮次目标由普通代码生成 assignment，不额外伪造 user
+  消息、不递归 `dispatch`；全部回复共享同一 `command_id`。
+- **上下文**：stateful agent 按现有 cursor 契约接收增量，所以下一轮可见其他
+  参与者上一轮回复而不重发自己的原生 session 内容；JSONL agent 使用本轮开始
+  时的有界 timeline 快照。
+- **安全边界**：讨论 assignment 明确只产出观点，不读取/修改文件、不执行命令、
+  不调用工具、Skill 或子 agent；transport 的 fail-closed 权限不因讨论放宽。
+  最大调用数固定为 `3×3+1=10`，agent 无权动态加轮或拉人。
+- **异常分支**：参与者失败不取消同轮其他人，但失败者退出后续轮次，避免重放
+  不确定投递；存活者少于两个时跳过剩余交叉轮，moderator 仍总结已有证据。
+  所有 worker/moderator 失败都保留在 `DispatchOutcome`，CommandBus 最终为
+  `failed`。取消任一轮即取消整个 command，不再进入下一轮或主持总结。
+- **验收**：parser 在 timeline 写入前拒绝缺主题、人数/轮数越界、重复/未知成员
+  和主持人冲突；同轮并发、跨轮可见、唯一 user、终局主持及失败收口均有 fake
+  contract；TUI 精确 `/discuss` 显示用法，带参数命令与 MCP 共用 CommandBus。
+- **独立证据来源**：`tests/test_discussion.py`、
+  `tests/test_tui_completion.py`、`tests/test_m3_bus.py` 既有 command 终态契约；
+  ADR-0008 的授权真实模型回放不进入默认 gate。
+- **真实验收证据**：2026-08-08 恢复命名房间
+  `collab-smoke-20260808-7f3c`，经真实 MCP bridge 提交 Kimi/OpenCode 两轮
+  `/discuss`，再由 Codex host 仲裁。command
+  `ce688171-43e4-401d-81a5-ee1ff9cc5d8f` 为 completed；新增 timeline
+  `seq=6..11` 恰含一条 user、两条 Kimi、两条 OpenCode 和一条 host，全部绑定
+  同一 command id。两名 ACP worker 沿用原 session id，cursor 从 1 推进到 8；
+  第二轮双方均明确回应对方首轮观点，证明跨轮共享生效。事件无 tool/permission，
+  退出后无 endpoint/socket/agent 进程残留。
+- **人工验收边界**：开放式讨论质量、不同模型观点的实际独立性和成本由用户验收；
+  自动化只证明调度、上下文、边界与终态。
+- **里程碑**：M5.1。
+
 ### UC-ACP-001 有状态增量上下文
 
 - **角色 / 触发**：用户连续多次 `@` 同一个 ACP agent。
@@ -83,7 +128,8 @@
 
 ### UC-PERM-001 权限请求与选择
 
-- **角色 / 触发**：Kimi ACP 在工具调用前发 `session/request_permission`。
+- **角色 / 触发**：Kimi/OpenCode ACP 在受控工具调用前发
+  `session/request_permission`。
 - **前置条件**：TUI 已注入 agent-aware 异步权限处理器。
 - **主流程**：弹窗显示来源 agent、工具标题和 options；用户选择；client 只接受
   本次 options 内非空 optionId。
@@ -96,6 +142,8 @@
   2026-07-26 在临时目录用真实 Kimi Code CLI 0.29.1 + Textual TUI 验证实际
   `allow_once / allow_always / reject_once` options，选择 `allow_once` 后探针
   文件内容正确；严格 optionId 成员校验落地后再次真实复验通过。
+  2026-08-08 OpenCode 1.18.14 临时目录 probe 证明 runtime ask policy
+  将无害 Bash 请求转为相同三类 options，默认 deny 后 `end_turn`。
 - **人工验收边界**：任何真实工具写入与 `auto` 模式必须由用户逐次授权；自动化
   测试不能代替风险接受。
 - **里程碑**：M2。
@@ -206,6 +254,71 @@
   仍未验收。
 - **里程碑**：M2.5。
 
+### UC-HYBRID-001 Kimi ACP-first 受限降级
+
+- **角色 / 触发**：用户向 Kimi worker 派发任务，但新 ACP 连接在
+  start、initialize 或 session prepare 阶段失败。
+- **主流程**：`AcpKimiAdapter` 在同一 writer lock 内保持统一
+  `AgentAdapter` interface；prepare 失败时先以
+  `fallback:jsonl:kimi` 调用 checkpoint hook，再使用
+  `kimi -p --output-format stream-json --agent-file <readonly-profile>` 执行
+  一次降级轮，并公开 `prepare-only` fallback info 事件。
+- **权限边界**：降级 profile 只暴露 `Read` / `Grep` / `Glob`，
+  `subagents: []`；禁止写入、命令、网络、Skill、子 agent 和 MCP。
+  JSONL 可返回分析或明确阻塞，不得伪装已完成变更。
+- **禁止分支**：活跃 session 冲突、checkpoint 失败、prompt 明确拒绝
+  以及 prompt 提交后的取消/超时/断线/不确定结果均不调用
+  fallback。后一类先建立 no-replay cursor 再公开失败。
+- **恢复**：下一轮不对 `fallback:jsonl:*` 伪 id 执行
+  `session/load`，直接新建 ACP session；以 fresh/unrestored 语义
+  归零 cursor 并有界 bootstrap。两种 transport 不并发写同一 session。
+- **验收**：生产注册仍由 `AcpKimiAdapter` 构造，可见 transport
+  为 `acp+jsonl`；prepare 失败正好调用一次受限 JSONL；
+  prompt 拒绝、post-submit 静默与写入后断线均零 fallback 调用；首个可见
+  ACP 输出前已提交内部 `delivery_committed`。
+- **独立证据来源**：Kimi CLI 0.34.0 本机 `--help` 和官方 reference
+  确认 `-p` / `stream-json` / `--agent-file`；`tests/fake_acp_server.py`
+  作为独立 protocol fixture，`tests/test_kimi_hybrid.py` 验证工具白名单、
+  prepare-only、伪 checkpoint 恢复、交付提交时序和 no-replay 反例。
+- **人工验收边界**：真实 Kimi 模型的降级回复质量与 CLI 升级后
+  schema 漂移需受限临时目录探针；默认 gate 不调用外部 agent。
+- **里程碑**：M4.4。
+
+### UC-HYBRID-002 OpenCode ACP-first 权限收口与受限降级
+
+- **角色 / 触发**：用户向 OpenCode worker 派发任务；正常走 ACP，或新 ACP
+  连接在 start、initialize、session prepare 阶段失败。
+- **ACP 主流程**：生产由 `AcpOpenCodeAdapter` 构造，运行
+  `opencode acp`，保持持久 session、增量 cursor、权限 UI、取消与恢复。
+  OpenCode runtime 权限将未知工具、写入、命令、网络、Skill、子 agent、
+  MCP 与外部目录收口为 ask；read/search/lsp/todo allow。无 TUI handler
+  仍由通用 client cancelled。
+- **降级流程**：prepare 失败时以 `fallback:jsonl:opencode` checkpoint，
+  然后运行 `opencode --pure run --format json --agent
+  myagents-readonly-fallback`。环境禁用项目配置、Claude 兼容层、自动升级，
+  inline profile 与 runtime permission 双重限制为
+  `read` / `glob` / `grep` / `list`。
+- **禁止分支**：活跃 session 冲突、checkpoint 失败、prompt 明确拒绝以及
+  prompt 提交后的取消、超时、断线或结果不确定均零 fallback；后一类先形成
+  no-replay cursor。下一轮不 load fallback 伪 id，直接新建 ACP session。
+- **验收**：生产 transport 为 `acp+jsonl`；真实 ACP v1 capability 包含
+  loadSession、image、list/resume；无害 Bash 请求进入 ACP permission，默认
+  deny 后正常结束；只读 JSONL profile 无 `--auto`，写入/命令/网络工具均 deny。
+- **独立证据来源**：本机 OpenCode 1.18.14 CLI/capability/permission wire
+  probe；OpenCode 官方 Permissions/Agents/Config 文档；
+  `tests/fake_acp_server.py` 独立协议 fixture；
+  `tests/test_opencode_hybrid.py` 固定 registry、ACP policy、隔离 profile、
+  prepare-only 与 post-submit no-replay。
+- **真实验收证据**：2026-08-08 在临时目录通过生产 adapter 完成 ACP
+  `end_turn`、关闭重连后的 `session/load`（同 session id，输出
+  `OPENCODE_ACP_ONE` / `OPENCODE_ACP_RESUMED`）、Bash 权限默认 deny，
+  以及强制 prepare 失败后的真实只读 JSONL；写入探针文件未产生，结束后
+  无残留 OpenCode 进程。ACP export 独立确认两轮 token 已持久化。
+- **人工验收边界**：真实模型、session/load、权限 options 与 fallback 工具集
+  已完成本版本受限复验；真实 cancel 时延、长会话 compaction，以及 OpenCode
+  升级后的 `OPENCODE_PERMISSION` seam 仍需单独复验。默认 gate 不调用外部 agent。
+- **里程碑**：M4.5。
+
 ### UC-CTRL-001 外部命令注入（command bus + MCP stdio）
 
 - **角色 / 触发**：本机另一个 coding agent（MCP host）经
@@ -295,6 +408,30 @@
 - **证据**：`tests/test_m3_bus.py`、`tests/test_m3_control.py`、
   `tests/test_m3_mcp.py`。
 - **里程碑**：M3.1。
+
+### UC-IMAGE-001 剪贴板图片附件
+
+- **角色 / 触发**：macOS TUI 用户在草稿中按 `Ctrl+V` 且 Textual 文本剪贴板
+  为空，或精确输入 `/paste-image`。
+- **主流程**：系统读取 macOS 剪贴板的 PNG 表示，保存到当前命名房间的
+  `attachments/`，再在光标位置插入 `[图片附件：绝对路径]`；不自动提交，
+  用户可继续补充文字和 `@agent`。消息正常进入共享 timeline，被调用 agent
+  收到图片读取提示；Kimi ACP 使用原生 `image` block，Codex app-server
+  使用原生 `localImage`。无 mention 时仍按既有规则交给 host 决定。
+- **安全边界**：附件目录为 0700、文件为 0600；文件必须是普通 PNG，单张
+  不超过 20 MiB；不把二进制写入 timeline/events，也不写入目标工作区。
+  只有解析后仍位于当前房间 `attachments/` 的路径才能升级为协议图片，
+  防止手写标记读取任意本地文件。
+- **异常分支**：非 macOS、剪贴板没有 PNG、读取超时、格式错误或大小超限时，
+  显示可操作错误，不改变草稿、不提交消息、不留下不完整 PNG。
+- **生命周期**：附件随房间保留；当前版本不提供预览、删除、跨机器传输或
+  JPEG/HEIC 转换。
+- **验收**：成功粘贴只改变草稿；路径位于当前 room；权限和格式正确；失败
+  不残留文件。`Ctrl+V` 有文本时仍使用 Textual 原文本粘贴。
+- **证据**：`tests/test_clipboard_image.py` 的注入式 macOS fixture；
+  真实剪贴板脚本探针验证无 PNG 时返回稳定错误。真实截图视觉内容由用户人工
+  验收，自动测试不声称证明 agent 的视觉理解质量。
+- **里程碑**：M4.3。
 
 ### UC-CODEX-001 Codex 原生长连接
 

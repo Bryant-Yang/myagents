@@ -32,23 +32,54 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from dataclasses import dataclass
-from typing import AsyncIterator, Awaitable, Callable
+from pathlib import Path
+from typing import AsyncIterator, Awaitable, Callable, Mapping
 
 from adapters.base import (
+    AgentAdapter,
     AgentDeliveryUncertainError,
     AgentEvent,
     redact_sensitive_text,
 )
+from clipboard_image import prompt_images
 
-from .client import AcpClient, AcpError, PermissionHandler
+from .client import (
+    AcpClient,
+    AcpError,
+    AcpRemoteError,
+    AcpRequestNotSentError,
+    PermissionHandler,
+)
 
 _CANCEL_TIMEOUT = 10  # 等 agent 确认 cancelled 的有限超时（秒）
 _INACTIVITY_TIMEOUT = 120  # prompt 连续无任何 ACP 事件的上限（秒）
 _TOOL_INACTIVITY_TIMEOUT = 900  # 活跃工具允许更长的无输出窗口（秒）
+_FALLBACK_SESSION_PREFIX = "fallback:jsonl:"
 _TERMINAL_TOOL_STATUSES = {
     "completed", "succeeded", "success", "failed", "error",
     "declined", "cancelled", "canceled",
+}
+
+# OpenCode 默认允许大部分工具。ACP 生产路径必须把未知工具、写入、命令、
+# 网络、Skill、子 agent 与外部目录统一变成 ask，才能由 myagents TUI
+# fail-closed 决策；读取/搜索和本地只读索引保持无弹窗。
+OPENCODE_ACP_PERMISSION_POLICY = {
+    "*": "ask",
+    "read": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "lsp": "allow",
+    "todowrite": "allow",
+    "edit": "ask",
+    "bash": "ask",
+    "task": "ask",
+    "skill": "ask",
+    "webfetch": "ask",
+    "websearch": "ask",
+    "external_directory": "ask",
 }
 
 # 通用 agent-aware 权限决策器：async (agent_name, params) -> outcome。
@@ -92,6 +123,8 @@ class AcpAdapter:
         inactivity_timeout: float = _INACTIVITY_TIMEOUT,
         tool_inactivity_timeout: float = _TOOL_INACTIVITY_TIMEOUT,
         permission_handler: PermissionHandler | None = None,
+        fallback_adapter: AgentAdapter | None = None,
+        env_overrides: Mapping[str, str] | None = None,
     ) -> None:
         if cancel_timeout <= 0:
             raise ValueError("cancel_timeout 必须大于 0")
@@ -104,11 +137,15 @@ class AcpAdapter:
         self._cmd = cmd
         self._permission = permission
         self._permission_handler = permission_handler
+        self._fallback = fallback_adapter
+        self._env_overrides = dict(env_overrides or {})
+        self._attachment_root: Path | None = None
         self._cancel_timeout = cancel_timeout
         self._inactivity_timeout = inactivity_timeout
         self._tool_inactivity_timeout = tool_inactivity_timeout
         self._client = AcpClient(cmd, permission=permission,
-                                 permission_handler=permission_handler)
+                                 permission_handler=permission_handler,
+                                 env_overrides=self._env_overrides)
         self._started = False
         self._lock = asyncio.Lock()  # session 唯一 writer：串行化本 adapter 的轮次
 
@@ -123,6 +160,10 @@ class AcpAdapter:
         else:
             self._permission_handler = lambda params: handler(self.name, params)
         self._client.set_permission_handler(self._permission_handler)
+
+    def set_attachment_root(self, root: Path | None) -> None:
+        """限制可作为 ACP image block 发送的本地附件目录。"""
+        self._attachment_root = None if root is None else Path(root).absolute()
 
     async def _prepare_locked(self, workdir: str,
                               resume_session_id: str | None = None
@@ -146,6 +187,12 @@ class AcpAdapter:
                 session_id=self.session_id,
                 restored=resume_session_id is not None,
                 load_failed=False, fresh=False)
+        if (resume_session_id is not None
+                and resume_session_id.startswith(_FALLBACK_SESSION_PREFIX)):
+            # JSONL 降级轮只是持久化 checkpoint 占位，不是可被 ACP
+            # session/load 的真实 session。下一轮恢复为新 ACP session，
+            # 让 Orchestrator 按 fresh-session 契约有界 bootstrap。
+            resume_session_id = None
         try:
             await self._client.start()
             restored = False
@@ -177,7 +224,8 @@ class AcpAdapter:
         with contextlib.suppress(Exception):
             await self._client.close()
         self._client = AcpClient(self._cmd, permission=self._permission,
-                                 permission_handler=self._permission_handler)
+                                 permission_handler=self._permission_handler,
+                                 env_overrides=self._env_overrides)
         self._started = False
         self.session_id = None
 
@@ -211,7 +259,19 @@ class AcpAdapter:
         复用旧活跃 session（非 fresh）时的 factory 异常不销毁现有 session。
         """
         async with self._lock:
-            prep = await self._prepare_locked(workdir, resume_session_id)
+            was_started = self._started
+            try:
+                prep = await self._prepare_locked(workdir, resume_session_id)
+            except Exception:
+                # 只有新连接的 start/initialize/session prepare 失败才能
+                # 降级。活跃 session 冲突等内部错误不能被伪装成
+                # JSONL 成功；prompt 已发送后的异常也不经过此分支。
+                if was_started or self._fallback is None:
+                    raise
+                async for event in self._stream_fallback_locked(
+                        make_prompt, workdir, resume_session_id):
+                    yield event
+                return
             try:
                 prompt = make_prompt(prep)
             except BaseException:
@@ -235,6 +295,46 @@ class AcpAdapter:
                 # 锁内同步执行，而不是拖到 GC 的 asyncgen finalizer。
                 await inner.aclose()
 
+    async def _stream_fallback_locked(
+        self,
+        make_prompt: Callable[[SessionPreparation], str],
+        workdir: str,
+        resume_session_id: str | None,
+    ) -> AsyncIterator[AgentEvent]:
+        """ACP prepare 失败后的唯一安全 JSONL 降级点。
+
+        该方法只由 ``stream_prepared`` 的 prepare 异常分支调用，
+        仍持有同一 writer lock。先调 make_prompt 完成伪 session
+        checkpoint，再启动一次性 adapter；checkpoint 失败直接穿透，
+        不得用降级路径掩盖持久化错误。
+        """
+        assert self._fallback is not None
+        prep = SessionPreparation(
+            session_id=f"{_FALLBACK_SESSION_PREFIX}{self.name}",
+            restored=False,
+            load_failed=resume_session_id is not None,
+            fresh=True,
+        )
+        prompt = make_prompt(prep)
+        yield AgentEvent(
+            "info",
+            f"{self.name} ACP 启动失败，使用只读 JSONL fallback",
+            meta={
+                "primary_transport": "acp",
+                "fallback_transport": "jsonl",
+                "fallback_scope": "prepare-only",
+            },
+        )
+        inner = self._fallback.stream(prompt, workdir)
+        try:
+            async for event in inner:
+                yield event
+        finally:
+            closer = getattr(inner, "aclose", None)
+            if closer is not None:
+                with contextlib.suppress(RuntimeError):
+                    await closer()
+
     async def _prompt_locked(self, session_id: str,
                              prompt: str) -> AsyncIterator[AgentEvent]:
         """锁内执行一轮 prompt 并映射事件；取消契约见 stream_prepared。"""
@@ -245,6 +345,7 @@ class AcpAdapter:
         tool_fingerprints: dict[str, tuple[str, str, str, str]] = {}
         active_tools: set[str] = set()
         last_tool_key: str | None = None
+        delivery_committed = False
 
         def on_notify(method: str, params: dict) -> None:
             if params.get("sessionId") == session_id:
@@ -260,7 +361,14 @@ class AcpAdapter:
 
         self._client.on_notification = on_notify
         self._client.on_permission_activity = on_permission_activity
-        task = asyncio.create_task(self._client.prompt(session_id, prompt))
+        # Agents that omit or disable image capability must still get a
+        # defined images tuple; never leave it unbound across the prompt call.
+        images: tuple = ()
+        if self._client.capabilities.get(
+                "promptCapabilities", {}).get("image") is True:
+            images = prompt_images(prompt, self._attachment_root)
+        task = asyncio.create_task(
+            self._client.prompt(session_id, prompt, images))
         task.add_done_callback(lambda t: updates.put_nowait(("__done__", t)))
         try:
             while True:
@@ -286,6 +394,12 @@ class AcpAdapter:
                         f"ACP {scope}连续 {timeout:g} 秒无活动，"
                         "已取消本轮请求") from None
                 if method == "__permission_activity__":
+                    if not delivery_committed:
+                        delivery_committed = True
+                        yield AgentEvent("delivery_committed", meta={
+                            "sessionId": session_id,
+                            "transport": "acp",
+                        })
                     request_id = payload["request_id"]
                     if payload["phase"] == "requested":
                         pending_permissions.add(request_id)
@@ -293,12 +407,45 @@ class AcpAdapter:
                         pending_permissions.discard(request_id)
                     continue
                 if method == "__done__":
-                    result = payload.result()  # 失败在此抛出，交给编排器兜底
+                    try:
+                        result = payload.result()
+                    except AcpRequestNotSentError:
+                        # drain 前失败：服务端不可能看到该 prompt。
+                        raise
+                    except AcpRemoteError as exc:
+                        if not delivery_committed:
+                            # 还没有任何 session 活动且服务端显式回错：
+                            # 按未接受处理，下轮可以继续增量补发。
+                            raise
+                        raise AgentDeliveryUncertainError(
+                            f"ACP prompt 已产生会话活动后失败：{exc}"
+                        ) from exc
+                    except Exception as exc:
+                        # request 已经完成 stdio drain，但没有得到可信的
+                        # 显式拒绝；断线/协议错误可能发生在 agent 已
+                        # 开始执行之后，必须走 no-replay。
+                        raise AgentDeliveryUncertainError(
+                            f"ACP prompt 已发送但结果不确定：{exc}"
+                        ) from exc
+                    if not delivery_committed:
+                        delivery_committed = True
+                        yield AgentEvent("delivery_committed", meta={
+                            "sessionId": session_id,
+                            "transport": "acp",
+                        })
                     yield AgentEvent("done", meta={
                         "stopReason": result.get("stopReason", "")})
                     break
                 if method != "session/update":
                     continue
+                if not delivery_committed:
+                    # 在任何正文/工具/状态事件进入外部 sink 前，
+                    # 让 Orchestrator 先持久化 no-replay cursor。
+                    delivery_committed = True
+                    yield AgentEvent("delivery_committed", meta={
+                        "sessionId": session_id,
+                        "transport": "acp",
+                    })
                 update = payload.get("update", {})
                 kind = update.get("sessionUpdate")
                 if kind == "agent_message_chunk":
@@ -427,5 +574,47 @@ class AcpAdapter:
 
 
 class AcpKimiAdapter(AcpAdapter):
-    def __init__(self, permission: str = "deny") -> None:
-        super().__init__("kimi", ["kimi", "acp"], permission=permission)
+    def __init__(
+        self,
+        permission: str = "deny",
+        *,
+        fallback_jsonl: bool = True,
+        fallback_adapter: AgentAdapter | None = None,
+    ) -> None:
+        if fallback_jsonl and fallback_adapter is None:
+            from adapters.kimi_adapter import KimiAdapter
+
+            fallback_adapter = KimiAdapter.readonly_fallback()
+        super().__init__(
+            "kimi",
+            ["kimi", "acp"],
+            permission=permission,
+            fallback_adapter=(fallback_adapter if fallback_jsonl else None),
+        )
+
+
+class AcpOpenCodeAdapter(AcpAdapter):
+    def __init__(
+        self,
+        permission: str = "deny",
+        *,
+        fallback_jsonl: bool = True,
+        fallback_adapter: AgentAdapter | None = None,
+    ) -> None:
+        if fallback_jsonl and fallback_adapter is None:
+            from adapters.opencode_adapter import OpenCodeAdapter
+
+            fallback_adapter = OpenCodeAdapter.readonly_fallback()
+        super().__init__(
+            "opencode",
+            ["opencode", "acp"],
+            permission=permission,
+            fallback_adapter=(fallback_adapter if fallback_jsonl else None),
+            env_overrides={
+                "OPENCODE_PERMISSION": json.dumps(
+                    OPENCODE_ACP_PERMISSION_POLICY,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            },
+        )

@@ -34,7 +34,7 @@ _ROUTE_TEMPLATE = """\
 {transcript}
 
 请直接处理用户最新的消息，只能二选一：
-1. 需要写代码、改文件、跑命令或调研具体技术问题：只输出一行 JSON，
+1. 需要写代码、改文件、跑命令、查看图片附件或调研具体技术问题：只输出一行 JSON，
    不要输出其他文字：
    {{"targets": ["{first_worker}"], "reason": "一句话理由",
      "tasks": {{"{first_worker}": "直接交给该 agent 的完整、可执行任务"}}}}
@@ -58,6 +58,7 @@ MODERATOR_TEMPLATE = """\
 
 {transcript}
 
+{assignment}
 请以主持人身份回应用户最新的消息。直接输出内容，不要自我介绍，不要复述记录。
 如需读写文件、运行命令，都在当前目录内进行。
 """
@@ -162,6 +163,12 @@ class HostAgent:
                 setter(None)
             else:
                 setter(lambda _agent_name, params: handler(self.name, params))
+
+    def set_attachment_root(self, root) -> None:
+        """把当前房间附件信任根转发给底层 transport。"""
+        setter = getattr(self.adapter, "set_attachment_root", None)
+        if setter is not None:
+            setter(root)
 
     async def aclose(self) -> None:
         """回收底层长驻 transport；无生命周期能力的旧 adapter 无操作。"""

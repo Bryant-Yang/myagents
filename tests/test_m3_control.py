@@ -94,7 +94,7 @@ def test_protocol_roundtrip() -> None:
             assert info["active"] is True
             assert info["room_id"] == room.store.room_id
             assert info["workdir"] == str(room.workdir.resolve())
-            assert {"name": "kimi", "transport": "acp"} in info["agents"]
+            assert {"name": "kimi", "transport": "acp+jsonl"} in info["agents"]
 
             first = await room.client.submit("@kimi first", request_id="same")
             duplicate = await room.client.submit(

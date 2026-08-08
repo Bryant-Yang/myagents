@@ -1,7 +1,7 @@
 """Phase 2 里程碑测试：通用 ACP runtime 接入统一 TUI。
 
 覆盖：
-- AgentSpec 注册：kimi=ACP、codex=app-server、opencode=JSONL
+- AgentSpec 注册：kimi/opencode=ACP+JSONL、codex=app-server
 - ACP 增量上下文：不重复完整 transcript、跳过自己回复、失败不丢增量
 - 权限：默认拒绝 / TUI 选择 / 等待可取消
 - 生命周期：TUI 退出统一 aclose，fake ACP 无残留
@@ -19,9 +19,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from acp.adapter import AcpAdapter
+from acp.adapter import AcpAdapter, AcpOpenCodeAdapter
 from acp.client import AcpClient, AcpError
 from adapters.base import AgentEvent
+from adapters.kimi_adapter import KimiAdapter
 from adapters.opencode_adapter import OpenCodeAdapter
 from codex_app_server.adapter import CodexAppServerAdapter
 from host import HostDecision
@@ -111,9 +112,9 @@ def make_orch(**adapters) -> Orchestrator:
 # ---- 1. AgentSpec 注册 ----
 
 def test_agent_specs() -> None:
-    assert AGENTS["kimi"].transport == "acp"
+    assert AGENTS["kimi"].transport == "acp+jsonl"
     assert AGENTS["codex"].transport == "app-server"
-    assert AGENTS["opencode"].transport == "jsonl"
+    assert AGENTS["opencode"].transport == "acp+jsonl"
 
     orch = Orchestrator("/tmp", persistent=False)
     kimi = orch.adapters["kimi"]
@@ -121,13 +122,18 @@ def test_agent_specs() -> None:
     assert kimi._cmd == ["kimi", "acp"]
     assert getattr(kimi, "stateful_session", False) is True
     assert type(orch.adapters["codex"]) is CodexAppServerAdapter
-    assert type(orch.adapters["opencode"]) is OpenCodeAdapter
+    opencode = orch.adapters["opencode"]
+    assert isinstance(opencode, AcpOpenCodeAdapter)
+    assert opencode._cmd == ["opencode", "acp"]
     assert getattr(orch.adapters["codex"], "stateful_session", False) is True
     assert orch.adapters["codex"].ephemeral_thread is False
     assert isinstance(orch.host.adapter, CodexAppServerAdapter)
     assert orch.host.adapter.ephemeral_thread is True
     assert orch.host.adapter._fallback.ephemeral is True
-    print("ok  AgentSpec 注册（kimi=ACP，codex=app-server，opencode=JSONL）")
+    assert isinstance(kimi._fallback, KimiAdapter)
+    assert isinstance(opencode._fallback, OpenCodeAdapter)
+    print("ok  AgentSpec 注册（kimi/opencode=ACP+JSONL，"
+          "codex=app-server）")
 
 
 # ---- 2. ACP 增量上下文 ----
@@ -418,8 +424,9 @@ def test_tui_status_and_shutdown() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
             lines = _richlog_text(app)
-            assert "kimi(ACP)" in lines
-            assert "codex(APP-SERVER)" in lines and "opencode(JSONL)" in lines
+            assert "kimi(ACP+JSONL)" in lines
+            assert "codex(APP-SERVER)" in lines
+            assert "opencode(ACP+JSONL)" in lines
             # 跑一轮，让 kimi acp 进程真的起来；session id 应展示一次
             box = app.query_one(Input)
             box.value = "@kimi fast round"
@@ -434,7 +441,7 @@ def test_tui_status_and_shutdown() -> None:
                              capture_output=True, text=True).stdout.split()
         assert not out, f"残留 fake server 进程: {out}"
     asyncio.run(run())
-    print("ok  TUI 状态可见（ACP/JSONL）+ 退出统一 aclose（无残留进程）")
+    print("ok  TUI 状态可见（ACP+JSONL）+ 退出统一 aclose（无残留进程）")
 
 
 # ---- P1 回归：同一 stateful agent 的并发 dispatch ----

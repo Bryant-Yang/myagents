@@ -15,7 +15,7 @@
 | 调节目标 | 当前覆盖 | 证据索引 | 明确不保证 |
 | --- | --- | --- | --- |
 | Maintainability | 部分：项目入口、场景索引、文档引用、Python 语法和测试 gate | `AGENTS.md`、`workflow.md`、`scripts/check-harness.sh` | 没有 formatter、lint、静态类型检查和复杂度阈值 |
-| Architecture Fitness | 较强：transport 边界、通用 runtime、ACP-first 和权限默认值有确定性检查 | HARNESS R1–R4、`test_phase2.py` | 不证明新抽象必要，也不覆盖生产性能 |
+| Architecture Fitness | 较强：transport 边界、通用 runtime、ACP-first、权限默认值和有界讨论有确定性检查 | HARNESS R1–R5、`test_phase2.py`、`test_discussion.py` | 不证明新抽象必要，也不覆盖生产性能 |
 | Behaviour | 关键 Phase 2 + M2.5（持久化/恢复/lease）+ M3（command bus/控制 socket/MCP stdio）路径有 fake contract tests 与真实 Kimi E2E 双证据 | [`SPEC.md#关键行为用例`](SPEC.md#关键行为用例) | 不保证所有 CLI 版本、长会话 compaction 或真实 cancel 时延 |
 
 ## 2. Control Map
@@ -31,12 +31,15 @@
 | C7 | 持久化、命名会话、session restore 与单写者 lease | HARNESS §4.4；`acp-migration.md` 持久化与 session restore；ADR-0001、ADR-0005 | `test_storage.py`、`test_m25.py`（含本地 `/new` 与 no-replay）；SPEC UC-ROOM-001/UC-SESSION-001/UC-ACP-002 | fail loudly 不假提交；本地命令不入 timeline；会话切换先标准关闭旧 owner；修复后重跑 storage/M2.5 回归 | Bryant Yang |
 | C8 | 外部入口保持单写者、权限不绕过且失败终态真实 | HARNESS §4.5–4.6；ADR-0001 §2.4–2.6 | `test_m3_bus.py`（含 fan-out worker failure）、`test_m3_control.py`、`test_m3_mcp.py`；SPEC UC-CTRL-001/UC-CTRL-002 | 阻断；bridge 不得创建 Orchestrator/获取 lease/绕过 TUI 权限；worker 失败不得报 completed；修复后重跑 M3 回归 | Bryant Yang |
 | C9 | 执行状态有界、可读且不刷屏 | HARNESS §4.6；ADR-0002；`acp-migration.md` 可见状态 | `test_acp.py` tool-spam/long-tool watchdog、`test_m3_bus.py` 防御性去重、`test_basic.py` 工具折叠、`test_tui_status.py` 分 agent 状态；SPEC UC-OBS-001 | 阻断交付；在 adapter/bus/UI 正确边界恢复状态迁移、去重和索引清理，不删除 append-only 历史 | Bryant Yang |
+| C10 | 图片附件私有、有界且不污染工作区 | HARNESS §4.8；SPEC UC-IMAGE-001 | `test_clipboard_image.py` 权限/格式/大小/草稿 fixture；真实截图由用户人工验收 | 阻断交付；删除不完整附件，恢复 0700/0600、20 MiB 和不自动提交边界 | Bryant Yang |
+| C11 | ACP hybrid 降级不绕过权限、不跨协议重放 | ADR-0006/0007；HARNESS §4.2–4.3；SPEC UC-HYBRID-001/002 | R4 registry/profile/policy gate；Kimi/OpenCode hybrid tests；受限真实临时目录探针 | 阻断交付；恢复具体 ACP adapter、权限 policy、只读 profile 和 prompt 前唯一 fallback 点 | Bryant Yang |
+| C12 | 指定成员讨论有界、跨轮上下文正确且失败不假绿 | ADR-0008；HARNESS §4.1；SPEC UC-DISCUSS-001 | R5 bounds/AST gate；`test_discussion.py` parser/并发/失败 contract；授权真实 MCP 回放 | 阻断；恢复 2–3 人、1–3 轮、非递归状态机和失败汇总后复验 | Bryant Yang |
 
 ## 3. 约束等级
 
 | ID | 等级 | 判据 | 处置 |
 | --- | --- | --- | --- |
-| R1–R4 | Deterministic Gate | AST/注册表检查低误报且能定位文件 | 违反必拦，修复后复验 |
+| R1–R5 | Deterministic Gate | AST/注册表/有界常量检查低误报且能定位文件 | 违反必拦，修复后复验 |
 | S1 | Inferential Review Criterion | 新抽象、跨层职责、重复逻辑需要语义判断 | review 提供证据与替代方案，不假装机械事实 |
 | S2 | Inferential Review Criterion | fake server 是否仍代表真实 ACP 边界 | 比较真实 wire/options；必要时更新 fixture |
 | A1 | Human Acceptance Decision | 真实工具调用、auto 权限和外部系统写入风险 | 只有用户明确授权才执行 |
@@ -47,7 +50,10 @@
 | 用例 / 风险 | SPEC 证据位置 | Control |
 | --- | --- | --- |
 | 显式路由与 fan-out | [`SPEC.md#uc-route-001-显式路由与并发扇出`](SPEC.md#uc-route-001-显式路由与并发扇出) | C1 |
+| 指定成员有界讨论 | [`SPEC.md#uc-discuss-001-指定成员的有界多智能体讨论`](SPEC.md#uc-discuss-001-指定成员的有界多智能体讨论) | C12、C3、C8 |
 | ACP 增量上下文 | [`SPEC.md#uc-acp-001-有状态增量上下文`](SPEC.md#uc-acp-001-有状态增量上下文) | C1、C3 |
+| Kimi hybrid 受限降级 | [`SPEC.md#uc-hybrid-001-kimi-acp-first-受限降级`](SPEC.md#uc-hybrid-001-kimi-acp-first-受限降级) | C1、C2、C3、C11 |
+| OpenCode hybrid 权限与受限降级 | [`SPEC.md#uc-hybrid-002-opencode-acp-first-权限收口与受限降级`](SPEC.md#uc-hybrid-002-opencode-acp-first-权限收口与受限降级) | C1、C2、C3、C11 |
 | 权限决策 | [`SPEC.md#uc-perm-001-权限请求与选择`](SPEC.md#uc-perm-001-权限请求与选择) | C2、C6 |
 | 生命周期 | [`SPEC.md#uc-life-001-取消与退出回收`](SPEC.md#uc-life-001-取消与退出回收) | C4、C6 |
 | 持久房间与重启恢复 | [`SPEC.md#uc-room-001-持久房间与重启恢复`](SPEC.md#uc-room-001-持久房间与重启恢复) | C7、C6 |
@@ -64,7 +70,7 @@
 | Agent 本地循环 | `check-redlines.sh` + 相关 test script | 当前 agent 自修并复验 |
 | 完整交付 | `check-harness.sh`（含 storage/M2.5/M3 回归） | 阻断“完成”声明 |
 | 人工 Review | SPEC 证据边界、真实权限/协议风险；长会话 compaction 与真实 cancel 时延仍是证据缺口 | 修改或由 Owner 明确接受 |
-| 真实 agent 验收 | `scripts/e2e-m3-real.py`：临时目录、真实 Kimi session/load、独立 MCP client、退出后进程检查；调用真实模型，不进默认快速 gate | 立即停止外部写入并报告 |
+| 真实 agent 验收 | `scripts/e2e-m3-real.py`、ADR-0006/0007 临时目录探针与 ADR-0008 真实讨论回放；真实模型不进默认快速 gate；结束后检查进程 | 立即停止外部写入并报告 |
 
 ## 6. Steering
 
@@ -73,7 +79,7 @@
 
 ## 7. Baseline 与模板升级
 
-- **Legacy baseline**：R1–R4 当前均为零命中，不需要债务 baseline。生成方式是
+- **Legacy baseline**：R1–R5 当前均为零命中，不需要债务 baseline。生成方式是
   `bash scripts/check-redlines.sh`；若未来接入时已有历史债，必须先保存稳定、
   去行号的命中集合，再用 `comm -13` 只拦新增。
 - **模板来源**：Harness Framework `2.1.0`，来源 commit

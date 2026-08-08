@@ -11,3 +11,6 @@
 | [0003](0003-codex-app-server-transport.md) | Accepted | M4 Codex app-server 长连接、默认配置继承与安全 fallback |
 | [0004](0004-ephemeral-codex-host-threads.md) | Accepted | M4.1 Codex host 使用不落盘的 ephemeral thread |
 | [0005](0005-project-conversation-sessions.md) | Accepted | M4.2 同一项目的独立命名会话与安全切换 |
+| [0006](0006-kimi-hybrid-transport-policy.md) | Accepted | M4.4 Kimi ACP-first、prepare-only 只读 JSONL fallback 与 no-replay |
+| [0007](0007-opencode-hybrid-transport-policy.md) | Accepted | M4.5 OpenCode ACP-first、ask-by-default 权限收口与只读 JSONL fallback |
+| [0008](0008-bounded-multi-agent-discussion.md) | Accepted | M5.1 `/discuss` 有界轮次、失败收口与终局主持 |

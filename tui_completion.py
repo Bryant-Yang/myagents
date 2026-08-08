@@ -25,7 +25,11 @@ class LocalCommand:
 LOCAL_COMMANDS: tuple[LocalCommand, ...] = (
     LocalCommand("new", "新建独立会话", "action_new_session"),
     LocalCommand("cancel", "取消当前任务", "action_cancel_active"),
+    LocalCommand(
+        "discuss", "查看有界多智能体讨论用法", "action_show_discuss_help"),
     LocalCommand("details", "显示或隐藏工具详情", "action_toggle_details"),
+    LocalCommand(
+        "paste-image", "粘贴 macOS 剪贴板图片", "action_paste_image"),
     LocalCommand("agents", "查看已注册 agent", "action_show_agents"),
     LocalCommand("help", "查看本地命令与快捷键", "action_show_help"),
 )

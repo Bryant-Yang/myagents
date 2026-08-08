@@ -21,22 +21,49 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import AsyncIterator
 
 from .base import AgentEvent, stream_jsonl
 
 
+KIMI_READONLY_AGENT_FILE = Path(__file__).with_name(
+    "kimi_readonly_fallback.md").resolve()
+
+
 class KimiAdapter:
     name = "kimi"
 
-    def __init__(self, use_resume: bool = False) -> None:
+    def __init__(
+        self,
+        use_resume: bool = False,
+        *,
+        agent_file: str | Path | None = None,
+    ) -> None:
         self.session_id: str | None = None
         self.use_resume = use_resume  # True 时后续调用带上 -S <id> 延续会话
+        self.agent_file = (
+            None if agent_file is None else Path(agent_file).resolve())
+
+    @classmethod
+    def readonly_fallback(cls) -> "KimiAdapter":
+        """构造 ACP prepare 失败时的受限 JSONL adapter。
+
+        Kimi ``-p`` 会自动处理工具权限，所以安全边界不能只靠
+        prompt。显式 agent file 用工具白名单把降级路径限制为代码
+        阅读，禁止写入、命令、网络、Skill 和子 agent。
+        """
+        return cls(agent_file=KIMI_READONLY_AGENT_FILE)
 
     async def stream(self, prompt: str, workdir: str) -> AsyncIterator[AgentEvent]:
         cmd = ["kimi", "-p", prompt, "--output-format", "stream-json"]
         if self.use_resume and self.session_id:
             cmd += ["--session", self.session_id]
+        elif self.agent_file is not None:
+            if not self.agent_file.is_file():
+                raise RuntimeError(
+                    f"Kimi agent file 不存在：{self.agent_file}")
+            cmd += ["--agent-file", str(self.agent_file)]
 
         async for line in stream_jsonl(cmd, workdir):
             try:
@@ -46,9 +73,13 @@ class KimiAdapter:
 
             role = ev.get("role")
             if role == "assistant":
-                yield AgentEvent("text", ev.get("content", ""))
+                content = ev.get("content")
+                if isinstance(content, str) and content:
+                    yield AgentEvent("text", content)
             elif role == "meta" and ev.get("type") == "session.resume_hint":
-                self.session_id = ev.get("session_id")
+                session_id = ev.get("session_id")
+                if isinstance(session_id, str) and session_id:
+                    self.session_id = session_id
             # 其他 role（tool 调用等）MVP 阶段不展示
 
         yield AgentEvent("done")

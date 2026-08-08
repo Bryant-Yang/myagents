@@ -18,7 +18,7 @@ import os
 import re
 import signal
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Protocol
+from typing import AsyncIterator, Mapping, Protocol
 
 
 class AgentDeliveryUncertainError(RuntimeError):
@@ -164,7 +164,12 @@ async def read_lines(stream: asyncio.StreamReader) -> AsyncIterator[str]:
         yield tail
 
 
-async def stream_jsonl(cmd: list[str], workdir: str) -> AsyncIterator[str]:
+async def stream_jsonl(
+    cmd: list[str],
+    workdir: str,
+    *,
+    env_overrides: Mapping[str, str] | None = None,
+) -> AsyncIterator[str]:
     """公共助手：spawn 子进程，逐行产出 stdout。
 
     各家 CLI 的无头模式都是"命令 + JSONL 输出"，差异只在参数和 JSON 结构，
@@ -183,9 +188,14 @@ async def stream_jsonl(cmd: list[str], workdir: str) -> AsyncIterator[str]:
       子进程不够——CLI 启动的 shell/tool 后代会继承管道，既卡死读取，
       又可能在 TUI 退出后继续改工作区。
     """
+    process_env = None
+    if env_overrides:
+        process_env = os.environ.copy()
+        process_env.update(env_overrides)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=workdir,
+        env=process_env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,  # 自立进程组，pgid = 子进程 pid

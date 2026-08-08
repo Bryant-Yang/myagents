@@ -1,9 +1,11 @@
 # ACP 迁移设计（最小方案）
 
-状态：**Phase 4 已完成**。`AgentAdapter` 是 TUI 与不同 coding agent 的
+状态：**Phase 4.5 已完成**。`AgentAdapter` 是 TUI 与不同 coding agent 的
 统一行为契约；wire protocol 按厂商能力选择：`acp/` 是通用 ACP runtime，
-Kimi 走 `kimi acp`；Codex 走官方 `codex app-server`；OpenCode 与旧 Codex
-adapter 保留 JSONL fallback。app-server 不是 ACP，二者只在 adapter 层统一。
+Kimi/OpenCode 分别走 `kimi acp` / `opencode acp`，只在 ACP prepare
+失败前使用各自受限 JSONL fallback；Codex 走官方 `codex app-server`，旧
+Codex adapter 保留 JSONL fallback。app-server 不是 ACP，各协议只在
+adapter 层统一。
 Phase 2.5 落地了共享 history 持久化、ACP
 session 映射与重启恢复、房间单写者 lease；Phase 3 落地了内部
 command bus（`control/`）、私有 Unix 控制 socket 与 stdio MCP 外部入口
@@ -22,6 +24,7 @@ orchestrator 管——ACP 只负责传输，不参与"派给谁"的决策。
 ```
 → {"id":0,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{...}}}
 ← {"id":0,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,
+    "promptCapabilities":{"image":true,"audio":false,"embeddedContext":true},
     "sessionCapabilities":{"list":{},"resume":{}},...},"agentInfo":{...}}}
 
 → {"id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}
@@ -42,14 +45,22 @@ orchestrator 管——ACP 只负责传输，不参与"派给谁"的决策。
 → {"method":"session/cancel","params":{"sessionId":"..."}}   （通知，无响应）
 ```
 
+M4.3 图片附件沿用同一个 `session/prompt`：只有 Kimi 明确声明
+`promptCapabilities.image=true` 时，客户端才在 text block 后追加
+`{"type":"image","mimeType":"image/png","data":"<base64>"}`。图片只从当前
+房间的私有 `attachments/` 信任根提取；聊天文本中的任意外部路径不会升级为
+image block。二进制不进入共享 timeline。
+
 ## 架构（Phase 2 现状）
 
 ```
 orchestrator.py（AgentAdapter 接口不变；AGENT_SPECS 注册表）
    │  AgentSpec(name, transport, factory)
-   │    kimi     → acp   → AcpKimiAdapter（首个生产 ACP agent）
+   │    kimi     → acp+jsonl → AcpKimiAdapter
+   │                         └→ KimiAdapter（prepare-only，只读 profile）
    │    codex    → app-server → CodexAppServerAdapter（原生 thread/turn）
-   │    opencode → jsonl      → OpenCodeAdapter
+   │    opencode → acp+jsonl → AcpOpenCodeAdapter
+   │                         └→ OpenCodeAdapter（prepare-only，隔离只读配置）
    │                              CodexAdapter 作为安全 JSONL fallback
    │
    ├─ acp/adapter.py  AcpAdapter（通用：name + cmd 即一个 ACP agent；
@@ -67,6 +78,9 @@ orchestrator.py（AgentAdapter 接口不变；AGENT_SPECS 注册表）
 新增一个 ACP agent 不需要改编排器：写一行 `AgentSpec` 即可。
 协议判断只看 `transport` / adapter 能力声明（`stateful_session`、
 `set_permission_handler`、`aclose`），不散落 `if name == "..."`。
+Kimi/OpenCode hybrid 的完整时机、权限与 checkpoint 契约见
+[ADR-0006](adr/0006-kimi-hybrid-transport-policy.md)与
+[ADR-0007](adr/0007-opencode-hybrid-transport-policy.md)。
 
 ## 铁律：会话唯一持有者
 
@@ -97,7 +111,9 @@ ACP session 是持久上下文，编排器**不再**每轮转发完整 transcrip
   到达的新消息留给下一轮）。prompt 提交前或服务端明确拒绝的失败不推进，
   下一轮从旧 cursor 补发；prompt 已提交后的 inactivity timeout 等结果不确定
   失败必须先提交同一快照末尾的 no-replay cursor，再公开失败，避免工具任务
-  被重复执行。
+  被重复执行。ACP adapter 在首个 `session/update` / 权限活动进入外部 sink
+  前发内部 `delivery_committed`，Orchestrator 据此先持久化 cursor；prompt
+  写入后的断线即使没有收到 update，也按结果不确定处理。
 - 无状态 JSONL fallback 不受影响：仍用 dispatch 瞬间的完整 transcript 快照
   （最近 12 条，防并发串话）。
 
@@ -160,11 +176,14 @@ client 声明 `fs/terminal` 能力为 false（不代理文件/终端）。
    发无效 outcome。
 
 等待用户决策期间不阻塞 read loop（独立 task 应答），并暂停 adapter 的
-agent inactivity timeout；权限结果发回后重新开始普通静默计时。等待仍可取消——
-TUI 退出时所有挂起的权限 Future 按 cancelled 收尾（`on_unmount` →
+agent inactivity timeout；权限结果发回后重新开始普通静默计时。OpenCode ACP
+还通过 runtime permission policy 把默认偏宽的 unknown、edit、bash、task、
+skill、network、MCP 与 external-directory 收口为 ask；read/search/lsp/todo
+allow。等待仍可取消——TUI 退出时所有挂起的权限 Future 按 cancelled 收尾
+（`on_unmount` →
 `_cancel_pending_permissions` → `orch.aclose()`，顺序不能反：aclose
 等的锁可能被等权限的 prompt 持有），不留挂起 Future 或 `kimi acp`
-子进程。权限后台 task 的异常由 done callback 消费（连接断开导致应答
+／`opencode acp` 子进程。权限后台 task 的异常由 done callback 消费（连接断开导致应答
 发不出去时不会留下 "Task exception was never retrieved"）。
 
 ## 取消契约（Phase 1 建立，Phase 2 不变）
@@ -188,7 +207,7 @@ prompt/session 初始化共用 adapter 的同一把锁，不竞态杀进程。
 
 ## 可见状态（Phase 2 新增）
 
-- TUI 启动行显示每个 agent 的传输协议：`@kimi(ACP) @opencode(JSONL)
+- TUI 启动行显示每个 agent 的传输协议：`@kimi(ACP+JSONL) @opencode(ACP+JSONL)
   @codex(APP-SERVER)`。
 - ACP session id 建立后通过 info 事件展示一次（每次建立一次，不刷屏）。
 - `tool_call` 保存脱敏后的 title/command；后续 `tool_call_update` 按
@@ -199,13 +218,27 @@ prompt/session 初始化共用 adapter 的同一把锁，不竞态杀进程。
 - 固定任务区显示 command 总状态、累计耗时及每个 agent 的阶段/终态；
   fan-out 中既有成功又有失败时显示“部分完成”，不抹掉成功 agent 的事实。
 
+## 有界讨论（M5.1）
+
+`/discuss` 不改变 ACP wire protocol，也不让 ACP agent 直接互发消息。它在
+Orchestrator 内用普通代码执行 1–3 轮状态机：同轮不同 adapter 并发，跨轮等待
+全部收尾，最后调用一次 moderator。整个讨论仍是一个 CommandBus command，
+因此沿用同一个取消、事件、权限和失败终态。
+
+每个 stateful 参与者继续使用原 delivery lock/cursor：第一轮成功后 cursor 只
+推进到本轮 prompt 构造时的 timeline 末尾；其他参与者随后落盘的回复自然留给
+下一轮增量。下一轮过滤自己的回复（原生 session 已有）并收到其他参与者发言，
+不需要复制完整 transcript。参与者失败后退出后续轮次，不把 post-submit 不确定
+结果当作可安全重试。完整工作流契约见
+[ADR-0008](adr/0008-bounded-multi-agent-discussion.md)。
+
 ## 阶段计划
 
 - [x] **Phase 1**：`acp/client.py` + `acp/adapter.py` + fake server 回归测试
   （initialize/new/list/load/prompt/update/cancel/权限默认 deny/auto opt-in/
   取消串行化/超时重建/close-during-prompt/initialize 失败回收）
 - [x] **Phase 2**：通用 ACP runtime 接入统一 TUI（kimi 为首个验收 agent）：
-  `AgentSpec` 注册表（transport = acp/jsonl）；ACP 增量上下文
+  `AgentSpec` 注册表（transport = acp/acp+jsonl/jsonl）；ACP 增量上下文
   （history cursor）；权限请求弹到 TUI 让用户决策；TUI 退出统一
   `aclose()`；协议状态可见。JSONL 保留为 fallback。
 - [x] **Phase 2.5**：共享 history 持久化（timeline/state + seq cursor）、
@@ -226,6 +259,14 @@ prompt/session 初始化共用 adapter 的同一把锁，不竞态杀进程。
   [ADR-0003](adr/0003-codex-app-server-transport.md)与
   [ADR-0004](adr/0004-ephemeral-codex-host-threads.md)。Claude 尚未注册；
   后续按其可靠官方协议单独接入，不把厂商协议强行伪装成 ACP。
+- [x] **Phase 4.4**：Kimi hybrid transport：保持 ACP-first，仅在新连接
+  prepare 失败时进入内置只读 JSONL profile；伪 checkpoint 下轮新建
+  ACP session，prompt 拒绝与 post-submit 失败禁止重放。见 ADR-0006。
+- [x] **Phase 4.5**：OpenCode hybrid transport：`opencode acp` 成为生产
+  主路径，风险/未知工具统一 ask；prepare-only fallback 使用 `--pure`、
+  隔离配置和 deny-all 只读 agent。见 ADR-0007。
+- [x] **Phase 5.1**：`/discuss` 指定 2–3 个 worker、1–3 轮有界讨论，
+  同轮 fan-out、跨轮增量上下文、失败者退出与终局 moderator。见 ADR-0008。
 - [ ] **Phase 5**：里程碑工作流、review → 修改 → 复核闭环与 steering
 
 A2A 不在当前阶段；Streamable HTTP、远程认证同样不在 M3（M3 是单机
@@ -247,7 +288,15 @@ A2A 不在当前阶段；Streamable HTTP、远程认证同样不在 M3（M3 是�
   后的 restore 行为。
 - **kimi acp 启动开销**：长驻进程只需一次握手，后续 prompt 无进程启动成本，
   比 JSONL 模式更快。
+- **JSONL 降级能力有意受限**：print mode 不能把写入权限交给
+  TUI，因此 Kimi 自动 fallback 只提供 Read/Grep/Glob，OpenCode 只提供
+  read/glob/grep/list；需要变更时应说明阻塞，不得伪装完成。
+- **OpenCode 权限默认值**：上游默认允许大部分工具，生产 ACP 必须保留
+  runtime ask policy；CLI 升级后用 `opencode debug agent build` 和真实
+  permission wire probe 复验规则顺序。
 - **断线**：agent 进程 EOF 时所有 pending request 立即失败（带 stderr 尾段），
   由编排器的 `_run_one` 兜底成 error 事件。
+- **图片能力漂移**：Kimi 不再声明 `promptCapabilities.image` 时退化为文本附件
+  引用，不伪造协议能力；fake ACP contract 固定 text + image block 形状。
 - **增量补发的重复**：失败重试会把失败轮的增量再发一遍，agent 会在
   session 里看到重复的用户消息——可接受（丢上下文不可接受）。

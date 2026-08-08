@@ -7,9 +7,11 @@
 聊天室里 @kimi / @opencode / @codex 把消息派发给对应 agent，支持一条消息
 @多个（并发执行）。@host 叫主持人（由 codex 扮演）出来总结/仲裁；不带 @
 的消息由 host 用一次调用直接回答或决定派给谁。
+`/discuss` 可在一个 CommandBus command 内安排 2–3 个 worker 做 1–3 轮
+有界讨论，再由指定 moderator 最终仲裁。
 
-接入协议：可靠官方长连接优先。Kimi 走 ACP 长驻会话，Codex 走原生
-app-server，OpenCode 走 JSONL；权限请求会弹窗交给用户决策。启动信息里
+接入协议：可靠官方长连接优先。Kimi/OpenCode 走 ACP 长驻会话，Codex 走原生
+app-server；ACP prepare 失败才进入受限 JSONL。权限请求会弹窗交给用户决策。启动信息里
 能看到每个 agent 的传输协议。
 """
 
@@ -24,6 +26,8 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -39,6 +43,8 @@ from adapters.base import (
     tool_status_label,
 )
 from control import CommandBus, ControlServer
+from clipboard_image import ClipboardImageError, capture_clipboard_png
+from discussion import DISCUSSION_USAGE
 from storage.store import (
     DEFAULT_SESSION_NAME,
     RoomBusyError,
@@ -212,6 +218,13 @@ class ComposerInput(Input):
         if not self.app.accept_completion():
             await super().action_submit()
 
+    def action_paste(self) -> None:
+        """文本剪贴板沿用 Textual；空文本时尝试读取系统图片。"""
+        if self.app.clipboard:
+            super().action_paste()
+        else:
+            self.app.action_paste_image()
+
 
 class ChatApp(App):
     BINDINGS = [
@@ -251,7 +264,9 @@ class ChatApp(App):
 
     def __init__(self, workdir: str, persistent: bool = True, *,
                  orchestrator: Orchestrator | None = None,
-                 session_name: str | None = None) -> None:
+                 session_name: str | None = None,
+                 clipboard_image_capture: Callable[
+                     [Path], Path] = capture_clipboard_png) -> None:
         super().__init__()
         if orchestrator is not None:
             # 注入的 orchestrator 必须属于同一房间，不能静默换房
@@ -304,6 +319,8 @@ class ChatApp(App):
             tuple[str, str, str], tuple[str, AgentEvent]
         ] = {}
         self._show_tool_details = False
+        self._clipboard_image_capture = clipboard_image_capture
+        self._image_paste_in_progress = False
         self._task_progresses: dict[str, TaskProgress] = {}
         self._task_started_at: dict[str, float] = {}
         self._latest_task_id: str | None = None
@@ -688,12 +705,57 @@ class ChatApp(App):
             f"{commands}\n"
             "候选：输入 @ 或 /，↑↓ 选择，Tab/Enter 补全，Esc 关闭")
 
+    def action_show_discuss_help(self) -> None:
+        self._system(
+            "有界讨论用法：\n"
+            f"{DISCUSSION_USAGE}\n"
+            "参与者 2–3 个，轮数 1–3；默认两轮并由 host 最终仲裁。")
+
     def action_toggle_details(self) -> None:
         """切换工具命令详情，并原位重绘现有工具记录。"""
         self._show_tool_details = not self._show_tool_details
         latest = list(self._tool_latest.values())
         for name, event in latest:
             self._upsert_tool_line(name, event)
+
+    def action_paste_image(self) -> None:
+        """保存系统剪贴板图片，并把本地附件引用插入当前草稿。"""
+        if self._image_paste_in_progress:
+            self._system("正在读取剪贴板图片…")
+            return
+        store = self.orch.store
+        if store is None:
+            self._write(
+                "system", "图片粘贴需要持久会话", "bold red")
+            return
+        self._image_paste_in_progress = True
+        destination = store.room_dir / "attachments"
+
+        async def runner() -> None:
+            try:
+                path = await asyncio.to_thread(
+                    self._clipboard_image_capture, destination)
+            except ClipboardImageError as exc:
+                self._write("system", str(exc), "bold red")
+                return
+            except Exception as exc:
+                self._write(
+                    "system", f"粘贴图片失败：{exc}", "bold red")
+                return
+            finally:
+                self._image_paste_in_progress = False
+            box = self.query_one("#composer", ComposerInput)
+            reference = f"[图片附件：{path}]"
+            start, end = box.selection
+            prefix = "" if start == 0 or box.value[start - 1].isspace() else " "
+            suffix = "" if end == len(box.value) or (
+                end < len(box.value) and box.value[end].isspace()
+            ) else " "
+            box.replace(f"{prefix}{reference}{suffix}", start, end)
+            box.focus()
+            self._system(f"已粘贴图片：{path.name}")
+
+        self.run_worker(runner())
 
     def _dispatch_from_ui(self, text: str) -> None:
         """经 CommandBus 提交（唯一入口，不再直接 orch.dispatch）。

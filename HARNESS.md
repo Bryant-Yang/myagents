@@ -20,7 +20,7 @@
 | 原则 | 项目解释 |
 | --- | --- |
 | 一个编排中心 | agent 不直接互调，消息与 history 统一经过 Orchestrator。 |
-| 原生长连接优先，JSONL fallback | 有官方可靠长连接时优先使用；Kimi 走 ACP，Codex 走 app-server，JSONL 只兼容回退。 |
+| 原生长连接优先，JSONL fallback | 有官方可靠长连接时优先使用；Kimi/OpenCode 走 ACP，Codex 走 app-server，JSONL 只兼容回退。 |
 | 协议通用、差异下沉 | 通用 runtime 不按 agent 名分支，具体差异进入 adapter/spec。 |
 | 权限 fail-closed | 无处理器、异常或畸形选择一律拒绝；auto 必须显式授权。 |
 | 生命周期负责到底 | 启动的进程组必须能 cancel、close 并被独立验证已回收。 |
@@ -34,7 +34,7 @@
 | TUI | Textual `>=1.0` |
 | ACP transport | NDJSON JSON-RPC 2.0 over stdio，protocolVersion 1 |
 | Codex transport | app-server JSONL over stdio（JSON-RPC-like，无 `jsonrpc` header） |
-| JSONL transport | 各 agent CLI 无头模式 |
+| JSONL transport | 各 agent CLI 无头模式；Kimi/OpenCode 自动降级只允许各自内置只读 profile |
 | 持久化 | RoomStore：timeline.jsonl（对话）+ events.jsonl（执行）+ state.json（seq/cursor/session）+ owner.lock |
 | 外部入口 | control/：CommandBus FIFO + 私有 Unix 控制 socket；myagents_mcp.py stdio MCP bridge（`mcp>=1.27,<2`） |
 | 测试 | 直接运行的 Python test scripts + Textual pilot + fake ACP server + 官方 MCP SDK stdio client |
@@ -63,7 +63,8 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 - `main.py` 只负责 UI、权限交互和生命周期入口，不直接启动 agent 进程。
 - `orchestrator.py` 只面向 adapter 能力和 `AgentSpec`，不解析厂商协议。
 - `acp/client.py` 负责通用 ACP framing、request/response、反向权限请求和进程回收。
-- `acp/adapter.py` 把 ACP session 转成 `AgentEvent`。
+- `acp/adapter.py` 把 ACP session 转成 `AgentEvent`，并将可选的
+  prepare-only JSONL 降级收在同一 adapter seam 内。
 - `codex_app_server/client.py` 独占 Codex app-server 进程，负责 initialize、
   request/response、反向 approval、通知和进程回收。
 - `codex_app_server/adapter.py` 把 Codex thread/turn 映射成 stateful
@@ -101,10 +102,16 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
   允许下轮补发；prompt 已提交后的静默超时属于结果不确定，必须先持久化
   no-replay cursor 再公开失败，不能自动重放。
 - 首次 ACP bootstrap 最多发送 `history_limit` 条共享历史。
+- `/discuss` 是 Orchestrator 内的确定性有界状态机：2–3 个显式 worker、
+  1–3 轮、一个终局 moderator。同轮复用 fan-out，跨轮等待全部收尾；内部
+  assignment 不写成 user timeline，不递归 `dispatch`，agent 不决定下一轮。
+- 讨论参与者失败后退出后续轮次，避免把不确定投递当作安全重试；moderator
+  仍总结已有证据，但 `DispatchOutcome` 保留失败，CommandBus 不得报 completed。
 
 ### 4.2 权限
 
-- `AcpClient`、`AcpAdapter`、`AcpKimiAdapter` 默认权限都是 `deny`。
+- `AcpClient`、`AcpAdapter`、`AcpKimiAdapter`、`AcpOpenCodeAdapter`
+  默认权限都是 `deny`。OpenCode ACP 还必须把未知及有副作用工具收口为 ask。
 - TUI 异步决定权限并显示来源 agent。
 - `session/request_permission` 到权限结果发回前属于人工等待，不计入 ACP
   inactivity timeout；read loop、取消和关闭仍保持可响应。
@@ -121,6 +128,13 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 - cancel 后必须等待原 prompt 停止；超时则关闭并重建连接。
 - 子进程使用独立进程组；退出时 SIGTERM，超时再 SIGKILL。
 - TUI unmount 先取消权限 Future，再调用 `Orchestrator.aclose()`。
+- worker JSONL fallback 只允许在新 ACP 连接的 start/initialize/
+  session prepare 失败时启动；活跃 session 冲突、checkpoint 失败、
+  prompt 拒绝和 post-submit 失败均禁止跨协议重放。
+- Kimi fallback agent file 只允许 `Read` / `Grep` / `Glob`；OpenCode
+  fallback 只允许 `read` / `glob` / `grep` / `list`，并禁用项目配置、
+  Claude 兼容层、plugin 和自动升级。两者均禁止写入、命令、网络、Skill、
+  子 agent 和 MCP；权限必须由各 CLI runtime 执行，不能退化为 prompt-only。
 
 ### 4.4 持久化与恢复（M2.5）
 
@@ -220,12 +234,26 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 - app-server 是 Codex 专用实验协议；最小 wire contract 由 fake tests 固定，
   CLI 升级后必须重跑 contract 与真实探针。
 
+### 4.8 剪贴板图片附件（M4.3）
+
+- TUI 只从 macOS 系统剪贴板读取 PNG；文本粘贴保持 Textual 原行为。
+- 图片写入当前房间的 `attachments/`，目录 0700、文件 0600；不得写入目标
+  工作区、timeline 或 events，单张上限 20 MiB。
+- 粘贴只在光标处插入附件引用，不自动提交。可信房间附件通过 Kimi ACP
+  `image` block 和 Codex app-server `localImage` 原生发送；文本引用仍保留
+  在共享 timeline。手写的房间外路径不得升级成协议图片；host 遇图片附件
+  必须路由给 worker。
+- 失败不得改变草稿或残留不完整文件。终端内图片预览、转换、删除与跨机器同步
+  不在本阶段。
+
 ## 5. 测试策略
 
 | 层级 | 证据 |
 | --- | --- |
 | 路由/编排 | `tests/test_basic.py` |
 | ACP 协议与取消 | `tests/test_acp.py` + `tests/fake_acp_server.py` |
+| Kimi hybrid transport | `tests/test_kimi_hybrid.py` + `tests/fake_acp_server.py` |
+| OpenCode hybrid transport | `tests/test_opencode_hybrid.py` + `tests/fake_acp_server.py` |
 | TUI/增量/权限/回收 | `tests/test_phase2.py` |
 | RoomStore 持久化 | `tests/test_storage.py` |
 | M2.5 恢复/lease/时序 | `tests/test_m25.py` |
@@ -233,7 +261,8 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 | M3 控制 socket 安全/协议 | `tests/test_m3_control.py` |
 | M3 MCP stdio | `tests/test_m3_mcp.py`（官方 SDK client） |
 | M4 Codex app-server | `tests/test_codex_app_server.py` + `tests/fake_codex_app_server.py` |
-| 真实协议边界 | `docs/SPEC.md` 登记的 Kimi ACP + Textual 人工 E2E |
+| M4.3 剪贴板图片 | `tests/test_clipboard_image.py` + macOS 人工截图验收 |
+| 真实协议边界 | `docs/SPEC.md` 登记的 Kimi/OpenCode ACP + Textual/受限临时目录 E2E |
 
 普通测试禁止调用真实 Kimi/Codex/OpenCode。真实 agent 验收必须由用户明确授权，
 在临时目录运行，并在结束后检查没有残留进程。
@@ -244,7 +273,10 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 
 ```text
 harness 文档引用 → redlines → py_compile → basic → ACP → Phase 2
+→ Kimi hybrid
+→ OpenCode hybrid
 → storage → M2.5 → M3 bus → M3 control → M3 MCP stdio → M4 app-server
+→ M4.3 clipboard image
 ```
 
 运行：
@@ -264,25 +296,31 @@ branch protection / required checks 需要单独配置后才能宣称生效。
 以下重要但不能伪装成 grep 红线：
 
 - 新抽象是否真的比现有 `AgentSpec + AgentAdapter` 更简单；
-- 某 agent 的 ACP 适配器是否成熟到可替换 JSONL fallback；
+- 某 agent 的 ACP 适配器是否成熟到作为 JSONL fallback 的主路径；
 - 外部入口传输已定为私有 Unix socket + stdio MCP（ADR-0001）；是否引入
   Streamable HTTP、远程认证或 A2A 仍需人工决策，M3 不做；
 - 真实工具调用的权限风险是否可接受；
 - TUI 的可用性、长会话 token/内存表现和真实 cancel 时延；
 - 真实 Kimi `session/load` 与 MCP 端到端恢复已由
   `scripts/e2e-m3-real.py` 验收；它调用真实模型，不进默认快速 gate；
+- OpenCode 1.18.14 的 ACP 正常回合、重连 `session/load`、Bash 权限 deny、
+  prepare 失败只读 JSONL 与无残留进程已于 2026-08-08 受限验收；
+- `/discuss` 已于 2026-08-08 在同一持久房间恢复原 Kimi/OpenCode session，
+  经 MCP 完成两轮交叉讨论和 Codex host 仲裁；单 user、连续 timeline、跨轮
+  引用、无工具事件及退出回收均已核对。真实模型不进默认 gate；
 - 长会话 compaction 后的 restore、真实 cancel 时延仍需人工验收。
 
 具体 Owner、Sensor 与处置见 [`docs/harness-controls.md`](docs/harness-controls.md)。
 
-## 8. 红线（4 条，违反必驳回）
+## 8. 红线（5 条，违反必驳回）
 
 | # | 红线 | 守门 |
 | --- | --- | --- |
 | R1 | 生产构造不得显式使用 `permission="auto"`，权限默认必须为 `deny` | `bash scripts/check-redlines.sh` 的 AST permission gate |
 | R2 | 通用 orchestration/ACP 层不得按具体 agent 名做条件分支 | `bash scripts/check-redlines.sh` 的 AST name-branch gate |
 | R3 | UI、orchestrator、host 不得直接启动 shell/子进程 | `bash scripts/check-redlines.sh` 的 AST process-boundary gate |
-| R4 | Kimi 生产注册不得从 ACP 回退到旧 JSONL `KimiAdapter` | `bash scripts/check-redlines.sh` 的 registry/import gate |
+| R4 | Kimi/OpenCode 生产必须 ACP-first；风险工具 ask；JSONL 仅 prepare-only 且只读 | `bash scripts/check-redlines.sh` 的 registry/policy/profile gate |
+| R5 | `/discuss` 必须保持 2–3 人、1–3 轮、终局主持且不得递归 dispatch | `bash scripts/check-redlines.sh` 的 discussion bounds/AST gate |
 
 红线变更必须同步本文、`AGENTS.md`、`docs/workflow.md`、enforcement 与
 `docs/harness-controls.md`，并重新做正向和负向验证。
@@ -296,6 +334,12 @@ branch protection / required checks 需要单独配置后才能宣称生效。
   [`docs/adr/0002-durable-execution-observability.md`](docs/adr/0002-durable-execution-observability.md)。
 - M4 Codex app-server 事实源：
   [`docs/adr/0003-codex-app-server-transport.md`](docs/adr/0003-codex-app-server-transport.md)。
+- M4.4 Kimi hybrid transport 事实源：
+  [`docs/adr/0006-kimi-hybrid-transport-policy.md`](docs/adr/0006-kimi-hybrid-transport-policy.md)。
+- M4.5 OpenCode hybrid transport 事实源：
+  [`docs/adr/0007-opencode-hybrid-transport-policy.md`](docs/adr/0007-opencode-hybrid-transport-policy.md)。
+- M5.1 有界多智能体讨论事实源：
+  [`docs/adr/0008-bounded-multi-agent-discussion.md`](docs/adr/0008-bounded-multi-agent-discussion.md)。
 - 当前路线图：[`README.md`](README.md)“路线图”。
 - 重大协议/安全边界改变先形成可评审设计记录，再修改本契约。
 - Steering 只在同类失败至少两次或已有趋势证据时建立；单次失败只修当前问题。

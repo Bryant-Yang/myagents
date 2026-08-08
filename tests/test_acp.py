@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from acp.adapter import AcpAdapter
 from acp.client import AcpClient, AcpError
 from adapters.base import AgentDeliveryUncertainError
+from clipboard_image import TrustedImage
 
 SERVER = str(Path(__file__).parent / "fake_acp_server.py")
 STATE = "/tmp/myagents_fake_acp_state"
@@ -87,6 +88,48 @@ def test_prompt_streaming() -> None:
         await client.close()
     asyncio.run(run())
     print("ok  session/prompt + update 流")
+
+
+def test_image_prompt_uses_fake_wire_contract() -> None:
+    async def run() -> None:
+        reset_state()
+        client = await make_client()
+        assert client.capabilities["promptCapabilities"]["image"] is True
+        sid = await client.session_new("/tmp")
+        image = TrustedImage(
+            path=Path("/tmp/myagents_fake_acp_image.png"),
+            attachment_root=Path("/tmp"),
+            relative_path=Path("myagents_fake_acp_image.png"),
+            data=b"fake image bytes for wire test",
+        )
+        await client.prompt(sid, "看图", (image,))
+        await client.close()
+        assert "prompt-types:text,image" in state_events()
+
+    asyncio.run(run())
+    print("ok  ACP fake contract 接收原生 image block")
+
+
+def test_adapter_prompt_without_image_capability() -> None:
+    """无 image capability 时不得 UnboundLocalError，且不发 image block。"""
+    async def run() -> None:
+        reset_state()
+        os.environ["FAKE_ACP_NO_IMAGE_CAP"] = "1"
+        try:
+            adapter = AcpAdapter("fake", [sys.executable, SERVER])
+            texts = [
+                ev.text async for ev in adapter.stream("看图", "/tmp")
+                if ev.kind == "text"
+            ]
+            await adapter.aclose()
+        finally:
+            os.environ.pop("FAKE_ACP_NO_IMAGE_CAP", None)
+        assert texts
+        assert "prompt-types:text" in state_events()
+        assert "prompt-types:text,image" not in state_events()
+
+    asyncio.run(run())
+    print("ok  ACP adapter 在无 image capability 时仍可 prompt")
 
 
 def test_permission_default_deny() -> None:
@@ -790,6 +833,8 @@ if __name__ == "__main__":
     test_initialize()
     test_session_new_list_load()
     test_prompt_streaming()
+    test_image_prompt_uses_fake_wire_contract()
+    test_adapter_prompt_without_image_capability()
     test_permission_default_deny()
     test_permission_auto_optin()
     test_permission_wait_pauses_inactivity_timeout()

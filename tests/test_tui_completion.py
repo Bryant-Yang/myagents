@@ -21,7 +21,7 @@ from tui_completion import (
 
 AGENTS = (
     ("kimi", "ACP"),
-    ("opencode", "JSONL"),
+    ("opencode", "ACP+JSONL"),
     ("codex", "APP-SERVER"),
     ("host", "MODERATOR"),
 )
@@ -44,6 +44,8 @@ def test_completion_parser_and_command_boundary() -> None:
     assert completion_context("请看 /ca", 6, AGENTS) is None
 
     assert local_command_for("/new") is not None
+    assert local_command_for("/discuss") is not None
+    assert local_command_for("/discuss @kimi @opencode -- 主题") is None
     assert local_command_for(" /new ") is not None
     assert local_command_for("/new task") is None
     assert local_command_for("/unknown") is None
@@ -132,6 +134,14 @@ def test_slash_commands_unknown_agent_and_submit_behaviour() -> None:
             await pilot.pause()
             assert box.value == "/agents"
             assert orch.history == []
+            await pilot.press("enter")
+            await pilot.pause()
+            assert box.value == ""
+            assert orch.history == []
+
+            # 精确 /discuss 只显示用法；带参数形式才经 CommandBus。
+            box.value = "/discuss"
+            box.cursor_position = len(box.value)
             await pilot.press("enter")
             await pilot.pause()
             assert box.value == ""

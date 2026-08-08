@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from adapters.base import BoundedLog, read_lines, redact_sensitive_text
+from clipboard_image import TrustedImage, verify_unchanged_image
 
 PermissionHandler = Callable[[dict], Awaitable[dict] | dict]
 _FORWARDED_NOTIFICATIONS = {
@@ -245,10 +246,18 @@ class CodexAppServerClient:
         prompt: str,
         *,
         workdir: str | None = None,
+        images: tuple[TrustedImage, ...] = (),
     ) -> str:
         params: dict[str, Any] = {
             "threadId": thread_id,
-            "input": [{"type": "text", "text": prompt}],
+            "input": [
+                {"type": "text", "text": prompt},
+                # app-server 的 localImage wire format 只能传路径。提交前在
+                # 受限附件目录句柄内重新读同一文件；变化即拒绝本轮，不能把
+                # adapter 早先验证的路径升级为另一张图片。
+                *({"type": "localImage", "path": str(verify_unchanged_image(image))}
+                  for image in images),
+            ],
         }
         if workdir is not None:
             params["cwd"] = workdir

@@ -29,15 +29,25 @@ import re
 from dataclasses import dataclass
 from typing import Callable
 
-from acp.adapter import AcpKimiAdapter, AgentPermissionHandler
+from acp.adapter import (
+    AcpKimiAdapter,
+    AcpOpenCodeAdapter,
+    AgentPermissionHandler,
+)
 from adapters.base import (
     AgentAdapter,
     AgentDeliveryCancelledError,
     AgentDeliveryUncertainError,
     AgentEvent,
 )
-from adapters.opencode_adapter import OpenCodeAdapter
 from codex_app_server.adapter import CodexAppServerAdapter
+from discussion import (
+    MIN_DISCUSSION_PARTICIPANTS,
+    DiscussionRequest,
+    moderator_assignment,
+    parse_discussion_request,
+    participant_assignment,
+)
 from host import MODERATOR_TEMPLATE, HostAgent
 from storage.store import (
     DEFAULT_SESSION_NAME,
@@ -61,6 +71,7 @@ class AgentSpec:
 
     transport:
       - "acp"        ACP 有状态会话，编排器发增量上下文
+      - "acp+jsonl" ACP 为主，仅 prepare 失败时受限 JSONL 降级
       - "app-server" Codex 原生有状态 thread，编排器发增量上下文
       - "jsonl"      无头一次性调用，编排器发完整 transcript 快照
 
@@ -69,7 +80,7 @@ class AgentSpec:
     """
 
     name: str
-    transport: str  # "acp" | "app-server" | "jsonl"
+    transport: str  # "acp" | "acp+jsonl" | "app-server" | "jsonl"
     factory: Callable[[], AgentAdapter]
 
 
@@ -93,12 +104,14 @@ class DispatchOutcome:
             for failure in self.failures)
 
 
-# 工人 agent 注册表：ACP-first，JSONL 保留为 fallback。
-# Kimi 是首个生产 ACP agent（命令 ["kimi", "acp"]）；
+# 工人 agent 注册表：长连接协议优先，JSONL 只作受约束降级。
+# Kimi 主路径是 ACP（命令 ["kimi", "acp"]），只允许在
+# ACP prepare 失败前使用只读 JSONL fallback；OpenCode 使用同一 ACP seam，
+# 但由专用 adapter 注入 ask-by-default 权限策略和 OpenCode 只读配置；
 # Codex 使用官方 app-server 长连接；旧 Codex JSONL adapter 保留为 fallback。
 AGENT_SPECS: tuple[AgentSpec, ...] = (
-    AgentSpec("kimi", "acp", AcpKimiAdapter),
-    AgentSpec("opencode", "jsonl", OpenCodeAdapter),
+    AgentSpec("kimi", "acp+jsonl", AcpKimiAdapter),
+    AgentSpec("opencode", "acp+jsonl", AcpOpenCodeAdapter),
     AgentSpec("codex", "app-server", CodexAppServerAdapter),
 )
 AGENTS: dict[str, AgentSpec] = {spec.name: spec for spec in AGENT_SPECS}
@@ -114,6 +127,7 @@ _PROMPT_TEMPLATE = """\
 {assignment}
 请作为 {name}，针对用户最新的消息给出回复或执行其中的任务。
 要求：直接输出内容，不要自我介绍，不要复述上面的记录。
+遇到 `[图片附件：绝对路径]` 时，先使用可用的图像或文件读取能力查看图片。
 如需读写文件、运行命令，都在当前目录内进行。
 """
 
@@ -129,6 +143,7 @@ _ACP_PROMPT_TEMPLATE = """\
 {assignment}
 请作为 {name}，针对最新的消息给出回复或执行其中的任务。
 要求：直接输出内容，不要自我介绍，不要复述上面的记录。
+遇到 `[图片附件：绝对路径]` 时，先使用可用的图像或文件读取能力查看图片。
 如需读写文件、运行命令，都在当前目录内进行。
 """
 
@@ -210,6 +225,14 @@ class Orchestrator:
                     f"store 属于会话 {store.session_name!r}，"
                     f"与请求会话 {self.session_name!r} 不一致")
             self.store = store
+        self._attachment_root = (
+            self.store.room_dir / "attachments"
+            if self.store is not None else None
+        )
+        for adapter in self.adapters.values():
+            setter = getattr(adapter, "set_attachment_root", None)
+            if setter is not None:
+                setter(self._attachment_root)
         self.history: list[Message] = []
         # 无 store 时的内存 seq 分配起点；有 store 时 seq 来自 timeline。
         self._next_memory_seq = 1
@@ -362,8 +385,17 @@ class Orchestrator:
             assignment: str | None = None) -> str:
         transcript = self._format(messages)
         if agent_name == HOST_NAME:
-            template = MODERATOR_TEMPLATE
-            return template.format(name=agent_name, transcript=transcript)
+            assignment_block = ""
+            if assignment:
+                assignment_block = (
+                    "主持人本轮明确任务：\n"
+                    f"{assignment.strip()[:4000]}\n"
+                )
+            return MODERATOR_TEMPLATE.format(
+                name=agent_name,
+                transcript=transcript,
+                assignment=assignment_block,
+            )
         elif getattr(self.adapters[agent_name], "stateful_session", False):
             template = _ACP_PROMPT_TEMPLATE
         else:
@@ -415,6 +447,13 @@ class Orchestrator:
         """
         if self._closed:
             raise OrchestratorClosedError("Orchestrator 已关闭，拒绝 dispatch")
+        discussion = parse_discussion_request(
+            user_text, (spec.name for spec in self.specs),
+            host_name=HOST_NAME,
+        )
+        if discussion is not None:
+            return await self._dispatch_discussion(
+                discussion, user_text, on_event, command_id)
         committed = self._append_message("user", user_text,
                                          command_id=command_id)
         on_event("user", AgentEvent("committed", user_text,
@@ -428,8 +467,8 @@ class Orchestrator:
         snapshot = list(self.history)
         snapshot_text = self._format(snapshot[-self.history_limit:])
         targets = self.parse_mentions(user_text)
-        routed_by_host = not targets
         assignments: dict[str, str] = {}
+        routed_by_host = not targets
         if routed_by_host:
             # decide 不在 _run_one 的异常保护里，自己兜底。契约：
             # 路由失败 → error 事件 + 确定性回退到第一个工人（可用性
@@ -505,6 +544,116 @@ class Orchestrator:
             if error is not None
         )
         return DispatchOutcome(failures)
+
+    async def _dispatch_discussion(
+            self,
+            request: DiscussionRequest,
+            user_text: str,
+            on_event: EventCallback,
+            command_id: str | None,
+    ) -> DispatchOutcome:
+        """Execute one bounded discussion without recursively dispatching.
+
+        The raw command is the only user record.  Participant instructions are
+        per-turn assignments, so internal rounds never impersonate the user or
+        create nested CommandBus commands.
+        """
+        committed = self._append_message(
+            "user", user_text, command_id=command_id)
+        on_event("user", AgentEvent(
+            "committed", user_text,
+            meta={"seq": committed.seq, "command_id": command_id},
+        ))
+        active = list(request.participants)
+        failures: list[AgentFailure] = []
+
+        for round_number in range(1, request.rounds + 1):
+            if round_number > 1 \
+                    and len(active) < MIN_DISCUSSION_PARTICIPANTS:
+                on_event("system", AgentEvent(
+                    "status",
+                    "存活参与者不足两人，停止后续交叉轮并进入主持总结",
+                    meta={"phase": "讨论提前收口"},
+                ))
+                break
+            on_event("system", AgentEvent(
+                "status",
+                f"讨论第 {round_number}/{request.rounds} 轮："
+                f"{'、'.join(active)}",
+                meta={"phase": f"讨论 {round_number}/{request.rounds}"},
+            ))
+            snapshot = list(self.history)
+            for name in active:
+                on_event(name, AgentEvent(
+                    "status",
+                    f"准备讨论第 {round_number}/{request.rounds} 轮",
+                    meta={
+                        "agent_state": "running",
+                        "phase": f"讨论 {round_number}/{request.rounds}",
+                    },
+                ))
+
+            # Intermediate done would make the TUI regard an agent as terminal
+            # before its next round.  Preserve the event as a running status;
+            # after gather we emit a real done only for participants that will
+            # not receive another turn.
+            has_possible_next_round = round_number < request.rounds
+
+            def round_event(name: str, event: AgentEvent) -> None:
+                if has_possible_next_round and event.kind == "done":
+                    on_event(name, AgentEvent(
+                        "status",
+                        f"第 {round_number} 轮回复已落盘",
+                        meta={
+                            **event.meta,
+                            "agent_state": "running",
+                            "phase": "等待下一轮",
+                        },
+                    ))
+                    return
+                on_event(name, event)
+
+            results = await asyncio.gather(
+                *(self._run_one(
+                    name,
+                    round_event,
+                    snapshot,
+                    command_id,
+                    participant_assignment(request, name, round_number),
+                ) for name in active)
+            )
+            next_active: list[str] = []
+            for name, error in zip(active, results):
+                if error is None:
+                    next_active.append(name)
+                else:
+                    failures.append(AgentFailure(name, error))
+
+            will_continue = (
+                round_number < request.rounds
+                and len(next_active) >= MIN_DISCUSSION_PARTICIPANTS
+            )
+            if has_possible_next_round and not will_continue:
+                for name in next_active:
+                    on_event(name, AgentEvent(
+                        "done", meta={"discussionStoppedEarly": True}))
+            active = next_active
+
+        on_event(request.moderator, AgentEvent(
+            "status",
+            "正在汇总讨论",
+            meta={"agent_state": "running", "phase": "主持仲裁"},
+        ))
+        moderator_error = await self._run_one(
+            request.moderator,
+            on_event,
+            list(self.history),
+            command_id,
+            moderator_assignment(request),
+        )
+        if moderator_error is not None:
+            failures.append(AgentFailure(request.moderator, moderator_error))
+        return DispatchOutcome(tuple(failures))
 
     async def _run_one(self, name: str, on_event: EventCallback,
                        snapshot: list[Message],

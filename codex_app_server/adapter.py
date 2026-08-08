@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable
 
 from adapters.base import (
@@ -16,6 +17,7 @@ from adapters.base import (
     redact_sensitive_text,
 )
 from adapters.codex_adapter import CodexAdapter
+from clipboard_image import prompt_images
 
 from .client import (
     CodexAppServerClient,
@@ -88,6 +90,7 @@ class CodexAppServerAdapter:
             ephemeral=ephemeral_thread,
         )
         self._permission_handler = permission_handler
+        self._attachment_root: Path | None = None
         self._cancel_timeout = cancel_timeout
         self._inactivity_timeout = inactivity_timeout
         self._request_timeout = request_timeout
@@ -124,6 +127,10 @@ class CodexAppServerAdapter:
                 },
             )
         self._client.set_permission_handler(self._permission_handler)
+
+    def set_attachment_root(self, root: Path | None) -> None:
+        """限制可作为 app-server localImage 发送的本地附件目录。"""
+        self._attachment_root = None if root is None else Path(root).absolute()
 
     async def _reset(self) -> None:
         with contextlib.suppress(Exception):
@@ -278,8 +285,14 @@ class CodexAppServerAdapter:
         terminal = False
         try:
             try:
+                images = prompt_images(
+                    prompt, self._attachment_root)
                 turn_id = await self._client.turn_start(
-                    thread_id, prompt, workdir=workdir)
+                    thread_id,
+                    prompt,
+                    workdir=workdir,
+                    images=images,
+                )
             except CodexAppServerRequestCancelled as exc:
                 await self._reset()
                 raise AgentDeliveryCancelledError(
