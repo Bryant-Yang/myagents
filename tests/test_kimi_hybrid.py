@@ -17,7 +17,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import adapters.kimi_adapter as kimi_jsonl
 from acp.adapter import AcpAdapter, AcpKimiAdapter
-from adapters.base import AgentDeliveryUncertainError, AgentEvent
+from adapters.base import (
+    AgentDeliveryUncertainError,
+    AgentEvent,
+    ExecutionMode,
+    ReadOnlyFallbackError,
+)
 from adapters.kimi_adapter import KIMI_READONLY_AGENT_FILE, KimiAdapter
 from orchestrator import AGENTS
 
@@ -146,6 +151,48 @@ def test_prepare_failure_uses_visible_jsonl_fallback() -> None:
         with fake_acp_env(FAKE_ACP_STATE=state, FAKE_ACP_FAIL_INIT="1"):
             asyncio.run(body(state))
     print("ok  ACP prepare 失败显式进入只读 JSONL fallback")
+
+
+def test_execution_mode_denies_readonly_and_blocks_write_fallback() -> None:
+    async def readonly_body(state: str) -> None:
+        adapter = AcpAdapter("fake", CMD, fallback_adapter=RecordingFallback())
+        adapter.set_permission_handler(
+            lambda _name, _params: {
+                "outcome": "selected", "optionId": "allow"})
+        await collect(adapter.stream(
+            "perm", "/tmp", execution_mode=ExecutionMode.READ_ONLY))
+        await adapter.aclose()
+        permission = next(
+            line for line in Path(state).read_text(encoding="utf-8").splitlines()
+            if line.startswith("permission:"))
+        assert "cancelled" in permission
+        assert "allow" not in permission
+
+    async def write_body() -> None:
+        adapter = AcpAdapter("fake", CMD, fallback_adapter=RecordingFallback())
+        try:
+            await collect(adapter.stream_prepared(
+                lambda _prep: "write",
+                "/tmp",
+                execution_mode=ExecutionMode.WORKSPACE_WRITE,
+            ))
+        except ReadOnlyFallbackError:
+            pass
+        else:
+            raise AssertionError("workspace_write 不得进入只读 fallback")
+        finally:
+            await adapter.aclose()
+
+    with tempfile.TemporaryDirectory() as td:
+        state = str(Path(td) / "state")
+        with fake_acp_env(FAKE_ACP_STATE=state):
+            asyncio.run(readonly_body(state))
+        with fake_acp_env(
+            FAKE_ACP_STATE=state,
+            FAKE_ACP_FAIL_INIT="1",
+        ):
+            asyncio.run(write_body())
+    print("ok  execution mode 只读拒权 + 写阶段 fallback fail-closed")
 
 
 def test_fallback_checkpoint_is_not_loaded_as_acp_session() -> None:
@@ -302,6 +349,7 @@ def test_production_registration_is_acp_first_hybrid() -> None:
 if __name__ == "__main__":
     test_kimi_jsonl_uses_enforced_readonly_profile()
     test_prepare_failure_uses_visible_jsonl_fallback()
+    test_execution_mode_denies_readonly_and_blocks_write_fallback()
     test_fallback_checkpoint_is_not_loaded_as_acp_session()
     test_prompt_rejection_never_uses_fallback()
     test_post_submit_uncertainty_never_uses_fallback()

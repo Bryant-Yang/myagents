@@ -4,7 +4,7 @@
 Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5 与 M5.1 已完成。
+> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M5.1 与 M5 已完成。
 > 共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
 > stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
@@ -38,6 +38,10 @@ Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并�
 - 多 agent fan-out：同一消息可同时点名多个 agent，并发执行。
 - 有界讨论：`/discuss` 在一个 command 内安排 2–3 个指定 worker 做 1–3 轮
   独立提案与交叉评议，再由 `host` 或另一个未参会 worker 最终仲裁。
+- 有界工作流：`/workflow` 固定 reviewer、唯一 implementer 和 verifier，依次
+  review → implement → verify；复核不通过时最多一次 repair/reverify，最后由
+  host 如实汇总。Git baseline/candidate、execution mode 和失败终态由普通代码
+  锁定，运行中可用有界 `/steer` 补充尚未开始阶段的约束。
 - ACP 增量上下文：每个 stateful agent 独立维护 history cursor。
 - 并发顺序保证：同一 ACP agent 严格串行，不同 agent 保持并行。
 - 持久时间线：房间 timeline/state 落盘（单调 seq、UTC 时间戳），TUI 重启
@@ -55,7 +59,7 @@ Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并�
 - 本机控制 socket：TUI 私有的 Unix socket JSONL 协议（**不是 MCP**）；
   socket/endpoint 0600，活跃房间不被第二个 server 抢占，stale 文件
   只在确认无监听者后清理。
-- MCP stdio bridge：七个 `myagents_*` 工具把本机其他 agent 的 review
+- MCP stdio bridge：八个 `myagents_*` 工具把本机其他 agent 的 review
   注入同一房间；bridge 不创建第二 Orchestrator、不直写 timeline、
   不绕过 TUI 权限。
 - 可观测执行：独立 events 日志、累计且原位更新的静默 heartbeat、工具/权限
@@ -160,6 +164,8 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
 @kimi @opencode 分别提出一个方案
 @host 总结上面两个方案的分歧
 /discuss @kimi @opencode --rounds 2 --moderator host -- 讨论新增 adapter 的协议选择
+/workflow --reviewer @kimi --implementer @codex -- 给解析器补边界测试并验收
+/steer -- 额外覆盖空输入，保持现有公开 API
 ```
 
 `/discuss` 默认两轮、默认由 `host` 主持。参与者必须是 2–3 个不同 worker，
@@ -167,6 +173,13 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
 拉人。讨论模式只要求文字观点，不用于并发修改代码。MCP/API 也可把主题写在
 首行参数后的下一行。完整契约见
 [ADR-0008](docs/adr/0008-bounded-multi-agent-discussion.md)。
+
+`/workflow` 只接受干净 Git 工作区；reviewer/verifier 默认只读，只有固定的
+implementer 可写。未指定 `--verifier` 时由 reviewer 复核。`/steer` 只作用于
+当前活动 workflow，且只在 review/implement/repair 阶段接受；TUI 固定任务区会
+显示当前 workflow 阶段、审/写/验角色、各角色“进行中/等待”状态和 steering
+是否仍可用。完整契约见
+[ADR-0009](docs/adr/0009-bounded-milestone-workflow-steering.md)。
 
 空闲时按 `Ctrl+N` 或精确输入 `/new` 可新建会话：输入名称，或留空自动命名。
 `/new` 是本地命令，不会写入时间线，也不会发送给 host 或 worker。已有名称
@@ -196,6 +209,8 @@ TUI 目前显示附件文件名而不是终端内预览。Kimi ACP 与 Codex app
    只要任一 worker 失败，该 command 终态就是 `failed`。
 5. `/discuss` 同轮并发、跨轮串行；失败参与者不自动重试，主持人仍总结已有
    证据，但不能把失败 command 洗成 completed。
+6. `/workflow` 固定阶段串行推进，任何阶段、Git 漂移或最终汇总失败都会保留
+   独立失败证据，host 不能把失败洗成 completed。
 
 ## Transport 与上下文
 
@@ -255,7 +270,7 @@ workdir 一致；命名会话还必须传同名 `--session`）：
 }
 ```
 
-七个工具：
+八个工具：
 
 | MCP tool | 语义 | 注解 |
 | --- | --- | --- |
@@ -266,6 +281,7 @@ workdir 一致；命名会话还必须传同名 `--session`）：
 | `myagents_get_command` | 查 queued/running/completed/failed/cancelled | read-only、idempotent、closed-world |
 | `myagents_wait_command` | 有界等待（≤30s）状态变化，超时不取消任务 | read-only、idempotent、closed-world |
 | `myagents_cancel_command` | 精确取消 queued/running 命令；terminal 幂等 | write、idempotent、closed-world |
+| `myagents_steer_command` | 给活动 workflow 追加下一阶段生效的有界指令 | write、non-idempotent、closed-world |
 
 最短 send → wait → read 流程：
 
@@ -433,8 +449,8 @@ myagents/
 - [x] M4.4：Kimi ACP-first + prepare-only 只读 JSONL fallback。
 - [x] M4.5：OpenCode ACP-first + ask-by-default 权限 + 隔离只读 JSONL fallback。
 - [x] M5.1：`/discuss` 指定成员、1–3 轮有界讨论与终局 moderator。
-- [ ] M5：ADR-0009 已冻结；里程碑 review → 修改 → 复核闭环与阶段边界
-  steering 待实现。
+- [x] M5：干净 Git fixed point、review → 单 writer 修改 → 独立复核、最多
+  一次 repair/reverify、阶段边界 steering 与 TUI 阶段状态。
 - [ ] Later：只有出现跨机器、跨组织 agent 协作需求时再评估 A2A。
 
 ## 当前限制
@@ -462,6 +478,11 @@ myagents/
 - M5.1 `/discuss` 已于 2026-08-08 在同一命名房间恢复原 Kimi/OpenCode
   session，通过 MCP 完成两轮交叉讨论和一次 Codex host 仲裁；6 条新增
   timeline 连续、第二轮能回应对方首轮、无工具/权限事件且退出无残留。
+- M5 真实探针已于 2026-08-09 通过
+  [`scripts/e2e-m5-real.py`](scripts/e2e-m5-real.py)：Kimi 只读 review/verify，
+  Codex 作为唯一 writer 在临时 Git repo 增加 `subtract` 与两个测试，host 最终
+  汇总；时间线恰为 user/Kimi/Codex/Kimi/host，HEAD、branch、index 保持 baseline，
+  最终 3 个 unittest 全部通过。真实模型探针不进入默认快速 gate。
 - 独立 ACP client 写入已有 Kimi session 不会让已打开的 native Kimi TUI
   实时刷新；一个前端应独占该 session。
 - 当前只支持新建会话和用 `--session NAME` 恢复；TUI 内的会话列表、删除和

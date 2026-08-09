@@ -46,7 +46,7 @@ from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from adapters.base import AgentEvent  # noqa: E402
+from adapters.base import AgentEvent, ExecutionMode  # noqa: E402
 from adapters import codex_adapter as codex_jsonl  # noqa: E402
 from clipboard_image import TrustedImage  # noqa: E402
 from codex_app_server.adapter import CodexAppServerAdapter  # noqa: E402
@@ -966,6 +966,38 @@ def test_adapter_two_streams_reuse_thread_and_pid() -> None:
     print("ok  adapter 两轮 stream 复用 thread 与进程")
 
 
+def test_execution_mode_switches_sandbox_and_readonly_denies_approval() -> None:
+    async def body() -> None:
+        reset_state()
+        adapter = CodexAppServerAdapter(CMD)
+        adapter.set_permission_handler(
+            lambda _name, _params: {
+                "outcome": "selected", "optionId": "accept"})
+        await collect(adapter.stream(
+            "approval",
+            "/tmp",
+            execution_mode=ExecutionMode.READ_ONLY,
+        ))
+        await collect(adapter.stream(
+            "writer",
+            "/tmp",
+            execution_mode=ExecutionMode.WORKSPACE_WRITE,
+        ))
+        await adapter.aclose()
+        events = state_events()
+        approvals = [item for item in events if item.startswith("approval:")]
+        assert len(approvals) == 1
+        assert '"decision": "decline"' in approvals[0]
+        thread_params = [
+            json.loads(item.split(":", 1)[1])
+            for item in events if item.startswith("thread-params:")]
+        assert [item["sandbox"] for item in thread_params] == [
+            "read-only", "workspace-write"]
+
+    run(body())
+    print("ok  execution mode 切换 sandbox 且 read_only 不可批准权限")
+
+
 def test_ephemeral_clean_threads_reuse_pid_without_persisting_host_history(
         ) -> None:
     """Host 每轮建干净 thread，但必须标为 ephemeral，避免污染 Codex 历史。"""
@@ -1174,6 +1206,7 @@ if __name__ == "__main__":
     test_invalid_terminal_status_fails_and_rebuilds()
     test_server_interrupted_is_regular_failure_not_task_cancellation()
     test_adapter_two_streams_reuse_thread_and_pid()
+    test_execution_mode_switches_sandbox_and_readonly_denies_approval()
     test_ephemeral_clean_threads_reuse_pid_without_persisting_host_history()
     test_ephemeral_thread_rejects_reuse_configuration()
     test_adapter_resumes_thread_after_process_restart()

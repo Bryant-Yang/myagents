@@ -132,12 +132,26 @@ def test_protocol_roundtrip() -> None:
             # terminal cancel 幂等，不改变成功结果。
             cancelled = await room.client.cancel_command(first["command_id"])
             assert cancelled["status"] == "completed"
+            room.bus.steer = lambda command_id, instruction: {
+                "command_id": command_id,
+                "accepted": 1,
+                "total_chars": len(instruction),
+                "applies_after": "review",
+            }
+            steered = await room.client.steer_command(
+                first["command_id"], "补充回归测试")
+            assert steered == {
+                "command_id": first["command_id"],
+                "accepted": 1,
+                "total_chars": 6,
+                "applies_after": "review",
+            }
         finally:
             await room.close()
             room.cleanup()
 
     asyncio.run(run())
-    print("ok  control 七方法 + FIFO/idempotency + timeline/events + cancel")
+    print("ok  control 八方法 + FIFO/idempotency + timeline/events + cancel/steer")
 
 
 def test_named_session_control_discovery() -> None:

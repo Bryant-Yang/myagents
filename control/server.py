@@ -377,6 +377,16 @@ class ControlServer:
             if not isinstance(command_id, str) or not command_id:
                 raise _InvalidParams("command_id 必须是非空字符串")
             return (await self._bus.cancel(command_id)).to_dict()
+        if method == "command.steer":
+            _validate_keys(
+                params, required={"command_id", "instruction"})
+            command_id = params["command_id"]
+            instruction = params["instruction"]
+            if not isinstance(command_id, str) or not command_id:
+                raise _InvalidParams("command_id 必须是非空字符串")
+            if not isinstance(instruction, str) or not instruction.strip():
+                raise _InvalidParams("instruction 必须是非空字符串")
+            return self._bus.steer(command_id, instruction)
         raise _InvalidParamsMethod(method)
 
     async def _send(self, writer: asyncio.StreamWriter,

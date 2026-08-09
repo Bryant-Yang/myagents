@@ -176,7 +176,7 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
   拒绝 symlink、强制 0600、按 workdir/session_name 计算 room_id 并校验
   room_id/workdir/socket_path 匹配后，
   每次调用仍实际连接验证。
-- MCP bridge 七个 `myagents_*` 工具只翻译到上述 socket 协议；
+- MCP bridge 八个 `myagents_*` 工具只翻译到上述 socket 协议；
   `ControlClientError` 一律转为可操作 tool error，不使 server 崩溃；
   stdout 只输出 MCP 帧；stdin EOF 后干净退出；权限请求仍由 TUI 决策，
   bridge 无 `auto` 入口。
@@ -312,7 +312,7 @@ branch protection / required checks 需要单独配置后才能宣称生效。
 
 具体 Owner、Sensor 与处置见 [`docs/harness-controls.md`](docs/harness-controls.md)。
 
-## 8. 红线（5 条，违反必驳回）
+## 8. 红线（6 条，违反必驳回）
 
 | # | 红线 | 守门 |
 | --- | --- | --- |
@@ -321,6 +321,7 @@ branch protection / required checks 需要单独配置后才能宣称生效。
 | R3 | UI、orchestrator、host 不得直接启动 shell/子进程 | `bash scripts/check-redlines.sh` 的 AST process-boundary gate |
 | R4 | Kimi/OpenCode 生产必须 ACP-first；风险工具 ask；JSONL 仅 prepare-only 且只读 | `bash scripts/check-redlines.sh` 的 registry/policy/profile gate |
 | R5 | `/discuss` 必须保持 2–3 人、1–3 轮、终局主持且不得递归 dispatch | `bash scripts/check-redlines.sh` 的 discussion bounds/AST gate |
+| R6 | `/workflow` 必须保持固定角色/阶段、单 writer、最多一次 repair/reverify、read-only 复核和有界 steering | `bash scripts/check-redlines.sh` 的 workflow bounds/mode/AST gate |
 
 红线变更必须同步本文、`AGENTS.md`、`docs/workflow.md`、enforcement 与
 `docs/harness-controls.md`，并重新做正向和负向验证。
@@ -340,7 +341,7 @@ branch protection / required checks 需要单独配置后才能宣称生效。
   [`docs/adr/0007-opencode-hybrid-transport-policy.md`](docs/adr/0007-opencode-hybrid-transport-policy.md)。
 - M5.1 有界多智能体讨论事实源：
   [`docs/adr/0008-bounded-multi-agent-discussion.md`](docs/adr/0008-bounded-multi-agent-discussion.md)。
-- M5 有界里程碑工作流设计输入（尚未实现）：
+- M5 有界里程碑工作流事实源：
   [`docs/adr/0009-bounded-milestone-workflow-steering.md`](docs/adr/0009-bounded-milestone-workflow-steering.md)。
 - 当前路线图：[`README.md`](README.md)“路线图”。
 - 重大协议/安全边界改变先形成可评审设计记录，再修改本契约。

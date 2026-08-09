@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Callable
 
-from adapters.base import AgentAdapter, AgentEvent
+from adapters.base import AgentAdapter, AgentEvent, ExecutionMode
 from adapters.kimi_adapter import KimiAdapter
 
 # host 一次调用完成二选一：需要 worker 才输出路由 JSON；能自己处理就直接回答。
@@ -150,9 +150,20 @@ class HostAgent:
         targets = choices[:1]
         return HostDecision(targets, "host 无输出，回退到 worker")
 
-    async def stream(self, prompt: str, workdir: str) -> AsyncIterator[AgentEvent]:
+    async def stream(
+        self,
+        prompt: str,
+        workdir: str,
+        *,
+        execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
+    ) -> AsyncIterator[AgentEvent]:
         """让 host 也能像普通 agent 一样被 dispatch（@host 时走这条路）。"""
-        async for ev in self.adapter.stream(prompt, workdir):
+        if execution_mode is ExecutionMode.DEFAULT:
+            stream = self.adapter.stream(prompt, workdir)
+        else:
+            stream = self.adapter.stream(
+                prompt, workdir, execution_mode=execution_mode)
+        async for ev in stream:
             yield ev
 
     def set_permission_handler(self, handler) -> None:

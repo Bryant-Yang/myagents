@@ -37,6 +37,12 @@ CANCEL_COMMAND = ToolAnnotations(
     idempotentHint=True,
     openWorldHint=False,
 )
+STEER_COMMAND = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=False,
+)
 
 
 def build_server(client: ControlClient) -> FastMCP:
@@ -159,6 +165,25 @@ def build_server(client: ControlClient) -> FastMCP:
     async def cancel_command(command_id: str) -> dict[str, Any]:
         return await call(
             "command.cancel", {"command_id": command_id})
+
+    @server.tool(
+        name="myagents_steer_command",
+        description=(
+            "Add one bounded instruction to the active milestone workflow. "
+            "It takes effect only at the next stage boundary and cannot "
+            "change roles, permissions, or workflow bounds."
+        ),
+        annotations=STEER_COMMAND,
+        structured_output=True,
+    )
+    async def steer_command(
+        command_id: str,
+        instruction: str,
+    ) -> dict[str, Any]:
+        return await call("command.steer", {
+            "command_id": command_id,
+            "instruction": instruction,
+        })
 
     return server
 

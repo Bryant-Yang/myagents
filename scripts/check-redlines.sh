@@ -306,6 +306,101 @@ else:
         errors.append(
             "[R5] orchestrator.py: 讨论必须由确定性参与者轮次和终局主持收口")
 
+# R6: milestone workflow keeps fixed roles/stages, one writer, one repair,
+# strict steering bounds, and execution modes at the adapter seam.
+workflow = ROOT / "workflow.py"
+if not workflow.is_file():
+    errors.append("[R6] workflow.py: 缺少有界里程碑 workflow 深模块")
+else:
+    workflow_tree = parse(workflow)
+    workflow_source = workflow.read_text(encoding="utf-8")
+    expected_bounds = {
+        "MAX_GOAL_CHARS": 3000,
+        "MAX_RESULT_BYTES": 4096,
+        "MAX_FINDINGS": 32,
+        "MAX_FINDING_CHARS": 64,
+        "MAX_STEERING_ITEMS": 5,
+        "MAX_STEERING_CHARS": 1000,
+        "MAX_STEERING_TOTAL_CHARS": 4000,
+    }
+    found_bounds: dict[str, object] = {}
+    for node in workflow_tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in expected_bounds:
+                try:
+                    found_bounds[target.id] = ast.literal_eval(node.value)
+                except (ValueError, TypeError):
+                    found_bounds[target.id] = None
+    if found_bounds != expected_bounds:
+        errors.append(
+            "[R6] workflow.py: goal/result/finding/steering 有界常量被放宽")
+    if '_STEERABLE = frozenset({"review", "implement", "repair"})' \
+            not in workflow_source:
+        errors.append(
+            "[R6] workflow.py: steering 只能在 review/implement/repair 开放")
+
+    run_method = next((
+        item for node in workflow_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MilestoneWorkflow"
+        for item in node.body
+        if isinstance(item, ast.AsyncFunctionDef) and item.name == "run"
+    ), None)
+    if run_method is None:
+        errors.append("[R6] workflow.py: 缺少 MilestoneWorkflow.run")
+    else:
+        calls = [
+            node.func.attr for node in ast.walk(run_method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+        ]
+        if calls.count("_write_stage") != 2 \
+                or calls.count("_read_stage") != 3 \
+                or calls.count("_final") != 1:
+            errors.append(
+                "[R6] workflow.py: 必须保持 review/implement/verify、"
+                "最多一次 repair/reverify 和一次 final")
+
+    required_mode_source = (
+        "ExecutionMode.READ_ONLY",
+        "ExecutionMode.WORKSPACE_WRITE",
+    )
+    if not all(value in workflow_source for value in required_mode_source):
+        errors.append(
+            "[R6] workflow.py: 读写阶段必须显式传递 adapter execution mode")
+
+workflow_dispatch = next((
+    node for node in ast.walk(tree)
+    if isinstance(node, ast.AsyncFunctionDef)
+    and node.name == "_dispatch_workflow"
+), None)
+if workflow_dispatch is None:
+    errors.append("[R6] orchestrator.py: 缺少 _dispatch_workflow")
+else:
+    for node in ast.walk(workflow_dispatch):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "self"
+                and node.func.attr == "dispatch"):
+            fail("R6", orchestrator, node,
+                 "workflow 不得递归 dispatch 或创建嵌套 command")
+
+for path in [ROOT / "workflow.py"]:
+    if path.is_file():
+        for node in ast.walk(parse(path)):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = ([alias.name for alias in node.names]
+                         if isinstance(node, ast.Import)
+                         else [node.module or ""])
+                if any(name == "subprocess" or name.startswith("subprocess.")
+                       for name in names):
+                    fail("R6", path, node,
+                         "workflow 不得启动 git；必须注入 WorkspaceInspector")
+
 if errors:
     print("红线检查失败：")
     for error in errors:
@@ -318,4 +413,5 @@ print("✓ R2 通用层无 agent-name 协议分支")
 print("✓ R3 子进程仅由 transport 层启动")
 print("✓ R4 Kimi/OpenCode ACP-first + prepare-only 只读 JSONL fallback")
 print("✓ R5 /discuss 参与者/轮次有界且不递归 dispatch")
+print("✓ R6 /workflow 固定阶段/单 writer/一次 repair/steering 有界")
 PY

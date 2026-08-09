@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from adapters.base import AgentEvent
 from main import ChatApp
+from textual.widgets import RichLog
 from test_basic import make_orch
 from tui_status import TaskProgress
 
@@ -32,6 +33,16 @@ def test_partial_completion_keeps_per_agent_truth() -> None:
     assert "01:35" in rendered
     assert "kimi 失败 · ACP 超时" in rendered
     assert "codex 完成 · 实现与 Review 完成" in rendered
+
+    progress.set_workflow(
+        "implement",
+        {"reviewer": "codex", "implementer": "kimi", "verifier": "opencode"},
+        True,
+    )
+    workflow = progress.render(elapsed_seconds=95)
+    assert "workflow implement" in workflow
+    assert "审 codex → 写 kimi → 验 opencode" in workflow
+    assert "可追加 /steer" in workflow
 
     routed_failure = TaskProgress("cmd-routed")
     routed_failure.set_agent("host", "completed", "路由完成")
@@ -73,6 +84,37 @@ def test_tui_status_panel_tracks_agent_lifecycle() -> None:
             assert "kimi 失败" in panel, panel
             assert "codex 完成" in panel, panel
             assert "Ctrl+X" not in panel, panel
+
+            workflow_id = "cmd-workflow"
+            log = app.query_one(RichLog)
+            workflow_line_start = len(log.lines)
+            app._on_agent_event("user", AgentEvent(
+                "committed",
+                "/workflow ...",
+                {
+                    "command_id": workflow_id,
+                    "workflow": True,
+                    "workflow_stage": "queued",
+                    "workflow_roles": {
+                        "reviewer": "codex",
+                        "implementer": "kimi",
+                        "verifier": "opencode",
+                    },
+                    "steering_available": True,
+                },
+            ))
+            await pilot.pause()
+            workflow_panel = str(app.query_one("#task-status").render())
+            assert "workflow queued" in workflow_panel
+            assert "审 codex → 写 kimi → 验 opencode" in workflow_panel
+            assert "可追加 /steer" in workflow_panel
+            assert "codex 进行中 · 审查中" in workflow_panel
+            assert "kimi 排队 · 等待实现" in workflow_panel
+            assert "opencode 排队 · 等待复核" in workflow_panel
+            rendered = "\n".join(
+                str(line.text) for line in log.lines[workflow_line_start:])
+            assert "workflow 已创建" in rendered
+            assert "kimi 思考中" not in rendered
 
             running_id = "cmd-cancel"
             app._on_agent_event("user", AgentEvent(

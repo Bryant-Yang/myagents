@@ -41,6 +41,8 @@ from adapters.base import (
     AgentAdapter,
     AgentDeliveryUncertainError,
     AgentEvent,
+    ExecutionMode,
+    ReadOnlyFallbackError,
     redact_sensitive_text,
 )
 from clipboard_image import prompt_images
@@ -147,6 +149,10 @@ class AcpAdapter:
                                  permission_handler=permission_handler,
                                  env_overrides=self._env_overrides)
         self._started = False
+        # 当前活跃 session 已经运行过的最近 execution mode。read_only 只能
+        # 复用同为 read_only 的 session；普通轮次可能持有 allow_always，
+        # 必须连进程一起隔离，不能只拒绝新的 permission request。
+        self._session_execution_mode: ExecutionMode | None = None
         self._lock = asyncio.Lock()  # session 唯一 writer：串行化本 adapter 的轮次
 
     def set_permission_handler(self, handler: AgentPermissionHandler | None) -> None:
@@ -228,18 +234,31 @@ class AcpAdapter:
                                  env_overrides=self._env_overrides)
         self._started = False
         self.session_id = None
+        self._session_execution_mode = None
 
-    def stream(self, prompt: str, workdir: str) -> AsyncIterator[AgentEvent]:
+    def stream(
+        self,
+        prompt: str,
+        workdir: str,
+        *,
+        execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
+    ) -> AsyncIterator[AgentEvent]:
         # 直接返回底层 async generator（不再包一层）：调用方 aclose() 时
         # GeneratorExit 一次性打进持有锁的 stream_prepared，取消契约
         # 同步走完；多层 async for 包装会把关闭推迟到 GC finalizer。
-        return self.stream_prepared(lambda _prep: prompt, workdir)
+        return self.stream_prepared(
+            lambda _prep: prompt,
+            workdir,
+            execution_mode=execution_mode,
+        )
 
     async def stream_prepared(
         self,
         make_prompt: Callable[[SessionPreparation], str],
         workdir: str,
         resume_session_id: str | None = None,
+        *,
+        execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
     ) -> AsyncIterator[AgentEvent]:
         """restore 原语：prepare（start/load/new）与 prompt 在同一锁生命周期。
 
@@ -259,6 +278,16 @@ class AcpAdapter:
         复用旧活跃 session（非 fresh）时的 factory 异常不销毁现有 session。
         """
         async with self._lock:
+            if (execution_mode is ExecutionMode.READ_ONLY
+                    and self._session_execution_mode
+                    is not ExecutionMode.READ_ONLY):
+                # 非只读 session 可能在先前轮次获得 allow_always/session 级
+                # 写入授权。fresh session 还不够保守：runtime 也可能在进程
+                # 内缓存授权，所以关闭整个 ACP client，并禁止 load 持久化
+                # resume id。新连接的 prepare 失败仍可走既有只读 fallback。
+                if self._started:
+                    await self._reset()
+                resume_session_id = None
             was_started = self._started
             try:
                 prep = await self._prepare_locked(workdir, resume_session_id)
@@ -269,7 +298,8 @@ class AcpAdapter:
                 if was_started or self._fallback is None:
                     raise
                 async for event in self._stream_fallback_locked(
-                        make_prompt, workdir, resume_session_id):
+                        make_prompt, workdir, resume_session_id,
+                        execution_mode):
                     yield event
                 return
             try:
@@ -280,12 +310,14 @@ class AcpAdapter:
                     # 必须回收，否则下轮拿旧 resume id 会撞"拒绝偷换"
                     await self._reset()
                 raise
+            self._session_execution_mode = execution_mode
             if prep.fresh:
                 # session id 只展示一次（每次建立/恢复时），不刷屏；
                 # close/重建后下轮 fresh 又为 True，会再次如实报告
                 verb = "已恢复" if prep.restored else "已建立"
                 yield AgentEvent("info", f"ACP session {verb}：{prep.session_id}")
-            inner = self._prompt_locked(prep.session_id, prompt)
+            inner = self._prompt_locked(
+                prep.session_id, prompt, execution_mode)
             try:
                 async for ev in inner:
                     yield ev
@@ -300,6 +332,7 @@ class AcpAdapter:
         make_prompt: Callable[[SessionPreparation], str],
         workdir: str,
         resume_session_id: str | None,
+        execution_mode: ExecutionMode,
     ) -> AsyncIterator[AgentEvent]:
         """ACP prepare 失败后的唯一安全 JSONL 降级点。
 
@@ -309,6 +342,10 @@ class AcpAdapter:
         不得用降级路径掩盖持久化错误。
         """
         assert self._fallback is not None
+        if execution_mode is ExecutionMode.WORKSPACE_WRITE:
+            raise ReadOnlyFallbackError(
+                f"{self.name} ACP prepare 失败；只读 JSONL fallback "
+                "不能承担 workspace_write 阶段")
         prep = SessionPreparation(
             session_id=f"{_FALLBACK_SESSION_PREFIX}{self.name}",
             restored=False,
@@ -325,7 +362,11 @@ class AcpAdapter:
                 "fallback_scope": "prepare-only",
             },
         )
-        inner = self._fallback.stream(prompt, workdir)
+        if execution_mode is ExecutionMode.DEFAULT:
+            inner = self._fallback.stream(prompt, workdir)
+        else:
+            inner = self._fallback.stream(
+                prompt, workdir, execution_mode=execution_mode)
         try:
             async for event in inner:
                 yield event
@@ -335,8 +376,12 @@ class AcpAdapter:
                 with contextlib.suppress(RuntimeError):
                     await closer()
 
-    async def _prompt_locked(self, session_id: str,
-                             prompt: str) -> AsyncIterator[AgentEvent]:
+    async def _prompt_locked(
+        self,
+        session_id: str,
+        prompt: str,
+        execution_mode: ExecutionMode,
+    ) -> AsyncIterator[AgentEvent]:
         """锁内执行一轮 prompt 并映射事件；取消契约见 stream_prepared。"""
         updates: asyncio.Queue = asyncio.Queue()
         seen_status: set[str] = set()
@@ -361,6 +406,11 @@ class AcpAdapter:
 
         self._client.on_notification = on_notify
         self._client.on_permission_activity = on_permission_activity
+        if execution_mode is ExecutionMode.READ_ONLY:
+            self._client.set_permission_handler(
+                lambda _params: {"outcome": "cancelled"})
+        else:
+            self._client.set_permission_handler(self._permission_handler)
         # Agents that omit or disable image capability must still get a
         # defined images tuple; never leave it unbound across the prompt call.
         images: tuple = ()
@@ -551,6 +601,7 @@ class AcpAdapter:
                         seen_status.add(status)
                         yield AgentEvent("status", status)
         finally:
+            self._client.set_permission_handler(self._permission_handler)
             if self._client.on_permission_activity is on_permission_activity:
                 self._client.on_permission_activity = None
             if not task.done():
@@ -571,6 +622,7 @@ class AcpAdapter:
             await self._client.close()
             self._started = False
             self.session_id = None
+            self._session_execution_mode = None
 
 
 class AcpKimiAdapter(AcpAdapter):

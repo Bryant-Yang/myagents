@@ -27,7 +27,12 @@ import json
 from pathlib import Path
 from typing import AsyncIterator
 
-from .base import AgentEvent, stream_jsonl
+from .base import (
+    AgentEvent,
+    ExecutionMode,
+    ReadOnlyFallbackError,
+    stream_jsonl,
+)
 
 
 OPENCODE_READONLY_AGENT = "myagents-readonly-fallback"
@@ -69,17 +74,25 @@ class OpenCodeAdapter:
         """
         return cls(readonly_config_file=OPENCODE_READONLY_CONFIG_FILE)
 
-    async def stream(self, prompt: str, workdir: str) -> AsyncIterator[AgentEvent]:
+    async def stream(
+        self,
+        prompt: str,
+        workdir: str,
+        *,
+        execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
+    ) -> AsyncIterator[AgentEvent]:
+        if (execution_mode is ExecutionMode.WORKSPACE_WRITE
+                and self.readonly_config_file is not None):
+            raise ReadOnlyFallbackError(
+                "OpenCode 只读 JSONL fallback 不能承担 workspace_write 阶段")
         cmd = ["opencode", "run", prompt, "--format", "json", "--dir", workdir]
         env_overrides = None
-        if self.use_resume and self.session_id:
-            cmd += ["--session", self.session_id]
-        elif self.readonly_config_file is not None:
-            if not self.readonly_config_file.is_file():
+        if execution_mode is ExecutionMode.READ_ONLY:
+            readonly_config_file = OPENCODE_READONLY_CONFIG_FILE
+            if not readonly_config_file.is_file():
                 raise RuntimeError(
-                    f"OpenCode 只读配置不存在：{self.readonly_config_file}")
-            config_content = self.readonly_config_file.read_text(
-                encoding="utf-8")
+                    f"OpenCode 只读配置不存在：{readonly_config_file}")
+            config_content = readonly_config_file.read_text(encoding="utf-8")
             try:
                 json.loads(config_content)
             except json.JSONDecodeError as exc:
@@ -98,6 +111,38 @@ class OpenCodeAdapter:
                 "OPENCODE_DISABLE_CLAUDE_CODE": "1",
                 "OPENCODE_DISABLE_AUTOUPDATE": "1",
             }
+        elif self.use_resume and self.session_id:
+            cmd += ["--session", self.session_id]
+        else:
+            readonly_config_file = self.readonly_config_file
+            if (readonly_config_file is not None
+                    and not readonly_config_file.is_file()):
+                raise RuntimeError(
+                    f"OpenCode 只读配置不存在：{readonly_config_file}")
+            if readonly_config_file is None:
+                config_content = None
+            else:
+                config_content = readonly_config_file.read_text(
+                encoding="utf-8")
+            if config_content is not None:
+                try:
+                    json.loads(config_content)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"OpenCode 只读配置不是合法 JSON：{exc}") from exc
+                cmd = ["opencode", "--pure", *cmd[1:]]
+                cmd += ["--agent", OPENCODE_READONLY_AGENT]
+                env_overrides = {
+                    "OPENCODE_CONFIG_CONTENT": config_content,
+                    "OPENCODE_PERMISSION": json.dumps(
+                        OPENCODE_READONLY_PERMISSION,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+                    "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+                    "OPENCODE_DISABLE_AUTOUPDATE": "1",
+                }
 
         async for line in stream_jsonl(
                 cmd, workdir, env_overrides=env_overrides):

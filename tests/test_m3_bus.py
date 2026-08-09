@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -342,6 +343,128 @@ def test_fanout_partial_events_keep_agent_identity() -> None:
 
     asyncio.run(run())
     print("ok  fan-out partial 按 agent 独立持久化")
+
+
+def test_workflow_steering_uses_active_owner_and_persists_event() -> None:
+    class SteeringOrch(FakeOrch):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.current = None
+            self.accepted: list[str] = []
+
+        async def dispatch(self, message, on_event, command_id=None):
+            self.current = (command_id, on_event)
+            self.started.set()
+            await self.release.wait()
+
+        def prepare_workflow_steering(self, command_id, instruction):
+            assert self.current is not None
+            current_id, _on_event = self.current
+            assert command_id == current_id
+            event = AgentEvent(
+                "steering", instruction,
+                {"workflow": True, "workflow_stage": "review"})
+            receipt = SimpleNamespace(to_dict=lambda: {
+                "command_id": command_id,
+                "accepted": 1,
+                "total_chars": len(instruction),
+                "applies_after": "review",
+            })
+            return SimpleNamespace(
+                event=event,
+                commit=lambda: (
+                    self.accepted.append(instruction) or receipt),
+            )
+
+    async def run() -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workdir = root / "work"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            orch = SteeringOrch()
+            orch.store = store
+            bus = make_bus(orch)
+            snap = await bus.submit("/workflow ...")
+            await orch.started.wait()
+            receipt = bus.steer(snap.command_id, "补充空输入回归测试")
+            assert receipt["accepted"] == 1
+            persisted = [
+                event for event in store.read_events(0, 50)["items"]
+                if event.command_id == snap.command_id
+                and event.kind == "steering"]
+            assert [(item.agent, item.text) for item in persisted] == [
+                ("user", "补充空输入回归测试")]
+            assert orch.accepted == ["补充空输入回归测试"]
+            orch.release.set()
+            assert (await bus.wait(
+                snap.command_id, timeout=5))["status"] == "completed"
+            with _Raises(CommandValidationError):
+                bus.steer(snap.command_id, "太晚")
+            await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  steering 复用活动 owner 并独立持久化 execution event")
+
+
+def test_workflow_steering_persistence_failure_does_not_commit() -> None:
+    class FailingSteeringStore(RoomStore):
+        def append_event(self, *, command_id, agent, kind, text):
+            if kind == "steering":
+                raise OSError("disk unavailable")
+            return super().append_event(
+                command_id=command_id, agent=agent, kind=kind, text=text)
+
+    class SteeringOrch(FakeOrch):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.accepted: list[str] = []
+
+        async def dispatch(self, message, on_event, command_id=None):
+            self.started.set()
+            await self.release.wait()
+
+        def prepare_workflow_steering(self, command_id, instruction):
+            receipt = SimpleNamespace(to_dict=lambda: {
+                "command_id": command_id,
+                "accepted": 1,
+                "total_chars": len(instruction),
+                "applies_after": "review",
+            })
+            return SimpleNamespace(
+                event=AgentEvent(
+                    "steering", instruction,
+                    {"workflow": True, "workflow_stage": "review"}),
+                commit=lambda: (
+                    self.accepted.append(instruction) or receipt),
+            )
+
+    async def run() -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workdir = root / "work"
+            workdir.mkdir()
+            orch = SteeringOrch()
+            orch.store = FailingSteeringStore(
+                workdir, state_root=root / "state")
+            bus = make_bus(orch)
+            snap = await bus.submit("/workflow ...")
+            await orch.started.wait()
+            with _Raises(CommandBusError):
+                bus.steer(snap.command_id, "不得成为幽灵指令")
+            assert orch.accepted == []
+            persisted = orch.store.read_events(0, 50)["items"]
+            assert not any(item.kind == "steering" for item in persisted)
+            orch.release.set()
+            await bus.wait(snap.command_id, timeout=5)
+            await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  steering 持久化失败时不修改 workflow 内存")
 
 
 def test_duplicate_tool_updates_are_forwarded_and_persisted_once() -> None:
@@ -896,6 +1019,8 @@ if __name__ == "__main__":
     test_active_cancel_heartbeat_and_worker_survives()
     test_event_persistence_failure_fails_command_not_worker()
     test_fanout_partial_events_keep_agent_identity()
+    test_workflow_steering_uses_active_owner_and_persists_event()
+    test_workflow_steering_persistence_failure_does_not_commit()
     test_duplicate_tool_updates_are_forwarded_and_persisted_once()
     test_activity_only_events_refresh_silence_without_becoming_visible()
     test_status_dedup_keeps_visible_phase_changes()

@@ -24,7 +24,12 @@ import json
 from pathlib import Path
 from typing import AsyncIterator
 
-from .base import AgentEvent, stream_jsonl
+from .base import (
+    AgentEvent,
+    ExecutionMode,
+    ReadOnlyFallbackError,
+    stream_jsonl,
+)
 
 
 KIMI_READONLY_AGENT_FILE = Path(__file__).with_name(
@@ -55,15 +60,33 @@ class KimiAdapter:
         """
         return cls(agent_file=KIMI_READONLY_AGENT_FILE)
 
-    async def stream(self, prompt: str, workdir: str) -> AsyncIterator[AgentEvent]:
+    async def stream(
+        self,
+        prompt: str,
+        workdir: str,
+        *,
+        execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
+    ) -> AsyncIterator[AgentEvent]:
+        if (execution_mode is ExecutionMode.WORKSPACE_WRITE
+                and self.agent_file is not None):
+            raise ReadOnlyFallbackError(
+                "Kimi 只读 JSONL fallback 不能承担 workspace_write 阶段")
         cmd = ["kimi", "-p", prompt, "--output-format", "stream-json"]
-        if self.use_resume and self.session_id:
-            cmd += ["--session", self.session_id]
-        elif self.agent_file is not None:
-            if not self.agent_file.is_file():
+        if execution_mode is ExecutionMode.READ_ONLY:
+            agent_file = KIMI_READONLY_AGENT_FILE
+            if not agent_file.is_file():
                 raise RuntimeError(
-                    f"Kimi agent file 不存在：{self.agent_file}")
-            cmd += ["--agent-file", str(self.agent_file)]
+                    f"Kimi agent file 不存在：{agent_file}")
+            cmd += ["--agent-file", str(agent_file)]
+        elif self.use_resume and self.session_id:
+            cmd += ["--session", self.session_id]
+        else:
+            agent_file = self.agent_file
+            if agent_file is not None and not agent_file.is_file():
+                raise RuntimeError(
+                    f"Kimi agent file 不存在：{agent_file}")
+            if agent_file is not None:
+                cmd += ["--agent-file", str(agent_file)]
 
         async for line in stream_jsonl(cmd, workdir):
             try:

@@ -274,6 +274,34 @@ class CommandBus:
             command.status not in TERMINAL_STATUSES
             for command in self._commands.values())
 
+    def steer(self, command_id: str, instruction: str) -> dict[str, Any]:
+        """给当前正在运行的 workflow 追加一条阶段边界指令。"""
+        cmd = self._lookup(command_id)
+        if cmd.status is not CommandStatus.RUNNING or self._active is not cmd:
+            raise CommandValidationError(
+                "steering 只接受当前 running workflow")
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise CommandValidationError("instruction 必须是非空字符串")
+        try:
+            proposal = self._orch.prepare_workflow_steering(
+                command_id, instruction)
+        except (ValueError, RuntimeError) as exc:
+            raise CommandValidationError(str(exc)) from exc
+        # steering 的 durable event 是提交点：先落盘，成功后才修改 workflow
+        # 内存；持久化失败时 proposal 不 commit，下一阶段不会注入幽灵指令。
+        self._append_execution_event(
+            command_id, "user", "steering", proposal.event.text)
+        receipt = proposal.commit()
+        self._last_activity = asyncio.get_running_loop().time()
+        if self._event_sink is not None:
+            event = AgentEvent(
+                proposal.event.kind,
+                proposal.event.text,
+                {**proposal.event.meta, "command_id": command_id},
+            )
+            self._event_sink("user", event)
+        return receipt.to_dict()
+
     async def cancel(self, command_id: str) -> CommandSnapshot:
         """精确取消 queued/running 命令；terminal 命令幂等返回。"""
         cmd = self._lookup(command_id)
@@ -566,6 +594,7 @@ class CommandBus:
             "permission": "permission",
             "info": "status",
             "error": "status",
+            "steering": "steering",
         }
         kind = kind_map.get(event.kind)
         if kind is None or not event.text:

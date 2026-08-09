@@ -45,7 +45,12 @@ def test_completion_parser_and_command_boundary() -> None:
 
     assert local_command_for("/new") is not None
     assert local_command_for("/discuss") is not None
+    assert local_command_for("/workflow") is not None
+    assert local_command_for("/steer") is not None
     assert local_command_for("/discuss @kimi @opencode -- 主题") is None
+    assert local_command_for(
+        "/workflow --reviewer @host --implementer @kimi -- 主题") is None
+    assert local_command_for("/steer -- 新约束") is None
     assert local_command_for(" /new ") is not None
     assert local_command_for("/new task") is None
     assert local_command_for("/unknown") is None

@@ -43,6 +43,8 @@ NO_IMAGE_CAP = os.environ.get("FAKE_ACP_NO_IMAGE_CAP") == "1"
 
 # 挂起的 prompt：{"rid": 请求 id, "mode": "slow" | "never"}；同时最多一轮
 PENDING: dict = {"rid": None, "mode": None}
+# 仅存在于当前 fake server 进程，模拟 allow_always/session 授权缓存。
+ALWAYS_ALLOWED_SESSIONS: set[str] = set()
 
 
 def log(event: str) -> None:
@@ -132,7 +134,10 @@ def main() -> None:
                 send({"jsonrpc": "2.0", "id": rid,
                       "error": {"code": -32000, "message": "prompt boom"}})
                 continue
-            if "perm" in text:
+            needs_permission = "perm" in text or "requires-write" in text
+            if needs_permission and sid in ALWAYS_ALLOWED_SESSIONS:
+                log("permission-bypassed:" + sid)
+            elif needs_permission:
                 permission_title = (
                     "API_TOKEN=secret-value 写文件"
                     if "secret-title" in text else "写文件"
@@ -147,15 +152,27 @@ def main() -> None:
                                          "command": "printf demo > examples/demo.txt",
                                      }},
                                  "options": [
-                                     {"optionId": "allow", "kind": "allow_once",
-                                      "name": "允许一次"},
+                                     {"optionId": "allow", "kind": (
+                                         "allow_always"
+                                         if "perm-always" in text
+                                         else "allow_once"),
+                                      "name": (
+                                          "始终允许"
+                                          if "perm-always" in text
+                                          else "允许一次")},
                                      {"optionId": "deny", "kind": "reject_once",
                                       "name": "拒绝"},
                                  ]}})
                 # 同步等客户端应答后再继续（测试 server，要确定性时序）
                 resp = json.loads(sys.stdin.readline())
-                log("permission:" + json.dumps(
-                    resp.get("result", resp.get("error")), ensure_ascii=False))
+                permission_result = resp.get("result", resp.get("error"))
+                rendered_permission = json.dumps(
+                    permission_result, ensure_ascii=False)
+                log("permission:" + rendered_permission)
+                if ("perm-always" in text
+                        and '"outcome": "selected"' in rendered_permission
+                        and '"optionId": "allow"' in rendered_permission):
+                    ALWAYS_ALLOWED_SESSIONS.add(sid)
             if "slow" in text:
                 chunk(sid, "开始了")
                 PENDING["rid"] = rid
@@ -208,7 +225,7 @@ def main() -> None:
                             },
                         },
                     })
-            if "perm" not in text:
+            if not needs_permission:
                 send({"jsonrpc": "2.0", "method": "session/update", "params": {
                     "sessionId": sid, "update": {
                         "sessionUpdate": "agent_thought_chunk",

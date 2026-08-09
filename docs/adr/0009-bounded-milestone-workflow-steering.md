@@ -118,8 +118,10 @@ workflow 在现有 `AgentAdapter` seam 上增加通用 execution mode，并在�
 execution mode 是 adapter interface 的通用语义，不由 Orchestrator 按 agent 名
 分支。Codex adapter 把 `read_only` 映射到 app-server sandbox；ACP adapter 在
 read-only 阶段取消所有权限升级，并保留具体 runtime 的 write/command/network
-ask/deny 策略；无头 fallback 只能使用现有只读 profile。任何 adapter 不能证明
-read-only 时，该角色阶段直接 blocked。
+ask/deny 策略。为防普通轮次的 `allow_always` 或 session 级授权泄漏，ACP
+`read_only` 只能复用同为只读的 session；从其他 mode 进入时关闭旧 ACP 进程、
+禁止 load 旧 session 并新建隔离 session。无头 fallback 只能使用现有只读
+profile。任何 adapter 不能证明 read-only 时，该角色阶段直接 blocked。
 
 Kimi/OpenCode implement 阶段若因 ACP prepare 失败进入只读 JSONL fallback，
 workflow 必须把阶段标为 blocked；只读分析回复不能伪装成已修改工作区。所有阶段
@@ -216,4 +218,16 @@ writer。代价是 adapter interface 需要 execution mode，CommandBus/control/
 实现顺序固定为：workspace inspector + `workflow.py` 纯 parser/状态机及 fake
 contract → adapter execution mode 与负向写入测试 → Orchestrator/CommandBus
 集成 → TUI/control/MCP steering → Harness 红线与真实验收。ADR Accepted 只表示
-语义冻结；在上述证据完成前，README/SPEC 必须继续标记 M5 为“待实现”。
+语义冻结；README/SPEC 只有在上述证据全部完成后才能把 M5 标记为完成，当前
+实现与验收状态记录如下。
+
+## 6. 实现与验收状态
+
+2026-08-09 已按上述顺序完成生产实现。`tests/test_workflow.py`、adapter hybrid/
+app-server contracts、CommandBus/control/MCP/TUI tests 覆盖 fixed point、execution
+mode、严格信封、steering 原子提交、失败聚合、六阶段取消与进程回收；完整
+`bash scripts/check-harness.sh` 通过。
+
+授权真实探针 `scripts/e2e-m5-real.py` 由 Kimi 执行只读 review/verify、Codex
+作为唯一 writer、host 最终汇总；HEAD/branch/index 不变，最终 3 个 unittest
+通过。README/SPEC 因此可将 M5 标记为完成。

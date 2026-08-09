@@ -84,6 +84,7 @@ def test_official_stdio_client() -> None:
                             "myagents_get_command",
                             "myagents_wait_command",
                             "myagents_cancel_command",
+                            "myagents_steer_command",
                         }
                         read_only = tools["myagents_get_room"].annotations
                         assert read_only.readOnlyHint is True
@@ -95,6 +96,11 @@ def test_official_stdio_client() -> None:
                         assert send.destructiveHint is True
                         assert send.idempotentHint is False
                         assert send.openWorldHint is True
+                        steer = tools["myagents_steer_command"].annotations
+                        assert steer.readOnlyHint is False
+                        assert steer.destructiveHint is True
+                        assert steer.idempotentHint is False
+                        assert steer.openWorldHint is False
 
                         room = await session.call_tool("myagents_get_room", {})
                         assert room.isError is False
@@ -145,6 +151,21 @@ def test_official_stdio_client() -> None:
                             {"command_id": command_id})
                         assert cancelled.structuredContent[
                             "status"] == "completed"
+                        bus.steer = lambda selected, instruction: {
+                            "command_id": selected,
+                            "accepted": 1,
+                            "total_chars": len(instruction),
+                            "applies_after": "implement",
+                        }
+                        steered = await session.call_tool(
+                            "myagents_steer_command",
+                            {
+                                "command_id": command_id,
+                                "instruction": "补充回归测试",
+                            },
+                        )
+                        assert steered.isError is False
+                        assert steered.structuredContent["accepted"] == 1
 
                         # ControlRemoteError → actionable tool error，server 不崩
                         missing = await session.call_tool(

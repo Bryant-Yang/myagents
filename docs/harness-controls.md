@@ -15,7 +15,7 @@
 | 调节目标 | 当前覆盖 | 证据索引 | 明确不保证 |
 | --- | --- | --- | --- |
 | Maintainability | 部分：项目入口、场景索引、文档引用、Python 语法和测试 gate | `AGENTS.md`、`workflow.md`、`scripts/check-harness.sh` | 没有 formatter、lint、静态类型检查和复杂度阈值 |
-| Architecture Fitness | 较强：transport 边界、通用 runtime、ACP-first、权限默认值和有界讨论有确定性检查 | HARNESS R1–R5、`test_phase2.py`、`test_discussion.py` | 不证明新抽象必要，也不覆盖生产性能 |
+| Architecture Fitness | 较强：transport 边界、通用 runtime、ACP-first、权限默认值、有界讨论和单写者 workflow 有确定性检查 | HARNESS R1–R6、`test_phase2.py`、`test_discussion.py`、`test_workflow.py` | 不证明新抽象必要，也不覆盖生产性能 |
 | Behaviour | 关键 Phase 2 + M2.5（持久化/恢复/lease）+ M3（command bus/控制 socket/MCP stdio）路径有 fake contract tests 与真实 Kimi E2E 双证据 | [`SPEC.md#关键行为用例`](SPEC.md#关键行为用例) | 不保证所有 CLI 版本、长会话 compaction 或真实 cancel 时延 |
 
 ## 2. Control Map
@@ -34,12 +34,13 @@
 | C10 | 图片附件私有、有界且不污染工作区 | HARNESS §4.8；SPEC UC-IMAGE-001 | `test_clipboard_image.py` 权限/格式/大小/草稿 fixture；真实截图由用户人工验收 | 阻断交付；删除不完整附件，恢复 0700/0600、20 MiB 和不自动提交边界 | Bryant Yang |
 | C11 | ACP hybrid 降级不绕过权限、不跨协议重放 | ADR-0006/0007；HARNESS §4.2–4.3；SPEC UC-HYBRID-001/002 | R4 registry/profile/policy gate；Kimi/OpenCode hybrid tests；受限真实临时目录探针 | 阻断交付；恢复具体 ACP adapter、权限 policy、只读 profile 和 prompt 前唯一 fallback 点 | Bryant Yang |
 | C12 | 指定成员讨论有界、跨轮上下文正确且失败不假绿 | ADR-0008；HARNESS §4.1；SPEC UC-DISCUSS-001 | R5 bounds/AST gate；`test_discussion.py` parser/并发/失败 contract；授权真实 MCP 回放 | 阻断；恢复 2–3 人、1–3 轮、非递归状态机和失败汇总后复验 | Bryant Yang |
+| C13 | 里程碑 workflow 保持 Git fixed point、单 writer、固定复核与阶段边界 steering | ADR-0009；SPEC UC-WORKFLOW-001 | R6 bounds/mode/AST gate；`test_workflow.py`；hybrid/app-server/control/MCP/TUI contract；授权真实验收 | 阻断；恢复 fixed point、read-only 复核、一次 repair 和 steering 上限后复验 | Bryant Yang |
 
 ## 3. 约束等级
 
 | ID | 等级 | 判据 | 处置 |
 | --- | --- | --- | --- |
-| R1–R5 | Deterministic Gate | AST/注册表/有界常量检查低误报且能定位文件 | 违反必拦，修复后复验 |
+| R1–R6 | Deterministic Gate | AST/注册表/有界常量检查低误报且能定位文件 | 违反必拦，修复后复验 |
 | S1 | Inferential Review Criterion | 新抽象、跨层职责、重复逻辑需要语义判断 | review 提供证据与替代方案，不假装机械事实 |
 | S2 | Inferential Review Criterion | fake server 是否仍代表真实 ACP 边界 | 比较真实 wire/options；必要时更新 fixture |
 | A1 | Human Acceptance Decision | 真实工具调用、auto 权限和外部系统写入风险 | 只有用户明确授权才执行 |
@@ -79,7 +80,7 @@
 
 ## 7. Baseline 与模板升级
 
-- **Legacy baseline**：R1–R5 当前均为零命中，不需要债务 baseline。生成方式是
+- **Legacy baseline**：R1–R6 当前均为零命中，不需要债务 baseline。生成方式是
   `bash scripts/check-redlines.sh`；若未来接入时已有历史债，必须先保存稳定、
   去行号的命中集合，再用 `comm -13` 只拦新增。
 - **模板来源**：Harness Framework `2.1.0`，来源 commit

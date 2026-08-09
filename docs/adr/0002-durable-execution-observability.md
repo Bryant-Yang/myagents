@@ -94,8 +94,9 @@ CommandBus 为每个 active command 持有独立 dispatch task：
 | `command.cancel` | 精确取消 queued/running 命令 |
 
 MCP bridge 对应新增 `myagents_read_events` 与
-`myagents_cancel_command`，总计七个工具。权限所有权仍在 TUI，bridge
-不能授权工具。
+`myagents_cancel_command`，在 M3.1 当时总计七个工具；M5 后续增加
+`myagents_steer_command`，当前总计八个。权限所有权仍在 TUI，bridge 不能
+授权工具。
 
 ## 3. 验收
 

@@ -36,7 +36,7 @@ MAX_TEXT_BYTES = 64 * 1024      # 单条消息文本上限（UTF-8 字节）
 MAX_RECORD_BYTES = 128 * 1024   # 单条 JSONL 记录上限（UTF-8 字节）
 EXECUTION_EVENT_KINDS = frozenset({
     "queued", "running", "status", "tool", "permission", "partial",
-    "completed", "failed", "cancelled",
+    "steering", "completed", "failed", "cancelled",
 })
 
 ROOM_DIR_MODE = 0o700

@@ -46,6 +46,10 @@ hub-and-spoke 方式维护统一时间线，以 ACP 作为有状态 coding agent
 - **R5 多智能体讨论必须显式且有界**：`/discuss` 只允许 2–3 个已注册
   worker、1–3 轮和一个终局 moderator；轮次由普通代码推进，禁止 agent
   自主递归派发、动态扩员或形成无界对话。
+- **R6 里程碑 workflow 必须固定且单写者**：`/workflow` 固定 review →
+  implement → verify，最多一次同 writer repair/reverify 和一次 host final；
+  review/verify/final 必须 read-only，steering 只允许在阶段边界按冻结上限追加，
+  禁止递归派发、换角色、扩权限或无界修复。
 
 ## 4. 工作要求
 

@@ -18,6 +18,7 @@ import os
 import re
 import signal
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import AsyncIterator, Mapping, Protocol
 
 
@@ -27,6 +28,18 @@ class AgentDeliveryUncertainError(RuntimeError):
 
 class AgentDeliveryCancelledError(asyncio.CancelledError):
     """请求已提交后被取消；保持取消语义，同时禁止自动重投。"""
+
+
+class ReadOnlyFallbackError(RuntimeError):
+    """写阶段只能进入只读 fallback；调用方必须 fail-closed。"""
+
+
+class ExecutionMode(str, Enum):
+    """一轮 agent 调用允许的工作区能力。"""
+
+    DEFAULT = "default"
+    READ_ONLY = "read_only"
+    WORKSPACE_WRITE = "workspace_write"
 
 
 _SENSITIVE_ASSIGNMENT = re.compile(
@@ -83,6 +96,7 @@ class AgentEvent:
       - "activity": 无可见增量的协议活动；只刷新 CommandBus 静默时钟，
         不进入 UI 或持久事件
       - "cancel_requested": 控制层请求取消，UI 应先结束权限等待
+      - "steering": workflow 已接受的阶段边界补充指令；只进 execution event
       - "delivery_committed": 内部投递确认；Orchestrator 在公开任何后续
         事件前持久化 no-replay cursor，不转发给 UI
       - "error" : 出错（非零退出、stderr 内容）
@@ -105,7 +119,13 @@ class AgentAdapter(Protocol):
     name: str
     session_id: str | None  # 上一次调用拿到的会话 id，用于 resume
 
-    def stream(self, prompt: str, workdir: str) -> AsyncIterator[AgentEvent]:
+    def stream(
+        self,
+        prompt: str,
+        workdir: str,
+        *,
+        execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
+    ) -> AsyncIterator[AgentEvent]:
         """异步生成器：执行一轮对话，边执行边吐事件。"""
         ...
 

@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 from typing import AsyncIterator
 
-from .base import AgentEvent, stream_jsonl
+from .base import AgentEvent, ExecutionMode, stream_jsonl
 
 
 class CodexAdapter:
@@ -45,17 +45,27 @@ class CodexAdapter:
         self.sandbox = sandbox
         self.ephemeral = ephemeral
 
-    async def stream(self, prompt: str, workdir: str) -> AsyncIterator[AgentEvent]:
+    async def stream(
+        self,
+        prompt: str,
+        workdir: str,
+        *,
+        execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
+    ) -> AsyncIterator[AgentEvent]:
+        sandbox = {
+            ExecutionMode.READ_ONLY: "read-only",
+            ExecutionMode.WORKSPACE_WRITE: "workspace-write",
+        }.get(execution_mode, self.sandbox)
         if self.use_resume and self.session_id:
             cmd = ["codex", "exec", "resume", self.session_id, prompt,
-                   "--json", "--skip-git-repo-check", "--sandbox", self.sandbox]
+                   "--json", "--skip-git-repo-check", "--sandbox", sandbox]
         else:
             cmd = ["codex", "exec"]
             if self.ephemeral:
                 cmd.append("--ephemeral")
             cmd.extend([
                 "--cd", workdir,
-                "--sandbox", self.sandbox,
+                "--sandbox", sandbox,
                 "--skip-git-repo-check",
                 "--json",
                 prompt,

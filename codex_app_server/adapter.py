@@ -14,6 +14,7 @@ from adapters.base import (
     AgentDeliveryCancelledError,
     AgentDeliveryUncertainError,
     AgentEvent,
+    ExecutionMode,
     redact_sensitive_text,
 )
 from adapters.codex_adapter import CodexAdapter
@@ -96,6 +97,7 @@ class CodexAppServerAdapter:
         self._request_timeout = request_timeout
         self._client = self._new_client()
         self._started = False
+        self._active_sandbox: str | None = None
         self._closed = False
         self._active_inner: AsyncIterator[AgentEvent] | None = None
         self._stream_task: asyncio.Task | None = None
@@ -136,6 +138,7 @@ class CodexAppServerAdapter:
         with contextlib.suppress(Exception):
             await self._client.close()
         self._started = False
+        self._active_sandbox = None
         self.session_id = None
         if not self._closed:
             self._client = self._new_client()
@@ -144,7 +147,10 @@ class CodexAppServerAdapter:
         self,
         workdir: str,
         resume_session_id: str | None = None,
+        sandbox: str | None = None,
     ) -> ThreadPreparation:
+        if sandbox is None:
+            sandbox = self.sandbox
         if self._closed:
             raise CodexAppServerError("adapter 已关闭")
         if self._started:
@@ -173,7 +179,7 @@ class CodexAppServerAdapter:
                     self.session_id = await self._client.thread_resume(
                         resume_session_id,
                         workdir,
-                        sandbox=self.sandbox,
+                        sandbox=sandbox,
                         approval_policy=self.approval_policy,
                     )
                     restored = True
@@ -182,7 +188,7 @@ class CodexAppServerAdapter:
             if not restored:
                 self.session_id = await self._client.thread_start(
                     workdir,
-                    sandbox=self.sandbox,
+                    sandbox=sandbox,
                     approval_policy=self.approval_policy,
                     ephemeral=True if self.ephemeral_thread else None,
                 )
@@ -190,6 +196,7 @@ class CodexAppServerAdapter:
             await self._reset()
             raise
         self._started = True
+        self._active_sandbox = sandbox
         assert self.session_id is not None
         return ThreadPreparation(
             self.session_id,
@@ -198,14 +205,26 @@ class CodexAppServerAdapter:
             fresh=True,
         )
 
-    def stream(self, prompt: str, workdir: str) -> AsyncIterator[AgentEvent]:
-        return self.stream_prepared(lambda _prep: prompt, workdir)
+    def stream(
+        self,
+        prompt: str,
+        workdir: str,
+        *,
+        execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
+    ) -> AsyncIterator[AgentEvent]:
+        return self.stream_prepared(
+            lambda _prep: prompt,
+            workdir,
+            execution_mode=execution_mode,
+        )
 
     async def stream_prepared(
         self,
         make_prompt: Callable[[ThreadPreparation], str],
         workdir: str,
         resume_session_id: str | None = None,
+        *,
+        execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
     ) -> AsyncIterator[AgentEvent]:
         if self._closed:
             raise CodexAppServerError("adapter 已关闭")
@@ -215,9 +234,12 @@ class CodexAppServerAdapter:
             owner = asyncio.current_task()
             self._stream_task = owner
             try:
+                sandbox = self._sandbox_for(execution_mode)
+                if self._started and self._active_sandbox != sandbox:
+                    await self._reset()
                 try:
                     prep = await self._prepare_locked(
-                        workdir, resume_session_id)
+                        workdir, resume_session_id, sandbox)
                 except Exception:
                     if self._closed or not self._fallback_jsonl:
                         raise
@@ -234,7 +256,11 @@ class CodexAppServerAdapter:
                     yield AgentEvent(
                         "info",
                         "Codex app-server 启动失败，使用 JSONL fallback")
-                    inner = self._fallback.stream(prompt, workdir)
+                    if execution_mode is ExecutionMode.DEFAULT:
+                        inner = self._fallback.stream(prompt, workdir)
+                    else:
+                        inner = self._fallback.stream(
+                            prompt, workdir, execution_mode=execution_mode)
                     self._active_inner = inner
                     try:
                         async for event in inner:
@@ -255,7 +281,8 @@ class CodexAppServerAdapter:
                     verb = "已恢复" if prep.restored else "已建立"
                     yield AgentEvent(
                         "info", f"Codex thread {verb}：{prep.session_id}")
-                inner = self._turn_locked(prep.session_id, prompt, workdir)
+                inner = self._turn_locked(
+                    prep.session_id, prompt, workdir, execution_mode)
                 self._active_inner = inner
                 try:
                     async for event in inner:
@@ -270,6 +297,7 @@ class CodexAppServerAdapter:
                         # Reuse the warm process, but start a clean thread next time
                         # so those snapshots are not duplicated in native history.
                         self._started = False
+                        self._active_sandbox = None
                         self.session_id = None
             finally:
                 if self._stream_task is owner:
@@ -280,9 +308,18 @@ class CodexAppServerAdapter:
         thread_id: str,
         prompt: str,
         workdir: str,
+        execution_mode: ExecutionMode,
     ) -> AsyncIterator[AgentEvent]:
         turn_id: str | None = None
         terminal = False
+        if execution_mode is ExecutionMode.READ_ONLY:
+            self._client.set_permission_handler(
+                lambda _params: {
+                    "outcome": "selected",
+                    "optionId": "decline",
+                })
+        else:
+            self._client.set_permission_handler(self._permission_handler)
         try:
             try:
                 images = prompt_images(
@@ -418,8 +455,16 @@ class CodexAppServerAdapter:
                 f"Codex turn 已提交但未成功完成：{exc}"
             ) from exc
         finally:
+            self._client.set_permission_handler(self._permission_handler)
             if turn_id is not None and not terminal:
                 await self._interrupt_and_confirm(thread_id, turn_id)
+
+    def _sandbox_for(self, execution_mode: ExecutionMode) -> str | None:
+        if execution_mode is ExecutionMode.READ_ONLY:
+            return "read-only"
+        if execution_mode is ExecutionMode.WORKSPACE_WRITE:
+            return "workspace-write"
+        return self.sandbox
 
     async def _interrupt_and_confirm(
         self,
@@ -569,4 +614,5 @@ class CodexAppServerAdapter:
                 self._lock.release()
         self._active_inner = None
         self._started = False
+        self._active_sandbox = None
         self.session_id = None

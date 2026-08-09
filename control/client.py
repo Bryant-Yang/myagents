@@ -197,3 +197,13 @@ class ControlClient:
     async def cancel_command(self, command_id: str) -> dict[str, Any]:
         return await self.call(
             "command.cancel", {"command_id": command_id})
+
+    async def steer_command(
+        self,
+        command_id: str,
+        instruction: str,
+    ) -> dict[str, Any]:
+        return await self.call("command.steer", {
+            "command_id": command_id,
+            "instruction": instruction,
+        })

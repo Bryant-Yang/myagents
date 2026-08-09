@@ -1,6 +1,6 @@
 # ACP 迁移设计（最小方案）
 
-状态：**Phase 4.5 与 Phase 5.1 已完成，Phase 5 设计已冻结、待实现**。
+状态：**Phase 4.5、Phase 5.1 与 Phase 5 已完成**。
 `AgentAdapter` 是 TUI 与不同 coding agent 的
 统一行为契约；wire protocol 按厂商能力选择：`acp/` 是通用 ACP runtime，
 Kimi/OpenCode 分别走 `kimi acp` / `opencode acp`，只在 ACP prepare
@@ -233,23 +233,25 @@ Orchestrator 内用普通代码执行 1–3 轮状态机：同轮不同 adapter 
 结果当作可安全重试。完整工作流契约见
 [ADR-0008](adr/0008-bounded-multi-agent-discussion.md)。
 
-## 有界里程碑工作流（M5 设计）
+## 有界里程碑工作流（M5）
 
 M5 不改变 ACP wire protocol，也不向 agent 暴露自主派发能力。`/workflow`
 由普通代码严格推进 review → 单 writer implement → 独立 verify；首次复核要求
 修改时最多允许同一 writer repair 一次并 reverify，最后由 host 汇总，最大六次
 模型调用。全部阶段仍属于一个 CommandBus command 和一个 `command_id`。
 
-adapter interface 将在 `stream` / `stream_prepared` 两条投递路径增加通用
+adapter interface 已在 `stream` / `stream_prepared` 两条投递路径增加通用
 execution mode：review/verify 映射为 `read_only`，implement/repair 映射为
 `workspace_write`。具体 sandbox、权限和 fallback 行为仍由各 adapter 在现有
-seam 内实现，Orchestrator 不按 agent 名分支。Kimi/OpenCode 的只读 JSONL
-fallback 不能承担写阶段；触发时 workflow 必须 blocked。
+seam 内实现，Orchestrator 不按 agent 名分支。ACP 从普通轮次进入 `read_only`
+时关闭旧进程、禁止 load 旧 session 并建立隔离 session，避免继承历史
+`allow_always`；Kimi/OpenCode 的只读 JSONL fallback 不能承担写阶段，触发时
+workflow 必须 blocked。
 
 运行中 steering 只在下一阶段边界注入尚未开始的 assignment，不并发写当前
 ACP session、不修改已提交 prompt，也不能换人、加轮或扩大权限。完整设计见
-[ADR-0009](adr/0009-bounded-milestone-workflow-steering.md)；当前只冻结合同，
-生产命令、execution mode 和 steering 入口尚未实现。
+[ADR-0009](adr/0009-bounded-milestone-workflow-steering.md)。生产 `/workflow`、
+execution mode 与 TUI/control/MCP steering 均已实现并纳入 Harness。
 
 workflow 还要求从干净 Git 工作区捕获 baseline HEAD/branch 和完整工作区指纹，
 read-only 阶段前后不得漂移，写阶段不得改变 HEAD/branch/index。Git 探测由注入的
@@ -273,7 +275,7 @@ transport adapter 执行；Orchestrator/workflow 不直接启动子进程。外�
   `control/command_bus.py` FIFO 单 worker（request_id 永久幂等、容量
   硬上限、close 兜底 cancelled）；`control/server.py` 私有 Unix 控制
   socket（0600、stale 验证后清理、活跃不抢占、稳定错误码）；
-  `myagents_mcp.py` stdio MCP bridge（官方 SDK `mcp>=1.27,<2`，七个
+  `myagents_mcp.py` stdio MCP bridge（官方 SDK `mcp>=1.27,<2`，八个
   `myagents_*` 工具）只连运行中 TUI 的 socket，绝不实例化第二
   Orchestrator、不获取 lease、不绕过 TUI 权限。细节见
   [ADR-0001](adr/0001-persistent-room-command-bus-mcp.md)
@@ -291,9 +293,9 @@ transport adapter 执行；Orchestrator/workflow 不直接启动子进程。外�
   隔离配置和 deny-all 只读 agent。见 ADR-0007。
 - [x] **Phase 5.1**：`/discuss` 指定 2–3 个 worker、1–3 轮有界讨论，
   同轮 fan-out、跨轮增量上下文、失败者退出与终局 moderator。见 ADR-0008。
-- [ ] **Phase 5**：ADR-0009 已冻结里程碑 review → 单 writer 修改 → 独立
-  复核、最多一次 repair/reverify 与阶段边界 steering；代码和真实验收待完成。
-  见 ADR-0009。
+- [x] **Phase 5**：里程碑 review → 单 writer 修改 → 独立复核、最多一次
+  repair/reverify、阶段边界 steering、Git fixed point 与 TUI 阶段状态已完成；
+  真实 Kimi review/verify + Codex implementer 临时仓库探针通过。见 ADR-0009。
 
 A2A 不在当前阶段；Streamable HTTP、远程认证同样不在 M3（M3 是单机
 单用户 stdio 集成，见 ADR-0001 §3）。只有出现跨机器、跨组织 agent
@@ -309,6 +311,10 @@ A2A 不在当前阶段；Streamable HTTP、远程认证同样不在 M3（M3 是�
   `scripts/e2e-m3-real.py` 用真实 `kimi acp` + 独立 MCP stdio client
   完成两轮 TUI 生命周期，第二轮 `session/load` 复用同一 session id，
   timeline 无重复，退出后无 endpoint/socket/agent 残留。
+- **M5 真实 E2E 已通过**（2026-08-09）：
+  `scripts/e2e-m5-real.py` 在临时 Git repo 由 Kimi 只读 review/verify、Codex
+  单 writer implement、host final；HEAD/branch/index 不变，最终 3 个 unittest
+  通过。真实模型探针不进入默认快速 gate。
 - **仍未覆盖**：cancel 响应时延在真实二进制上的表现（10s 有限超时
   契约只经 fake server 验证）；长会话的内存/token 增长与 compaction
   后的 restore 行为。

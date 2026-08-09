@@ -41,6 +41,9 @@ class TaskProgress:
     status: str = "queued"
     error: str | None = None
     agents: dict[str, AgentProgress] = field(default_factory=dict)
+    workflow_stage: str | None = None
+    workflow_roles: dict[str, str] = field(default_factory=dict)
+    steering_available: bool | None = None
 
     def set_command(self, status: str, error: str | None = None) -> None:
         self.status = status
@@ -63,6 +66,25 @@ class TaskProgress:
             state=state,
             phase=clean_phase or _AGENT_LABELS.get(state, state),
         )
+
+    def set_workflow(
+        self,
+        stage: object,
+        roles: object,
+        steering_available: object,
+    ) -> None:
+        if isinstance(stage, str) and stage:
+            self.workflow_stage = stage[:32]
+        if isinstance(roles, dict):
+            clean = {
+                str(key): str(value)
+                for key, value in roles.items()
+                if key in {"reviewer", "implementer", "verifier"}
+            }
+            if clean:
+                self.workflow_roles = clean
+        if isinstance(steering_available, bool):
+            self.steering_available = steering_available
 
     @property
     def overall_label(self) -> str:
@@ -88,6 +110,20 @@ class TaskProgress:
         if self.status in {"queued", "running"}:
             line += "  Ctrl+X 取消"
         details = [line]
+        if self.workflow_stage is not None:
+            roles = self.workflow_roles
+            role_line = " → ".join(filter(None, (
+                f"审 {roles.get('reviewer')}" if roles.get("reviewer") else "",
+                f"写 {roles.get('implementer')}" if roles.get("implementer") else "",
+                f"验 {roles.get('verifier')}" if roles.get("verifier") else "",
+            )))
+            steering = (
+                "可追加 /steer"
+                if self.steering_available else "steering 已关闭"
+            )
+            suffix = f" · {role_line}" if role_line else ""
+            details.append(
+                f"workflow {self.workflow_stage}{suffix} · {steering}")
         for name, item in self.agents.items():
             label = _AGENT_LABELS.get(item.state, item.state)
             details.append(f"{name} {label} · {item.phase}")

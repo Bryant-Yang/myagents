@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from acp.adapter import AcpAdapter
 from acp.client import AcpClient, AcpError
-from adapters.base import AgentDeliveryUncertainError
+from adapters.base import AgentDeliveryUncertainError, ExecutionMode
 from clipboard_image import TrustedImage
 
 SERVER = str(Path(__file__).parent / "fake_acp_server.py")
@@ -829,6 +829,50 @@ def test_nonfresh_factory_error_keeps_session() -> None:
     print("ok  非 fresh factory 异常 → 保留活跃 session")
 
 
+def test_readonly_mode_does_not_inherit_allow_always_session() -> None:
+    """普通 session 的 allow_always 不得跨到后续 read_only 轮次。"""
+    async def run() -> None:
+        reset_state()
+        adapter = AcpAdapter("fake", [sys.executable, SERVER])
+        adapter.set_permission_handler(
+            lambda _name, _params: {
+                "outcome": "selected", "optionId": "allow"})
+        first_preps = []
+        async for _ in adapter.stream_prepared(
+                lambda prep: first_preps.append(prep) or "perm-always",
+                "/tmp"):
+            pass
+        first_session = first_preps[0].session_id
+        first_pid = adapter._client._proc.pid
+
+        second_preps = []
+        async for _ in adapter.stream_prepared(
+                lambda prep: second_preps.append(prep) or "requires-write",
+                "/tmp",
+                resume_session_id=first_session,
+                execution_mode=ExecutionMode.READ_ONLY):
+            pass
+        second_pid = adapter._client._proc.pid
+        await adapter.aclose()
+
+        assert second_preps[0].fresh is True
+        assert second_preps[0].restored is False
+        assert first_pid != second_pid, "read_only 必须隔离旧 ACP 进程"
+        events = state_events()
+        assert events.count("new:/tmp") == 2, events
+        assert not any(item.startswith("load:") for item in events), events
+        assert not any(
+            item.startswith("permission-bypassed:") for item in events), events
+        permissions = [
+            item for item in events if item.startswith("permission:")]
+        assert len(permissions) == 2, permissions
+        assert '"outcome": "selected"' in permissions[0]
+        assert '"outcome": "cancelled"' in permissions[1]
+
+    asyncio.run(run())
+    print("ok  read_only fresh ACP session 不继承 allow_always")
+
+
 if __name__ == "__main__":
     test_initialize()
     test_session_new_list_load()
@@ -862,4 +906,5 @@ if __name__ == "__main__":
     test_factory_runs_before_first_event()
     test_fresh_factory_error_resets()
     test_nonfresh_factory_error_keeps_session()
+    test_readonly_mode_does_not_inherit_allow_always_session()
     print("\nACP 全部通过")

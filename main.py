@@ -45,6 +45,12 @@ from adapters.base import (
 from control import CommandBus, ControlServer
 from clipboard_image import ClipboardImageError, capture_clipboard_png
 from discussion import DISCUSSION_USAGE
+from workflow import (
+    STEER_USAGE,
+    WORKFLOW_USAGE,
+    WorkflowValidationError,
+    parse_steer_instruction,
+)
 from storage.store import (
     DEFAULT_SESSION_NAME,
     RoomBusyError,
@@ -711,6 +717,18 @@ class ChatApp(App):
             f"{DISCUSSION_USAGE}\n"
             "参与者 2–3 个，轮数 1–3；默认两轮并由 host 最终仲裁。")
 
+    def action_show_workflow_help(self) -> None:
+        self._system(
+            "有界里程碑 workflow 用法：\n"
+            f"{WORKFLOW_USAGE}\n"
+            "固定 review → 单 writer 实现 → 独立复核；最多一次 repair。")
+
+    def action_show_steer_help(self) -> None:
+        self._system(
+            "运行中 workflow steering 用法：\n"
+            f"{STEER_USAGE}\n"
+            "只在 review/implement/repair 阶段接受，并从下一阶段边界生效。")
+
     def action_toggle_details(self) -> None:
         """切换工具命令详情，并原位重绘现有工具记录。"""
         self._show_tool_details = not self._show_tool_details
@@ -764,6 +782,26 @@ class ChatApp(App):
         都显示为红色 system 错误；bus FIFO 串行执行，事件经 event_sink
         回到 _on_agent_event。
         """
+        try:
+            instruction = parse_steer_instruction(text)
+        except WorkflowValidationError as exc:
+            self._write("system", str(exc), "bold red")
+            return
+        if instruction is not None:
+            active = self.bus.active()
+            if active is None:
+                self._write("system", "当前没有 running workflow", "bold red")
+                return
+            try:
+                receipt = self.bus.steer(active.command_id, instruction)
+            except Exception as exc:
+                self._write("system", f"steering 失败：{exc}", "bold red")
+            else:
+                self._system(
+                    f"steering 已接受（第 {receipt['accepted']} 条），"
+                    "将在下一阶段边界生效")
+            return
+
         async def runner() -> None:
             try:
                 snap = await self.bus.submit(text)
@@ -803,6 +841,14 @@ class ChatApp(App):
             self, command_id: str, name: str,
             state: str, phase: str = "") -> None:
         self._ensure_task(command_id).set_agent(name, state, phase)
+        self._render_task_status()
+
+    def _set_workflow_status(self, command_id: str, meta: dict) -> None:
+        self._ensure_task(command_id).set_workflow(
+            meta.get("workflow_stage"),
+            meta.get("workflow_roles"),
+            meta.get("steering_available"),
+        )
         self._render_task_status()
 
     def _selected_task(self) -> TaskProgress | None:
@@ -905,23 +951,49 @@ class ChatApp(App):
     def _on_agent_event(self, name: str, ev: AgentEvent) -> None:
         command_value = ev.meta.get("command_id")
         command_id = str(command_value) if command_value else None
+        if command_id is not None and ev.meta.get("workflow") is True:
+            self._set_workflow_status(command_id, ev.meta)
         if ev.kind == "committed" and name == "user":
             # 用户消息已持久确认：此时才显示文本和派发状态
             self._write("user", ev.text)
-            targets = self.orch.parse_mentions(ev.text)
             if command_id is not None:
                 self._set_command_status(command_id, "running")
-            if targets:
-                for target in targets:
+            roles = ev.meta.get("workflow_roles")
+            if ev.meta.get("workflow") is True and isinstance(roles, dict):
+                reviewer = str(roles.get("reviewer") or "")
+                implementer = str(roles.get("implementer") or "")
+                verifier = str(roles.get("verifier") or "")
+                if command_id is not None:
+                    if reviewer:
+                        phase = (
+                            "审查中（后续复核）"
+                            if reviewer == verifier else "审查中"
+                        )
+                        self._set_agent_status(
+                            command_id, reviewer, "running", phase)
+                    if implementer:
+                        self._set_agent_status(
+                            command_id, implementer, "queued", "等待实现")
+                    if verifier and verifier != reviewer:
+                        self._set_agent_status(
+                            command_id, verifier, "queued", "等待复核")
+                self._system(
+                    "workflow 已创建："
+                    f"审 {reviewer} → 写 {implementer} → 验 {verifier}"
+                )
+            else:
+                targets = self.orch.parse_mentions(ev.text)
+                if targets:
+                    for target in targets:
+                        if command_id is not None:
+                            self._set_agent_status(
+                                command_id, target, "queued", "等待派发")
+                        self._system(f"{target} 思考中…")
+                else:
                     if command_id is not None:
                         self._set_agent_status(
-                            command_id, target, "queued", "等待派发")
-                    self._system(f"{target} 思考中…")
-            else:
-                if command_id is not None:
-                    self._set_agent_status(
-                        command_id, HOST_NAME, "running", "路由中")
-                self._system("host 处理中…")
+                            command_id, HOST_NAME, "running", "路由中")
+                    self._system("host 处理中…")
         elif ev.kind == "text":
             if command_id is not None:
                 self._set_agent_status(
@@ -987,6 +1059,8 @@ class ChatApp(App):
             # 这里只是请求已发出；真正 terminal 由 CommandBus wait 结果确认。
             # 保留工具状态和运行态，避免取消超时期间短暂显示假成功。
             self._system(ev.text)
+        elif ev.kind == "steering":
+            self._system(f"steering 已记录：{ev.text}")
         elif ev.kind == "error":
             self._finish_stream_text(name)
             self._clear_tool_state(ev.meta.get("command_id"), name)

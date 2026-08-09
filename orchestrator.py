@@ -39,6 +39,7 @@ from adapters.base import (
     AgentDeliveryCancelledError,
     AgentDeliveryUncertainError,
     AgentEvent,
+    ExecutionMode,
 )
 from codex_app_server.adapter import CodexAppServerAdapter
 from discussion import (
@@ -49,6 +50,13 @@ from discussion import (
     participant_assignment,
 )
 from host import MODERATOR_TEMPLATE, HostAgent
+from workflow import (
+    MilestoneWorkflow,
+    StageDelivery,
+    WorkflowValidationError,
+    parse_workflow_request,
+)
+from workspace import GitWorkspaceInspector
 from storage.store import (
     DEFAULT_SESSION_NAME,
     MAX_READ_LIMIT,
@@ -189,11 +197,14 @@ class Orchestrator:
                  specs: tuple[AgentSpec, ...] = AGENT_SPECS, *,
                  store: RoomStore | None = None,
                  persistent: bool = True,
-                 session_name: str = DEFAULT_SESSION_NAME) -> None:
+                 session_name: str = DEFAULT_SESSION_NAME,
+                 workspace_inspector=None) -> None:
         self.workdir = workdir
         self.session_name = normalize_session_name(session_name)
         self.history_limit = history_limit
         self.specs = specs
+        self.workspace_inspector = (
+            workspace_inspector or GitWorkspaceInspector())
         self.adapters: dict[str, AgentAdapter] = {
             spec.name: spec.factory() for spec in specs
         }
@@ -276,6 +287,7 @@ class Orchestrator:
         # 推进 cursor 是一个原子单元。没有它，两个针对同一 agent 的并发
         # dispatch 会都按旧 cursor 构造 prompt，重复/乱序投递。
         self._delivery_locks: dict[str, asyncio.Lock] = {}
+        self._active_workflows: dict[str, MilestoneWorkflow] = {}
         # 关闭标志：aclose() 原子置位；dispatch 与排队中的 _run_one 据此
         # 拒绝新工作，closed 后不再写 timeline、不再 start/load/prompt。
         self._closed = False
@@ -389,7 +401,7 @@ class Orchestrator:
             if assignment:
                 assignment_block = (
                     "主持人本轮明确任务：\n"
-                    f"{assignment.strip()[:4000]}\n"
+                    f"{assignment.strip()[:12000]}\n"
                 )
             return MODERATOR_TEMPLATE.format(
                 name=agent_name,
@@ -404,7 +416,7 @@ class Orchestrator:
         if assignment:
             assignment_block = (
                 "主持人本轮明确委托：\n"
-                f"{assignment.strip()[:4000]}\n"
+                f"{assignment.strip()[:12000]}\n"
                 "请直接执行完整任务；除非存在无法自行解决的真实阻塞，"
                 "不要把任务退回给主持人或用户，也不要只给候选方案等待确认。\n"
             )
@@ -447,6 +459,21 @@ class Orchestrator:
         """
         if self._closed:
             raise OrchestratorClosedError("Orchestrator 已关闭，拒绝 dispatch")
+        workflow_request = parse_workflow_request(
+            user_text,
+            tuple(spec.name for spec in self.specs),
+            host_name=HOST_NAME,
+        )
+        if workflow_request is not None:
+            baseline = await self.workspace_inspector.capture_baseline(
+                self.workdir)
+            return await self._dispatch_workflow(
+                workflow_request,
+                baseline,
+                user_text,
+                on_event,
+                command_id,
+            )
         discussion = parse_discussion_request(
             user_text, (spec.name for spec in self.specs),
             host_name=HOST_NAME,
@@ -544,6 +571,134 @@ class Orchestrator:
             if error is not None
         )
         return DispatchOutcome(failures)
+
+    async def _dispatch_workflow(
+        self,
+        request,
+        baseline,
+        user_text: str,
+        on_event: EventCallback,
+        command_id: str | None,
+    ) -> DispatchOutcome:
+        """把一条命令委托给 workflow 深模块；内部阶段不递归 dispatch。"""
+        committed = self._append_message(
+            "user", user_text, command_id=command_id)
+        on_event("user", AgentEvent(
+            "committed",
+            user_text,
+            {
+                "seq": committed.seq,
+                "command_id": command_id,
+                "workflow": True,
+                "workflow_stage": "queued",
+                "workflow_roles": request.roles,
+                "baseline_head": baseline.head,
+                "baseline_branch": baseline.branch,
+                "baseline_fingerprint": baseline.fingerprint,
+                "steering_available": False,
+            },
+        ))
+        on_event("system", AgentEvent(
+            "status",
+            "workflow baseline · "
+            f"head={baseline.head} · branch={baseline.branch} · "
+            f"fingerprint={baseline.fingerprint}",
+            {
+                "command_id": command_id,
+                "workflow": True,
+                "workflow_stage": "baseline",
+                "workflow_roles": request.roles,
+                "baseline_head": baseline.head,
+                "baseline_branch": baseline.branch,
+                "baseline_fingerprint": baseline.fingerprint,
+                "steering_available": False,
+                "agent_state": "running",
+                "phase": "workflow baseline 已持久化",
+            },
+        ))
+        workflow_id = command_id or f"direct-{committed.seq}"
+
+        async def stage_runner(
+            name: str,
+            stage: str,
+            assignment: str,
+            execution_mode: ExecutionMode,
+        ) -> StageDelivery:
+            before_seq = self.history[-1].seq if self.history else 0
+            snapshot = list(self.history)
+
+            def stage_event(agent_name: str, event: AgentEvent) -> None:
+                # 一个角色可能在 repair/reverify 再次出现；阶段间 done 不得
+                # 让固定 TUI 状态提前锁成 terminal。
+                if event.kind == "done" and stage != "final":
+                    on_event(agent_name, AgentEvent(
+                        "status",
+                        f"workflow {stage} 响应已落盘",
+                        {
+                            **event.meta,
+                            "workflow": True,
+                            "workflow_stage": stage,
+                            "workflow_roles": request.roles,
+                            "workflow_agent": agent_name,
+                            "steering_available": (
+                                workflow.steering_available),
+                            "agent_state": "running",
+                            "phase": f"workflow {stage} 已完成",
+                        },
+                    ))
+                    return
+                on_event(agent_name, event)
+
+            error = await self._run_one(
+                name,
+                stage_event,
+                snapshot,
+                command_id,
+                assignment,
+                execution_mode,
+            )
+            replies = [
+                message.text for message in self.history
+                if (message.seq > before_seq
+                    and message.speaker == name
+                    and message.command_id == command_id)
+            ]
+            return StageDelivery(replies[-1] if replies else "", error)
+
+        workflow = MilestoneWorkflow(
+            request,
+            workflow_id,
+            baseline,
+            self.workspace_inspector,
+            stage_runner,
+            on_event,
+        )
+        if command_id is not None:
+            self._active_workflows[command_id] = workflow
+        try:
+            result = await workflow.run()
+        finally:
+            if command_id is not None:
+                self._active_workflows.pop(command_id, None)
+        return DispatchOutcome(tuple(
+            AgentFailure(item.agent, item.error)
+            for item in result.failures
+        ))
+
+    def prepare_workflow_steering(self, command_id: str, instruction: str):
+        workflow = self._active_workflows.get(command_id)
+        if workflow is None:
+            raise WorkflowValidationError(
+                f"命令 {command_id} 不是活动 workflow")
+        return workflow.prepare_steering(instruction)
+
+    def steer_workflow(self, command_id: str, instruction: str):
+        """无持久层调用方的兼容入口；CommandBus 使用两阶段 prepare/commit。"""
+        workflow = self._active_workflows.get(command_id)
+        if workflow is None:
+            raise WorkflowValidationError(
+                f"命令 {command_id} 不是活动 workflow")
+        return workflow.steer(instruction)
 
     async def _dispatch_discussion(
             self,
@@ -658,7 +813,9 @@ class Orchestrator:
     async def _run_one(self, name: str, on_event: EventCallback,
                        snapshot: list[Message],
                        command_id: str | None = None,
-                       assignment: str | None = None) -> str | None:
+                       assignment: str | None = None,
+                       execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
+                       ) -> str | None:
         adapter = self.adapters[name]
         if getattr(adapter, "stateful_session", False):
             # P1 契约：读 cursor → 选增量 → stream 完整执行 → 推进 cursor
@@ -675,13 +832,14 @@ class Orchestrator:
                     # ACP restore 原语：prepare 与 prompt 同一锁生命周期，
                     # checkpoint（cursor/session_id）在 prompt 前原子提交。
                     failed, delivered_upto = await self._deliver_prepared(
-                        name, adapter, on_event, command_id, assignment)
+                        name, adapter, on_event, command_id, assignment,
+                        execution_mode)
                 else:
                     # 无 stream_prepared 的 stateful fake：纯内存 seq 路径
                     messages, delivered_upto = self._messages_for(name)
                     failed = await self._deliver(name, adapter, messages,
                                                  on_event, command_id,
-                                                 assignment)
+                                                 assignment, execution_mode)
                 if failed is None:
                     # 成功交付后才推进 cursor，且只推进到本轮构造时的快照
                     # 末尾 seq：1) 明确未提交的失败不推进——下轮从旧 cursor
@@ -698,12 +856,13 @@ class Orchestrator:
             # 无状态（JSONL）agent：dispatch 瞬间的 transcript 快照
             return await self._deliver(
                 name, adapter, snapshot[-self.history_limit:], on_event,
-                command_id, assignment)
+                command_id, assignment, execution_mode)
 
     async def _deliver_prepared(self, name: str, adapter: AgentAdapter,
                                 on_event: EventCallback,
                                 command_id: str | None = None,
-                                assignment: str | None = None
+                                assignment: str | None = None,
+                                execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
                                 ) -> tuple[str | None, int]:
         """ACP 路径：session prepare 与 prompt 在 adapter writer lock 内
         原子完成；返回（失败信息, 交付目标 seq）。
@@ -747,8 +906,14 @@ class Orchestrator:
         failed: str | None = None
         done_meta: dict = {}
         try:
-            async for ev in adapter.stream_prepared(
-                    make_prompt, self.workdir, resume_session_id):
+            if execution_mode is ExecutionMode.DEFAULT:
+                stream = adapter.stream_prepared(
+                    make_prompt, self.workdir, resume_session_id)
+            else:
+                stream = adapter.stream_prepared(
+                    make_prompt, self.workdir, resume_session_id,
+                    execution_mode=execution_mode)
+            async for ev in stream:
                 if ev.kind == "delivery_committed":
                     # adapter 已确认用户 turn 被接受。必须先持久化，再公开
                     # 任何可能触发 events/UI 写入的后续事件。
@@ -803,14 +968,21 @@ class Orchestrator:
                        messages: list[Message],
                        on_event: EventCallback,
                        command_id: str | None = None,
-                       assignment: str | None = None) -> str | None:
+                       assignment: str | None = None,
+                       execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
+                       ) -> str | None:
         """执行一轮并把结果写回 history；返回失败信息（None = 成功）。"""
         prompt = self._build_prompt(name, messages, assignment)
         parts: list[str] = []
         failed: str | None = None
         done_meta: dict = {}
         try:
-            async for ev in adapter.stream(prompt, self.workdir):
+            if execution_mode is ExecutionMode.DEFAULT:
+                stream = adapter.stream(prompt, self.workdir)
+            else:
+                stream = adapter.stream(
+                    prompt, self.workdir, execution_mode=execution_mode)
+            async for ev in stream:
                 if ev.kind == "done":
                     # done 不立即转发：等回复落盘成功后才发（见方法尾）
                     done_meta = ev.meta

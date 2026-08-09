@@ -16,14 +16,14 @@
 | M2 | 完成 | Kimi ACP 接入、增量 history、权限 UI、统一回收、真实 E2E |
 | M2.5 | 完成 | 持久房间（timeline/state/seq cursor）、ACP session 恢复、owner lease、持久确认时序 |
 | M3 | 完成 | 内部 command bus、私有 Unix 控制 socket、MCP stdio 外部入口 |
-| M3.1 | 完成 | 持久执行事件、heartbeat、权限/工具上下文、精确取消（七个 MCP 工具） |
+| M3.1 | 完成 | 持久执行事件、heartbeat、权限/工具上下文、精确取消与 steering（八个 MCP 工具） |
 | M4 | 完成 | Codex app-server 长连接、thread/turn 事件、取消、审批与 JSONL fallback |
 | M4.2 | 完成 | 同一项目独立会话、默认房间兼容、TUI 安全切换与外部 selector |
 | M4.3 | 完成 | macOS 剪贴板 PNG、会话私有附件、草稿引用与真实视觉验收 |
 | M4.4 | 完成 | Kimi ACP-first、prepare-only 只读 JSONL fallback 与 no-replay |
 | M4.5 | 完成 | OpenCode ACP-first、ask-by-default 权限收口与只读 JSONL fallback |
 | M5.1 | 完成 | `/discuss` 指定成员、1–3 轮有界讨论与终局 moderator |
-| M5 | 设计冻结，待实现 | review → 单 writer 修改 → 独立复核、一次修复上限与阶段边界 steering |
+| M5 | 完成 | review → 单 writer 修改 → 独立复核、一次修复上限与阶段边界 steering |
 
 ## 1. 角色
 
@@ -114,8 +114,8 @@
 
 ### UC-WORKFLOW-001 有界里程碑工作流与阶段边界 steering
 
-- **状态**：ADR-0009 已冻结，生产代码尚未实现；当前不得把 `/workflow` 或
-  `/steer` 描述为可用功能。
+- **状态**：已实现并通过自动化与授权真实模型验收；`/workflow` 可从 TUI/MCP
+  提交，`/steer` 可从 TUI、control socket 或 MCP 提交。
 - **角色 / 触发**：用户提交
   `/workflow --reviewer @agent|@host --implementer @worker
   [--verifier @agent|@host] -- 任务目标`。verifier 缺省为 reviewer；implementer
@@ -138,8 +138,9 @@
   均 fail-closed；host 不能覆盖 verifier 终态。
 - **写入与权限**：review/verify/final 使用 adapter `read_only` execution mode，
   implement/repair 使用 `workspace_write`；只有 implementer 是 writer，两个写
-  阶段严格串行。Kimi/OpenCode implement 若进入只读 JSONL fallback，阶段必须
-  blocked，不得以分析回复冒充已修改。
+  阶段严格串行。ACP `read_only` 不 load/复用曾运行非只读轮次的 session，进入
+  时重建进程与 fresh session，防止继承 `allow_always`；Kimi/OpenCode implement
+  若进入只读 JSONL fallback，阶段必须 blocked，不得以分析回复冒充已修改。
 - **steering**：只有正在 review、implement 或 repair 且后面仍有验证阶段的
   workflow 可接收最多 5 条、单条 1000 字符且累计 4000 字符的补充指令；
   verify/reverify/final 已开始时拒绝。steering 作为 execution event 持久化，
@@ -148,11 +149,20 @@
 - **失败/取消**：transport、持久化、host 或阶段信封失败均保留已完成证据并使
   command failed；post-submit 不确定失败不重试、不换 agent；取消后不进入任何
   后续阶段。进程重启只显示上次中断，不自动续跑写阶段。
-- **验收计划**：workspace inspector fixed-point/drift fake、`workflow.py`
-  parser/状态机 fake contract、adapter read-only 负向写入测试、CommandBus/
-  control/MCP steering、TUI 帮助与取消/回收测试，最后做一次授权真实工作区的
-  固定三角色验收。设计阶段没有自动化或真实完成证据，不能以 ADR 代替实现验收。
-- **事实源**：ADR-0009。
+- **独立证据来源**：`tests/test_workflow.py` 覆盖 parser/严格信封、固定状态机、
+  Git index flags/tracked/untracked fixed point、read-only 漂移、主失败与 final 失败
+  聚合、六阶段取消、Git 进程组回收、baseline events 持久化与 active owner 清理；
+  `tests/test_acp.py` 覆盖跨轮 `allow_always` 授权隔离；Kimi/OpenCode/Codex
+  adapter contract 覆盖 execution mode 与写阶段 fallback
+  fail-closed；`tests/test_m3_bus.py` 覆盖 steering 先持久化后提交及落盘失败回滚；
+  control/MCP/TUI completion/status tests 覆盖同一 owner 和阶段状态 UX。
+- **真实验收证据**：2026-08-09 运行 `scripts/e2e-m5-real.py`，command
+  `3e0c46d3-d658-49b8-8ed8-74ab9436ed2b` 在临时 Git repo 以 Kimi 为
+  reviewer/verifier、Codex 为唯一 implementer，时间线依次为 user、Kimi、Codex、
+  Kimi、host。baseline HEAD `57ce8875e1d4e4126e8afbf8d9a8e9af4c263639`
+  和 main branch 未改变，index 为空；最终 diff 增加 `subtract` 与正/负两个
+  unittest，完整 3 个 unittest 通过，workflow verdict 为 completed。
+- **事实源**：ADR-0009、`workflow.py`、`workspace/git_adapter.py`。
 - **里程碑**：M5。
 
 ### UC-ACP-001 有状态增量上下文
@@ -387,14 +397,14 @@
   `BUS_CLOSED`），不泄漏 traceback；外部消息触发工具权限时仍在 TUI
   弹窗由用户决策，bridge 无 `auto` 放行入口；control/validation 错误
   不会使 MCP server 崩溃。
-- **验收**：七方法语义正确；同房间并发 submit 按 FIFO 顺序执行且相同
+- **验收**：八方法语义正确；同房间并发 submit 按 FIFO 顺序执行且相同
   `request_id` 不重复执行；官方 Python MCP SDK（`mcp>=1.27,<2`）经
   stdio 完成 initialize/list_tools/call_tool，stdout 无非协议输出；
   stdin EOF 后 bridge 进程 rc=0 干净退出；TUI 正常退出后无 socket、
   endpoint、MCP 或 agent 残留进程。
 - **独立证据来源**：`tests/test_m3_bus.py`（FIFO、request_id 永久幂等、
   容量硬上限、close 兜底 cancelled）、`tests/test_m3_control.py`
-  （七方法 roundtrip、0600/close 清理、stale 恢复与活跃不抢占、稳定
+  （八方法 roundtrip、0600/close 清理、stale 恢复与活跃不抢占、稳定
   错误码、start 失败无泄漏、AF_UNIX 超长路径可操作错误、Textual pilot
   外部命令实时可见、外部权限仍由 TUI 决策）、`tests/test_m3_mcp.py`（官方 SDK stdio
   list/call、注解、structuredContent、tool error 映射、干净退出）。
