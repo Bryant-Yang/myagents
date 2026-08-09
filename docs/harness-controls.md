@@ -32,7 +32,7 @@
 | C8 | 外部入口保持单写者、权限不绕过且失败终态真实 | HARNESS §4.5–4.6；ADR-0001 §2.4–2.6 | `test_m3_bus.py`（含 fan-out worker failure）、`test_m3_control.py`、`test_m3_mcp.py`；SPEC UC-CTRL-001/UC-CTRL-002 | 阻断；bridge 不得创建 Orchestrator/获取 lease/绕过 TUI 权限；worker 失败不得报 completed；修复后重跑 M3 回归 | Bryant Yang |
 | C9 | 执行状态有界、可读且不刷屏 | HARNESS §4.6；ADR-0002；`acp-migration.md` 可见状态 | `test_acp.py` tool-spam/long-tool watchdog、`test_m3_bus.py` 防御性去重、`test_basic.py` 工具折叠、`test_tui_status.py` 分 agent 状态；SPEC UC-OBS-001 | 阻断交付；在 adapter/bus/UI 正确边界恢复状态迁移、去重和索引清理，不删除 append-only 历史 | Bryant Yang |
 | C10 | 图片附件私有、有界且不污染工作区 | HARNESS §4.8；SPEC UC-IMAGE-001 | `test_clipboard_image.py` 权限/格式/大小/草稿 fixture；真实截图由用户人工验收 | 阻断交付；删除不完整附件，恢复 0700/0600、20 MiB 和不自动提交边界 | Bryant Yang |
-| C11 | ACP hybrid 降级不绕过权限、不跨协议重放 | ADR-0006/0007；HARNESS §4.2–4.3；SPEC UC-HYBRID-001/002 | R4 registry/profile/policy gate；Kimi/OpenCode hybrid tests；受限真实临时目录探针 | 阻断交付；恢复具体 ACP adapter、权限 policy、只读 profile 和 prompt 前唯一 fallback 点 | Bryant Yang |
+| C11 | ACP hybrid 降级不绕过权限、不跨协议重放；Qwen 保持 ACP-only + default/plan profile | ADR-0006/0007/0009；HARNESS §4.2–4.3；SPEC UC-HYBRID-001/002 与 UC-ACP-003 | R4 registry/profile/policy gate；Kimi/OpenCode hybrid tests；Qwen command-profile/fresh-session contract；受限真实临时目录探针 | 阻断交付；恢复具体 ACP adapter、权限 policy、已获证只读 profile 和 prompt 前唯一 fallback 点；Qwen 不得继承 auto/yolo 或静默接入未验证 JSONL | Bryant Yang |
 | C12 | 指定成员讨论有界、跨轮上下文正确且失败不假绿 | ADR-0008；HARNESS §4.1；SPEC UC-DISCUSS-001 | R5 bounds/AST gate；`test_discussion.py` parser/并发/失败 contract；授权真实 MCP 回放 | 阻断；恢复 2–3 人、1–3 轮、非递归状态机和失败汇总后复验 | Bryant Yang |
 | C13 | 里程碑 workflow 保持 Git fixed point、单 writer、固定复核与阶段边界 steering | ADR-0009；SPEC UC-WORKFLOW-001 | R6 bounds/mode/AST gate；`test_workflow.py`；hybrid/app-server/control/MCP/TUI contract；授权真实验收 | 阻断；恢复 fixed point、read-only 复核、一次 repair 和 steering 上限后复验 | Bryant Yang |
 
@@ -55,6 +55,7 @@
 | ACP 增量上下文 | [`SPEC.md#uc-acp-001-有状态增量上下文`](SPEC.md#uc-acp-001-有状态增量上下文) | C1、C3 |
 | Kimi hybrid 受限降级 | [`SPEC.md#uc-hybrid-001-kimi-acp-first-受限降级`](SPEC.md#uc-hybrid-001-kimi-acp-first-受限降级) | C1、C2、C3、C11 |
 | OpenCode hybrid 权限与受限降级 | [`SPEC.md#uc-hybrid-002-opencode-acp-first-权限收口与受限降级`](SPEC.md#uc-hybrid-002-opencode-acp-first-权限收口与受限降级) | C1、C2、C3、C11 |
+| Qwen Code ACP-only 接入 | [`SPEC.md#uc-acp-003-qwen-code-acp-only-接入`](SPEC.md#uc-acp-003-qwen-code-acp-only-接入) | C1、C2、C3、C11 |
 | 权限决策 | [`SPEC.md#uc-perm-001-权限请求与选择`](SPEC.md#uc-perm-001-权限请求与选择) | C2、C6 |
 | 生命周期 | [`SPEC.md#uc-life-001-取消与退出回收`](SPEC.md#uc-life-001-取消与退出回收) | C4、C6 |
 | 持久房间与重启恢复 | [`SPEC.md#uc-room-001-持久房间与重启恢复`](SPEC.md#uc-room-001-持久房间与重启恢复) | C7、C6 |

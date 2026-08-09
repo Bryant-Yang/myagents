@@ -118,7 +118,11 @@ workflow 在现有 `AgentAdapter` seam 上增加通用 execution mode，并在�
 execution mode 是 adapter interface 的通用语义，不由 Orchestrator 按 agent 名
 分支。Codex adapter 把 `read_only` 映射到 app-server sandbox；ACP adapter 在
 read-only 阶段取消所有权限升级，并保留具体 runtime 的 write/command/network
-ask/deny 策略。为防普通轮次的 `allow_always` 或 session 级授权泄漏，ACP
+ask/deny 策略。OpenCode 的只读 profile 在 runtime 层 hard deny 未知/有副作用
+工具并只放行安全读取，避免 Bash ask 被 cancelled 后直接零正文结束；普通 profile
+仍为 ask 并可进入 TUI。Qwen 普通轮强制 approval `default`，只读轮强制上游
+`plan` profile，使已保存的 auto/yolo 不会跳过 ACP 权限并在 reviewer/verifier
+阶段写入；两个 profile 互相切换时必须 fresh。为防普通轮次的 `allow_always` 或 session 级授权泄漏，ACP
 `read_only` 只能复用同为只读的 session；从其他 mode 进入时关闭旧 ACP 进程、
 禁止 load 旧 session 并新建隔离 session。无头 fallback 只能使用现有只读
 profile。任何 adapter 不能证明 read-only 时，该角色阶段直接 blocked。

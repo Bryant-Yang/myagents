@@ -22,6 +22,7 @@
 | M4.3 | 完成 | macOS 剪贴板 PNG、会话私有附件、草稿引用与真实视觉验收 |
 | M4.4 | 完成 | Kimi ACP-first、prepare-only 只读 JSONL fallback 与 no-replay |
 | M4.5 | 完成 | OpenCode ACP-first、ask-by-default 权限收口与只读 JSONL fallback |
+| M4.6 | 完成 | Qwen Code `qwen --acp` 接入、TUI 点名与 ACP-only 安全边界 |
 | M5.1 | 完成 | `/discuss` 指定成员、1–3 轮有界讨论与终局 moderator |
 | M5 | 完成 | review → 单 writer 修改 → 独立复核、一次修复上限与阶段边界 steering |
 
@@ -139,7 +140,9 @@
 - **写入与权限**：review/verify/final 使用 adapter `read_only` execution mode，
   implement/repair 使用 `workspace_write`；只有 implementer 是 writer，两个写
   阶段严格串行。ACP `read_only` 不 load/复用曾运行非只读轮次的 session，进入
-  时重建进程与 fresh session，防止继承 `allow_always`；Kimi/OpenCode implement
+  时重建进程与 fresh session，防止继承 `allow_always`。OpenCode 只读轮次在
+  runtime 层 hard deny 未知/有副作用工具并只允许安全读取，避免权限 cancelled
+  后零正文结束；切回普通轮次再次重建并恢复 TUI ask。Kimi/OpenCode implement
   若进入只读 JSONL fallback，阶段必须 blocked，不得以分析回复冒充已修改。
 - **steering**：只有正在 review、implement 或 repair 且后面仍有验证阶段的
   workflow 可接收最多 5 条、单条 1000 字符且累计 4000 字符的补充指令；
@@ -162,6 +165,12 @@
   Kimi、host。baseline HEAD `57ce8875e1d4e4126e8afbf8d9a8e9af4c263639`
   和 main branch 未改变，index 为空；最终 diff 增加 `subtract` 与正/负两个
   unittest，完整 3 个 unittest 通过，workflow verdict 为 completed。
+  同日以 `--verifier opencode` 运行同一探针，command
+  `a9d65665-d712-4f7e-932b-8cb6ad80e576` 依次完成 Kimi review、Codex
+  implement、OpenCode verify 和 host final；baseline
+  `c9f7627e4d635d5e083746c14b282487db395662`、main、index 均未漂移，最终
+  subtract diff 与 3 个 unittest 通过。此前零正文复现为 5/5；修复后同形状
+  OpenCode 只读探针 5/5 返回合法 verify/pass 信封。
 - **事实源**：ADR-0009、`workflow.py`、`workspace/git_adapter.py`。
 - **里程碑**：M5。
 
@@ -179,6 +188,37 @@
   独立构造过并发复现，确认修复前第二轮重复 first、修复后回归通过。
 - **人工验收边界**：长会话 token/内存增长和 compaction 策略尚未验收。
 - **里程碑**：M2。
+
+### UC-ACP-003 Qwen Code ACP-only 接入
+
+- **角色 / 触发**：用户在聊天室输入 `@qwen`，或把 Qwen 选为讨论/workflow
+  中满足既有角色约束的 worker。
+- **主流程**：`AGENT_SPECS` 以 `AgentSpec("qwen", "acp", AcpQwenAdapter)`
+  注册；普通轮启动 `qwen --acp --approval-mode default`，workflow `read_only`
+  启动 `qwen --acp --approval-mode plan`，profile 切换时重建进程、丢弃 resume id
+  并 `session/new`。两者复用通用 ACP 增量 cursor、权限 UI、取消和进程组回收
+  契约。TUI 的 `@` 补全、`/agents` 与启动状态动态展示 `@qwen(ACP)`，编排器
+  不增加任何按 qwen 名称分支。
+- **安全边界**：默认 `permission="deny"`，无处理器或非法 option 一律
+  cancelled。普通轮显式覆盖用户 native TUI 可能保存的 auto/yolo mode；只读轮
+  使用 Qwen 上游定义的 plan profile，在 runtime 层阻断文件修改和有副作用命令，
+  不能只取消新的 ACP permission request。当前不启用 `stream-json` headless
+  fallback：上游输入协议仍标记为未完成，且本项目尚无 Qwen fallback 的
+  prepare-only/no-replay 与工具白名单证据；ACP prepare 失败直接失败，不跨协议重放。
+- **验收**：红线强制 Qwen ACP-only 注册、deny 默认值和 default/plan 命令；fake
+  contract 验证 profile 切换会 fresh 进程/session、无 fallback、TUI 补全/状态和
+  普通 mention 路由；完整 Harness 不调用真实模型。
+- **真实协议证据**：本地上游源码 0.21.8 的 CLI 配置与 ACP bridge 均以
+  `qwen --acp` 作为一等入口。2026-08-09 本机安装版 0.21.7 已完成认证并接入
+  LM Studio 的 `google/gemma-4-e4b`；生产 `AcpQwenAdapter` 在隔离临时目录建立
+  session `031bddd9-5dbc-43eb-ac82-09b0abe8668b`，先产生
+  `delivery_committed`，再流式返回 `QWEN_ACP_OK.`，以 `end_turn` 正常结束，
+  `aclose()` 后无 Qwen ACP 子进程残留。独立 `--approval-mode plan` 写入探针建立
+  session `a6b3b519-ac4c-49e2-9a48-d06c79deaad2`，模型发起的 `WriteFile` 在执行前
+  以 failed 结束，目标文件未产生；切换 `default` 的同类探针也未写入。
+- **人工验收边界**：真实 session、模型正文与正常回收已验收；真实权限 options、
+  跨进程 `session/load` 恢复和取消时延尚未验收。默认 gate 不调用外部模型。
+- **里程碑**：M4.6。
 
 ### UC-PERM-001 权限请求与选择
 
@@ -346,7 +386,9 @@
   `opencode acp`，保持持久 session、增量 cursor、权限 UI、取消与恢复。
   OpenCode runtime 权限将未知工具、写入、命令、网络、Skill、子 agent、
   MCP 与外部目录收口为 ask；read/search/lsp/todo allow。无 TUI handler
-  仍由通用 client cancelled。
+  仍由通用 client cancelled。workflow `read_only` 使用独立 runtime policy：
+  unknown/risky deny、read/search/lsp/todo allow；profile 前后切换重建 ACP
+  进程和 fresh session，普通轮次恢复 ask。
 - **降级流程**：prepare 失败时以 `fallback:jsonl:opencode` checkpoint，
   然后运行 `opencode --pure run --format json --agent
   myagents-readonly-fallback`。环境禁用项目配置、Claude 兼容层、自动升级，
@@ -357,17 +399,24 @@
   no-replay cursor。下一轮不 load fallback 伪 id，直接新建 ACP session。
 - **验收**：生产 transport 为 `acp+jsonl`；真实 ACP v1 capability 包含
   loadSession、image、list/resume；无害 Bash 请求进入 ACP permission，默认
-  deny 后正常结束；只读 JSONL profile 无 `--auto`，写入/命令/网络工具均 deny。
+  deny 后正常结束；ACP `read_only` 的 Bash 在 runtime hard deny 后仍产出严格
+  workflow 信封，切回普通轮恢复 TUI ask；只读 JSONL profile 无 `--auto`，
+  写入/命令/网络工具均 deny。
 - **独立证据来源**：本机 OpenCode 1.18.14 CLI/capability/permission wire
   probe；OpenCode 官方 Permissions/Agents/Config 文档；
   `tests/fake_acp_server.py` 独立协议 fixture；
-  `tests/test_opencode_hybrid.py` 固定 registry、ACP policy、隔离 profile、
-  prepare-only 与 post-submit no-replay。
+  `tests/test_opencode_hybrid.py` 固定 registry、普通/只读 ACP policy、profile
+  切换进程隔离、硬拒绝后继续输出、隔离 fallback、prepare-only 与 post-submit
+  no-replay。
 - **真实验收证据**：2026-08-08 在临时目录通过生产 adapter 完成 ACP
   `end_turn`、关闭重连后的 `session/load`（同 session id，输出
   `OPENCODE_ACP_ONE` / `OPENCODE_ACP_RESUMED`）、Bash 权限默认 deny，
   以及强制 prepare 失败后的真实只读 JSONL；写入探针文件未产生，结束后
   无残留 OpenCode 进程。ACP export 独立确认两轮 token 已持久化。
+  2026-08-09 本机 OpenCode 1.18.15 额外复现 workflow 只读轮次因 Bash ask
+  被 cancelled 而 5/5 零正文；改为 runtime hard deny 后，同形状探针 5/5
+  产出合法 verify/pass，并完成 command
+  `a9d65665-d712-4f7e-932b-8cb6ad80e576` 的真实多角色 workflow。
 - **人工验收边界**：真实模型、session/load、权限 options 与 fallback 工具集
   已完成本版本受限复验；真实 cancel 时延、长会话 compaction，以及 OpenCode
   升级后的 `OPENCODE_PERMISSION` seam 仍需单独复验。默认 gate 不调用外部 agent。

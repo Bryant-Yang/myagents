@@ -53,6 +53,18 @@ no-replay、图片与 prepare-only fallback seam。Orchestrator 不出现 OpenCo
 `session/request_permission`，最后仍由 `AcpClient(permission="deny")` 或 TUI
 选择决定。无 TUI handler、handler 异常、非法 optionId 一律 cancelled。
 
+workflow 的 `read_only` 是独立 execution profile：runtime 改为 `*=deny`，只对
+`read` / `glob` / `grep` / `list` / `lsp` / `todowrite` allow。不能沿用普通
+轮次的 ask 再由 ACP client 回 cancelled；OpenCode 1.18.14–1.18.15 实测在
+Bash 权限被 cancelled 后会直接 `end_turn` 且不产生正文，导致 verifier 无法
+提交结果信封。
+runtime hard deny 会把工具失败反馈给模型，使其继续使用安全读取并产出报告。
+
+普通与 `read_only` profile 互相切换时必须关闭 ACP 进程、丢弃 resume id 并
+`session/new`；不能在同一进程/session 中切换环境，也不能继承普通轮次可能获得的
+`allow_always`。进入普通轮次后恢复 unknown/risky=ask，不能把只读 deny 策略
+扩散到用户可交互授权的任务。
+
 `OPENCODE_PERMISSION` 是本机 1.18.14 已验证的 runtime seam，CLI 升级后必须
 通过 `opencode debug agent build` 和真实 ACP 权限探针复验，不能只看帮助文本。
 
@@ -98,8 +110,10 @@ bootstrap。
    list/resume capability。
 2. 真实无害 Bash probe 产生 `session/request_permission`，options 为
    allow_once / allow_always / reject_once；默认 deny 后以 end_turn 结束。
-3. contract test 证明生产注册为 `AcpOpenCodeAdapter`，ACP 权限 policy 是
-   unknown/risky=ask、read/search=allow。
+3. contract test 证明生产注册为 `AcpOpenCodeAdapter`；普通 ACP policy 是
+   unknown/risky=ask、read/search=allow；`read_only` 是 unknown/risky=deny、
+   read/search=allow，硬拒绝工具后仍输出 workflow 信封，切回普通模式重建进程
+   并恢复 ask。
 4. JSONL contract 证明 `--pure`、隔离环境和专用 agent 生效；profile 精确为
    deny-all + read/glob/grep/list allow，且命令不含 `--auto`。
 5. fake initialize 失败只调用一次 fallback，公开 prepare-only info；
@@ -108,6 +122,9 @@ bootstrap。
    放宽；清理探针后全量 Harness 通过。
 7. 真实临时目录探针覆盖 ACP 正常回复、session/load、权限 deny 和受限 JSONL；
    结束后没有残留 `opencode acp` 进程。真实模型不进入默认 gate。
+8. OpenCode 1.18.15 workflow-shaped 只读探针连续 5/5 在 Bash runtime deny 后
+   改用安全读取并返回合法 verify/pass 信封；完整 Kimi → Codex → OpenCode →
+   host 临时仓库 workflow 通过。该真实探针仍不进入默认 gate。
 
 ## 4. 后果
 
@@ -116,5 +133,7 @@ bootstrap。
 - OpenCode 不再每轮启动 JSONL server；正常多轮复用 ACP 进程/session。
 - OpenCode 默认 permissive 权限被生产 adapter 收口，但用户仍可在 TUI 对单次
   请求选择 allow_once / allow_always。
+- OpenCode workflow 复核不会再因权限 cancelled 静默结束；代价是 execution
+  profile 切换会建立 fresh ACP 进程/session，不保留跨 profile 原生上下文。
 - fallback 能力有意只读；需要写入时返回阻塞说明，等待 ACP 恢复后继续。
 - OpenCode CLI 的权限和配置环境变量可能漂移，升级后需重跑真实 probe。

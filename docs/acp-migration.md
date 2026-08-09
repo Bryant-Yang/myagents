@@ -1,10 +1,11 @@
 # ACP 迁移设计（最小方案）
 
-状态：**Phase 4.5、Phase 5.1 与 Phase 5 已完成**。
+状态：**Phase 4.5、Phase 4.6、Phase 5.1 与 Phase 5 已完成**。
 `AgentAdapter` 是 TUI 与不同 coding agent 的
 统一行为契约；wire protocol 按厂商能力选择：`acp/` 是通用 ACP runtime，
 Kimi/OpenCode 分别走 `kimi acp` / `opencode acp`，只在 ACP prepare
-失败前使用各自受限 JSONL fallback；Codex 走官方 `codex app-server`，旧
+失败前使用各自受限 JSONL fallback；Qwen Code 走 `qwen --acp` 且保持
+ACP-only；Codex 走官方 `codex app-server`，旧
 Codex adapter 保留 JSONL fallback。app-server 不是 ACP，各协议只在
 adapter 层统一。
 Phase 2.5 落地了共享 history 持久化、ACP
@@ -60,9 +61,10 @@ orchestrator.py（AgentAdapter 接口不变；AGENT_SPECS 注册表）
    │    kimi     → acp+jsonl → AcpKimiAdapter
    │                         └→ KimiAdapter（prepare-only，只读 profile）
    │    codex    → app-server → CodexAppServerAdapter（原生 thread/turn）
+   │                         └→ CodexAdapter（安全 JSONL fallback）
    │    opencode → acp+jsonl → AcpOpenCodeAdapter
    │                         └→ OpenCodeAdapter（prepare-only，隔离只读配置）
-   │                              CodexAdapter 作为安全 JSONL fallback
+   │    qwen     → acp       → AcpQwenAdapter（default/plan，无自动降级）
    │
    ├─ acp/adapter.py  AcpAdapter（通用：name + cmd 即一个 ACP agent；
    │     │            stateful_session = True 声明"会话在 agent 侧保持"）
@@ -81,7 +83,10 @@ orchestrator.py（AgentAdapter 接口不变；AGENT_SPECS 注册表）
 `set_permission_handler`、`aclose`），不散落 `if name == "..."`。
 Kimi/OpenCode hybrid 的完整时机、权限与 checkpoint 契约见
 [ADR-0006](adr/0006-kimi-hybrid-transport-policy.md)与
-[ADR-0007](adr/0007-opencode-hybrid-transport-policy.md)。
+[ADR-0007](adr/0007-opencode-hybrid-transport-policy.md)。Qwen Code 的
+`stream-json` 输入仍在上游文档中标记为未完成，且项目尚无独立只读 fallback
+profile 的安全证据，因此生产只注册 ACP 路径，不做跨协议自动重放；普通 ACP
+轮强制 `--approval-mode default`，workflow 只读轮强制 `plan`。
 
 ## 铁律：会话唯一持有者
 
@@ -180,7 +185,12 @@ client 声明 `fs/terminal` 能力为 false（不代理文件/终端）。
 agent inactivity timeout；权限结果发回后重新开始普通静默计时。OpenCode ACP
 还通过 runtime permission policy 把默认偏宽的 unknown、edit、bash、task、
 skill、network、MCP 与 external-directory 收口为 ask；read/search/lsp/todo
-allow。等待仍可取消——TUI 退出时所有挂起的权限 Future 按 cancelled 收尾
+allow。其 workflow `read_only` profile 改为 unknown/risky=deny、只允许安全
+读取；profile 切换关闭进程、禁止 load 并建立 fresh session，切回普通轮次恢复
+ask。这样既隔离 `allow_always`，也避免 OpenCode 在 ask 被 cancelled 后直接
+`end_turn` 且零正文。Qwen 普通 ACP 轮强制 approval `default`，避免继承 native
+TUI 的 auto/yolo；只读轮用上游 plan mode 在 runtime 层阻断写入/有副作用命令，
+profile 前后同样重建进程与 fresh session。等待仍可取消——TUI 退出时所有挂起的权限 Future 按 cancelled 收尾
 （`on_unmount` →
 `_cancel_pending_permissions` → `orch.aclose()`，顺序不能反：aclose
 等的锁可能被等权限的 prompt 持有），不留挂起 Future 或 `kimi acp`
@@ -209,7 +219,7 @@ prompt/session 初始化共用 adapter 的同一把锁，不竞态杀进程。
 ## 可见状态（Phase 2 新增）
 
 - TUI 启动行显示每个 agent 的传输协议：`@kimi(ACP+JSONL) @opencode(ACP+JSONL)
-  @codex(APP-SERVER)`。
+  @qwen(ACP) @codex(APP-SERVER)`。
 - ACP session id 建立后通过 info 事件展示一次（每次建立一次，不刷屏）。
 - `tool_call` 保存脱敏后的 title/command；后续 `tool_call_update` 按
   `toolCallId` 继承上下文，只在 title/status/command/kind 的可见指纹变化时
@@ -245,7 +255,9 @@ execution mode：review/verify 映射为 `read_only`，implement/repair 映射�
 `workspace_write`。具体 sandbox、权限和 fallback 行为仍由各 adapter 在现有
 seam 内实现，Orchestrator 不按 agent 名分支。ACP 从普通轮次进入 `read_only`
 时关闭旧进程、禁止 load 旧 session 并建立隔离 session，避免继承历史
-`allow_always`；Kimi/OpenCode 的只读 JSONL fallback 不能承担写阶段，触发时
+`allow_always`；OpenCode 同时切换到 runtime deny-all + 安全读取白名单，退出
+只读 mode 时再重建并恢复普通 ask；Qwen 切换到 `plan`，退出时恢复强制
+`default`。Kimi/OpenCode 的只读 JSONL fallback 不能承担写阶段，触发时
 workflow 必须 blocked。
 
 运行中 steering 只在下一阶段边界注入尚未开始的 assignment，不并发写当前
@@ -314,7 +326,9 @@ A2A 不在当前阶段；Streamable HTTP、远程认证同样不在 M3（M3 是�
 - **M5 真实 E2E 已通过**（2026-08-09）：
   `scripts/e2e-m5-real.py` 在临时 Git repo 由 Kimi 只读 review/verify、Codex
   单 writer implement、host final；HEAD/branch/index 不变，最终 3 个 unittest
-  通过。真实模型探针不进入默认快速 gate。
+  通过；使用 `--verifier opencode` 的 Kimi review、Codex implement、OpenCode
+  verify、host final 变体同样通过。OpenCode 1.18.15 同形状只读回复在 runtime
+  hard deny 后连续 5/5 产出合法信封。真实模型探针不进入默认快速 gate。
 - **仍未覆盖**：cancel 响应时延在真实二进制上的表现（10s 有限超时
   契约只经 fake server 验证）；长会话的内存/token 增长与 compaction
   后的 restore 行为。
@@ -324,8 +338,9 @@ A2A 不在当前阶段；Streamable HTTP、远程认证同样不在 M3（M3 是�
   TUI，因此 Kimi 自动 fallback 只提供 Read/Grep/Glob，OpenCode 只提供
   read/glob/grep/list；需要变更时应说明阻塞，不得伪装完成。
 - **OpenCode 权限默认值**：上游默认允许大部分工具，生产 ACP 必须保留
-  runtime ask policy；CLI 升级后用 `opencode debug agent build` 和真实
-  permission wire probe 复验规则顺序。
+  普通轮次 runtime ask policy，workflow 只读轮次必须保留 hard deny + 安全读取
+  白名单；CLI 升级后用 `opencode debug agent build` 和真实 permission/workflow
+  wire probe 复验规则顺序与零正文行为。
 - **断线**：agent 进程 EOF 时所有 pending request 立即失败（带 stderr 尾段），
   由编排器的 `_run_one` 兜底成 error 事件。
 - **图片能力漂移**：Kimi 不再声明 `promptCapabilities.image` 时退化为文本附件

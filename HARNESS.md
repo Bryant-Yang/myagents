@@ -20,7 +20,7 @@
 | 原则 | 项目解释 |
 | --- | --- |
 | 一个编排中心 | agent 不直接互调，消息与 history 统一经过 Orchestrator。 |
-| 原生长连接优先，JSONL fallback | 有官方可靠长连接时优先使用；Kimi/OpenCode 走 ACP，Codex 走 app-server，JSONL 只兼容回退。 |
+| 原生长连接优先，JSONL fallback | 有官方可靠长连接时优先使用；Kimi/OpenCode/Qwen Code 走 ACP，Codex 走 app-server；Qwen 在只读降级契约获证前保持 ACP-only。 |
 | 协议通用、差异下沉 | 通用 runtime 不按 agent 名分支，具体差异进入 adapter/spec。 |
 | 权限 fail-closed | 无处理器、异常或畸形选择一律拒绝；auto 必须显式授权。 |
 | 生命周期负责到底 | 启动的进程组必须能 cancel、close 并被独立验证已回收。 |
@@ -34,7 +34,7 @@
 | TUI | Textual `>=1.0` |
 | ACP transport | NDJSON JSON-RPC 2.0 over stdio，protocolVersion 1 |
 | Codex transport | app-server JSONL over stdio（JSON-RPC-like，无 `jsonrpc` header） |
-| JSONL transport | 各 agent CLI 无头模式；Kimi/OpenCode 自动降级只允许各自内置只读 profile |
+| JSONL transport | 各 agent CLI 无头模式；Kimi/OpenCode 自动降级只允许各自内置只读 profile；Qwen 不自动降级 |
 | 持久化 | RoomStore：timeline.jsonl（对话）+ events.jsonl（执行）+ state.json（seq/cursor/session）+ owner.lock |
 | 外部入口 | control/：CommandBus FIFO + 私有 Unix 控制 socket；myagents_mcp.py stdio MCP bridge（`mcp>=1.27,<2`） |
 | 测试 | 直接运行的 Python test scripts + Textual pilot + fake ACP server + 官方 MCP SDK stdio client |
@@ -110,8 +110,12 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 
 ### 4.2 权限
 
-- `AcpClient`、`AcpAdapter`、`AcpKimiAdapter`、`AcpOpenCodeAdapter`
-  默认权限都是 `deny`。OpenCode ACP 还必须把未知及有副作用工具收口为 ask。
+- `AcpClient`、`AcpAdapter`、`AcpKimiAdapter`、`AcpOpenCodeAdapter`、`AcpQwenAdapter`
+  默认权限都是 `deny`。OpenCode ACP 普通轮次把未知及有副作用工具收口为 ask；
+  `read_only` 轮次改用 runtime deny-all + 安全读取白名单，并在 profile 切换时
+  重建进程/session，避免取消权限导致零正文或跨 mode 继承授权。Qwen ACP
+  普通轮强制 `--approval-mode default`，`read_only` 强制 `plan`；不能继承用户
+  native TUI 的 auto/yolo mode，也不能只依赖 ACP permission cancelled。
 - TUI 异步决定权限并显示来源 agent。
 - `session/request_permission` 到权限结果发回前属于人工等待，不计入 ACP
   inactivity timeout；read loop、取消和关闭仍保持可响应。
@@ -254,6 +258,7 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 | ACP 协议与取消 | `tests/test_acp.py` + `tests/fake_acp_server.py` |
 | Kimi hybrid transport | `tests/test_kimi_hybrid.py` + `tests/fake_acp_server.py` |
 | OpenCode hybrid transport | `tests/test_opencode_hybrid.py` + `tests/fake_acp_server.py` |
+| Qwen Code ACP-only 注册 | `tests/test_phase2.py` + `tests/fake_acp_server.py` |
 | TUI/增量/权限/回收 | `tests/test_phase2.py` |
 | RoomStore 持久化 | `tests/test_storage.py` |
 | M2.5 恢复/lease/时序 | `tests/test_m25.py` |
@@ -262,9 +267,9 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 | M3 MCP stdio | `tests/test_m3_mcp.py`（官方 SDK client） |
 | M4 Codex app-server | `tests/test_codex_app_server.py` + `tests/fake_codex_app_server.py` |
 | M4.3 剪贴板图片 | `tests/test_clipboard_image.py` + macOS 人工截图验收 |
-| 真实协议边界 | `docs/SPEC.md` 登记的 Kimi/OpenCode ACP + Textual/受限临时目录 E2E |
+| 真实协议边界 | `docs/SPEC.md` 登记的 Kimi/OpenCode ACP + Textual/受限临时目录 E2E；Qwen 上游源码与本机启动证据 |
 
-普通测试禁止调用真实 Kimi/Codex/OpenCode。真实 agent 验收必须由用户明确授权，
+普通测试禁止调用真实 Kimi/Codex/OpenCode/Qwen。真实 agent 验收必须由用户明确授权，
 在临时目录运行，并在结束后检查没有残留进程。
 
 ## 6. 质量门禁
@@ -305,6 +310,13 @@ branch protection / required checks 需要单独配置后才能宣称生效。
   `scripts/e2e-m3-real.py` 验收；它调用真实模型，不进默认快速 gate；
 - OpenCode 1.18.14 的 ACP 正常回合、重连 `session/load`、Bash 权限 deny、
   prepare 失败只读 JSONL 与无残留进程已于 2026-08-08 受限验收；
+- OpenCode 1.18.15 的 workflow 只读 runtime deny 已于 2026-08-09 完成 5/5
+  同形状回复与 Kimi → Codex → OpenCode → host 真实临时仓库验收；
+- Qwen Code 0.21.7 已于 2026-08-09 通过生产 adapter 建立真实 ACP session，
+  经本机 LM Studio `google/gemma-4-e4b` 返回流式正文并 `end_turn`，关闭后无
+  Qwen ACP 子进程残留；独立 plan profile 写入探针在 runtime 层失败且未产生
+  文件，default profile 同类探针也未写入；真实权限 options、跨进程恢复与取消
+  时延仍待人工验收；
 - `/discuss` 已于 2026-08-08 在同一持久房间恢复原 Kimi/OpenCode session，
   经 MCP 完成两轮交叉讨论和 Codex host 仲裁；单 user、连续 timeline、跨轮
   引用、无工具事件及退出回收均已核对。真实模型不进默认 gate；
@@ -319,7 +331,7 @@ branch protection / required checks 需要单独配置后才能宣称生效。
 | R1 | 生产构造不得显式使用 `permission="auto"`，权限默认必须为 `deny` | `bash scripts/check-redlines.sh` 的 AST permission gate |
 | R2 | 通用 orchestration/ACP 层不得按具体 agent 名做条件分支 | `bash scripts/check-redlines.sh` 的 AST name-branch gate |
 | R3 | UI、orchestrator、host 不得直接启动 shell/子进程 | `bash scripts/check-redlines.sh` 的 AST process-boundary gate |
-| R4 | Kimi/OpenCode 生产必须 ACP-first；风险工具 ask；JSONL 仅 prepare-only 且只读 | `bash scripts/check-redlines.sh` 的 registry/policy/profile gate |
+| R4 | Kimi/OpenCode 必须受限 ACP-first；Qwen 必须 ACP-only 且固定 default/plan runtime profile；OpenCode 普通轮风险工具 ask、只读轮 runtime deny；JSONL 仅获证的 prepare-only 只读降级 | `bash scripts/check-redlines.sh` 的 registry/policy/profile gate |
 | R5 | `/discuss` 必须保持 2–3 人、1–3 轮、终局主持且不得递归 dispatch | `bash scripts/check-redlines.sh` 的 discussion bounds/AST gate |
 | R6 | `/workflow` 必须保持固定角色/阶段、单 writer、最多一次 repair/reverify、read-only 复核和有界 steering | `bash scripts/check-redlines.sh` 的 workflow bounds/mode/AST gate |
 

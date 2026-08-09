@@ -32,6 +32,7 @@ from typing import Callable
 from acp.adapter import (
     AcpKimiAdapter,
     AcpOpenCodeAdapter,
+    AcpQwenAdapter,
     AgentPermissionHandler,
 )
 from adapters.base import (
@@ -116,10 +117,12 @@ class DispatchOutcome:
 # Kimi 主路径是 ACP（命令 ["kimi", "acp"]），只允许在
 # ACP prepare 失败前使用只读 JSONL fallback；OpenCode 使用同一 ACP seam，
 # 但由专用 adapter 注入 ask-by-default 权限策略和 OpenCode 只读配置；
-# Codex 使用官方 app-server 长连接；旧 Codex JSONL adapter 保留为 fallback。
+# Qwen Code 使用 ACP-only；Codex 使用官方 app-server 长连接；旧 Codex JSONL
+# adapter 保留为 fallback。
 AGENT_SPECS: tuple[AgentSpec, ...] = (
     AgentSpec("kimi", "acp+jsonl", AcpKimiAdapter),
     AgentSpec("opencode", "acp+jsonl", AcpOpenCodeAdapter),
+    AgentSpec("qwen", "acp", AcpQwenAdapter),
     AgentSpec("codex", "app-server", CodexAppServerAdapter),
 )
 AGENTS: dict[str, AgentSpec] = {spec.name: spec for spec in AGENT_SPECS}

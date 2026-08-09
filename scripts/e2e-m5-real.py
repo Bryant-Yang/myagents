@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """授权手工探针：在临时 Git repo 运行真实 M5 多角色 workflow。
 
-不进入默认 Harness；会调用本机真实 Kimi/Codex，并只允许 writer 在
-自动创建的临时 repo 中修改文件。退出时整个临时目录自动删除。
+不进入默认 Harness；会调用本机真实 Kimi/Codex 和所选 verifier，并只允许
+writer 在自动创建的临时 repo 中修改文件。退出时整个临时目录自动删除。
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ def prepare_repo(root: Path) -> str:
     return run_checked(root, "git", "rev-parse", "HEAD")
 
 
-async def exercise(root: Path) -> dict[str, object]:
+async def exercise(root: Path, verifier: str) -> dict[str, object]:
     command_id = str(uuid.uuid4())
     events: list[dict[str, object]] = []
     orch = Orchestrator(str(root), persistent=False)
@@ -74,6 +74,7 @@ async def exercise(root: Path) -> dict[str, object]:
 
     command = (
         "/workflow --reviewer @kimi --implementer @codex "
+        f"--verifier @{verifier} "
         "-- 在 calc.py 新增 subtract(a: int, b: int) -> int，并在 test_calc.py "
         "新增至少两个覆盖正数和负数的 unittest；运行完整 unittest。"
     )
@@ -108,8 +109,12 @@ def main() -> None:
     parser.add_argument(
         "--keep", action="store_true",
         help="成功后保留临时 repo 并打印路径")
+    parser.add_argument(
+        "--verifier", choices=("kimi", "opencode"), default="kimi",
+        help="真实只读 verifier（默认 kimi）")
     args = parser.parse_args()
-    missing = [name for name in ("kimi", "codex")
+    required = tuple(dict.fromkeys(("kimi", "codex", args.verifier)))
+    missing = [name for name in required
                if shutil.which(name) is None]
     if missing:
         raise SystemExit(f"缺少真实 agent CLI：{', '.join(missing)}")
@@ -117,7 +122,7 @@ def main() -> None:
     root = Path(tempfile.mkdtemp(prefix="myagents-m5-"))
     try:
         baseline = prepare_repo(root)
-        evidence = asyncio.run(exercise(root))
+        evidence = asyncio.run(exercise(root, args.verifier))
         failures = evidence["failures"]
         if failures:
             print(json.dumps(evidence, ensure_ascii=False, indent=2))

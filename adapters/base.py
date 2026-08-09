@@ -1,11 +1,11 @@
-"""Adapter 基类：把各家 agent CLI 的无头模式统一成一个接口。
+"""Adapter 基类：把各家 agent transport 统一成一个接口。
 
 关键概念（学习要点）：
-- **Adapter 模式**：kimi / opencode / claude / codex 各自的命令行参数和
+- **Adapter 模式**：kimi / opencode / qwen / claude / codex 各自的命令行参数和
   输出格式都不同，这里定义统一契约，上层 orchestrator 不需要关心差异。
 - **流式事件（streaming events）**：agent 干活是长时间的（几十秒到几分钟），
-  不能等它跑完才显示。各家 CLI 都以 JSONL（每行一个 JSON）输出事件，
-  我们逐行解析、逐条吐给 UI。
+  不能等它跑完才显示。具体 transport 把 ACP 或 JSONL 事件统一成
+  `AgentEvent`，逐条吐给 UI。
 - **会话恢复（session resume）**：每次无头调用默认是全新会话。CLI 会返回
   session id，下次调用带上它可以延续上下文。MVP 默认不用（用 transcript
   转发代替），但接口里留好了位置。

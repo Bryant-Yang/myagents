@@ -35,7 +35,7 @@ import contextlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Awaitable, Callable, Mapping
+from typing import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 
 from adapters.base import (
     AgentAdapter,
@@ -84,6 +84,31 @@ OPENCODE_ACP_PERMISSION_POLICY = {
     "external_directory": "ask",
 }
 
+# read_only 阶段不能把 ask 简单回成 cancelled：OpenCode 1.18.14–1.18.15
+# 在工具权限被取消后会直接 end_turn 且不产生正文。把有副作用工具在 runtime
+# 层硬拒绝，模型会收到失败的工具结果并继续用只读工具完成报告；未知工具仍
+# fail-closed。
+OPENCODE_ACP_READ_ONLY_PERMISSION_POLICY = {
+    "*": "deny",
+    "read": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "lsp": "allow",
+    "todowrite": "allow",
+}
+
+# Qwen 会从用户配置继承 approval mode；若 native TUI 正处于 auto/yolo，
+# ACP runtime 可能直接执行工具而不发 requestPermission。生产普通轮强制 default，
+# 让写入/命令回到 ACP 权限仲裁；workflow 只读轮强制 plan，在 runtime 层阻断
+# 文件修改和有副作用命令，不能只依赖 client cancelled。
+QWEN_ACP_DEFAULT_CMD = (
+    "qwen", "--acp", "--approval-mode", "default",
+)
+QWEN_ACP_READ_ONLY_CMD = (
+    "qwen", "--acp", "--approval-mode", "plan",
+)
+
 # 通用 agent-aware 权限决策器：async (agent_name, params) -> outcome。
 # orchestrator 用它把 TUI 决策注入所有 ACP adapter（通用 runtime 里弹窗必须
 # 知道权限来自哪个 agent）；名字在 adapter 内绑定，client 层仍只见
@@ -119,7 +144,7 @@ class AcpAdapter:
     def __init__(
         self,
         name: str,
-        cmd: list[str],
+        cmd: Sequence[str],
         permission: str = "deny",  # 默认拒绝；auto 必须显式 opt-in
         cancel_timeout: float = _CANCEL_TIMEOUT,
         inactivity_timeout: float = _INACTIVITY_TIMEOUT,
@@ -127,6 +152,12 @@ class AcpAdapter:
         permission_handler: PermissionHandler | None = None,
         fallback_adapter: AgentAdapter | None = None,
         env_overrides: Mapping[str, str] | None = None,
+        execution_env_overrides: Mapping[
+            ExecutionMode, Mapping[str, str]
+        ] | None = None,
+        execution_cmd_overrides: Mapping[
+            ExecutionMode, Sequence[str]
+        ] | None = None,
     ) -> None:
         if cancel_timeout <= 0:
             raise ValueError("cancel_timeout 必须大于 0")
@@ -136,18 +167,29 @@ class AcpAdapter:
             raise ValueError("tool_inactivity_timeout 必须大于 0")
         self.name = name
         self.session_id: str | None = None
-        self._cmd = cmd
+        self._cmd = list(cmd)
         self._permission = permission
         self._permission_handler = permission_handler
         self._fallback = fallback_adapter
         self._env_overrides = dict(env_overrides or {})
+        self._execution_env_overrides = {
+            mode: dict(overrides)
+            for mode, overrides in (execution_env_overrides or {}).items()
+        }
+        self._execution_cmd_overrides = {
+            mode: list(command)
+            for mode, command in (execution_cmd_overrides or {}).items()
+        }
+        self._active_env_overrides = self._env_for_mode(
+            ExecutionMode.DEFAULT)
+        self._active_cmd = self._cmd_for_mode(ExecutionMode.DEFAULT)
         self._attachment_root: Path | None = None
         self._cancel_timeout = cancel_timeout
         self._inactivity_timeout = inactivity_timeout
         self._tool_inactivity_timeout = tool_inactivity_timeout
-        self._client = AcpClient(cmd, permission=permission,
+        self._client = AcpClient(self._active_cmd, permission=permission,
                                  permission_handler=permission_handler,
-                                 env_overrides=self._env_overrides)
+                                 env_overrides=self._active_env_overrides)
         self._started = False
         # 当前活跃 session 已经运行过的最近 execution mode。read_only 只能
         # 复用同为 read_only 的 session；普通轮次可能持有 allow_always，
@@ -170,6 +212,18 @@ class AcpAdapter:
     def set_attachment_root(self, root: Path | None) -> None:
         """限制可作为 ACP image block 发送的本地附件目录。"""
         self._attachment_root = None if root is None else Path(root).absolute()
+
+    def _env_for_mode(self, execution_mode: ExecutionMode) -> dict[str, str]:
+        """合并进程级基础环境与 execution-mode 专用收口。"""
+        return {
+            **self._env_overrides,
+            **self._execution_env_overrides.get(execution_mode, {}),
+        }
+
+    def _cmd_for_mode(self, execution_mode: ExecutionMode) -> list[str]:
+        """选择 execution mode 对应的进程级命令。"""
+        return list(self._execution_cmd_overrides.get(
+            execution_mode, self._cmd))
 
     async def _prepare_locked(self, workdir: str,
                               resume_session_id: str | None = None
@@ -225,13 +279,21 @@ class AcpAdapter:
             session_id=self.session_id, restored=restored,
             load_failed=load_failed, fresh=True)
 
-    async def _reset(self) -> None:
+    async def _reset(
+        self,
+        env_overrides: Mapping[str, str] | None = None,
+        cmd: Sequence[str] | None = None,
+    ) -> None:
         """关闭当前连接并标记必须重建（下轮 stream 重新 start + session/new）。"""
         with contextlib.suppress(Exception):
             await self._client.close()
-        self._client = AcpClient(self._cmd, permission=self._permission,
+        if env_overrides is not None:
+            self._active_env_overrides = dict(env_overrides)
+        if cmd is not None:
+            self._active_cmd = list(cmd)
+        self._client = AcpClient(self._active_cmd, permission=self._permission,
                                  permission_handler=self._permission_handler,
-                                 env_overrides=self._env_overrides)
+                                 env_overrides=self._active_env_overrides)
         self._started = False
         self.session_id = None
         self._session_execution_mode = None
@@ -278,7 +340,17 @@ class AcpAdapter:
         复用旧活跃 session（非 fresh）时的 factory 异常不销毁现有 session。
         """
         async with self._lock:
-            if (execution_mode is ExecutionMode.READ_ONLY
+            target_env = self._env_for_mode(execution_mode)
+            target_cmd = self._cmd_for_mode(execution_mode)
+            if (target_env != self._active_env_overrides
+                    or target_cmd != self._active_cmd):
+                # 环境与 CLI profile 都属于 ACP 子进程，不可能在活进程内
+                # 安全切换。
+                # profile 变化时重建进程并禁止 load 旧 session，避免权限缓存
+                # 或上一 mode 的 runtime policy 穿透本轮。
+                await self._reset(target_env, target_cmd)
+                resume_session_id = None
+            elif (execution_mode is ExecutionMode.READ_ONLY
                     and self._session_execution_mode
                     is not ExecutionMode.READ_ONLY):
                 # 非只读 session 可能在先前轮次获得 allow_always/session 级
@@ -652,6 +724,7 @@ class AcpOpenCodeAdapter(AcpAdapter):
         *,
         fallback_jsonl: bool = True,
         fallback_adapter: AgentAdapter | None = None,
+        cmd: list[str] | None = None,
     ) -> None:
         if fallback_jsonl and fallback_adapter is None:
             from adapters.opencode_adapter import OpenCodeAdapter
@@ -659,7 +732,7 @@ class AcpOpenCodeAdapter(AcpAdapter):
             fallback_adapter = OpenCodeAdapter.readonly_fallback()
         super().__init__(
             "opencode",
-            ["opencode", "acp"],
+            cmd or ["opencode", "acp"],
             permission=permission,
             fallback_adapter=(fallback_adapter if fallback_jsonl else None),
             env_overrides={
@@ -668,5 +741,28 @@ class AcpOpenCodeAdapter(AcpAdapter):
                     separators=(",", ":"),
                     sort_keys=True,
                 ),
+            },
+            execution_env_overrides={
+                ExecutionMode.READ_ONLY: {
+                    "OPENCODE_PERMISSION": json.dumps(
+                        OPENCODE_ACP_READ_ONLY_PERMISSION_POLICY,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                },
+            },
+        )
+
+
+class AcpQwenAdapter(AcpAdapter):
+    """Qwen Code 的 ACP-only 生产 adapter。"""
+
+    def __init__(self, permission: str = "deny") -> None:
+        super().__init__(
+            "qwen",
+            QWEN_ACP_DEFAULT_CMD,
+            permission=permission,
+            execution_cmd_overrides={
+                ExecutionMode.READ_ONLY: QWEN_ACP_READ_ONLY_CMD,
             },
         )

@@ -1,7 +1,7 @@
 """Phase 2 里程碑测试：通用 ACP runtime 接入统一 TUI。
 
 覆盖：
-- AgentSpec 注册：kimi/opencode=ACP+JSONL、codex=app-server
+- AgentSpec 注册：kimi/opencode=ACP+JSONL、qwen=ACP、codex=app-server
 - ACP 增量上下文：不重复完整 transcript、跳过自己回复、失败不丢增量
 - 权限：默认拒绝 / TUI 选择 / 等待可取消
 - 生命周期：TUI 退出统一 aclose，fake ACP 无残留
@@ -19,9 +19,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from acp.adapter import AcpAdapter, AcpOpenCodeAdapter
+from acp.adapter import (
+    QWEN_ACP_DEFAULT_CMD,
+    QWEN_ACP_READ_ONLY_CMD,
+    AcpAdapter,
+    AcpOpenCodeAdapter,
+    AcpQwenAdapter,
+)
 from acp.client import AcpClient, AcpError
-from adapters.base import AgentEvent
+from adapters.base import AgentEvent, ExecutionMode
 from adapters.kimi_adapter import KimiAdapter
 from adapters.opencode_adapter import OpenCodeAdapter
 from codex_app_server.adapter import CodexAppServerAdapter
@@ -102,7 +108,7 @@ class FakeHost(FakeJsonl):
 def make_orch(**adapters) -> Orchestrator:
     """真实 Orchestrator + 假 adapter；未指定的工人用 FakeJsonl 占位。"""
     orch = Orchestrator(workdir="/tmp", persistent=False)
-    for name in ("kimi", "opencode", "codex"):
+    for name in ("kimi", "opencode", "qwen", "codex"):
         orch.adapters[name] = adapters.get(name, FakeJsonl(name))
     orch.host = FakeHost()
     orch.adapters["host"] = orch.host
@@ -115,6 +121,7 @@ def test_agent_specs() -> None:
     assert AGENTS["kimi"].transport == "acp+jsonl"
     assert AGENTS["codex"].transport == "app-server"
     assert AGENTS["opencode"].transport == "acp+jsonl"
+    assert AGENTS["qwen"].transport == "acp"
 
     orch = Orchestrator("/tmp", persistent=False)
     kimi = orch.adapters["kimi"]
@@ -125,6 +132,13 @@ def test_agent_specs() -> None:
     opencode = orch.adapters["opencode"]
     assert isinstance(opencode, AcpOpenCodeAdapter)
     assert opencode._cmd == ["opencode", "acp"]
+    qwen = orch.adapters["qwen"]
+    assert isinstance(qwen, AcpQwenAdapter)
+    assert qwen._cmd == list(QWEN_ACP_DEFAULT_CMD)
+    assert qwen._active_cmd == list(QWEN_ACP_DEFAULT_CMD)
+    assert qwen._execution_cmd_overrides[ExecutionMode.READ_ONLY] == list(
+        QWEN_ACP_READ_ONLY_CMD)
+    assert qwen._fallback is None
     assert getattr(orch.adapters["codex"], "stateful_session", False) is True
     assert orch.adapters["codex"].ephemeral_thread is False
     assert isinstance(orch.host.adapter, CodexAppServerAdapter)
@@ -132,7 +146,7 @@ def test_agent_specs() -> None:
     assert orch.host.adapter._fallback.ephemeral is True
     assert isinstance(kimi._fallback, KimiAdapter)
     assert isinstance(opencode._fallback, OpenCodeAdapter)
-    print("ok  AgentSpec 注册（kimi/opencode=ACP+JSONL，"
+    print("ok  AgentSpec 注册（kimi/opencode=ACP+JSONL，qwen=ACP，"
           "codex=app-server）")
 
 
@@ -427,6 +441,7 @@ def test_tui_status_and_shutdown() -> None:
             assert "kimi(ACP+JSONL)" in lines
             assert "codex(APP-SERVER)" in lines
             assert "opencode(ACP+JSONL)" in lines
+            assert "qwen(ACP)" in lines
             # 跑一轮，让 kimi acp 进程真的起来；session id 应展示一次
             box = app.query_one(Input)
             box.value = "@kimi fast round"

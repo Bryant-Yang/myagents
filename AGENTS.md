@@ -38,11 +38,15 @@ hub-and-spoke 方式维护统一时间线，以 ACP 作为有状态 coding agent
   `AgentSpec` 或具体 adapter。
 - **R3 进程只能由 transport 层启动**：`main.py`、`orchestrator.py`、
   `host.py` 不得直接创建 shell/子进程。
-- **R4 Kimi/OpenCode 生产路径保持 ACP-first**：生产注册必须分别由
+- **R4 ACP worker 的生产路径保持受约束**：Kimi/OpenCode 生产注册必须分别由
   `AcpKimiAdapter` / `AcpOpenCodeAdapter` 构造；JSONL 只能作 ACP
   prepare 失败前的只读 fallback，并使用各自项目内置工具白名单。
   禁止直接注册旧 JSONL adapter、放宽写入/命令工具或在 prompt
-  提交后跨协议重放；OpenCode 未知及有副作用工具必须进入 ask。
+  提交后跨协议重放；OpenCode 普通轮次的未知及有副作用工具必须进入 ask，
+  workflow 只读轮次必须在 runtime 层 deny 并只放行安全读取。Qwen Code
+  必须由 `AcpQwenAdapter` 注册为 ACP-only：普通轮强制 approval `default`，
+  workflow 只读轮强制 `plan` 并在 profile 切换时重建进程/session；在只读
+  fallback 安全契约得到独立证据前不得自动降级到 headless JSONL。
 - **R5 多智能体讨论必须显式且有界**：`/discuss` 只允许 2–3 个已注册
   worker、1–3 轮和一个终局 moderator；轮次由普通代码推进，禁止 agent
   自主递归派发、动态扩员或形成无界对话。

@@ -44,7 +44,9 @@ class FakeHost(FakeAdapter):
 
 def make_orch() -> Orchestrator:
     orch = Orchestrator(workdir=".", persistent=False)
-    orch.adapters = {n: FakeAdapter(n) for n in ("kimi", "opencode", "codex")}
+    orch.adapters = {
+        n: FakeAdapter(n) for n in ("kimi", "opencode", "qwen", "codex")
+    }
     orch.host = FakeHost()
     orch.adapters["host"] = orch.host
     return orch
@@ -55,6 +57,7 @@ def test_parse_mentions() -> None:
     assert orch.parse_mentions("@kimi 看看这个") == ["kimi"]
     assert orch.parse_mentions("@kimi @opencode 比比谁快") == ["kimi", "opencode"]
     assert orch.parse_mentions("@kimi @kimi 重复只算一次") == ["kimi"]
+    assert orch.parse_mentions("@qwen 看看这个") == ["qwen"]
     assert orch.parse_mentions("@nobody 不存在") == []
     assert orch.parse_mentions("没有提到任何人") == []
     print("ok  parse_mentions")
@@ -452,6 +455,15 @@ def test_tui() -> None:
     print("ok  TUI（Textual pilot）")
 
 
+def test_qwen_has_distinct_tui_color() -> None:
+    """新 worker 不应退化为未知 speaker 的默认白色。"""
+    from main import ChatApp
+
+    rendered = ChatApp._line("qwen", "收到")
+    assert rendered.spans[0].style == "bold bright_blue"
+    print("ok  Qwen TUI speaker 颜色")
+
+
 def test_tui_coalesces_stream_chunks() -> None:
     """一条流式回复的 token/chunk 不应各占一行。"""
     from textual.widgets import Input, RichLog
@@ -660,6 +672,7 @@ if __name__ == "__main__":
     test_kill_on_cancel()
     test_bounded_stderr()
     test_tui()
+    test_qwen_has_distinct_tui_color()
     test_tui_coalesces_stream_chunks()
     test_tui_coalesces_heartbeat_and_avoids_false_success_copy()
     test_tui_updates_one_line_per_tool()

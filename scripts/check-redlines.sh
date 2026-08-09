@@ -34,7 +34,7 @@ production = [
 ]
 
 # R1: production call sites may not opt into auto permission. Function defaults
-# for the three production ACP constructors must remain deny.
+# for the production ACP constructors must remain deny.
 for path in production:
     tree = parse(path)
     for node in ast.walk(tree):
@@ -50,7 +50,8 @@ for path in production:
 required_deny_defaults = {
     ROOT / "acp/client.py": {"AcpClient"},
     ROOT / "acp/adapter.py": {
-        "AcpAdapter", "AcpKimiAdapter", "AcpOpenCodeAdapter"},
+        "AcpAdapter", "AcpKimiAdapter", "AcpOpenCodeAdapter",
+        "AcpQwenAdapter"},
 }
 for path, classes in required_deny_defaults.items():
     tree = parse(path)
@@ -80,7 +81,7 @@ for path, classes in required_deny_defaults.items():
 
 # R2: generic orchestration/runtime may register names, but may not branch on
 # specific worker literals.
-worker_names = {"kimi", "codex", "opencode", "claude"}
+worker_names = {"kimi", "codex", "opencode", "qwen", "claude"}
 for path in [ROOT / "orchestrator.py", ROOT / "acp/client.py"]:
     tree = parse(path)
     for node in ast.walk(tree):
@@ -117,8 +118,8 @@ for path in [ROOT / "main.py", ROOT / "orchestrator.py", ROOT / "host.py"]:
                 fail("R3", path, node,
                      f"上层直接调用 {attr}；改由 ACP/JSONL adapter 执行")
 
-# R4: production Kimi/OpenCode remain ACP-first. JSONL is allowed only behind
-# the prepare-only seam and must use each runtime's checked read-only profile.
+# R4: production Kimi/OpenCode remain constrained ACP-first and Qwen remains
+# ACP-only. JSONL is allowed only behind each verified prepare-only seam.
 orchestrator = ROOT / "orchestrator.py"
 source = orchestrator.read_text(encoding="utf-8")
 tree = parse(orchestrator)
@@ -135,6 +136,9 @@ if 'AgentSpec("opencode", "acp+jsonl", AcpOpenCodeAdapter)' not in source:
     errors.append("[R4] orchestrator.py: OpenCode 生产注册必须是 "
                   'AgentSpec("opencode", "acp+jsonl", '
                   "AcpOpenCodeAdapter)")
+if 'AgentSpec("qwen", "acp", AcpQwenAdapter)' not in source:
+    errors.append("[R4] orchestrator.py: Qwen 生产注册必须是 "
+                  'AgentSpec("qwen", "acp", AcpQwenAdapter)')
 
 acp_adapter = ROOT / "acp/adapter.py"
 acp_source = acp_adapter.read_text(encoding="utf-8")
@@ -163,21 +167,93 @@ expected_opencode_policy = {
     "websearch": "ask",
     "external_directory": "ask",
 }
-opencode_policy = None
+expected_opencode_readonly_policy = {
+    "*": "deny",
+    "read": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "lsp": "allow",
+    "todowrite": "allow",
+}
+opencode_policies = {}
 for node in parse(acp_adapter).body:
     if not isinstance(node, ast.Assign):
         continue
-    if any(isinstance(target, ast.Name)
-           and target.id == "OPENCODE_ACP_PERMISSION_POLICY"
-           for target in node.targets):
+    names = {
+        target.id for target in node.targets if isinstance(target, ast.Name)
+    }
+    matched = names & {
+        "OPENCODE_ACP_PERMISSION_POLICY",
+        "OPENCODE_ACP_READ_ONLY_PERMISSION_POLICY",
+    }
+    for name in matched:
         try:
-            opencode_policy = ast.literal_eval(node.value)
+            opencode_policies[name] = ast.literal_eval(node.value)
         except (ValueError, TypeError):
-            opencode_policy = None
-if opencode_policy != expected_opencode_policy:
+            opencode_policies[name] = None
+if (opencode_policies.get("OPENCODE_ACP_PERMISSION_POLICY")
+        != expected_opencode_policy):
     errors.append(
         "[R4] acp/adapter.py: OPENCODE_ACP_PERMISSION_POLICY 必须保持 "
         "unknown/risky=ask、read/search=allow")
+if (opencode_policies.get("OPENCODE_ACP_READ_ONLY_PERMISSION_POLICY")
+        != expected_opencode_readonly_policy):
+    errors.append(
+        "[R4] acp/adapter.py: OPENCODE_ACP_READ_ONLY_PERMISSION_POLICY "
+        "必须保持 unknown/risky=deny、read/search=allow")
+opencode_adapter_class = next(
+    (node for node in parse(acp_adapter).body
+     if isinstance(node, ast.ClassDef) and node.name == "AcpOpenCodeAdapter"),
+    None,
+)
+opencode_adapter_source = (
+    ast.get_source_segment(acp_source, opencode_adapter_class)
+    if opencode_adapter_class is not None else ""
+)
+if ("execution_env_overrides" not in opencode_adapter_source
+        or "ExecutionMode.READ_ONLY" not in opencode_adapter_source
+        or "OPENCODE_ACP_READ_ONLY_PERMISSION_POLICY"
+        not in opencode_adapter_source):
+    errors.append(
+        "[R4] acp/adapter.py: OpenCode read_only 必须注入独立 runtime policy")
+
+expected_qwen_commands = {
+    "QWEN_ACP_DEFAULT_CMD": (
+        "qwen", "--acp", "--approval-mode", "default"),
+    "QWEN_ACP_READ_ONLY_CMD": (
+        "qwen", "--acp", "--approval-mode", "plan"),
+}
+qwen_commands = {}
+for node in parse(acp_adapter).body:
+    if not isinstance(node, ast.Assign):
+        continue
+    for target in node.targets:
+        if (isinstance(target, ast.Name)
+                and target.id in expected_qwen_commands):
+            try:
+                qwen_commands[target.id] = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                qwen_commands[target.id] = None
+for name, expected in expected_qwen_commands.items():
+    if qwen_commands.get(name) != expected:
+        errors.append(
+            f"[R4] acp/adapter.py: {name} 必须固定 Qwen runtime approval profile")
+qwen_adapter_class = next(
+    (node for node in parse(acp_adapter).body
+     if isinstance(node, ast.ClassDef) and node.name == "AcpQwenAdapter"),
+    None,
+)
+qwen_adapter_source = (
+    ast.get_source_segment(acp_source, qwen_adapter_class)
+    if qwen_adapter_class is not None else ""
+)
+if ("execution_cmd_overrides" not in qwen_adapter_source
+        or "ExecutionMode.READ_ONLY" not in qwen_adapter_source
+        or "QWEN_ACP_DEFAULT_CMD" not in qwen_adapter_source
+        or "QWEN_ACP_READ_ONLY_CMD" not in qwen_adapter_source):
+    errors.append(
+        "[R4] acp/adapter.py: Qwen 必须普通轮 default、read_only 轮 plan")
 
 profile = ROOT / "adapters/kimi_readonly_fallback.md"
 if not profile.is_file():
@@ -411,7 +487,7 @@ if errors:
 print("✓ R1 权限默认 fail-closed")
 print("✓ R2 通用层无 agent-name 协议分支")
 print("✓ R3 子进程仅由 transport 层启动")
-print("✓ R4 Kimi/OpenCode ACP-first + prepare-only 只读 JSONL fallback")
+print("✓ R4 Kimi/OpenCode 受限 ACP-first + Qwen ACP-only default/plan")
 print("✓ R5 /discuss 参与者/轮次有界且不递归 dispatch")
 print("✓ R6 /workflow 固定阶段/单 writer/一次 repair/steering 有界")
 PY

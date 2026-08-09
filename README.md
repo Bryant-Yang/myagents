@@ -1,15 +1,15 @@
 # myagents
 
 原生长连接优先的本地多 agent 终端编排器：在一个 Textual TUI 中点名 Kimi、
-Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
+Codex、OpenCode、Qwen Code 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M5.1 与 M5 已完成。
+> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M5.1 与 M5 已完成。
 > 共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
 > stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
-> Kimi/OpenCode 使用 ACP-first + prepare-only 只读 JSONL fallback，Codex 使用官方
-> app-server；JSONL 不会在已提交任务后跨协议重放。真实 Kimi + MCP
+> Kimi/OpenCode 使用 ACP-first + prepare-only 只读 JSONL fallback，Qwen Code
+> 使用 ACP-only，Codex 使用官方 app-server；JSONL 不会在已提交任务后跨协议重放。真实 Kimi + MCP
 > 端到端验收是发布前手工证据，见“当前限制”。
 
 ## 为什么做这个项目
@@ -32,6 +32,9 @@ Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并�
 - `@codex`：通过 `codex app-server` 复用长驻进程与原生 thread。
 - `@opencode`：正常通过 `opencode acp` 使用持久 ACP session；未知及
   有副作用工具进入 TUI 权限，只有 prepare 失败才进入隔离只读 JSONL。
+- `@qwen`：通过 `qwen --acp` 使用持久 ACP session；普通轮强制 approval
+  `default`，workflow 只读轮强制 `plan`，避免继承 native TUI 的 auto/yolo。
+  当前不启用 headless JSONL fallback，避免在独立降级 profile 尚未验证前扩大权限面。
 - `@host`：由只读 Codex adapter 扮演主持人，负责总结和仲裁。
 - 无显式 mention：host 用一次调用决定“直接回答”或输出结构化 worker
   路由；直接回答时不再发起第二次 host 调用。
@@ -94,7 +97,7 @@ Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并�
               │                 │
 ┌─────────────▼──────────┐  ┌───▼────────────────────┐
 │ acp/                   │  │ codex_app_server/      │
-│ Kimi/OpenCode ACP      │  │ Codex native runtime   │
+│ Kimi/OpenCode/Qwen ACP │  │ Codex native runtime   │
 └────────────────────────┘  └────────────────────────┘
               │                 │
               └────────┬────────┘
@@ -118,11 +121,15 @@ Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并�
 ## 环境要求
 
 - macOS 或 Linux
+- Qwen Code 可选：Node.js 22+，且 `qwen` 命令可从 PATH 解析。若使用本地源码，
+  先在源码仓库执行 `npm install && npm run build`，再按其贡献指南将
+  `packages/cli` 链接为 `qwen` 命令。
 - Python 3.11+
 - 需要使用的 agent CLI 已安装并完成登录
   - [Kimi Code CLI](https://www.kimi.com/code)
   - [OpenAI Codex CLI](https://developers.openai.com/codex/cli)
   - [OpenCode](https://opencode.ai/)
+  - [Qwen Code](https://github.com/QwenLM/qwen-code)
 
 只使用某一个 agent 时，不要求安装其他 worker CLI；但无 mention 路由和
 `@host` 当前依赖 Codex CLI。
@@ -162,6 +169,7 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
 @kimi 解释这个模块，并给出最小修改方案
 @codex review 当前实现，只报告可复现问题
 @kimi @opencode 分别提出一个方案
+@qwen 检查当前模块并给出最小修复
 @host 总结上面两个方案的分歧
 /discuss @kimi @opencode --rounds 2 --moderator host -- 讨论新增 adapter 的协议选择
 /workflow --reviewer @kimi --implementer @codex -- 给解析器补边界测试并验收

@@ -18,10 +18,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import adapters.opencode_adapter as opencode_jsonl
 from acp.adapter import (
     OPENCODE_ACP_PERMISSION_POLICY,
+    OPENCODE_ACP_READ_ONLY_PERMISSION_POLICY,
     AcpAdapter,
     AcpOpenCodeAdapter,
 )
-from adapters.base import AgentDeliveryUncertainError, AgentEvent
+from adapters.base import (
+    AgentDeliveryUncertainError,
+    AgentEvent,
+    ExecutionMode,
+)
 from adapters.opencode_adapter import (
     OPENCODE_READONLY_AGENT,
     OPENCODE_READONLY_CONFIG_FILE,
@@ -158,6 +163,56 @@ def test_acp_policy_is_ask_by_default() -> None:
     print("ok  OpenCode ACP 未知及有副作用工具统一进入 TUI ask")
 
 
+def test_read_only_tool_denial_still_produces_workflow_result() -> None:
+    """read-only 硬拒绝后继续输出，切回默认模式恢复 TUI ask。"""
+    async def body(state_path: Path) -> None:
+        adapter = AcpOpenCodeAdapter(
+            fallback_jsonl=False,
+            cmd=CMD,
+        )
+        try:
+            readonly_events = await collect(adapter.stream(
+                "opencode-readonly-tool-flow",
+                "/tmp",
+                execution_mode=ExecutionMode.READ_ONLY,
+            ))
+
+            async def allow_once(_agent_name: str, _params: dict) -> dict:
+                return {"outcome": "selected", "optionId": "allow"}
+
+            adapter.set_permission_handler(allow_once)
+            default_events = await collect(adapter.stream(
+                "opencode-readonly-tool-flow",
+                "/tmp",
+                execution_mode=ExecutionMode.DEFAULT,
+            ))
+        finally:
+            await adapter.aclose()
+        readonly_reply = "".join(
+            event.text for event in readonly_events if event.kind == "text")
+        default_reply = "".join(
+            event.text for event in default_events if event.kind == "text")
+        assert "MYAGENTS_WORKFLOW" in readonly_reply
+        assert "MYAGENTS_WORKFLOW" in default_reply
+        assert json.loads(
+            adapter._active_env_overrides["OPENCODE_PERMISSION"]
+        ) == OPENCODE_ACP_PERMISSION_POLICY
+        state = state_path.read_text()
+        assert state.count("new:/tmp") == 2
+        assert state.count("opencode-bash-policy:deny") == 1
+        assert state.count("opencode-bash-policy:ask") == 1
+        assert (
+            'opencode-permission:{"outcome": "selected", '
+            '"optionId": "allow"}'
+        ) in state
+
+    with tempfile.TemporaryDirectory() as td:
+        state_path = Path(td) / "state"
+        with fake_acp_env(FAKE_ACP_STATE=str(state_path)):
+            asyncio.run(body(state_path))
+    print("ok  OpenCode read-only 硬拒绝仍输出，默认模式恢复 TUI ask")
+
+
 def test_prepare_failure_uses_visible_jsonl_fallback() -> None:
     async def body() -> None:
         fallback = RecordingFallback()
@@ -223,6 +278,7 @@ def test_production_registration_is_acp_first_hybrid() -> None:
 if __name__ == "__main__":
     test_jsonl_fallback_enforces_readonly_inline_agent()
     test_acp_policy_is_ask_by_default()
+    test_read_only_tool_denial_still_produces_workflow_result()
     test_prepare_failure_uses_visible_jsonl_fallback()
     test_post_submit_disconnect_never_uses_fallback()
     test_production_registration_is_acp_first_hybrid()

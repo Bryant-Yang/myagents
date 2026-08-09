@@ -72,9 +72,10 @@ Anthropic 主导的协议：把**工具/数据源**标准化地暴露给 agent
 **ACP（Agent Client Protocol）**
 Zed 主导的协议：把 **agent 本身**标准化成服务（"我给你一个会话，
 可以 prompt、可以中断、会流式回报进展"）。编辑器/编排器是 client。
-kimi 已内置（`kimi acp`），claude code、codex 有适配器。
+kimi（`kimi acp`）、OpenCode（`opencode acp`）和 Qwen Code
+（`qwen --acp`）均有原生入口；Codex 在本项目使用官方 app-server。
 → 解决的是"怎么驱动另一个 agent"，正好是本项目的整合方向：
-三个 adapter 可以换成一个 ACP client。
+多个具体 adapter 共享同一个 ACP client/runtime。
 
 **A2A（Agent2Agent，Google）**
 agent 对 agent 的任务委托协议，面向"企业内部跨系统 agent 协作"。

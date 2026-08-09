@@ -4,7 +4,12 @@ from .client import (
     AcpRemoteError,
     AcpRequestNotSentError,
 )
-from .adapter import AcpAdapter, AcpKimiAdapter, AcpOpenCodeAdapter
+from .adapter import (
+    AcpAdapter,
+    AcpKimiAdapter,
+    AcpOpenCodeAdapter,
+    AcpQwenAdapter,
+)
 
 __all__ = [
     "AcpClient",
@@ -14,4 +19,5 @@ __all__ = [
     "AcpAdapter",
     "AcpKimiAdapter",
     "AcpOpenCodeAdapter",
+    "AcpQwenAdapter",
 ]

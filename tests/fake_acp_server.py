@@ -40,6 +40,11 @@ FAIL_PROMPT = os.environ.get("FAKE_ACP_FAIL_PROMPT") == "1"
 NO_LOAD_CAP = os.environ.get("FAKE_ACP_NO_LOAD_CAP") == "1"
 # initialize 将 promptCapabilities.image 置为 False（无原生图片能力）
 NO_IMAGE_CAP = os.environ.get("FAKE_ACP_NO_IMAGE_CAP") == "1"
+try:
+    OPENCODE_PERMISSION = json.loads(
+        os.environ.get("OPENCODE_PERMISSION", "{}"))
+except json.JSONDecodeError:
+    OPENCODE_PERMISSION = {}
 
 # 挂起的 prompt：{"rid": 请求 id, "mode": "slow" | "never"}；同时最多一轮
 PENDING: dict = {"rid": None, "mode": None}
@@ -133,6 +138,55 @@ def main() -> None:
             if FAIL_PROMPT:
                 send({"jsonrpc": "2.0", "id": rid,
                       "error": {"code": -32000, "message": "prompt boom"}})
+                continue
+            if "opencode-readonly-tool-flow" in text:
+                action = OPENCODE_PERMISSION.get(
+                    "bash", OPENCODE_PERMISSION.get("*", "ask"))
+                log("opencode-bash-policy:" + action)
+                send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": sid, "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "opencode-bash",
+                        "title": "bash",
+                        "kind": "execute",
+                        "status": "pending",
+                    }}})
+                if action == "ask":
+                    send({"jsonrpc": "2.0", "id": 901,
+                          "method": "session/request_permission",
+                          "params": {
+                              "sessionId": sid,
+                              "toolCall": {"title": "bash"},
+                              "options": [
+                                  {"optionId": "allow", "kind": "allow_once",
+                                   "name": "允许一次"},
+                                  {"optionId": "deny", "kind": "reject_once",
+                                   "name": "拒绝"},
+                              ],
+                          }})
+                    response = json.loads(sys.stdin.readline())
+                    outcome = response.get("result", {}).get("outcome", {})
+                    log("opencode-permission:" + json.dumps(
+                        outcome, ensure_ascii=False))
+                    if outcome.get("outcome") == "cancelled":
+                        send({"jsonrpc": "2.0", "id": rid,
+                              "result": {"stopReason": "end_turn"}})
+                        continue
+                send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": sid, "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "opencode-bash",
+                        "title": "bash",
+                        "kind": "execute",
+                        "status": "failed" if action == "deny" else "completed",
+                    }}})
+                chunk(
+                    sid,
+                    'MYAGENTS_WORKFLOW {"stage":"verify",'
+                    '"status":"pass","findings":[]}',
+                )
+                send({"jsonrpc": "2.0", "id": rid,
+                      "result": {"stopReason": "end_turn"}})
                 continue
             needs_permission = "perm" in text or "requires-write" in text
             if needs_permission and sid in ALWAYS_ALLOWED_SESSIONS:

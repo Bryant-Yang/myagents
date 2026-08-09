@@ -873,6 +873,47 @@ def test_readonly_mode_does_not_inherit_allow_always_session() -> None:
     print("ok  read_only fresh ACP session 不继承 allow_always")
 
 
+def test_execution_mode_command_profile_restarts_process() -> None:
+    """进程级 CLI profile 前后切换必须 fresh，不能复用旧 session。"""
+    async def run() -> None:
+        reset_state()
+        default_cmd = [sys.executable, SERVER, "default-profile"]
+        readonly_cmd = [sys.executable, SERVER, "readonly-profile"]
+        adapter = AcpAdapter(
+            "fake",
+            default_cmd,
+            execution_cmd_overrides={
+                ExecutionMode.READ_ONLY: readonly_cmd,
+            },
+        )
+
+        async for _ in adapter.stream("first", "/tmp"):
+            pass
+        default_pid = adapter._client._proc.pid
+        assert adapter._active_cmd == default_cmd
+
+        async for _ in adapter.stream(
+                "readonly", "/tmp",
+                execution_mode=ExecutionMode.READ_ONLY):
+            pass
+        readonly_pid = adapter._client._proc.pid
+        assert adapter._active_cmd == readonly_cmd
+
+        async for _ in adapter.stream("default-again", "/tmp"):
+            pass
+        restored_default_pid = adapter._client._proc.pid
+        assert adapter._active_cmd == default_cmd
+        await adapter.aclose()
+
+        assert len({default_pid, readonly_pid, restored_default_pid}) == 3
+        events = state_events()
+        assert events.count("new:/tmp") == 3, events
+        assert not any(item.startswith("load:") for item in events), events
+
+    asyncio.run(run())
+    print("ok  execution mode CLI profile 切换重建进程/session")
+
+
 if __name__ == "__main__":
     test_initialize()
     test_session_new_list_load()
@@ -907,4 +948,5 @@ if __name__ == "__main__":
     test_fresh_factory_error_resets()
     test_nonfresh_factory_error_keeps_session()
     test_readonly_mode_does_not_inherit_allow_always_session()
+    test_execution_mode_command_profile_restarts_process()
     print("\nACP 全部通过")
