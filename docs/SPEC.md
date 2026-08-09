@@ -19,7 +19,7 @@
 | M3.1 | 完成 | 持久执行事件、heartbeat、权限/工具上下文、精确取消（七个 MCP 工具） |
 | M4 | 完成 | Codex app-server 长连接、thread/turn 事件、取消、审批与 JSONL fallback |
 | M4.2 | 完成 | 同一项目独立会话、默认房间兼容、TUI 安全切换与外部 selector |
-| M4.3 | 实现完成，待人工验收 | macOS 剪贴板 PNG、会话私有附件与草稿引用 |
+| M4.3 | 完成 | macOS 剪贴板 PNG、会话私有附件、草稿引用与真实视觉验收 |
 | M4.4 | 完成 | Kimi ACP-first、prepare-only 只读 JSONL fallback 与 no-replay |
 | M4.5 | 完成 | OpenCode ACP-first、ask-by-default 权限收口与只读 JSONL fallback |
 | M5.1 | 完成 | `/discuss` 指定成员、1–3 轮有界讨论与终局 moderator |
@@ -429,8 +429,14 @@
 - **验收**：成功粘贴只改变草稿；路径位于当前 room；权限和格式正确；失败
   不残留文件。`Ctrl+V` 有文本时仍使用 Textual 原文本粘贴。
 - **证据**：`tests/test_clipboard_image.py` 的注入式 macOS fixture；
-  真实剪贴板脚本探针验证无 PNG 时返回稳定错误。真实截图视觉内容由用户人工
-  验收，自动测试不声称证明 agent 的视觉理解质量。
+  真实剪贴板脚本探针验证无 PNG 时返回稳定错误。自动测试不声称证明 agent
+  的视觉理解质量。
+- **真实验收证据**：2026-08-09 在房间 `e279f938f34e3475` 粘贴真实 macOS
+  剪贴板 PNG；附件目录为 0700、文件为 0600。command
+  `5415080a-1c55-4eba-b063-dd5b7203d877` 的 timeline `seq=5..7` 恰含一条
+  user 和两条 agent 结果；Kimi 通过 ACP 原生 `image` 输入准确识别黑白飞碟
+  画面。OpenCode 所选 `deepseek-v4-flash-free` 不支持视觉并明确拒绝，属于
+  模型能力限制，不影响已验证的附件保存、fan-out 与 Kimi 视觉链路。
 - **里程碑**：M4.3。
 
 ### UC-CODEX-001 Codex 原生长连接

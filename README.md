@@ -4,8 +4,8 @@
 Codex、OpenCode 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.4、M4.5 与 M5.1 已完成；M4.3 图片粘贴实现已完成，
-> 等待真实截图与 agent 视觉结果人工验收。共享 timeline 与执行 events 持久化、ACP session
+> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5 与 M5.1 已完成。
+> 共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
 > stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
 > Kimi/OpenCode 使用 ACP-first + prepare-only 只读 JSONL fallback，Codex 使用官方
@@ -429,7 +429,7 @@ myagents/
 - [x] M3.1：持久执行可观测性、heartbeat、权限上下文与精确取消。
 - [x] M4：Codex 官方 app-server 长连接接入，JSONL 退为安全兜底。
 - [x] M4.2：同一项目独立会话、默认历史兼容、TUI 安全切换与外部 selector。
-- [ ] M4.3：实现已完成；等待 macOS 真实截图与 agent 视觉结果人工验收。
+- [x] M4.3：macOS 真实截图、私有附件与 Kimi ACP 原生视觉输入已验收。
 - [x] M4.4：Kimi ACP-first + prepare-only 只读 JSONL fallback。
 - [x] M4.5：OpenCode ACP-first + ask-by-default 权限 + 隔离只读 JSONL fallback。
 - [x] M5.1：`/discuss` 指定成员、1–3 轮有界讨论与终局 moderator。
@@ -449,6 +449,11 @@ myagents/
   seam 属于 CLI 版本边界。1.18.14 的 ACP 回复、`session/load`、Bash deny、
   真实只读 fallback 和无残留进程已于 2026-08-08 通过；升级后必须重跑
   capability/permission/profile 探针。
+- M4.3 图片链路已于 2026-08-09 在房间 `e279f938f34e3475` 用真实 macOS
+  剪贴板 PNG 验收：附件目录/文件权限为 0700/0600，command
+  `5415080a-1c55-4eba-b063-dd5b7203d877` 的 timeline `seq=5..7` 完整，
+  Kimi 经 ACP 原生图片输入准确识别飞碟画面。OpenCode 当前选择的
+  `deepseek-v4-flash-free` 不支持视觉并明确拒绝，不视为附件链路失败。
 - M3 真实 E2E 已于 2026-07-26 通过
   [`scripts/e2e-m3-real.py`](scripts/e2e-m3-real.py)：两次独立
   TUI/ACP/MCP 生命周期复用同一 Kimi session，timeline 无重复，退出后无
