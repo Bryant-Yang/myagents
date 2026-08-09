@@ -433,7 +433,8 @@ myagents/
 - [x] M4.4：Kimi ACP-first + prepare-only 只读 JSONL fallback。
 - [x] M4.5：OpenCode ACP-first + ask-by-default 权限 + 隔离只读 JSONL fallback。
 - [x] M5.1：`/discuss` 指定成员、1–3 轮有界讨论与终局 moderator。
-- [ ] M5：里程碑工作流、review → 修改 → 复核闭环与 steering。
+- [ ] M5：ADR-0009 已冻结；里程碑 review → 修改 → 复核闭环与阶段边界
+  steering 待实现。
 - [ ] Later：只有出现跨机器、跨组织 agent 协作需求时再评估 A2A。
 
 ## 当前限制

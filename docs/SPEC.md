@@ -2,7 +2,7 @@
 
 <!-- harness:behaviour-evidence=canonical-source -->
 
-> 作者：Bryant Yang　最近更新：2026-08-08
+> 作者：Bryant Yang　最近更新：2026-08-09
 >
 > 本文是关键用户行为与独立证据的唯一事实源。工程边界见
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -23,6 +23,7 @@
 | M4.4 | 完成 | Kimi ACP-first、prepare-only 只读 JSONL fallback 与 no-replay |
 | M4.5 | 完成 | OpenCode ACP-first、ask-by-default 权限收口与只读 JSONL fallback |
 | M5.1 | 完成 | `/discuss` 指定成员、1–3 轮有界讨论与终局 moderator |
+| M5 | 设计冻结，待实现 | review → 单 writer 修改 → 独立复核、一次修复上限与阶段边界 steering |
 
 ## 1. 角色
 
@@ -110,6 +111,49 @@
 - **人工验收边界**：开放式讨论质量、不同模型观点的实际独立性和成本由用户验收；
   自动化只证明调度、上下文、边界与终态。
 - **里程碑**：M5.1。
+
+### UC-WORKFLOW-001 有界里程碑工作流与阶段边界 steering
+
+- **状态**：ADR-0009 已冻结，生产代码尚未实现；当前不得把 `/workflow` 或
+  `/steer` 描述为可用功能。
+- **角色 / 触发**：用户提交
+  `/workflow --reviewer @agent|@host --implementer @worker
+  [--verifier @agent|@host] -- 任务目标`。verifier 缺省为 reviewer；implementer
+  不得兼任 review/verify。
+- **工作区 fixed point**：只接受无 merge/rebase、HEAD/branch 可解析且
+  index/tracked/untracked 全干净的 Git 工作区；校验在 timeline 前完成。启动
+  HEAD OID 与覆盖 tracked diff、index、untracked 路径/内容的指纹构成 baseline。
+  read-only 阶段前后指纹必须一致；implement/repair 后 branch、HEAD、index 不得
+  改变，并生成 candidate 指纹供 verifier 锁定。外部 writer 在写阶段的归因无法
+  自动证明，属于人工验收边界。
+- **主流程**：一个 CommandBus command 和一条 user timeline 内依次执行
+  review → implement → verify。verify 首次返回 `changes_requested` 时只允许
+  原 implementer 修复一次，再由原 verifier 复核一次，最后 host 单次总结；
+  最大六次模型调用，角色、阶段和终止条件均由普通代码决定。
+- **阶段结果**：review/implement/verify/repair 以最后一行严格
+  `MYAGENTS_WORKFLOW {...}` 信封报告有界状态。信封必须且只能包含必填的
+  stage/status/findings，前缀只出现一次且位于最后非空行，UTF-8 最多 4096
+  字节；findings 是最多 32 个不重复 id 的数组，单个 id 最多 64 字符。未知字段、
+  字段缺失、类型错误、stage/status 不匹配、非法 JSON、blocked 或最终非 pass
+  均 fail-closed；host 不能覆盖 verifier 终态。
+- **写入与权限**：review/verify/final 使用 adapter `read_only` execution mode，
+  implement/repair 使用 `workspace_write`；只有 implementer 是 writer，两个写
+  阶段严格串行。Kimi/OpenCode implement 若进入只读 JSONL fallback，阶段必须
+  blocked，不得以分析回复冒充已修改。
+- **steering**：只有正在 review、implement 或 repair 且后面仍有验证阶段的
+  workflow 可接收最多 5 条、单条 1000 字符且累计 4000 字符的补充指令；
+  verify/reverify/final 已开始时拒绝。steering 作为 execution event 持久化，
+  不进入 timeline，只注入尚未开始的阶段；不能改角色/阶段/权限、增加修复次数
+  或修改已提交 prompt。立即停止仍使用 cancel。
+- **失败/取消**：transport、持久化、host 或阶段信封失败均保留已完成证据并使
+  command failed；post-submit 不确定失败不重试、不换 agent；取消后不进入任何
+  后续阶段。进程重启只显示上次中断，不自动续跑写阶段。
+- **验收计划**：workspace inspector fixed-point/drift fake、`workflow.py`
+  parser/状态机 fake contract、adapter read-only 负向写入测试、CommandBus/
+  control/MCP steering、TUI 帮助与取消/回收测试，最后做一次授权真实工作区的
+  固定三角色验收。设计阶段没有自动化或真实完成证据，不能以 ADR 代替实现验收。
+- **事实源**：ADR-0009。
+- **里程碑**：M5。
 
 ### UC-ACP-001 有状态增量上下文
 

@@ -14,3 +14,4 @@
 | [0006](0006-kimi-hybrid-transport-policy.md) | Accepted | M4.4 Kimi ACP-first、prepare-only 只读 JSONL fallback 与 no-replay |
 | [0007](0007-opencode-hybrid-transport-policy.md) | Accepted | M4.5 OpenCode ACP-first、ask-by-default 权限收口与只读 JSONL fallback |
 | [0008](0008-bounded-multi-agent-discussion.md) | Accepted | M5.1 `/discuss` 有界轮次、失败收口与终局主持 |
+| [0009](0009-bounded-milestone-workflow-steering.md) | Accepted | M5 review → 修改 → 复核闭环与阶段边界 steering |

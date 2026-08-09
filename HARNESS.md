@@ -340,6 +340,8 @@ branch protection / required checks 需要单独配置后才能宣称生效。
   [`docs/adr/0007-opencode-hybrid-transport-policy.md`](docs/adr/0007-opencode-hybrid-transport-policy.md)。
 - M5.1 有界多智能体讨论事实源：
   [`docs/adr/0008-bounded-multi-agent-discussion.md`](docs/adr/0008-bounded-multi-agent-discussion.md)。
+- M5 有界里程碑工作流设计输入（尚未实现）：
+  [`docs/adr/0009-bounded-milestone-workflow-steering.md`](docs/adr/0009-bounded-milestone-workflow-steering.md)。
 - 当前路线图：[`README.md`](README.md)“路线图”。
 - 重大协议/安全边界改变先形成可评审设计记录，再修改本契约。
 - Steering 只在同类失败至少两次或已有趋势证据时建立；单次失败只修当前问题。

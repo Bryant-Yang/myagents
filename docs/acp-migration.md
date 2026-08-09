@@ -1,6 +1,7 @@
 # ACP 迁移设计（最小方案）
 
-状态：**Phase 4.5 已完成**。`AgentAdapter` 是 TUI 与不同 coding agent 的
+状态：**Phase 4.5 与 Phase 5.1 已完成，Phase 5 设计已冻结、待实现**。
+`AgentAdapter` 是 TUI 与不同 coding agent 的
 统一行为契约；wire protocol 按厂商能力选择：`acp/` 是通用 ACP runtime，
 Kimi/OpenCode 分别走 `kimi acp` / `opencode acp`，只在 ACP prepare
 失败前使用各自受限 JSONL fallback；Codex 走官方 `codex app-server`，旧
@@ -232,6 +233,29 @@ Orchestrator 内用普通代码执行 1–3 轮状态机：同轮不同 adapter 
 结果当作可安全重试。完整工作流契约见
 [ADR-0008](adr/0008-bounded-multi-agent-discussion.md)。
 
+## 有界里程碑工作流（M5 设计）
+
+M5 不改变 ACP wire protocol，也不向 agent 暴露自主派发能力。`/workflow`
+由普通代码严格推进 review → 单 writer implement → 独立 verify；首次复核要求
+修改时最多允许同一 writer repair 一次并 reverify，最后由 host 汇总，最大六次
+模型调用。全部阶段仍属于一个 CommandBus command 和一个 `command_id`。
+
+adapter interface 将在 `stream` / `stream_prepared` 两条投递路径增加通用
+execution mode：review/verify 映射为 `read_only`，implement/repair 映射为
+`workspace_write`。具体 sandbox、权限和 fallback 行为仍由各 adapter 在现有
+seam 内实现，Orchestrator 不按 agent 名分支。Kimi/OpenCode 的只读 JSONL
+fallback 不能承担写阶段；触发时 workflow 必须 blocked。
+
+运行中 steering 只在下一阶段边界注入尚未开始的 assignment，不并发写当前
+ACP session、不修改已提交 prompt，也不能换人、加轮或扩大权限。完整设计见
+[ADR-0009](adr/0009-bounded-milestone-workflow-steering.md)；当前只冻结合同，
+生产命令、execution mode 和 steering 入口尚未实现。
+
+workflow 还要求从干净 Git 工作区捕获 baseline HEAD/branch 和完整工作区指纹，
+read-only 阶段前后不得漂移，写阶段不得改变 HEAD/branch/index。Git 探测由注入的
+transport adapter 执行；Orchestrator/workflow 不直接启动子进程。外部 writer
+恰好在 implement/repair 窗口写入时无法自动归因，必须作为人工验收边界披露。
+
 ## 阶段计划
 
 - [x] **Phase 1**：`acp/client.py` + `acp/adapter.py` + fake server 回归测试
@@ -267,7 +291,9 @@ Orchestrator 内用普通代码执行 1–3 轮状态机：同轮不同 adapter 
   隔离配置和 deny-all 只读 agent。见 ADR-0007。
 - [x] **Phase 5.1**：`/discuss` 指定 2–3 个 worker、1–3 轮有界讨论，
   同轮 fan-out、跨轮增量上下文、失败者退出与终局 moderator。见 ADR-0008。
-- [ ] **Phase 5**：里程碑工作流、review → 修改 → 复核闭环与 steering
+- [ ] **Phase 5**：ADR-0009 已冻结里程碑 review → 单 writer 修改 → 独立
+  复核、最多一次 repair/reverify 与阶段边界 steering；代码和真实验收待完成。
+  见 ADR-0009。
 
 A2A 不在当前阶段；Streamable HTTP、远程认证同样不在 M3（M3 是单机
 单用户 stdio 集成，见 ADR-0001 §3）。只有出现跨机器、跨组织 agent
