@@ -51,6 +51,13 @@ from discussion import (
     participant_assignment,
 )
 from host import MODERATOR_TEMPLATE, HostAgent
+from session_roles import (
+    SessionRole,
+    SessionRoleChanges,
+    apply_session_role_changes,
+    has_session_role_cue,
+    session_role_assignment,
+)
 from workflow import (
     MilestoneWorkflow,
     StageDelivery,
@@ -239,6 +246,10 @@ class Orchestrator:
                     f"store 属于会话 {store.session_name!r}，"
                     f"与请求会话 {self.session_name!r} 不一致")
             self.store = store
+        self._session_roles: dict[str, SessionRole] = (
+            self.store.get_session_roles()
+            if self.store is not None else {}
+        )
         self._attachment_root = (
             self.store.room_dir / "attachments"
             if self.store is not None else None
@@ -315,6 +326,63 @@ class Orchestrator:
         return message
 
     # ---- 注册信息 / 生命周期 ----
+
+    @property
+    def session_roles(self) -> dict[str, SessionRole]:
+        """当前房间角色快照；调用方不能修改内部状态。"""
+        return dict(self._session_roles)
+
+    def _apply_session_role_changes(
+        self,
+        changes: SessionRoleChanges,
+    ) -> None:
+        if changes.is_empty:
+            return
+        updated = apply_session_role_changes(self._session_roles, changes)
+        if self.store is not None:
+            self.store.set_session_roles(updated)
+        self._session_roles = updated
+
+    async def _extract_session_role_changes(
+        self,
+        text: str,
+        targets: list[str],
+        on_event: EventCallback,
+        *,
+        host_will_continue: bool = False,
+    ) -> SessionRoleChanges:
+        if not targets or not has_session_role_cue(text):
+            return SessionRoleChanges.empty()
+        on_event(HOST_NAME, AgentEvent(
+            "status",
+            "正在识别会话角色",
+            {"agent_state": "running", "phase": "角色识别"},
+        ))
+        try:
+            changes = await self.host.extract_session_roles(
+                text,
+                targets,
+                self.workdir,
+                lambda event: self._emit_adapter_event(
+                    on_event, HOST_NAME, event),
+            )
+        except _EventCallbackError as exc:
+            raise exc.cause from exc
+        except Exception as exc:
+            on_event(HOST_NAME, AgentEvent(
+                "info",
+                f"会话角色识别失败，原任务继续：{exc}",
+                {"phase": "角色识别失败"},
+            ))
+            changes = SessionRoleChanges.empty()
+        if not host_will_continue:
+            on_event(HOST_NAME, AgentEvent(
+                "done", meta={"roleExtraction": True}))
+        return changes
+
+    def _session_role_meta(self, name: str) -> dict[str, str]:
+        role = self._session_roles.get(name)
+        return {"session_role": role.label} if role is not None else {}
 
     def set_permission_handler(self, handler: AgentPermissionHandler | None) -> None:
         """把 TUI 的权限决策器注入所有支持它的 adapter（ACP）。
@@ -498,6 +566,7 @@ class Orchestrator:
         snapshot_text = self._format(snapshot[-self.history_limit:])
         targets = self.parse_mentions(user_text)
         assignments: dict[str, str] = {}
+        role_changes = SessionRoleChanges.empty()
         routed_by_host = not targets
         if routed_by_host:
             # decide 不在 _run_one 的异常保护里，自己兜底。契约：
@@ -540,6 +609,7 @@ class Orchestrator:
                         "done", meta={"hostAnswered": True}))
                     return DispatchOutcome()
                 targets, reason = decision.targets, decision.reason
+                role_changes = decision.role_changes
                 assignments = {
                     name: decision.tasks.get(name)
                     or self._fallback_assignment(user_text)
@@ -556,11 +626,23 @@ class Orchestrator:
             for name in targets:
                 assignments.setdefault(
                     name, self._fallback_assignment(user_text))
+        else:
+            role_changes = await self._extract_session_role_changes(
+                user_text,
+                targets,
+                on_event,
+                host_will_continue=HOST_NAME in targets,
+            )
+        self._apply_session_role_changes(role_changes)
         for name in targets:
             on_event(name, AgentEvent(
                 "status",
                 "已接收任务，准备执行",
-                meta={"agent_state": "running", "phase": "准备执行"},
+                meta={
+                    "agent_state": "running",
+                    "phase": "准备执行",
+                    **self._session_role_meta(name),
+                },
             ))
         results = await asyncio.gather(
             *(self._run_one(
@@ -584,9 +666,20 @@ class Orchestrator:
         command_id: str | None,
     ) -> DispatchOutcome:
         """把一条命令委托给 workflow 深模块；内部阶段不递归 dispatch。"""
+
+        def workflow_event(agent_name: str, event: AgentEvent) -> None:
+            role_meta = self._session_role_meta(agent_name)
+            if role_meta:
+                event = AgentEvent(
+                    event.kind,
+                    event.text,
+                    {**event.meta, **role_meta},
+                )
+            on_event(agent_name, event)
+
         committed = self._append_message(
             "user", user_text, command_id=command_id)
-        on_event("user", AgentEvent(
+        workflow_event("user", AgentEvent(
             "committed",
             user_text,
             {
@@ -601,7 +694,7 @@ class Orchestrator:
                 "steering_available": False,
             },
         ))
-        on_event("system", AgentEvent(
+        workflow_event("system", AgentEvent(
             "status",
             "workflow baseline · "
             f"head={baseline.head} · branch={baseline.branch} · "
@@ -634,7 +727,7 @@ class Orchestrator:
                 # 一个角色可能在 repair/reverify 再次出现；阶段间 done 不得
                 # 让固定 TUI 状态提前锁成 terminal。
                 if event.kind == "done" and stage != "final":
-                    on_event(agent_name, AgentEvent(
+                    workflow_event(agent_name, AgentEvent(
                         "status",
                         f"workflow {stage} 响应已落盘",
                         {
@@ -650,7 +743,7 @@ class Orchestrator:
                         },
                     ))
                     return
-                on_event(agent_name, event)
+                workflow_event(agent_name, event)
 
             error = await self._run_one(
                 name,
@@ -674,7 +767,7 @@ class Orchestrator:
             baseline,
             self.workspace_inspector,
             stage_runner,
-            on_event,
+            workflow_event,
         )
         if command_id is not None:
             self._active_workflows[command_id] = workflow
@@ -722,6 +815,15 @@ class Orchestrator:
             "committed", user_text,
             meta={"seq": committed.seq, "command_id": command_id},
         ))
+        role_targets = list(dict.fromkeys(
+            (*request.participants, request.moderator)))
+        role_changes = await self._extract_session_role_changes(
+            request.topic,
+            role_targets,
+            on_event,
+            host_will_continue=request.moderator == HOST_NAME,
+        )
+        self._apply_session_role_changes(role_changes)
         active = list(request.participants)
         failures: list[AgentFailure] = []
 
@@ -748,6 +850,7 @@ class Orchestrator:
                     meta={
                         "agent_state": "running",
                         "phase": f"讨论 {round_number}/{request.rounds}",
+                        **self._session_role_meta(name),
                     },
                 ))
 
@@ -800,7 +903,11 @@ class Orchestrator:
         on_event(request.moderator, AgentEvent(
             "status",
             "正在汇总讨论",
-            meta={"agent_state": "running", "phase": "主持仲裁"},
+            meta={
+                "agent_state": "running",
+                "phase": "主持仲裁",
+                **self._session_role_meta(request.moderator),
+            },
         ))
         moderator_error = await self._run_one(
             request.moderator,
@@ -819,6 +926,8 @@ class Orchestrator:
                        assignment: str | None = None,
                        execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
                        ) -> str | None:
+        assignment = session_role_assignment(
+            self._session_roles.get(name), assignment)
         adapter = self.adapters[name]
         if getattr(adapter, "stateful_session", False):
             # P1 契约：读 cursor → 选增量 → stream 完整执行 → 推进 cursor

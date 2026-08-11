@@ -16,6 +16,7 @@ from discussion import (
     parse_discussion_request,
 )
 from orchestrator import Orchestrator
+from session_roles import SessionRole, SessionRoleChanges
 
 
 WORKERS = ("kimi", "opencode", "codex")
@@ -140,6 +141,21 @@ class HangingAdapter(RoundAdapter):
         await asyncio.Event().wait()
         yield AgentEvent("text", "unreachable")
         yield AgentEvent("done")
+
+
+class RoleDiscussionHost(RoundAdapter):
+    def __init__(self) -> None:
+        super().__init__("host")
+        self.role_choices: list[tuple[str, ...]] = []
+
+    async def extract_session_roles(
+        self, text: str, choices: list[str], workdir: str, on_event=None
+    ) -> SessionRoleChanges:
+        self.role_choices.append(tuple(choices))
+        return SessionRoleChanges({
+            "kimi": SessionRole("正方", "提出可行路径并给出依据。"),
+            "opencode": SessionRole("反方", "寻找反例与边界。"),
+        }, ())
 
 
 def make_orch() -> tuple[Orchestrator, dict[str, RoundAdapter]]:
@@ -291,6 +307,53 @@ def test_registered_nonparticipant_can_moderate() -> None:
     print("ok  未参会的已注册 worker 可作为终局 moderator")
 
 
+def test_discussion_roles_apply_to_all_rounds_without_changing_bounds() -> None:
+    async def run() -> None:
+        orch, adapters = make_orch()
+        host = RoleDiscussionHost()
+        orch.host = host
+        orch.adapters["host"] = host
+        adapters["host"] = host
+        events: list[tuple[str, AgentEvent]] = []
+        outcome = await orch.dispatch(
+            "/discuss @kimi @opencode --rounds 2 -- "
+            "让 kimi 担任正方、opencode 担任反方，讨论是否接入新协议",
+            lambda name, event: events.append((name, event)),
+            command_id="role-discussion",
+        )
+
+        assert not outcome.failures
+        assert host.role_choices == [("kimi", "opencode", "host")]
+        assert len(adapters["kimi"].prompts) == 2
+        assert len(adapters["opencode"].prompts) == 2
+        assert len(host.prompts) == 1
+        assert all(
+            "当前聊天室会话中的临时角色：正方" in prompt
+            for prompt in adapters["kimi"].prompts
+        )
+        assert all(
+            "当前聊天室会话中的临时角色：反方" in prompt
+            for prompt in adapters["opencode"].prompts
+        )
+        assert "当前聊天室会话中的临时角色" not in host.prompts[0]
+        assert orch.session_roles["kimi"].label == "正方"
+        assert orch.session_roles["opencode"].label == "反方"
+        assert any(
+            name == "kimi"
+            and event.meta.get("session_role") == "正方"
+            for name, event in events
+        )
+        assert any(
+            name == "opencode"
+            and event.meta.get("session_role") == "反方"
+            for name, event in events
+        )
+        await orch.aclose()
+
+    asyncio.run(run())
+    print("ok  讨论角色跨轮生效且不改变参与者、轮数和 moderator")
+
+
 def test_invalid_discussion_does_not_enter_timeline() -> None:
     orch, _ = make_orch()
     try:
@@ -310,5 +373,6 @@ if __name__ == "__main__":
     test_failure_exits_later_rounds_but_moderator_runs_and_bus_fails()
     test_cancel_stops_later_rounds_and_moderator()
     test_registered_nonparticipant_can_moderate()
+    test_discussion_roles_apply_to_all_rounds_without_changing_bounds()
     test_invalid_discussion_does_not_enter_timeline()
     print("\n/discuss 全部通过")

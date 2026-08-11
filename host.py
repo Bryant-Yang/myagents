@@ -22,6 +22,7 @@ from typing import AsyncIterator, Callable
 
 from adapters.base import AgentAdapter, AgentEvent, ExecutionMode
 from adapters.kimi_adapter import KimiAdapter
+from session_roles import SessionRoleChanges
 
 # host 一次调用完成二选一：需要 worker 才输出路由 JSON；能自己处理就直接回答。
 # 这样闲聊、问候、总结等不再经历“先路由给 host，再调用 host 回答”的双重延迟。
@@ -34,19 +35,42 @@ _ROUTE_TEMPLATE = """\
 {transcript}
 
 请直接处理用户最新的消息，只能二选一：
-1. 需要写代码、改文件、跑命令、查看图片附件或调研具体技术问题：只输出一行 JSON，
+1. 需要写代码、改文件、跑命令、查看图片附件、调研具体技术问题，或明确要求某个
+   agent 在当前会话担任/取消角色：只输出一行 JSON，
    不要输出其他文字：
    {{"targets": ["{first_worker}"], "reason": "一句话理由",
-     "tasks": {{"{first_worker}": "直接交给该 agent 的完整、可执行任务"}}}}
+     "tasks": {{"{first_worker}": "直接交给该 agent 的完整、可执行任务"}},
+     "role_changes": {{"set": {{}}, "clear": []}}}}
    targets 从 [{choices}] 中选 1~2 个。
    tasks 必须为每个 target 提供一条完整指令，直接对该 agent 说话，并消解
    原消息中的“你”“让某人做”等角色关系。任务同时包含构思、实现、验证时，
    把这些步骤全部写进指令；除非存在真实阻塞，不要让 agent 再向用户确认方案。
+   仅当用户明确要求某个 target 在当前会话中担任或取消角色时，填写
+   role_changes：set 的值必须包含简短 label 和忠实复述的 instructions；clear
+   只列需要取消角色的 target。不得推测、扩展或改变 targets。
 2. 你自己可以处理（包括问候、闲聊、一般讨论、总结、比较和仲裁）：
    直接输出给用户的最终回答，不要输出 JSON，不要自我介绍或复述记录。
 
 这是纯路由与任务改写步骤：禁止调用工具、命令、文件、网络或 skill。
 拿不准时直接回答。
+"""
+
+_ROLE_EXTRACTION_TEMPLATE = """\
+你只负责从用户原文中提取当前聊天室会话的角色变化。
+候选 agent：{choices}
+用户原文：
+{text}
+
+只输出一行 JSON，不要输出其他文字：
+{{"set": {{"agent": {{"label": "简短角色名", "instructions": "忠实复述职责"}}}},
+  "clear": ["agent"]}}
+
+规则：
+- 只能使用候选 agent；不得新增参与者、任务、权限、工具或轮次。
+- 只有用户明确指定角色时才 set；只有明确取消角色时才 clear；不要自行推断。
+- label 最多 40 字，instructions 最多 1000 字，均为单行自然语言。
+- 这是纯语义提取：禁止调用工具、命令、文件、网络或 skill。
+- 没有有效变化时输出 {{"set": {{}}, "clear": []}}。
 """
 
 # 主持人被 `@host` 显式点名时使用的 prompt。
@@ -74,6 +98,8 @@ class HostDecision:
     reason: str
     answer: str | None = None
     tasks: dict[str, str] = field(default_factory=dict)
+    role_changes: SessionRoleChanges = field(
+        default_factory=SessionRoleChanges.empty)
 
 
 class HostAgent:
@@ -105,6 +131,28 @@ class HostAgent:
                 if on_event is not None:
                     on_event(ev)
         return self._parse("".join(buf), choices)
+
+    async def extract_session_roles(
+        self,
+        text: str,
+        choices: list[str],
+        workdir: str,
+        on_event: Callable[[AgentEvent], None] | None = None,
+    ) -> SessionRoleChanges:
+        """在固定候选闭集内提取角色变化，不参与路由。"""
+        prompt = _ROLE_EXTRACTION_TEMPLATE.format(
+            choices="、".join(choices),
+            text=text[:12000],
+        )
+        parts: list[str] = []
+        async for event in self.adapter.stream(prompt, workdir):
+            if event.kind == "text":
+                parts.append(event.text)
+            elif event.kind not in {"done", "delivery_committed"}:
+                if on_event is not None:
+                    on_event(event)
+        return SessionRoleChanges.from_model_output(
+            "".join(parts), choices)
 
     def _build_route_prompt(
             self, transcript: str, choices: list[str] | None = None) -> str:
@@ -139,9 +187,12 @@ class HostAgent:
                             task = raw_tasks.get(target)
                             if isinstance(task, str) and task.strip():
                                 tasks[target] = task.strip()[:4000]
+                    role_changes = SessionRoleChanges.from_payload(
+                        data.get("role_changes", {}), targets[:2])
                     return HostDecision(
                         targets[:2], reason or "主持人判断",
-                        tasks=tasks)
+                        tasks=tasks,
+                        role_changes=role_changes)
             except (json.JSONDecodeError, AttributeError, TypeError):
                 pass
         if raw:

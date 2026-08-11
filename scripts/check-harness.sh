@@ -23,6 +23,7 @@ required=(
   docs/adr/0008-bounded-multi-agent-discussion.md
   docs/adr/0009-bounded-milestone-workflow-steering.md
   docs/adr/0010-multi-session-tui-management.md
+  docs/adr/0011-session-scoped-natural-language-roles.md
   scripts/check-redlines.sh
 )
 
@@ -65,6 +66,7 @@ docs = [
     root / "docs/adr/0008-bounded-multi-agent-discussion.md",
     root / "docs/adr/0009-bounded-milestone-workflow-steering.md",
     root / "docs/adr/0010-multi-session-tui-management.md",
+    root / "docs/adr/0011-session-scoped-natural-language-roles.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -96,10 +98,11 @@ if [ ! -x .venv/bin/python ]; then
 fi
 
 .venv/bin/python -m py_compile \
-  main.py myagents_mcp.py orchestrator.py host.py discussion.py workflow.py session_catalog.py session_manager.py tui_activity.py \
+  main.py myagents_mcp.py orchestrator.py host.py discussion.py workflow.py session_roles.py session_catalog.py session_manager.py tui_activity.py \
   acp/*.py codex_app_server/*.py adapters/*.py control/*.py storage/*.py workspace/*.py tests/*.py \
   scripts/e2e-m3-real.py scripts/e2e-m5-real.py
 .venv/bin/python tests/test_basic.py
+.venv/bin/python tests/test_session_roles.py
 .venv/bin/python tests/test_tui_activity.py
 .venv/bin/python tests/test_tui_completion.py
 .venv/bin/python tests/test_discussion.py

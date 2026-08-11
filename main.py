@@ -784,6 +784,11 @@ class ChatApp(App):
                 ev.text,
                 state=str(ev.meta.get("agent_state") or "running"),
                 heartbeat=heartbeat,
+                session_role=(
+                    str(ev.meta["session_role"])
+                    if isinstance(ev.meta.get("session_role"), str)
+                    else None
+                ),
             )
         elif ev.kind == "tool":
             command = ev.meta.get("command")
@@ -1466,8 +1471,10 @@ class ChatApp(App):
 
     def _set_agent_status(
             self, command_id: str, name: str,
-            state: str, phase: str = "") -> None:
-        self._ensure_task(command_id).set_agent(name, state, phase)
+            state: str, phase: str = "",
+            *, session_role: str | None = None) -> None:
+        self._ensure_task(command_id).set_agent(
+            name, state, phase, session_role=session_role)
         self._render_task_status()
 
     def _set_workflow_status(self, command_id: str, meta: dict) -> None:
@@ -1870,6 +1877,11 @@ class ChatApp(App):
                     name,
                     str(ev.meta.get("agent_state") or "running"),
                     str(ev.meta.get("phase") or ev.text),
+                    session_role=(
+                        str(ev.meta["session_role"])
+                        if isinstance(ev.meta.get("session_role"), str)
+                        else None
+                    ),
                 )
             if command_id is not None:
                 heartbeat = ev.meta.get("heartbeat") is True
@@ -1884,6 +1896,11 @@ class ChatApp(App):
                     ev.text,
                     state=str(ev.meta.get("agent_state") or "running"),
                     heartbeat=heartbeat,
+                    session_role=(
+                        str(ev.meta["session_role"])
+                        if isinstance(ev.meta.get("session_role"), str)
+                        else None
+                    ),
                 ):
                     self._upsert_activity_card(command_id)
             else:

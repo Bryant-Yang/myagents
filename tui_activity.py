@@ -54,6 +54,7 @@ _TERMINAL_STATES = {"completed", "failed", "cancelled", "interrupted"}
 class _AgentActivity:
     state: str
     phase: str
+    session_role: str = ""
 
 
 @dataclass(frozen=True)
@@ -134,13 +135,19 @@ class ActivityFeed:
         *,
         state: str = "running",
         heartbeat: bool = False,
+        session_role: str | None = None,
     ) -> bool:
         card = self._cards.setdefault(command_id, _ActivityCard(command_id))
         changed = False
         current = card.agents.get(agent)
         # heartbeat 只刷新等待证据，不覆盖更有意义的实际阶段。
         if not heartbeat or current is None:
-            updated = _AgentActivity(state, phase)
+            role = (
+                _clean_session_role(session_role)
+                if session_role is not None
+                else (current.session_role if current is not None else "")
+            )
+            updated = _AgentActivity(state, phase, role)
             if current != updated:
                 card.agents[agent] = updated
                 card.agents.move_to_end(agent)
@@ -174,7 +181,11 @@ class ActivityFeed:
             changed = True
         if state is not None:
             current = card.agents.get(agent)
-            updated = _AgentActivity(state, text)
+            updated = _AgentActivity(
+                state,
+                text,
+                current.session_role if current is not None else "",
+            )
             if current != updated:
                 card.agents[agent] = updated
                 card.agents.move_to_end(agent)
@@ -229,7 +240,12 @@ class ActivityFeed:
                     card.historical_tool_exception, 0):
                 card.historical_tool_exception = status_label
                 changed = True
-        agent_activity = _AgentActivity("running", f"工具：{title}")
+        current_agent = card.agents.get(agent)
+        agent_activity = _AgentActivity(
+            "running",
+            f"工具：{title}",
+            current_agent.session_role if current_agent is not None else "",
+        )
         if card.agents.get(agent) != agent_activity:
             card.agents[agent] = agent_activity
             changed = True
@@ -280,7 +296,7 @@ class ActivityFeed:
             phase = latest.phase.replace("\n", " ")
             if len(phase) > 40:
                 phase = f"{phase[:39]}…"
-            focus = f"{latest_name}：{phase}"
+            focus = f"{_agent_label(card, latest_name)}：{phase}"
         else:
             focus = "准备中"
         if card.tools:
@@ -317,11 +333,14 @@ class ActivityFeed:
         rows: list[str] = [header]
         for (category, agent), note in card.notes.items():
             marker = _NOTE_LABELS.get(category, "阶段")
-            rows.append(f"  {agent} · {marker} · {note}")
+            rows.append(
+                f"  {_agent_label(card, agent)} · {marker} · {note}")
         for tool in card.tools.values():
             status = _TOOL_LABELS.get(
                 tool.status.lower(), tool.status or "已记录")
-            rows.append(f"  {tool.agent} · {tool.title} · {status}")
+            rows.append(
+                f"  {_agent_label(card, tool.agent)} · "
+                f"{tool.title} · {status}")
             if tool.detail:
                 detail = tool.detail.replace("\n", "\n    ")
                 rows.append(f"    {detail}")
@@ -338,3 +357,16 @@ class ActivityFeed:
         if card.error:
             rows.append(f"  失败原因 · {card.error}")
         return "\n".join(rows)
+
+
+def _clean_session_role(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:40]
+
+
+def _agent_label(card: _ActivityCard, agent: str) -> str:
+    activity = card.agents.get(agent)
+    if activity is None or not activity.session_role:
+        return agent
+    return f"{agent} · {activity.session_role}（本会话）"

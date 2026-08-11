@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 from adapters.base import AgentEvent, ExecutionMode
 from control import CommandBus
 from orchestrator import AgentSpec, Orchestrator
+from session_roles import SessionRole, SessionRoleChanges
 from storage.store import RoomStore
 from workflow import (
     MAX_STEERING_ITEMS,
@@ -339,12 +340,14 @@ def test_orchestrator_single_timeline_and_execution_modes() -> None:
             self.name = name
             self.session_id = None
             self.calls: list[ExecutionMode] = []
+            self.prompts: list[str] = []
 
         async def stream(
             self, prompt: str, workdir: str, *,
             execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
         ):
             self.calls.append(execution_mode)
+            self.prompts.append(prompt)
             if "有界 workflow 阶段：review" in prompt:
                 text = envelope("review", "ready")
             elif "有界 workflow 阶段：implement" in prompt:
@@ -369,6 +372,9 @@ def test_orchestrator_single_timeline_and_execution_modes() -> None:
         host = Adapter("host")
         orch.host = host
         orch.adapters["host"] = host
+        orch._apply_session_role_changes(SessionRoleChanges({
+            "review": SessionRole("严格审查者", "优先寻找可复现反例。"),
+        }, ()))
         events: list[tuple[str, AgentEvent]] = []
         outcome = await orch.dispatch(
             "/workflow --reviewer @review --implementer @write "
@@ -381,6 +387,8 @@ def test_orchestrator_single_timeline_and_execution_modes() -> None:
         assert len(users) == 1
         assert all(message.command_id == "cmd-integration" for message in orch.history)
         assert adapters["review"].calls == [ExecutionMode.READ_ONLY]
+        assert "当前聊天室会话中的临时角色：严格审查者" \
+            in adapters["review"].prompts[0]
         assert adapters["write"].calls == [ExecutionMode.WORKSPACE_WRITE]
         assert adapters["verify"].calls == [ExecutionMode.READ_ONLY]
         assert host.calls == [ExecutionMode.READ_ONLY]
@@ -391,6 +399,16 @@ def test_orchestrator_single_timeline_and_execution_modes() -> None:
             and event.meta.get("workflow_stage") == "baseline"
             and "fingerprint=baseline" in event.text
             for _name, event in events
+        )
+        assert any(
+            name == "review"
+            and event.meta.get("session_role") == "严格审查者"
+            for name, event in events
+        )
+        assert all(
+            event.meta.get("session_role") == "严格审查者"
+            for name, event in events
+            if name == "review" and event.kind in {"status", "text", "done"}
         )
         await orch.aclose()
 

@@ -24,6 +24,13 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Mapping
+
+from session_roles import (
+    SessionRole,
+    SessionRoleValidationError,
+    normalize_session_roles,
+)
 
 APP_NAME = "myagents"
 STATE_SCHEMA_VERSION = 1
@@ -420,6 +427,7 @@ class RoomStore:
             "workdir": self.workdir,
             "session_name": self.session_name,
             "agents": {},
+            "session_roles": {},
         }
         self._write_state(state)
         self._state = state
@@ -467,6 +475,11 @@ class RoomStore:
                 f"与本次打开的 {self.session_name!r} 不一致")
         if not isinstance(data.get("agents"), dict):
             raise CorruptedStorageError("state.json 缺少合法的 agents 映射")
+        try:
+            normalize_session_roles(data.get("session_roles", {}))
+        except SessionRoleValidationError as exc:
+            raise CorruptedStorageError(
+                f"state.json 的 session_roles 非法：{exc}") from exc
         if "session_title" in data:
             try:
                 normalize_session_title(data["session_title"])
@@ -656,6 +669,30 @@ class RoomStore:
             "session_title": normalized,
             "session_title_pending": pending,
             "session_updated_at": _utc_now_iso(),
+        }
+        self._write_state(new_state)
+        self._state = new_state
+
+    def get_session_roles(self) -> dict[str, SessionRole]:
+        """返回当前房间角色快照；旧房间缺字段时为空。"""
+        try:
+            return normalize_session_roles(
+                self._state.get("session_roles", {}))
+        except SessionRoleValidationError as exc:
+            raise CorruptedStorageError(
+                f"state.json 的 session_roles 非法：{exc}") from exc
+
+    def set_session_roles(
+        self,
+        roles: Mapping[str, SessionRole],
+    ) -> None:
+        """原子替换会话角色；写失败时内存和磁盘都保持旧值。"""
+        normalized = normalize_session_roles(dict(roles))
+        new_state = {
+            **self._state,
+            "session_roles": {
+                name: role.to_state() for name, role in normalized.items()
+            },
         }
         self._write_state(new_state)
         self._state = new_state

@@ -31,6 +31,7 @@ _TERMINAL_AGENT_STATES = {
 class AgentProgress:
     state: str = "queued"
     phase: str = "等待派发"
+    session_role: str = ""
 
 
 @dataclass
@@ -50,7 +51,14 @@ class TaskProgress:
         if error:
             self.error = error[:500]
 
-    def set_agent(self, name: str, state: str, phase: str = "") -> None:
+    def set_agent(
+        self,
+        name: str,
+        state: str,
+        phase: str = "",
+        *,
+        session_role: str | None = None,
+    ) -> None:
         current = self.agents.get(name)
         # 迟到的普通状态或 done 不得把已经记录的失败洗掉。
         if current is not None and current.state == "failed" \
@@ -65,6 +73,11 @@ class TaskProgress:
         self.agents[name] = AgentProgress(
             state=state,
             phase=clean_phase or _AGENT_LABELS.get(state, state),
+            session_role=(
+                _clean_session_role(session_role)
+                if session_role is not None
+                else (current.session_role if current is not None else "")
+            ),
         )
 
     def set_workflow(
@@ -126,5 +139,15 @@ class TaskProgress:
                 f"workflow {self.workflow_stage}{suffix} · {steering}")
         for name, item in self.agents.items():
             label = _AGENT_LABELS.get(item.state, item.state)
-            details.append(f"{name} {label} · {item.phase}")
+            agent_label = (
+                f"{name} · {item.session_role}（本会话）"
+                if item.session_role else name
+            )
+            details.append(f"{agent_label} {label} · {item.phase}")
         return "\n".join(details)
+
+
+def _clean_session_role(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:40]

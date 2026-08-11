@@ -168,6 +168,23 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
 不会写进目标工作区。未指定名称时使用兼容旧历史的 `default` 会话；同一房间
 同一时刻只允许一个 TUI 实例写入。
 
+### 会话级自然语言角色
+
+无需维护永久角色库，直接在聊天中指定即可：
+
+```text
+@qwen 接下来你担任产品研究员，先核对事实并列出未知项
+@opencode 你在本会话担任反方审查者，重点寻找反例
+@qwen 继续分析下一项
+@qwen 不再担任这个角色，恢复普通助手
+```
+
+角色会在当前命名会话的后续任务中持续生效，并在活动卡和任务状态中显示为
+`qwen · 产品研究员（本会话）`。切换到其他会话不会继承；关闭程序后重开同一
+会话则会恢复。角色只是工作视角，不能改变实际 agent、工具权限、runtime、讨论
+成员/轮数或 workflow 固定职责。完整契约见
+[ADR-0011](docs/adr/0011-session-scoped-natural-language-roles.md)。
+
 ## 使用方式
 
 ```text
@@ -175,6 +192,7 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
 @codex review 当前实现，只报告可复现问题
 @kimi @opencode 分别提出一个方案
 @qwen 检查当前模块并给出最小修复
+@qwen 接下来担任产品研究员，汇总现有证据并列出未知项
 @host 总结上面两个方案的分歧
 /discuss @kimi @opencode --rounds 2 --moderator host -- 讨论新增 adapter 的协议选择
 /workflow --reviewer @kimi --implementer @codex -- 给解析器补边界测试并验收
@@ -233,6 +251,7 @@ implementer 可写。未指定 `--verifier` 时由 reviewer 复核。`/steer` �
 | Kimi | ACP + 只读 JSONL (`kimi acp` → `kimi -p`) | 持久 session + 增量 history；只有 prepare 失败才降级 | ACP 已验证；hybrid contract 已验收 |
 | Codex | app-server (`codex app-server`) | 持久 thread + 增量 history + thread 恢复 | 已接入；JSONL fallback |
 | OpenCode | ACP + 隔离只读 JSONL (`opencode acp` → `opencode run`) | 持久 session + 增量 history；风险工具 ask；只有 prepare 失败才降级 | ACP/permission 已验证；hybrid contract 已验收 |
+| Qwen Code | ACP (`qwen --acp`) | 持久 session + 增量 history；普通轮 default、只读轮 plan | ACP-only 已验证 |
 | Claude | 未接入 | 预留 AgentSpec/adapter 扩展点 | 规划中 |
 
 有状态 agent 首次接入只收到最近 `history_limit` 条共享记录；后续只收到 cursor
@@ -448,6 +467,7 @@ myagents/
 - [docs/adr/0008-bounded-multi-agent-discussion.md](docs/adr/0008-bounded-multi-agent-discussion.md)：有界讨论状态机与失败收口。
 - [docs/adr/0009-bounded-milestone-workflow-steering.md](docs/adr/0009-bounded-milestone-workflow-steering.md)：有界里程碑 workflow 与 steering。
 - [docs/adr/0010-multi-session-tui-management.md](docs/adr/0010-multi-session-tui-management.md)：会话目录、后台任务、资源上限与图片短引用。
+- [docs/adr/0011-session-scoped-natural-language-roles.md](docs/adr/0011-session-scoped-natural-language-roles.md)：自然语言指定、会话生命周期与安全边界。
 - [docs/concepts.md](docs/concepts.md)：相关协议与编排模式。
 - [docs/knowledge-map.html](docs/knowledge-map.html)：可交互知识地图。
 
@@ -469,6 +489,7 @@ myagents/
 - [x] M5.1：`/discuss` 指定成员、1–3 轮有界讨论与终局 moderator。
 - [x] M5：干净 Git fixed point、review → 单 writer 修改 → 独立复核、最多
   一次 repair/reverify、阶段边界 steering 与 TUI 阶段状态。
+- [x] M6：自然语言指定会话级角色、跨任务持续、房间隔离与状态可见。
 - [ ] Later：只有出现跨机器、跨组织 agent 协作需求时再评估 A2A。
 
 ## 当前限制

@@ -92,6 +92,10 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
   加入该 worker 本轮 prompt，不写入共享 timeline。任务必须消解“你/让某人”
   等角色关系；旧格式或缺失任务使用原始用户请求生成执行型回退指令，不能只把
   `reason` 展示给用户后丢失委托语义。
+- 会话级角色只保存为当前 room 的 `实际 agent -> label + instructions`；由 host
+  在固定 targets 闭集内从自然语言提取，instructions 只注入对应 worker prompt，
+  不写共享 timeline。角色不得创建 agent、改变 runtime/权限、扩充讨论成员/轮次
+  或替换 workflow 固定职责；状态写失败时不得更新内存或继续派发。
 - host 路由是纯分类与任务改写步骤，prompt 明确禁止调用工具、文件、命令、
   网络或 skill；保持 Codex 默认配置继承，不用配置覆盖换取速度。底层若仍
   产生安全的 status/tool/permission 事件，必须透传到执行日志与 TUI，不能
@@ -277,6 +281,7 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 | Kimi hybrid transport | `tests/test_kimi_hybrid.py` + `tests/fake_acp_server.py` |
 | OpenCode hybrid transport | `tests/test_opencode_hybrid.py` + `tests/fake_acp_server.py` |
 | Qwen Code ACP-only 注册 | `tests/test_phase2.py` + `tests/fake_acp_server.py` |
+| 会话级自然语言角色 | `tests/test_session_roles.py` + `tests/test_discussion.py` + TUI 纯状态模型 |
 | TUI/增量/权限/回收 | `tests/test_phase2.py` |
 | 多会话目录/生命周期/TUI | `tests/test_session_catalog.py` + `tests/test_session_manager.py` + `tests/test_session_tui.py` |
 | RoomStore 持久化 | `tests/test_storage.py` |
@@ -296,7 +301,7 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 当前本地门禁顺序：
 
 ```text
-harness 文档引用 → redlines → py_compile → basic → ACP → Phase 2
+harness 文档引用 → redlines → py_compile → basic → 会话角色 → ACP → Phase 2
 → Kimi hybrid
 → OpenCode hybrid
 → storage → M2.5 → M3 bus → M3 control → M3 MCP stdio → M4 app-server
@@ -351,7 +356,7 @@ branch protection / required checks 需要单独配置后才能宣称生效。
 | R2 | 通用 orchestration/ACP 层不得按具体 agent 名做条件分支 | `bash scripts/check-redlines.sh` 的 AST name-branch gate |
 | R3 | UI、orchestrator、host 不得直接启动 shell/子进程 | `bash scripts/check-redlines.sh` 的 AST process-boundary gate |
 | R4 | Kimi/OpenCode 必须受限 ACP-first；Qwen 必须 ACP-only 且固定 default/plan runtime profile；OpenCode 普通轮风险工具 ask、只读轮 runtime deny；JSONL 仅获证的 prepare-only 只读降级 | `bash scripts/check-redlines.sh` 的 registry/policy/profile gate |
-| R5 | `/discuss` 必须保持 2–3 人、1–3 轮、终局主持且不得递归 dispatch | `bash scripts/check-redlines.sh` 的 discussion bounds/AST gate |
+| R5 | `/discuss` 必须保持 2–3 人、1–3 轮、终局主持且不得递归 dispatch；会话角色不得改变参与者、轮数、权限或 runtime | `bash scripts/check-redlines.sh` 的 discussion bounds/AST gate + `tests/test_session_roles.py` |
 | R6 | `/workflow` 必须保持固定角色/阶段、单 writer、最多一次 repair/reverify、read-only 复核和有界 steering | `bash scripts/check-redlines.sh` 的 workflow bounds/mode/AST gate |
 
 红线变更必须同步本文、`AGENTS.md`、`docs/workflow.md`、enforcement 与

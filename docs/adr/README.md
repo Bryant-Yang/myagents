@@ -16,3 +16,4 @@
 | [0008](0008-bounded-multi-agent-discussion.md) | Accepted | M5.1 `/discuss` 有界轮次、失败收口与终局主持 |
 | [0009](0009-bounded-milestone-workflow-steering.md) | Accepted | M5 review → 修改 → 复核闭环与阶段边界 steering |
 | [0010](0010-multi-session-tui-management.md) | Accepted | M4.7 会话目录、后台执行、资源 gate 与图片短引用 |
+| [0011](0011-session-scoped-natural-language-roles.md) | Accepted | M6 自然语言指定会话级角色、持久恢复与安全边界 |

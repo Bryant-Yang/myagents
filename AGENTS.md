@@ -49,7 +49,8 @@ hub-and-spoke 方式维护统一时间线，以 ACP 作为有状态 coding agent
   fallback 安全契约得到独立证据前不得自动降级到 headless JSONL。
 - **R5 多智能体讨论必须显式且有界**：`/discuss` 只允许 2–3 个已注册
   worker、1–3 轮和一个终局 moderator；轮次由普通代码推进，禁止 agent
-  自主递归派发、动态扩员或形成无界对话。
+  自主递归派发、动态扩员或形成无界对话。会话级自然语言角色只能绑定已固定的
+  实际 agent，不得改变参与者、moderator、轮数、工具权限或 runtime。
 - **R6 里程碑 workflow 必须固定且单写者**：`/workflow` 固定 review →
   implement → verify，最多一次同 writer repair/reverify 和一次 host final；
   review/verify/final 必须 read-only，steering 只允许在阶段边界按冻结上限追加，

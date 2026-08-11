@@ -17,6 +17,7 @@
 | 6 | 改持久化、恢复、会话身份/切换、lease、command bus、可观测性或 MCP 入口 | [`adr/0001-persistent-room-command-bus-mcp.md`](adr/0001-persistent-room-command-bus-mcp.md)、[`adr/0002-durable-execution-observability.md`](adr/0002-durable-execution-observability.md)、[`adr/0005-project-conversation-sessions.md`](adr/0005-project-conversation-sessions.md)、[`adr/0010-multi-session-tui-management.md`](adr/0010-multi-session-tui-management.md)；[`SPEC.md`](SPEC.md) 房间/恢复/会话/控制/可观测用例 | R1–R4、单写者、执行事件不进 history | `storage/`、`control/`、`session_catalog.py`、`session_manager.py`、ACP adapter、MCP bridge、TUI、对应测试 | storage/M2.5/M3 与 session catalog/manager/TUI 测试通过；会话隔离且 default 兼容；后台事件/权限按 room_id 归属；取消不杀其他会话；MCP 不创建第二 Orchestrator、不获取 lease、不绕过 TUI 权限 |
 | 7 | 改 Codex app-server、thread、approval 或 fallback | [`adr/0003-codex-app-server-transport.md`](adr/0003-codex-app-server-transport.md)、[`adr/0004-ephemeral-codex-host-threads.md`](adr/0004-ephemeral-codex-host-threads.md)；[`SPEC.md`](SPEC.md) Codex 用例 | R1–R4、默认配置继承、已发送 `turn/start` 不重放 | `codex_app_server/`、fake server、M4 tests、注册表 | worker 两轮同 PID/thread；host thread 不落盘；取消确认；断线失败；close 无残留；真实 E2E 单独登记 |
 | 8 | 实现里程碑 workflow 或运行中 steering | [`adr/0009-bounded-milestone-workflow-steering.md`](adr/0009-bounded-milestone-workflow-steering.md)；[`SPEC.md`](SPEC.md) UC-WORKFLOW-001；`../HARNESS.md` §4 | R1–R4、R6、干净 Git fixed point、单 writer、固定阶段/角色/修复上限、read-only review/verify | workspace inspector、`workflow.py`、adapter execution mode、Orchestrator/CommandBus、control/MCP/TUI、对应 fake tests | baseline/candidate 指纹固定且漂移 fail-closed；最多六次调用；阶段结果 fail-closed；steering 只在阶段边界生效；写入只由 implementer 串行发生；取消/no-replay/回收契约通过 |
+| 9 | 新增或修改会话级自然语言角色 | [`adr/0011-session-scoped-natural-language-roles.md`](adr/0011-session-scoped-natural-language-roles.md)；`../HARNESS.md` §4.1 | R1–R6、固定 target 闭集、room 级原子状态、角色不扩权 | `session_roles.py`、host/Orchestrator、RoomStore、TUI、对应 tests | 设置/取消、跨任务持续、讨论跨轮、命名会话隔离与重启恢复；写失败不假提交；活动区明确标注本会话 |
 
 不在表内且会改变协议、安全或外部接口的任务，先向用户确认范围。
 
@@ -39,6 +40,7 @@
 | 改 ACP 协议或 hybrid fallback | `docs/acp-migration.md`、对应 ADR-0006/0007、HARNESS §4 | `docs/harness-controls.md` 对应 Control |
 | 改编排器 | HARNESS §3–§4、SPEC 对应用例 | `host.py` 与 adapter 调用方 |
 | 新增 agent | `AGENTS.md`、HARNESS §1–§3 | 对应 CLI 官方协议文档 |
+| 改会话级自然语言角色 | ADR-0011、HARNESS §4.1 | RoomStore 与 host/Orchestrator/TUI 调用方 |
 | 处理重复失败 | `docs/harness-controls.md` Steering 规则 | 相关 Guide/Sensor 证据 |
 
 ## 4. Self-correction

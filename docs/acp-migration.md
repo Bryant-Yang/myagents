@@ -84,7 +84,9 @@ orchestrator.py（AgentAdapter 接口不变；AGENT_SPECS 注册表）
    └─ adapters/*_adapter.py  一次性 JSONL fallback
 ```
 
-新增一个 ACP agent 不需要改编排器：写一行 `AgentSpec` 即可。
+新增一个 ACP agent 不需要改编排器：写一行 `AgentSpec` 即可。会话中的自然语言
+角色不创建新 agent 或 runtime，只在实际 agent 的 assignment 前注入受限工作视角，
+具体约束见 [ADR-0011](adr/0011-session-scoped-natural-language-roles.md)。
 协议判断只看 `transport` / adapter 能力声明（`stateful_session`、
 `set_permission_handler`、`aclose`），不散落 `if name == "..."`。
 Kimi/OpenCode hybrid 的完整时机、权限与 checkpoint 契约见
