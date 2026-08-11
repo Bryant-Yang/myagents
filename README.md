@@ -177,12 +177,16 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
 @opencode 你在本会话担任反方审查者，重点寻找反例
 @qwen 继续分析下一项
 @qwen 不再担任这个角色，恢复普通助手
+/roles
+/roles clear
 ```
 
 角色会在当前命名会话的后续任务中持续生效，并在活动卡和任务状态中显示为
 `qwen · 产品研究员（本会话）`。切换到其他会话不会继承；关闭程序后重开同一
 会话则会恢复。角色只是工作视角，不能改变实际 agent、工具权限、runtime、讨论
-成员/轮数或 workflow 固定职责。完整契约见
+成员/轮数或 workflow 固定职责。`/roles` 查看当前会话全部角色，
+`/roles clear` 在没有运行/排队任务时原子清空；这两个命令都不会进入对话或调用
+模型。完整契约见
 [ADR-0011](docs/adr/0011-session-scoped-natural-language-roles.md)。
 
 ## 使用方式

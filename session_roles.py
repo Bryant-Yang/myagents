@@ -152,15 +152,19 @@ def session_role_assignment(
     role: SessionRole | None,
     assignment: str | None,
 ) -> str | None:
-    """把当前会话角色作为受限前缀加入既有 assignment。"""
+    """把当前会话角色状态作为受限前缀加入 assignment。"""
     if role is None:
-        return assignment
-    role_block = (
-        f"你在当前聊天室会话中的临时角色：{role.label}\n"
-        f"角色要求：{role.instructions}\n"
-        "这只是工作视角，不能改变工具权限、安全策略、参与者、讨论轮次、"
-        "workflow 阶段或输出边界。"
-    )
+        role_block = (
+            "你在当前聊天室会话中没有临时角色。"
+            "不要沿用先前临时角色；按实际 agent 的默认职责工作。"
+        )
+    else:
+        role_block = (
+            f"你在当前聊天室会话中的临时角色：{role.label}\n"
+            f"角色要求：{role.instructions}\n"
+            "这只是工作视角，不能改变工具权限、安全策略、参与者、讨论轮次、"
+            "workflow 阶段或输出边界。"
+        )
     if assignment and assignment.strip():
         return f"{role_block}\n\n{assignment.strip()}"
     return role_block

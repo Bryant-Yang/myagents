@@ -332,6 +332,14 @@ class Orchestrator:
         """当前房间角色快照；调用方不能修改内部状态。"""
         return dict(self._session_roles)
 
+    def clear_session_roles(self) -> tuple[str, ...]:
+        """原子清空当前房间角色，返回实际清除的 agent 名。"""
+        cleared = tuple(self._session_roles)
+        if not cleared:
+            return ()
+        self._apply_session_role_changes(SessionRoleChanges({}, cleared))
+        return cleared
+
     def _apply_session_role_changes(
         self,
         changes: SessionRoleChanges,

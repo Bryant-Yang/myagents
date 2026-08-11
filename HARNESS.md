@@ -95,7 +95,11 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 - 会话级角色只保存为当前 room 的 `实际 agent -> label + instructions`；由 host
   在固定 targets 闭集内从自然语言提取，instructions 只注入对应 worker prompt，
   不写共享 timeline。角色不得创建 agent、改变 runtime/权限、扩充讨论成员/轮次
-  或替换 workflow 固定职责；状态写失败时不得更新内存或继续派发。
+  或替换 workflow 固定职责；状态写失败时不得更新内存或继续派发。精确本地命令
+  `/roles` 与 `/roles clear` 分别只查看/原子清空当前 room，不进 timeline、不调用
+  模型；有 queued/running command 时不得跨阶段清空。
+  每轮 assignment 必须注入当前权威角色状态；角色已清除时显式声明无角色，
+  不得依赖有状态 runtime 自行忘记旧角色。
 - host 路由是纯分类与任务改写步骤，prompt 明确禁止调用工具、文件、命令、
   网络或 skill；保持 Codex 默认配置继承，不用配置覆盖换取速度。底层若仍
   产生安全的 status/tool/permission 事件，必须透传到执行日志与 TUI，不能
@@ -281,7 +285,7 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 | Kimi hybrid transport | `tests/test_kimi_hybrid.py` + `tests/fake_acp_server.py` |
 | OpenCode hybrid transport | `tests/test_opencode_hybrid.py` + `tests/fake_acp_server.py` |
 | Qwen Code ACP-only 注册 | `tests/test_phase2.py` + `tests/fake_acp_server.py` |
-| 会话级自然语言角色 | `tests/test_session_roles.py` + `tests/test_discussion.py` + TUI 纯状态模型 |
+| 会话级自然语言角色 | `tests/test_session_roles.py` + `tests/test_discussion.py` + `tests/test_tui_completion.py` + TUI 纯状态模型 |
 | TUI/增量/权限/回收 | `tests/test_phase2.py` |
 | 多会话目录/生命周期/TUI | `tests/test_session_catalog.py` + `tests/test_session_manager.py` + `tests/test_session_tui.py` |
 | RoomStore 持久化 | `tests/test_storage.py` |

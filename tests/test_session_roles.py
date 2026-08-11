@@ -231,6 +231,8 @@ def test_explicit_role_survives_session_until_natural_language_clear() -> None:
         "@qwen 分析第三个问题", lambda _name, _event: None))
     assert len(role_adapter.prompts) == 2
     assert "当前聊天室会话中的临时角色" not in qwen.last_prompt
+    assert "当前聊天室会话中没有临时角色" in qwen.last_prompt
+    assert "不要沿用先前临时角色" in qwen.last_prompt
     print("ok  显式角色在会话内持续，且可用自然语言清除")
 
 
@@ -314,6 +316,46 @@ def test_role_state_write_failure_prevents_worker_dispatch() -> None:
     print("ok  角色落盘失败不更新内存，也不派发 worker")
 
 
+def test_orchestrator_clear_session_roles_is_atomic() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        workdir = root / "work"
+        workdir.mkdir()
+        state_root = root / "state"
+        store = RoomStore(workdir, state_root=state_root)
+        roles = {
+            "qwen": SessionRole("产品研究员", "核对事实。"),
+            "opencode": SessionRole("反方", "寻找反例。"),
+        }
+        store.set_session_roles(roles)
+        orch = Orchestrator(str(workdir), store=store)
+        original_write = store._write_state
+
+        def fail_write(_data):
+            raise OSError("磁盘满了（模拟）")
+
+        store._write_state = fail_write  # type: ignore[method-assign]
+        try:
+            try:
+                orch.clear_session_roles()
+                raise AssertionError("清空角色写失败必须穿透")
+            except OSError:
+                pass
+            assert orch.session_roles == roles
+            assert RoomStore(
+                workdir, state_root=state_root).get_session_roles() == roles
+
+            store._write_state = original_write  # type: ignore[method-assign]
+            assert orch.clear_session_roles() == ("qwen", "opencode")
+            assert orch.session_roles == {}
+            assert RoomStore(
+                workdir, state_root=state_root).get_session_roles() == {}
+            assert orch.clear_session_roles() == ()
+        finally:
+            asyncio.run(orch.aclose())
+    print("ok  Orchestrator 公开清空接口原子提交且空操作幂等")
+
+
 def test_session_role_remains_visible_through_activity_updates() -> None:
     feed = ActivityFeed()
     feed.begin("command-role")
@@ -354,4 +396,5 @@ if __name__ == "__main__":
     test_host_route_reuses_single_call_for_role_changes()
     test_persistent_orchestrator_restores_room_role()
     test_role_state_write_failure_prevents_worker_dispatch()
+    test_orchestrator_clear_session_roles_is_atomic()
     test_session_role_remains_visible_through_activity_updates()

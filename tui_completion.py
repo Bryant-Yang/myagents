@@ -37,6 +37,8 @@ LOCAL_COMMANDS: tuple[LocalCommand, ...] = (
     LocalCommand(
         "paste-image", "粘贴 macOS 剪贴板图片", "action_paste_image"),
     LocalCommand("agents", "查看已注册 agent", "action_show_agents"),
+    LocalCommand("roles", "查看当前会话角色", "action_show_roles"),
+    LocalCommand("roles clear", "清空当前会话角色", "action_clear_roles"),
     LocalCommand("help", "查看本地命令与快捷键", "action_show_help"),
 )
 
@@ -65,7 +67,7 @@ class CompletionContext:
 
 
 def local_command_for(text: str) -> LocalCommand | None:
-    """只识别完整注册命令；带参数或未知 slash 文本仍是普通消息。"""
+    """只识别完整注册命令；其他 slash 文本仍是普通消息。"""
     return _COMMANDS_BY_TOKEN.get(text.strip())
 
 

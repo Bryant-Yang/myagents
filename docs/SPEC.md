@@ -78,11 +78,15 @@
 ### UC-ROLE-001 会话级自然语言角色
 
 - **角色 / 触发**：用户在普通消息或 `/discuss` 主题中自然表达“让 Qwen 在这个
-  会话担任产品研究员”“让 OpenCode 当反方”，或明确说“不再担任这个角色”。
+  会话担任产品研究员”“让 OpenCode 当反方”，或明确说“不再担任这个角色”；
+  也可用精确本地命令 `/roles` 查看、`/roles clear` 清空当前会话全部角色。
 - **主流程**：普通代码先固定实际 targets；host 仅在该闭集内提取 `set/clear`。
   无 mention 的消息复用既有 host 路由调用；显式 mention 和讨论只在存在角色线索
   时调用纯语义提取。合法变化先原子写入当前 room 的 `state.json.session_roles`，
-  再更新内存并派发。Orchestrator 在每轮 assignment 前注入角色要求。
+  再更新内存并派发。Orchestrator 在每轮 assignment 前注入权威的角色状态：
+  有角色时注入角色要求，无角色时明确不得沿用先前临时角色。
+  `/roles` 只读取 Orchestrator 快照；`/roles clear` 复用同一原子状态入口，不写
+  timeline、不路由、不调用模型。
 - **生命周期**：角色在当前命名会话的后续命令中持续，切换/新建会话不继承，
   重开同一会话会恢复；明确取消后删除。不提供永久 Profile、全局角色库或跨会话
   自动继承。
@@ -91,11 +95,16 @@
   或 workflow 的固定职责和 execution mode。
 - **异常分支**：未知 target、空值、畸形 JSON 与超限值不生效；提取失败保留已有
   角色并继续原任务。状态写失败则内存不更新、worker 不派发，错误向上传播。
+  清除后的无角色声明必须进入后续 assignment，避免有状态 runtime 沿用旧角色。
+  当前 room 存在 queued/running command 时 `/roles clear` 拒绝，避免阶段间漂移；
+  未注册的 `/roles ...` 参数形式仍作为普通消息。
 - **验收**：设置、跨任务沿用、自然语言取消、讨论跨轮注入、两个命名会话隔离、
   同会话重启恢复、损坏状态 fail loudly；活动卡和任务区显示
-  `agent · 角色（本会话）`，后续 tool/done 更新不丢角色。
+  `agent · 角色（本会话）`，后续 tool/done 更新不丢角色；查看/清空命令不进入
+  timeline、不调用 host，清空失败不假提交。
 - **独立证据来源**：`tests/test_session_roles.py`、`tests/test_discussion.py`、
-  `tests/test_tui_activity.py` 与 `tests/test_tui_status.py`。
+  `tests/test_tui_completion.py`、`tests/test_tui_activity.py` 与
+  `tests/test_tui_status.py`。
 - **人工验收边界**：模型对模糊角色表述的提取质量由用户验收；永久角色模板、
   跨会话复制和可视化角色编辑器不在本里程碑。
 - **里程碑**：M6。

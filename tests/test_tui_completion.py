@@ -10,7 +10,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
+from adapters.base import AgentEvent
 from main import ChatApp, ComposerInput
+from host import HostDecision
+from session_roles import SessionRole, SessionRoleChanges
 from test_basic import make_orch
 from tui_completion import (
     completion_context,
@@ -43,16 +46,22 @@ def test_completion_parser_and_command_boundary() -> None:
     assert slash is not None
     assert [item.value for item in slash.items] == ["/cancel"]
     assert completion_context("请看 /ca", 6, AGENTS) is None
+    roles = completion_context("/ro", 3, AGENTS)
+    assert roles is not None
+    assert [item.value for item in roles.items] == ["/roles", "/roles clear"]
 
     assert local_command_for("/new") is not None
     assert local_command_for("/discuss") is not None
     assert local_command_for("/workflow") is not None
     assert local_command_for("/steer") is not None
+    assert local_command_for("/roles").description == "查看当前会话角色"
+    assert local_command_for("/roles clear").description == "清空当前会话角色"
     assert local_command_for("/details").description == "展开或收起当前活动卡"
     assert local_command_for("/discuss @kimi @opencode -- 主题") is None
     assert local_command_for(
         "/workflow --reviewer @host --implementer @kimi -- 主题") is None
     assert local_command_for("/steer -- 新约束") is None
+    assert local_command_for("/roles delete") is None
     assert local_command_for(" /new ") is not None
     assert local_command_for("/new task") is None
     assert local_command_for("/unknown") is None
@@ -176,8 +185,126 @@ def test_slash_commands_unknown_agent_and_submit_behaviour() -> None:
     print("ok  /command 补全/本地执行/未知 agent/命令误判")
 
 
+def test_roles_commands_view_and_clear_without_dispatch() -> None:
+    from textual.widgets import RichLog
+
+    async def run() -> None:
+        orch = make_orch()
+        orch.host.route = HostDecision(
+            ["qwen"],
+            "设置会话角色",
+            tasks={"qwen": "以产品研究员视角分析"},
+            role_changes=SessionRoleChanges({
+                "qwen": SessionRole("产品研究员", "核对事实并列出未知项。"),
+            }, ()),
+        )
+        await orch.dispatch(
+            "让 qwen 在当前会话担任产品研究员",
+            lambda _name, _event: None,
+        )
+        before_history = list(orch.history)
+        before_decide_calls = orch.host.decide_calls
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test() as pilot:
+            box = app.query_one("#composer", ComposerInput)
+            box.value = "/roles"
+            box.cursor_position = len(box.value)
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines)
+            assert "当前会话角色：" in rendered
+            assert "@qwen · 产品研究员" in rendered
+            assert "核对事实并列出未知项。" in rendered
+            assert "清空全部：/roles clear" in rendered
+            assert orch.history == before_history
+            assert orch.host.decide_calls == before_decide_calls
+
+            box.value = "/roles clear"
+            box.cursor_position = len(box.value)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert orch.session_roles == {}
+            assert orch.history == before_history
+            assert orch.host.decide_calls == before_decide_calls
+            rendered = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines)
+            assert "已清空当前会话角色：@qwen" in rendered
+
+            box.value = "/roles"
+            box.cursor_position = len(box.value)
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines)
+            assert "当前会话没有设置角色" in rendered
+
+    asyncio.run(run())
+    print("ok  /roles 查看与清空均不进入 timeline 或调用 host")
+
+
+def test_roles_clear_waits_for_current_command_boundary() -> None:
+    from textual.widgets import RichLog
+
+    class HangingAdapter:
+        session_id = None
+
+        def __init__(self, started: asyncio.Event, release: asyncio.Event) -> None:
+            self.started = started
+            self.release = release
+
+        async def stream(self, prompt: str, workdir: str):
+            self.started.set()
+            await self.release.wait()
+            yield AgentEvent("text", "完成")
+            yield AgentEvent("done")
+
+    async def run() -> None:
+        orch = make_orch()
+        orch.host.route = HostDecision(
+            ["qwen"],
+            "设置会话角色",
+            tasks={"qwen": "以产品研究员视角分析"},
+            role_changes=SessionRoleChanges({
+                "qwen": SessionRole("产品研究员", "核对事实。"),
+            }, ()),
+        )
+        await orch.dispatch(
+            "让 qwen 在当前会话担任产品研究员",
+            lambda _name, _event: None,
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+        orch.adapters["qwen"] = HangingAdapter(started, release)
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test() as pilot:
+            box = app.query_one("#composer", ComposerInput)
+            box.value = "@qwen 执行长任务"
+            box.cursor_position = len(box.value)
+            await pilot.press("enter")
+            await asyncio.wait_for(started.wait(), timeout=2)
+
+            box.value = "/roles clear"
+            box.cursor_position = len(box.value)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert orch.session_roles["qwen"].label == "产品研究员"
+            rendered = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines)
+            assert "当前会话有任务正在运行或排队，结束后再清空角色" \
+                in rendered
+
+            release.set()
+            await app.workers.wait_for_complete()
+
+    asyncio.run(run())
+    print("ok  /roles clear 不跨越运行中 command 边界")
+
+
 if __name__ == "__main__":
     test_completion_parser_and_command_boundary()
     test_agent_completion_keyboard_and_focus()
     test_slash_commands_unknown_agent_and_submit_behaviour()
+    test_roles_commands_view_and_clear_without_dispatch()
+    test_roles_clear_waits_for_current_command_boundary()
     print("\nTUI completion 全部通过")

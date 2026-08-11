@@ -1234,8 +1234,8 @@ class ChatApp(App):
         self.close_completion()
         command = local_command_for(text)
         if command is not None:
-            # 本地命令必须在持久化/路由之前截获；未知或带参数的 slash
-            # 文本仍按普通消息提交，避免猜测用户语义。
+            # 本地命令必须在持久化/路由之前截获；未注册的 slash 文本仍按
+            # 普通消息提交，避免猜测用户语义。
             getattr(self, command.handler)()
             return
         # 不预先显示用户文本/思考状态：等 orchestrator 持久确认
@@ -1248,6 +1248,34 @@ class ChatApp(App):
             for name, transport in self._completion_agents()
         )
         self._system(f"可用 agent：{agents}")
+
+    def action_show_roles(self) -> None:
+        roles = self.orch.session_roles
+        if not roles:
+            self._system(
+                "当前会话没有设置角色；可直接说“让 @agent 担任……”")
+            return
+        rows = ["当前会话角色："]
+        for name, role in roles.items():
+            rows.append(f"@{name} · {role.label}")
+            rows.append(f"  {role.instructions}")
+        rows.append("清空全部：/roles clear")
+        self._system("\n".join(rows))
+
+    def action_clear_roles(self) -> None:
+        if self.bus.has_pending():
+            self._system("当前会话有任务正在运行或排队，结束后再清空角色")
+            return
+        try:
+            cleared = self.orch.clear_session_roles()
+        except Exception as exc:
+            self._write("system", f"清空会话角色失败：{exc}", "bold red")
+            return
+        if not cleared:
+            self._system("当前会话没有角色，无需清空")
+            return
+        rendered = "、".join(f"@{name}" for name in cleared)
+        self._system(f"已清空当前会话角色：{rendered}")
 
     def action_show_help(self) -> None:
         commands = "\n".join(

@@ -35,7 +35,7 @@
 | C11 | ACP hybrid 降级不绕过权限、不跨协议重放；Qwen 保持 ACP-only + default/plan profile | ADR-0006/0007/0009；HARNESS §4.2–4.3；SPEC UC-HYBRID-001/002 与 UC-ACP-003 | R4 registry/profile/policy gate；Kimi/OpenCode hybrid tests；Qwen command-profile/fresh-session contract；受限真实临时目录探针 | 阻断交付；恢复具体 ACP adapter、权限 policy、已获证只读 profile 和 prompt 前唯一 fallback 点；Qwen 不得继承 auto/yolo 或静默接入未验证 JSONL | Bryant Yang |
 | C12 | 指定成员讨论有界、跨轮上下文正确且失败不假绿 | ADR-0008；HARNESS §4.1；SPEC UC-DISCUSS-001 | R5 bounds/AST gate；`test_discussion.py` parser/并发/失败 contract；授权真实 MCP 回放 | 阻断；恢复 2–3 人、1–3 轮、非递归状态机和失败汇总后复验 | Bryant Yang |
 | C13 | 里程碑 workflow 保持 Git fixed point、单 writer、固定复核与阶段边界 steering | ADR-0009；SPEC UC-WORKFLOW-001 | R6 bounds/mode/AST gate；`test_workflow.py`；hybrid/app-server/control/MCP/TUI contract；授权真实验收 | 阻断；恢复 fixed point、read-only 复核、一次 repair 和 steering 上限后复验 | Bryant Yang |
-| C14 | 自然语言角色保持会话隔离且不改变编排安全边界 | ADR-0011；HARNESS §4.1；SPEC UC-ROLE-001 | `test_session_roles.py`；`test_discussion.py`；TUI activity/status tests | 阻断；恢复固定 target 闭集、room 级原子状态与 assignment-only 注入，确认不改权限/runtime/讨论边界/workflow | Bryant Yang |
+| C14 | 自然语言角色保持会话隔离且不改变编排安全边界 | ADR-0011；HARNESS §4.1；SPEC UC-ROLE-001 | `test_session_roles.py`；`test_discussion.py`；`test_tui_completion.py`；TUI activity/status tests | 阻断；恢复固定 target 闭集、room 级原子状态与 assignment-only 注入；查看/清空不得进入 timeline 或跨运行中 command 边界，确认不改权限/runtime/讨论边界/workflow | Bryant Yang |
 
 ## 3. 约束等级
 
