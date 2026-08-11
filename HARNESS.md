@@ -1,6 +1,6 @@
 # myagents 工程契约（HARNESS）
 
-> 作者：Bryant Yang　最近更新：2026-07-27
+> 作者：Bryant Yang　最近更新：2026-08-12
 > Harness Framework：2.1.0（来源 commit：
 > `b3b8fd47ebc49b57abdc365f327688b33970d54c`）
 
@@ -20,7 +20,7 @@
 | 原则 | 项目解释 |
 | --- | --- |
 | 一个编排中心 | agent 不直接互调，消息与 history 统一经过 Orchestrator。 |
-| 原生长连接优先，JSONL fallback | 有官方可靠长连接时优先使用；Kimi/OpenCode/Qwen Code 走 ACP，Codex 走 app-server；Qwen 在只读降级契约获证前保持 ACP-only。 |
+| 原生长连接优先，JSONL fallback | 有官方可靠长连接时优先使用；Kimi/OpenCode/Qwen Code/WorkBuddy 走 ACP，Codex 走 app-server；Qwen/WorkBuddy 在只读降级契约获证前保持 ACP-only。 |
 | 协议通用、差异下沉 | 通用 runtime 不按 agent 名分支，具体差异进入 adapter/spec。 |
 | 权限 fail-closed | 无处理器、异常或畸形选择一律拒绝；auto 必须显式授权。 |
 | 生命周期负责到底 | 启动的进程组必须能 cancel、close 并被独立验证已回收。 |
@@ -34,7 +34,7 @@
 | TUI | Textual `>=1.0` |
 | ACP transport | NDJSON JSON-RPC 2.0 over stdio，protocolVersion 1 |
 | Codex transport | app-server JSONL over stdio（JSON-RPC-like，无 `jsonrpc` header） |
-| JSONL transport | 各 agent CLI 无头模式；Kimi/OpenCode 自动降级只允许各自内置只读 profile；Qwen 不自动降级 |
+| JSONL transport | 各 agent CLI 无头模式；Kimi/OpenCode 自动降级只允许各自内置只读 profile；Qwen/WorkBuddy 不自动降级 |
 | 持久化 | RoomStore：timeline.jsonl（对话）+ events.jsonl（执行）+ state.json（seq/cursor/session）+ owner.lock |
 | 外部入口 | control/：CommandBus FIFO + 私有 Unix 控制 socket；myagents_mcp.py stdio MCP bridge（`mcp>=1.27,<2`） |
 | 测试 | 直接运行的 Python test scripts + Textual pilot + fake ACP server + 官方 MCP SDK stdio client |
@@ -118,12 +118,19 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 
 ### 4.2 权限
 
-- `AcpClient`、`AcpAdapter`、`AcpKimiAdapter`、`AcpOpenCodeAdapter`、`AcpQwenAdapter`
+- `AcpClient`、`AcpAdapter`、`AcpKimiAdapter`、`AcpOpenCodeAdapter`、`AcpQwenAdapter`、`AcpWorkBuddyAdapter`
   默认权限都是 `deny`。OpenCode ACP 普通轮次把未知及有副作用工具收口为 ask；
   `read_only` 轮次改用 runtime deny-all + 安全读取白名单，并在 profile 切换时
   重建进程/session，避免取消权限导致零正文或跨 mode 继承授权。Qwen ACP
   普通轮强制 `--approval-mode default`，`read_only` 强制 `plan`；不能继承用户
   native TUI 的 auto/yolo mode，也不能只依赖 ACP permission cancelled。
+- WorkBuddy 普通轮强制 `--permission-mode default`；`read_only` 强制
+  `dontAsk`、禁用 subagent 自动询问，并把内置工具闭集固定为
+  `Read,Glob,Grep`。两种 profile 都忽略用户/项目/local settings 与外部 MCP，
+  profile 切换必须重建进程/session。只使用可独立运行的官方 CLI，固定中国区
+  `internal` 环境，不回退 WorkBuddy.app 包内私有二进制。已有登录态直接复用；
+  只有 session prepare 明确返回认证错误才接受 initialize 公布的 method 并按需
+  认证。登录 URL 仅允许官方 HTTPS 域名，认证等待有界，失败原子回收。
 - TUI 异步决定权限并显示来源 agent。
 - `session/request_permission` 到权限结果发回前属于人工等待，不计入 ACP
   inactivity timeout；read loop、取消和关闭仍保持可响应。
@@ -285,6 +292,7 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 | Kimi hybrid transport | `tests/test_kimi_hybrid.py` + `tests/fake_acp_server.py` |
 | OpenCode hybrid transport | `tests/test_opencode_hybrid.py` + `tests/fake_acp_server.py` |
 | Qwen Code ACP-only 注册 | `tests/test_phase2.py` + `tests/fake_acp_server.py` |
+| WorkBuddy ACP-only 注册/认证/profile | `tests/test_workbuddy_acp.py` + `tests/fake_acp_server.py` |
 | 会话级自然语言角色 | `tests/test_session_roles.py` + `tests/test_discussion.py` + `tests/test_tui_completion.py` + TUI 纯状态模型 |
 | TUI/增量/权限/回收 | `tests/test_phase2.py` |
 | 多会话目录/生命周期/TUI | `tests/test_session_catalog.py` + `tests/test_session_manager.py` + `tests/test_session_tui.py` |
@@ -295,9 +303,9 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 | M3 MCP stdio | `tests/test_m3_mcp.py`（官方 SDK client） |
 | M4 Codex app-server | `tests/test_codex_app_server.py` + `tests/fake_codex_app_server.py` |
 | M4.3 剪贴板图片 | `tests/test_clipboard_image.py` + macOS 人工截图验收 |
-| 真实协议边界 | `docs/SPEC.md` 登记的 Kimi/OpenCode ACP + Textual/受限临时目录 E2E；Qwen 上游源码与本机启动证据 |
+| 真实协议边界 | `docs/SPEC.md` 登记的 Kimi/OpenCode/WorkBuddy ACP + Textual/受限临时目录 E2E；Qwen 上游源码与本机启动证据 |
 
-普通测试禁止调用真实 Kimi/Codex/OpenCode/Qwen。真实 agent 验收必须由用户明确授权，
+普通测试禁止调用真实 Kimi/Codex/OpenCode/Qwen/WorkBuddy。真实 agent 验收必须由用户明确授权，
 在临时目录运行，并在结束后检查没有残留进程。
 
 ## 6. 质量门禁
@@ -308,6 +316,7 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 harness 文档引用 → redlines → py_compile → basic → 会话角色 → ACP → Phase 2
 → Kimi hybrid
 → OpenCode hybrid
+→ WorkBuddy ACP
 → storage → M2.5 → M3 bus → M3 control → M3 MCP stdio → M4 app-server
 → M4.3 clipboard image
 ```
@@ -345,6 +354,14 @@ branch protection / required checks 需要单独配置后才能宣称生效。
   Qwen ACP 子进程残留；独立 plan profile 写入探针在 runtime 层失败且未产生
   文件，default profile 同类探针也未写入；真实权限 options、跨进程恢复与取消
   时延仍待人工验收；
+- WorkBuddy 官方独立 CodeBuddy CLI 2.134.0 已于 2026-08-12 完成生产 adapter
+  真实验收：中国区 `internal` 环境直接复用既有登录，default profile 建立 session
+  `fbcc8cb1-2ee9-440f-b202-3e81a3007f05`，返回 `WORKBUDDY_PRODUCTION_OK` 并
+  `end_turn`；read_only profile 的 Write、Bash、WebFetch 与 Agent/subagent 负向
+  探针均为 `Tool Not Found`，两个受检目录无新增文件，关闭后无 `codebuddy`
+  进程残留。WorkBuddy.app 包内 CodeBuddy CLI 2.115.0 虽能握手，但正文路径会
+  挂起，故明确不作为独立 CLI fallback；真实跨进程恢复、取消时延、图片与长期
+  session 稳定性仍待人工验收；
 - `/discuss` 已于 2026-08-08 在同一持久房间恢复原 Kimi/OpenCode session，
   经 MCP 完成两轮交叉讨论和 Codex host 仲裁；单 user、连续 timeline、跨轮
   引用、无工具事件及退出回收均已核对。真实模型不进默认 gate；
@@ -359,7 +376,7 @@ branch protection / required checks 需要单独配置后才能宣称生效。
 | R1 | 生产构造不得显式使用 `permission="auto"`，权限默认必须为 `deny` | `bash scripts/check-redlines.sh` 的 AST permission gate |
 | R2 | 通用 orchestration/ACP 层不得按具体 agent 名做条件分支 | `bash scripts/check-redlines.sh` 的 AST name-branch gate |
 | R3 | UI、orchestrator、host 不得直接启动 shell/子进程 | `bash scripts/check-redlines.sh` 的 AST process-boundary gate |
-| R4 | Kimi/OpenCode 必须受限 ACP-first；Qwen 必须 ACP-only 且固定 default/plan runtime profile；OpenCode 普通轮风险工具 ask、只读轮 runtime deny；JSONL 仅获证的 prepare-only 只读降级 | `bash scripts/check-redlines.sh` 的 registry/policy/profile gate |
+| R4 | Kimi/OpenCode 必须受限 ACP-first；Qwen/WorkBuddy 必须 ACP-only 且固定 runtime profile；OpenCode 普通轮风险工具 ask、只读轮 runtime deny；WorkBuddy 只用独立 CLI、固定已验收 region、按需有界认证且登录 URL fail-closed；JSONL 仅获证的 prepare-only 只读降级 | `bash scripts/check-redlines.sh` 的 registry/policy/profile gate |
 | R5 | `/discuss` 必须保持 2–3 人、1–3 轮、终局主持且不得递归 dispatch；会话角色不得改变参与者、轮数、权限或 runtime | `bash scripts/check-redlines.sh` 的 discussion bounds/AST gate + `tests/test_session_roles.py` |
 | R6 | `/workflow` 必须保持固定角色/阶段、单 writer、最多一次 repair/reverify、read-only 复核和有界 steering | `bash scripts/check-redlines.sh` 的 workflow bounds/mode/AST gate |
 

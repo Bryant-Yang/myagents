@@ -40,6 +40,15 @@ FAIL_PROMPT = os.environ.get("FAKE_ACP_FAIL_PROMPT") == "1"
 NO_LOAD_CAP = os.environ.get("FAKE_ACP_NO_LOAD_CAP") == "1"
 # initialize 将 promptCapabilities.image 置为 False（无原生图片能力）
 NO_IMAGE_CAP = os.environ.get("FAKE_ACP_NO_IMAGE_CAP") == "1"
+REQUIRE_AUTH = os.environ.get("FAKE_ACP_REQUIRE_AUTH") == "1"
+AUTH_AT_NEW = os.environ.get("FAKE_ACP_AUTH_AT_NEW") == "1"
+PREAUTHENTICATED = os.environ.get("FAKE_ACP_PREAUTHENTICATED") == "1"
+AUTH_URL = os.environ.get("FAKE_ACP_AUTH_URL") == "1"
+AUTH_HANG = os.environ.get("FAKE_ACP_AUTH_HANG") == "1"
+AUTH_URL_VALUE = os.environ.get(
+    "FAKE_ACP_AUTH_URL_VALUE",
+    "https://copilot.tencent.com/fake-auth",
+)
 try:
     OPENCODE_PERMISSION = json.loads(
         os.environ.get("OPENCODE_PERMISSION", "{}"))
@@ -70,6 +79,7 @@ def chunk(sid: str, text: str) -> None:
 
 
 def main() -> None:
+    authenticated = PREAUTHENTICATED
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -100,12 +110,40 @@ def main() -> None:
                 send({"jsonrpc": "2.0", "id": rid, "result": {
                     "protocolVersion": 1,
                     "agentCapabilities": caps,
-                    "authMethods": [],
+                    "authMethods": ([{
+                        "id": "internal",
+                        "name": "Login with WeChat",
+                    }] if REQUIRE_AUTH else []),
                     "agentInfo": {"name": "fake-acp", "version": "0.1"},
                 }})
+        elif method == "authenticate":
+            method_id = params.get("methodId", "")
+            log("authenticate:" + method_id)
+            if not REQUIRE_AUTH or method_id == "internal":
+                authenticated = True
+                if AUTH_URL:
+                    send({
+                        "jsonrpc": "2.0",
+                        "method": "_codebuddy.ai/authUrl",
+                        "params": {
+                            "authUrl": AUTH_URL_VALUE,
+                            "provider": "internal",
+                        },
+                    })
+                if AUTH_HANG:
+                    continue
+                send({"jsonrpc": "2.0", "id": rid, "result": {}})
+            else:
+                send({"jsonrpc": "2.0", "id": rid,
+                      "error": {"code": -32000,
+                                "message": "unknown auth method"}})
         elif method == "session/new":
             log("new:" + params.get("cwd", ""))
-            if FAIL_NEW:
+            if AUTH_AT_NEW and not authenticated:
+                send({"jsonrpc": "2.0", "id": rid,
+                      "error": {"code": -32000,
+                                "message": "Authentication required"}})
+            elif FAIL_NEW:
                 send({"jsonrpc": "2.0", "id": rid,
                       "error": {"code": -32000, "message": "new boom"}})
             else:
@@ -122,6 +160,11 @@ def main() -> None:
             else:
                 send({"jsonrpc": "2.0", "id": rid, "result": {}})
         elif method == "session/prompt":
+            if REQUIRE_AUTH and not authenticated:
+                send({"jsonrpc": "2.0", "id": rid,
+                      "error": {"code": -32000,
+                                "message": "auth_required"}})
+                continue
             if PENDING["rid"] is not None:
                 log("VIOLATION:overlap")
             text = params["prompt"][0]["text"]

@@ -4,14 +4,15 @@
     .venv/bin/python main.py            # 在当前目录启动
     .venv/bin/python main.py /path/to/project   # 指定 agent 的工作目录
 
-聊天室里 @kimi / @opencode / @qwen / @codex 把消息派发给对应 agent，支持一条消息
+聊天室里 @kimi / @opencode / @qwen / @workbuddy / @codex 把消息派发给对应 agent，支持一条消息
 @多个（并发执行）。@host 叫主持人（由 codex 扮演）出来总结/仲裁；不带 @
 的消息由 host 用一次调用直接回答或决定派给谁。
 `/discuss` 可在一个 CommandBus command 内安排 2–3 个 worker 做 1–3 轮
 有界讨论，再由指定 moderator 最终仲裁。
 
 接入协议：可靠官方长连接优先。Kimi/OpenCode 走 ACP 长驻会话，Codex 走原生
-app-server；ACP prepare 失败才进入受限 JSONL。权限请求会弹窗交给用户决策。启动信息里
+app-server；Qwen Code/WorkBuddy 走 ACP-only。仅已证明安全的 ACP prepare 失败才进入
+受限 JSONL。权限请求会弹窗交给用户决策。启动信息里
 能看到每个 agent 的传输协议。
 """
 
@@ -77,7 +78,8 @@ from tui_activity import ActivityFeed
 
 # 每个发言者的显示颜色
 _COLORS = {"user": "yellow", "kimi": "cyan", "opencode": "green",
-           "qwen": "bright_blue", "codex": "orange1", "host": "magenta",
+           "qwen": "bright_blue", "workbuddy": "bright_magenta",
+           "codex": "orange1", "host": "magenta",
            "activity": "bright_black"}
 
 # 权限弹窗的固定应答：用户取消 / 退出 TUI 兜底
@@ -609,7 +611,7 @@ class ChatApp(App):
         yield Static(id="completion-list")
         yield ComposerInput(
             placeholder=(
-                "@kimi @opencode 点名派发；/new 或 Ctrl+N 新会话；"
+                "输入 @ 选择 agent；/new 或 Ctrl+N 新会话；"
                 "Ctrl+O 会话；Ctrl+G 活动；Ctrl+X 取消当前任务；Ctrl+C 退出"
             ),
             id="composer",

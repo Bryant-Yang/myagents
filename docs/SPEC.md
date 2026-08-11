@@ -2,7 +2,7 @@
 
 <!-- harness:behaviour-evidence=canonical-source -->
 
-> 作者：Bryant Yang　最近更新：2026-08-11
+> 作者：Bryant Yang　最近更新：2026-08-12
 >
 > 本文是关键用户行为与独立证据的唯一事实源。工程边界见
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -25,6 +25,7 @@
 | M4.6 | 完成 | Qwen Code `qwen --acp` 接入、TUI 点名与 ACP-only 安全边界 |
 | M4.7 | 完成 | 多项目会话目录、后台执行、资源 gate、未读通知与图片短引用 |
 | M4.8 | 完成 | 聊天主线降噪、每任务活动摘要卡与逐卡键盘展开 |
+| M4.9 | 完成 | WorkBuddy ACP-only 接入、按需有界认证与读写 profile 隔离 |
 | M5.1 | 完成 | `/discuss` 指定成员、1–3 轮有界讨论与终局 moderator |
 | M5 | 完成 | review → 单 writer 修改 → 独立复核、一次修复上限与阶段边界 steering |
 | M6 | 完成 | 自然语言指定会话级角色、跨任务持续、房间隔离与状态可见 |
@@ -257,9 +258,50 @@
   跨进程 `session/load` 恢复和取消时延尚未验收。默认 gate 不调用外部模型。
 - **里程碑**：M4.6。
 
+### UC-ACP-004 WorkBuddy ACP-only 接入
+
+- **角色 / 触发**：用户在聊天室输入 `@workbuddy`，或把 WorkBuddy 选为满足
+  既有约束的讨论/workflow worker。产品身份始终显示为 WorkBuddy，不把内部
+  二进制名 `codebuddy`/`cbc` 暴露成另一个 agent。
+- **主流程**：`AGENT_SPECS` 以
+  `AgentSpec("workbuddy", "acp", AcpWorkBuddyAdapter)` 注册。adapter 依次查找
+  `MYAGENTS_WORKBUDDY_CLI` 和 PATH 中的 `codebuddy`/`cbc`，只使用可独立运行的
+  官方 CLI，不调用 WorkBuddy.app 包内私有二进制。使用
+  `--acp --acp-transport stdio` 并固定官方中国区 `internal` 环境；先尝试直接
+  `session/new` 复用既有登录态，只有服务端明确返回 `-32000 Authentication
+  required` 时才发送标准 `authenticate(methodId)`。默认 method 为 `internal`，
+  环境变量只可选择当次 initialize 确实公布的 method。收到登录通知时只在系统
+  浏览器打开官方 HTTPS 地址，最多等待 300 秒。
+- **安全边界**：默认 `permission="deny"`、无 JSONL fallback。普通轮固定
+  `--permission-mode default`、subagent `dontAsk`、空 setting sources 与 strict
+  空 MCP；workflow `read_only` 进一步改为 `dontAsk` 并把工具闭集限制为
+  `Read,Glob,Grep`。profile 切换重建整个进程/session，禁止 load 旧 session，
+  避免继承普通轮授权。server 未公布所选认证 method、登录 URL 非官方 HTTPS、
+  浏览器无法打开、认证超时或 ACP prepare 失败均 fail-closed 并原子回收，不跨
+  协议重放。
+- **验收**：`tests/test_workbuddy_acp.py` 固定 ACP-only 注册、产品命名、CLI
+  参数、普通/只读两次 fresh 进程/session、既有登录不重复认证、显式认证错误才
+  打开官方 URL、恶意 URL 拒绝、认证超时、launcher 进程组回收及禁止 App 私有
+  CLI fallback；`tests/test_phase2.py` 覆盖统一注册/增量路径，TUI 补全来自动态
+  AgentSpec。完整 Harness 不调用真实 WorkBuddy。
+- **真实协议证据**：2026-08-12 本机安装官方独立 CodeBuddy CLI 2.134.0。生产
+  `AcpWorkBuddyAdapter` 在 `internal` 环境直接复用既有登录，default profile 建立
+  session `fbcc8cb1-2ee9-440f-b202-3e81a3007f05`，返回
+  `WORKBUDDY_PRODUCTION_OK` 并以 `end_turn` 完成。read_only profile 建立 session
+  `066e9648-0f94-4508-a01f-63e70c2fe47f`，Write 与 Bash 均为 `Tool Not Found`；
+  session `0e8460bd-bd12-4cea-ada8-6356d066faf2` 中 WebFetch 与 Agent/subagent
+  同样为 `Tool Not Found`。临时工作区与项目目标文件均未产生，`aclose()` 后无
+  `codebuddy` 进程残留。WorkBuddy.app 包内 CodeBuddy CLI 2.115.0 能完成
+  initialize/session new，但真实 prompt 长时间无正文，因此被明确排除为 standalone
+  fallback。
+- **人工验收边界**：登录账户/计费由 WorkBuddy 管理；真实跨进程
+  `session/load`、取消时延、图片与长期 session 稳定性尚未验收。国际版与私有化
+  region profile 尚无独立安全证据，当前产品只启用已验收的中国区 `internal`。
+- **里程碑**：M4.9。
+
 ### UC-PERM-001 权限请求与选择
 
-- **角色 / 触发**：Kimi/OpenCode ACP 在受控工具调用前发
+- **角色 / 触发**：ACP agent 在受控工具调用前发
   `session/request_permission`。
 - **前置条件**：TUI 已注入 agent-aware 异步权限处理器。
 - **主流程**：弹窗显示来源 agent、工具标题和 options；用户选择；client 只接受

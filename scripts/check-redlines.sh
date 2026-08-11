@@ -51,7 +51,7 @@ required_deny_defaults = {
     ROOT / "acp/client.py": {"AcpClient"},
     ROOT / "acp/adapter.py": {
         "AcpAdapter", "AcpKimiAdapter", "AcpOpenCodeAdapter",
-        "AcpQwenAdapter"},
+        "AcpQwenAdapter", "AcpWorkBuddyAdapter"},
 }
 for path, classes in required_deny_defaults.items():
     tree = parse(path)
@@ -81,7 +81,8 @@ for path, classes in required_deny_defaults.items():
 
 # R2: generic orchestration/runtime may register names, but may not branch on
 # specific worker literals.
-worker_names = {"kimi", "codex", "opencode", "qwen", "claude"}
+worker_names = {
+    "kimi", "codex", "opencode", "qwen", "workbuddy", "claude"}
 for path in [ROOT / "orchestrator.py", ROOT / "acp/client.py"]:
     tree = parse(path)
     for node in ast.walk(tree):
@@ -118,8 +119,8 @@ for path in [ROOT / "main.py", ROOT / "orchestrator.py", ROOT / "host.py"]:
                 fail("R3", path, node,
                      f"上层直接调用 {attr}；改由 ACP/JSONL adapter 执行")
 
-# R4: production Kimi/OpenCode remain constrained ACP-first and Qwen remains
-# ACP-only. JSONL is allowed only behind each verified prepare-only seam.
+# R4: production Kimi/OpenCode remain constrained ACP-first; Qwen/WorkBuddy
+# remain ACP-only. JSONL is allowed only behind each verified prepare-only seam.
 orchestrator = ROOT / "orchestrator.py"
 source = orchestrator.read_text(encoding="utf-8")
 tree = parse(orchestrator)
@@ -139,6 +140,9 @@ if 'AgentSpec("opencode", "acp+jsonl", AcpOpenCodeAdapter)' not in source:
 if 'AgentSpec("qwen", "acp", AcpQwenAdapter)' not in source:
     errors.append("[R4] orchestrator.py: Qwen 生产注册必须是 "
                   'AgentSpec("qwen", "acp", AcpQwenAdapter)')
+if 'AgentSpec("workbuddy", "acp", AcpWorkBuddyAdapter)' not in source:
+    errors.append("[R4] orchestrator.py: WorkBuddy 生产注册必须是 "
+                  'AgentSpec("workbuddy", "acp", AcpWorkBuddyAdapter)')
 
 acp_adapter = ROOT / "acp/adapter.py"
 acp_source = acp_adapter.read_text(encoding="utf-8")
@@ -254,6 +258,121 @@ if ("execution_cmd_overrides" not in qwen_adapter_source
         or "QWEN_ACP_READ_ONLY_CMD" not in qwen_adapter_source):
     errors.append(
         "[R4] acp/adapter.py: Qwen 必须普通轮 default、read_only 轮 plan")
+
+expected_workbuddy_args = {
+    "WORKBUDDY_ACP_DEFAULT_ARGS": (
+        "--acp", "--acp-transport", "stdio",
+        "--permission-mode", "default",
+        "--subagent-permission-mode", "dontAsk",
+        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--setting-sources", "",
+    ),
+    "WORKBUDDY_ACP_READ_ONLY_ARGS": (
+        "--acp", "--acp-transport", "stdio",
+        "--permission-mode", "dontAsk",
+        "--subagent-permission-mode", "dontAsk",
+        "--tools", "Read,Glob,Grep",
+        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--setting-sources", "",
+    ),
+}
+workbuddy_args = {}
+for node in parse(acp_adapter).body:
+    if not isinstance(node, ast.Assign):
+        continue
+    for target in node.targets:
+        if (isinstance(target, ast.Name)
+                and target.id in expected_workbuddy_args):
+            try:
+                workbuddy_args[target.id] = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                workbuddy_args[target.id] = None
+for name, expected in expected_workbuddy_args.items():
+    if workbuddy_args.get(name) != expected:
+        errors.append(
+            f"[R4] acp/adapter.py: {name} 必须固定 WorkBuddy runtime profile")
+workbuddy_adapter_class = next(
+    (node for node in parse(acp_adapter).body
+     if isinstance(node, ast.ClassDef) and node.name == "AcpWorkBuddyAdapter"),
+    None,
+)
+workbuddy_adapter_source = (
+    ast.get_source_segment(acp_source, workbuddy_adapter_class)
+    if workbuddy_adapter_class is not None else ""
+)
+if ("execution_cmd_overrides" not in workbuddy_adapter_source
+        or "ExecutionMode.READ_ONLY" not in workbuddy_adapter_source
+        or "WORKBUDDY_ACP_DEFAULT_ARGS" not in workbuddy_adapter_source
+        or "WORKBUDDY_ACP_READ_ONLY_ARGS" not in workbuddy_adapter_source
+        or "MYAGENTS_WORKBUDDY_AUTH_METHOD" not in workbuddy_adapter_source
+        or "_workbuddy_auth_notification" not in workbuddy_adapter_source
+        or "auth_timeout" not in workbuddy_adapter_source
+        or "auth_required=True" not in workbuddy_adapter_source
+        or "authenticate_on_demand=True" not in workbuddy_adapter_source
+        or "CODEBUDDY_INTERNET_ENVIRONMENT" not in workbuddy_adapter_source
+        or '"internal"' not in workbuddy_adapter_source):
+    errors.append(
+        "[R4] acp/adapter.py: WorkBuddy 必须普通轮 default、read_only 轮 "
+        "dontAsk + 只读工具闭集，固定中国区环境、按需有界认证并通过进程级 "
+        "profile 隔离")
+acp_base_class = next(
+    (node for node in parse(acp_adapter).body
+     if isinstance(node, ast.ClassDef) and node.name == "AcpAdapter"),
+    None,
+)
+auth_required_guard = next(
+    (node for node in (acp_base_class.body if acp_base_class else [])
+     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+     and node.name == "_is_authentication_required"),
+    None,
+)
+auth_required_guard_source = (
+    ast.get_source_segment(acp_source, auth_required_guard)
+    if auth_required_guard is not None else ""
+)
+if ("type(exc.code) is int" not in auth_required_guard_source
+        or 'exc.remote_message == "Authentication required"'
+        not in auth_required_guard_source):
+    errors.append(
+        "[R4] acp/adapter.py: WorkBuddy 按需认证只允许原生整数 -32000 与"
+        "精确 Authentication required 消息触发")
+if ("_WORKBUDDY_APP_CLI" in acp_source
+        or "/Applications/WorkBuddy.app" in acp_source):
+    errors.append(
+        "[R4] acp/adapter.py: WorkBuddy 只能使用可独立运行的官方 CLI，"
+        "不得回退到 App 包内私有二进制")
+workbuddy_resolver = next(
+    (node for node in parse(acp_adapter).body
+     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+     and node.name == "_resolve_workbuddy_cli"),
+    None,
+)
+workbuddy_validator = next(
+    (node for node in parse(acp_adapter).body
+     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+     and node.name == "_validated_workbuddy_cli"),
+    None,
+)
+workbuddy_resolver_source = (
+    ast.get_source_segment(acp_source, workbuddy_resolver)
+    if workbuddy_resolver is not None else ""
+)
+workbuddy_validator_source = (
+    ast.get_source_segment(acp_source, workbuddy_validator)
+    if workbuddy_validator is not None else ""
+)
+if workbuddy_resolver_source.count("_validated_workbuddy_cli") < 2:
+    errors.append(
+        "[R4] acp/adapter.py: WorkBuddy 显式 CLI 与 PATH 候选都必须经过"
+        "独立可执行文件校验")
+if ("resolve(strict=True)" not in workbuddy_validator_source
+        or "os.access" not in workbuddy_validator_source
+        or "os.X_OK" not in workbuddy_validator_source
+        or 'endswith(".app")' not in workbuddy_validator_source
+        or '== "contents"' not in workbuddy_validator_source):
+    errors.append(
+        "[R4] acp/adapter.py: WorkBuddy CLI 校验必须 canonicalize、要求可执行，"
+        "并拒绝 App bundle 内目标（含符号链接）")
 
 profile = ROOT / "adapters/kimi_readonly_fallback.md"
 if not profile.is_file():
@@ -487,7 +606,7 @@ if errors:
 print("✓ R1 权限默认 fail-closed")
 print("✓ R2 通用层无 agent-name 协议分支")
 print("✓ R3 子进程仅由 transport 层启动")
-print("✓ R4 Kimi/OpenCode 受限 ACP-first + Qwen ACP-only default/plan")
+print("✓ R4 Kimi/OpenCode 受限 ACP-first + Qwen/WorkBuddy ACP-only 固定 profile")
 print("✓ R5 /discuss 参与者/轮次有界且不递归 dispatch")
 print("✓ R6 /workflow 固定阶段/单 writer/一次 repair/steering 有界")
 PY

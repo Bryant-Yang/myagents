@@ -2,7 +2,7 @@
 
 <!-- harness:controls-read-policy=on-demand -->
 
-> 作者：Bryant Yang　最近更新：2026-07-26
+> 作者：Bryant Yang　最近更新：2026-08-12
 >
 > 本文是所有编码 agent 的项目级入场入口，也是唯一的协作规则源。详细工程契约见
 > [`HARNESS.md`](HARNESS.md)，按任务选读规则见
@@ -47,6 +47,13 @@ hub-and-spoke 方式维护统一时间线，以 ACP 作为有状态 coding agent
   必须由 `AcpQwenAdapter` 注册为 ACP-only：普通轮强制 approval `default`，
   workflow 只读轮强制 `plan` 并在 profile 切换时重建进程/session；在只读
   fallback 安全契约得到独立证据前不得自动降级到 headless JSONL。
+  WorkBuddy 必须由 `AcpWorkBuddyAdapter` 注册为 ACP-only：普通轮固定
+  `default`，workflow 只读轮固定 `dontAsk` + `Read,Glob,Grep` 工具闭集，
+  profile 切换时重建进程/session；只允许可独立运行的官方 CLI，不得借用 App
+  包内私有二进制，运行环境固定为已验收的中国区 `internal`。已有登录态直接
+  复用，只有明确的 `Authentication required` 才按需认证；认证只能使用 server
+  公布的 ACP method，登录 URL 必须是官方 HTTPS 地址且等待有界，在独立
+  fallback 安全契约获证前不得自动降级。
 - **R5 多智能体讨论必须显式且有界**：`/discuss` 只允许 2–3 个已注册
   worker、1–3 轮和一个终局 moderator；轮次由普通代码推进，禁止 agent
   自主递归派发、动态扩员或形成无界对话。会话级自然语言角色只能绑定已固定的

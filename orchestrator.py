@@ -33,6 +33,7 @@ from acp.adapter import (
     AcpKimiAdapter,
     AcpOpenCodeAdapter,
     AcpQwenAdapter,
+    AcpWorkBuddyAdapter,
     AgentPermissionHandler,
 )
 from adapters.base import (
@@ -130,6 +131,7 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
     AgentSpec("kimi", "acp+jsonl", AcpKimiAdapter),
     AgentSpec("opencode", "acp+jsonl", AcpOpenCodeAdapter),
     AgentSpec("qwen", "acp", AcpQwenAdapter),
+    AgentSpec("workbuddy", "acp", AcpWorkBuddyAdapter),
     AgentSpec("codex", "app-server", CodexAppServerAdapter),
 )
 AGENTS: dict[str, AgentSpec] = {spec.name: spec for spec in AGENT_SPECS}

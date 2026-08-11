@@ -1,11 +1,12 @@
 # ACP 迁移设计（最小方案）
 
-状态：**Phase 4.5、Phase 4.6、Phase 5.1 与 Phase 5 已完成**。
+状态：**Phase 4.5、Phase 4.6、Phase 4.9、Phase 5.1 与 Phase 5 已完成**。
 `AgentAdapter` 是 TUI 与不同 coding agent 的
 统一行为契约；wire protocol 按厂商能力选择：`acp/` 是通用 ACP runtime，
 Kimi/OpenCode 分别走 `kimi acp` / `opencode acp`，只在 ACP prepare
-失败前使用各自受限 JSONL fallback；Qwen Code 走 `qwen --acp` 且保持
-ACP-only；Codex 走官方 `codex app-server`，旧
+失败前使用各自受限 JSONL fallback；Qwen Code 走 `qwen --acp`、WorkBuddy
+走官方独立 CodeBuddy CLI `--acp --acp-transport stdio`，两者保持 ACP-only；
+Codex 走官方 `codex app-server`，旧
 Codex adapter 保留 JSONL fallback。app-server 不是 ACP，各协议只在
 adapter 层统一。
 Phase 2.5 落地了共享 history 持久化、ACP
@@ -71,6 +72,7 @@ orchestrator.py（AgentAdapter 接口不变；AGENT_SPECS 注册表）
    │    opencode → acp+jsonl → AcpOpenCodeAdapter
    │                         └→ OpenCodeAdapter（prepare-only，隔离只读配置）
    │    qwen     → acp       → AcpQwenAdapter（default/plan，无自动降级）
+   │    workbuddy→ acp       → AcpWorkBuddyAdapter（default/受限只读，无自动降级）
    │
    ├─ acp/adapter.py  AcpAdapter（通用：name + cmd 即一个 ACP agent；
    │     │            stateful_session = True 声明"会话在 agent 侧保持"）
@@ -95,6 +97,16 @@ Kimi/OpenCode hybrid 的完整时机、权限与 checkpoint 契约见
 `stream-json` 输入仍在上游文档中标记为未完成，且项目尚无独立只读 fallback
 profile 的安全证据，因此生产只注册 ACP 路径，不做跨协议自动重放；普通 ACP
 轮强制 `--approval-mode default`，workflow 只读轮强制 `plan`。
+WorkBuddy 同样保持 ACP-only。adapter 优先解析显式
+`MYAGENTS_WORKBUDDY_CLI`、PATH 中的 `codebuddy`/`cbc`，只接受可独立运行的
+官方 CLI，不使用 WorkBuddy.app 包内私有二进制；产品身份始终显示为
+`workbuddy`。普通轮固定
+`--permission-mode default`，workflow 只读轮使用 `dontAsk`、
+`--subagent-permission-mode dontAsk` 与 `Read,Glob,Grep` 工具闭集，并用空 setting
+sources + strict 空 MCP 配置阻断用户/项目配置扩权；profile 切换会重建进程和
+fresh session。进程环境固定为已验收的中国区 `internal`；session prepare 优先
+复用已有登录，只有服务端明确返回 `-32000 Authentication required` 才进入有界
+浏览器认证。
 
 ## 铁律：会话唯一持有者
 
@@ -198,7 +210,11 @@ allow。其 workflow `read_only` profile 改为 unknown/risky=deny、只允许�
 ask。这样既隔离 `allow_always`，也避免 OpenCode 在 ask 被 cancelled 后直接
 `end_turn` 且零正文。Qwen 普通 ACP 轮强制 approval `default`，避免继承 native
 TUI 的 auto/yolo；只读轮用上游 plan mode 在 runtime 层阻断写入/有副作用命令，
-profile 前后同样重建进程与 fresh session。等待仍可取消——TUI 退出时所有挂起的权限 Future 按 cancelled 收尾
+profile 前后同样重建进程与 fresh session。WorkBuddy 先尝试 `session/new` 复用
+CLI 既有登录态；只在明确的认证错误后发送标准 ACP `authenticate(methodId)`。
+默认 method 是 `internal`，可由环境变量覆盖，但必须属于 server 当次公布的集合。私有
+`_codebuddy.ai/authUrl` 通知只允许打开官方 HTTPS 域名，认证等待最多 300 秒，
+失败时整条连接原子回收。等待仍可取消——TUI 退出时所有挂起的权限 Future 按 cancelled 收尾
 （`on_unmount` →
 `_cancel_pending_permissions` → `orch.aclose()`，顺序不能反：aclose
 等的锁可能被等权限的 prompt 持有），不留挂起 Future 或 `kimi acp`
@@ -227,7 +243,7 @@ prompt/session 初始化共用 adapter 的同一把锁，不竞态杀进程。
 ## 可见状态（Phase 2 新增）
 
 - TUI 启动行显示每个 agent 的传输协议：`@kimi(ACP+JSONL) @opencode(ACP+JSONL)
-  @qwen(ACP) @codex(APP-SERVER)`。
+  @qwen(ACP) @workbuddy(ACP) @codex(APP-SERVER)`。
 - ACP session id 建立后通过 info 事件展示一次（每次建立一次，不刷屏）。
 - `tool_call` 保存脱敏后的 title/command；后续 `tool_call_update` 按
   `toolCallId` 继承上下文，只在 title/status/command/kind 的可见指纹变化时

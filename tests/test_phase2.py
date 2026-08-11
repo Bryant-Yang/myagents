@@ -1,7 +1,7 @@
 """Phase 2 里程碑测试：通用 ACP runtime 接入统一 TUI。
 
 覆盖：
-- AgentSpec 注册：kimi/opencode=ACP+JSONL、qwen=ACP、codex=app-server
+- AgentSpec 注册：kimi/opencode=ACP+JSONL、qwen/workbuddy=ACP、codex=app-server
 - ACP 增量上下文：不重复完整 transcript、跳过自己回复、失败不丢增量
 - 权限：默认拒绝 / TUI 选择 / 等待可取消
 - 生命周期：TUI 退出统一 aclose，fake ACP 无残留
@@ -25,6 +25,7 @@ from acp.adapter import (
     AcpAdapter,
     AcpOpenCodeAdapter,
     AcpQwenAdapter,
+    AcpWorkBuddyAdapter,
 )
 from acp.client import AcpClient, AcpError
 from adapters.base import AgentEvent, ExecutionMode
@@ -108,7 +109,7 @@ class FakeHost(FakeJsonl):
 def make_orch(**adapters) -> Orchestrator:
     """真实 Orchestrator + 假 adapter；未指定的工人用 FakeJsonl 占位。"""
     orch = Orchestrator(workdir="/tmp", persistent=False)
-    for name in ("kimi", "opencode", "qwen", "codex"):
+    for name in ("kimi", "opencode", "qwen", "workbuddy", "codex"):
         orch.adapters[name] = adapters.get(name, FakeJsonl(name))
     orch.host = FakeHost()
     orch.adapters["host"] = orch.host
@@ -122,6 +123,7 @@ def test_agent_specs() -> None:
     assert AGENTS["codex"].transport == "app-server"
     assert AGENTS["opencode"].transport == "acp+jsonl"
     assert AGENTS["qwen"].transport == "acp"
+    assert AGENTS["workbuddy"].transport == "acp"
 
     orch = Orchestrator("/tmp", persistent=False)
     kimi = orch.adapters["kimi"]
@@ -139,6 +141,9 @@ def test_agent_specs() -> None:
     assert qwen._execution_cmd_overrides[ExecutionMode.READ_ONLY] == list(
         QWEN_ACP_READ_ONLY_CMD)
     assert qwen._fallback is None
+    workbuddy = orch.adapters["workbuddy"]
+    assert isinstance(workbuddy, AcpWorkBuddyAdapter)
+    assert workbuddy._fallback is None
     assert getattr(orch.adapters["codex"], "stateful_session", False) is True
     assert orch.adapters["codex"].ephemeral_thread is False
     assert isinstance(orch.host.adapter, CodexAppServerAdapter)
@@ -146,8 +151,8 @@ def test_agent_specs() -> None:
     assert orch.host.adapter._fallback.ephemeral is True
     assert isinstance(kimi._fallback, KimiAdapter)
     assert isinstance(opencode._fallback, OpenCodeAdapter)
-    print("ok  AgentSpec 注册（kimi/opencode=ACP+JSONL，qwen=ACP，"
-          "codex=app-server）")
+    print("ok  AgentSpec 注册（kimi/opencode=ACP+JSONL，"
+          "qwen/workbuddy=ACP，codex=app-server）")
 
 
 # ---- 2. ACP 增量上下文 ----

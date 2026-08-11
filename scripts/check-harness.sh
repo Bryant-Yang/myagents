@@ -113,6 +113,7 @@ fi
 .venv/bin/python tests/test_session_manager.py
 .venv/bin/python tests/test_session_tui.py
 .venv/bin/python tests/test_acp.py
+.venv/bin/python tests/test_workbuddy_acp.py
 .venv/bin/python tests/test_kimi_hybrid.py
 .venv/bin/python tests/test_opencode_hybrid.py
 .venv/bin/python tests/test_phase2.py

@@ -28,7 +28,7 @@
 | R1 | 权限默认 deny，生产不得显式 auto |
 | R2 | 通用层不按 agent 名分支 |
 | R3 | 子进程只在 transport 层启动 |
-| R4 | Kimi/OpenCode 保持受限 hybrid；Qwen Code 保持 ACP-only + default/plan profile |
+| R4 | Kimi/OpenCode 保持受限 hybrid；Qwen Code/WorkBuddy 保持 ACP-only + 固定 runtime profile |
 | R5 | `/discuss` 固定 2–3 人、1–3 轮，不由 agent 自主续轮 |
 | R6 | `/workflow` 固定角色/阶段、单 writer、一次 repair 上限和有界 steering |
 

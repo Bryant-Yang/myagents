@@ -55,6 +55,11 @@ class AcpRequestNotSentError(AcpError):
 class AcpRemoteError(AcpError):
     """agent 返回显式 JSON-RPC error；请求已被明确拒绝。"""
 
+    def __init__(self, code: object, message: object) -> None:
+        self.code = code
+        self.remote_message = str(message)
+        super().__init__(f"{code}: {message}")
+
 
 def _auto_permission(params: dict) -> dict:
     """自动放行策略（显式 opt-in 才会启用）：优先 allow_once，其次任何
@@ -135,6 +140,7 @@ class AcpClient:
         self._stderr = BoundedLog()
         self.protocol_version: int | None = None
         self.capabilities: dict = {}
+        self.auth_methods: list[dict] = []
         self.agent_info: dict = {}
 
     # ---- 生命周期 ----
@@ -183,6 +189,13 @@ class AcpClient:
             raise
         self.protocol_version = result.get("protocolVersion")
         self.capabilities = result.get("agentCapabilities", {})
+        methods = result.get("authMethods", [])
+        self.auth_methods = [
+            item for item in methods
+            if (isinstance(item, dict)
+                and isinstance(item.get("id"), str)
+                and item["id"])
+        ] if isinstance(methods, list) else []
         self.agent_info = result.get("agentInfo", {})
 
     async def close(self) -> None:
@@ -224,6 +237,32 @@ class AcpClient:
         self._permission_tasks.clear()
 
     # ---- 会话方法 ----
+
+    async def authenticate(
+        self,
+        method_id: str,
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        """使用 initialize 明确公布的认证方式完成 ACP 连接认证。"""
+        available = {
+            item["id"] for item in self.auth_methods
+            if isinstance(item.get("id"), str)
+        }
+        if not isinstance(method_id, str) or not method_id:
+            raise AcpError("ACP auth method id 不能为空")
+        if method_id not in available:
+            rendered = "、".join(sorted(available)) or "无"
+            raise AcpError(
+                f"ACP agent 未公布认证方式 {method_id!r}；可用：{rendered}")
+        try:
+            await self.request(
+                "authenticate", {"methodId": method_id}, timeout=timeout)
+        except TimeoutError as exc:
+            rendered = f"{timeout:g}" if timeout is not None else "有限"
+            raise AcpError(
+                f"ACP 认证在 {rendered} 秒内未完成；连接已关闭，可重试"
+            ) from exc
 
     async def session_new(self, cwd: str) -> str:
         result = await self.request("session/new", {"cwd": cwd, "mcpServers": []})
@@ -278,9 +317,15 @@ class AcpClient:
             self._pending.pop(rid, None)
             raise AcpRequestNotSentError(
                 f"{method} 请求未发送：{exc}") from exc
-        if timeout is not None:
-            return await asyncio.wait_for(fut, timeout)
-        return await fut
+        try:
+            if timeout is not None:
+                return await asyncio.wait_for(fut, timeout)
+            return await fut
+        finally:
+            # wait_for 超时或调用方取消会取消 Future；随后迟到的响应不应
+            # 继续占用 pending，也不能污染下一次连接。
+            if fut.cancelled():
+                self._pending.pop(rid, None)
 
     async def _send(self, obj: dict) -> None:
         """写锁 + drain：并发 JSON-RPC 写入不会交错，大消息（session/prompt
@@ -293,6 +338,7 @@ class AcpClient:
 
     async def _read_loop(self) -> None:
         assert self._proc and self._proc.stdout
+        read_error: BaseException | None = None
         try:
             async for line in read_lines(self._proc.stdout):
                 try:
@@ -310,14 +356,21 @@ class AcpClient:
                         if "error" in msg:
                             err = msg["error"]
                             fut.set_exception(AcpRemoteError(
-                                f"{err.get('code')}: {err.get('message')}"))
+                                err.get("code"), err.get("message")))
                         else:
                             fut.set_result(msg.get("result", {}))
+        except BaseException as exc:
+            read_error = exc
+            raise
         finally:  # 进程断开：所有 pending 立即失败，不许挂起调用方
             for fut in self._pending.values():
                 if not fut.done():
-                    fut.set_exception(AcpError(
-                        f"agent 进程断开：{self._stderr.render()[-300:]}"))
+                    if isinstance(read_error, AcpError):
+                        fut.set_exception(read_error)
+                    else:
+                        fut.set_exception(AcpError(
+                            "agent 进程断开："
+                            f"{self._stderr.render()[-300:]}"))
             self._pending.clear()
 
     async def _handle_incoming_request(self, msg: dict) -> None:

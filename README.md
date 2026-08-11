@@ -1,15 +1,15 @@
 # myagents
 
 原生长连接优先的本地多 agent 终端编排器：在一个 Textual TUI 中点名 Kimi、
-Codex、OpenCode、Qwen Code 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
+Codex、OpenCode、Qwen Code、WorkBuddy 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M5.1 与 M5 已完成。
+> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M5.1 与 M5 已完成。
 > 共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
 > stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
-> Kimi/OpenCode 使用 ACP-first + prepare-only 只读 JSONL fallback，Qwen Code
-> 使用 ACP-only，Codex 使用官方 app-server；JSONL 不会在已提交任务后跨协议重放。真实 Kimi + MCP
+> Kimi/OpenCode 使用 ACP-first + prepare-only 只读 JSONL fallback，Qwen Code /
+> WorkBuddy 使用 ACP-only，Codex 使用官方 app-server；JSONL 不会在已提交任务后跨协议重放。真实 Kimi + MCP
 > 端到端验收是发布前手工证据，见“当前限制”。
 
 ## 为什么做这个项目
@@ -35,6 +35,11 @@ Codex、OpenCode、Qwen Code 等 coding agent，共享时间线、流式接收�
 - `@qwen`：通过 `qwen --acp` 使用持久 ACP session；普通轮强制 approval
   `default`，workflow 只读轮强制 `plan`，避免继承 native TUI 的 auto/yolo。
   当前不启用 headless JSONL fallback，避免在独立降级 profile 尚未验证前扩大权限面。
+- `@workbuddy`：通过 WorkBuddy/CodeBuddy CLI 的官方 ACP stdio 使用持久 session。
+  普通轮固定 `default` 权限模式；workflow 只读轮强制 `dontAsk` 并把工具闭集
+  收口为 `Read,Glob,Grep`，profile 切换时重建进程/session。已有登录态会直接
+  复用；只有 CLI 明确返回需要认证时才在系统浏览器打开官方登录页，认证等待
+  有限超时；不提供 JSONL fallback。
 - `@host`：由只读 Codex adapter 扮演主持人，负责总结和仲裁。
 - 无显式 mention：host 用一次调用决定“直接回答”或输出结构化 worker
   路由；直接回答时不再发起第二次 host 调用。
@@ -102,7 +107,8 @@ Codex、OpenCode、Qwen Code 等 coding agent，共享时间线、流式接收�
               │                 │
 ┌─────────────▼──────────┐  ┌───▼────────────────────┐
 │ acp/                   │  │ codex_app_server/      │
-│ Kimi/OpenCode/Qwen ACP │  │ Codex native runtime   │
+│ Kimi/OpenCode/Qwen/    │  │ Codex native runtime   │
+│ WorkBuddy ACP          │  │                        │
 └────────────────────────┘  └────────────────────────┘
               │                 │
               └────────┬────────┘
@@ -135,6 +141,15 @@ Codex、OpenCode、Qwen Code 等 coding agent，共享时间线、流式接收�
   - [OpenAI Codex CLI](https://developers.openai.com/codex/cli)
   - [OpenCode](https://opencode.ai/)
   - [Qwen Code](https://github.com/QwenLM/qwen-code)
+  - [WorkBuddy Code CLI](https://www.codebuddy.cn/docs/cli/installation)：安装可独立
+    运行的官方 CLI，例如 `npm install -g @tencent-ai/codebuddy-code`。项目不会
+    调用 WorkBuddy.app 包内私有二进制；若 CLI 不在 PATH，用
+    `MYAGENTS_WORKBUDDY_CLI=/absolute/path/to/codebuddy` 指定。
+
+WorkBuddy 当前固定使用官方文档中的中国区环境 `internal`。连接优先复用 CLI
+已有登录态；仅当 `session/new` 明确返回 `Authentication required` 时，才使用
+`MYAGENTS_WORKBUDDY_AUTH_METHOD`（默认 `internal`）发起认证，并且该 method 必须
+由本次 `initialize.authMethods` 公布。其他区域 profile 尚未独立验收。
 
 只使用某一个 agent 时，不要求安装其他 worker CLI；但无 mention 路由和
 `@host` 当前依赖 Codex CLI。

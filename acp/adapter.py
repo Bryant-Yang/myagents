@@ -32,10 +32,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
+import os
+import signal
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from urllib.parse import urlparse
 
 from adapters.base import (
     AgentAdapter,
@@ -58,6 +63,8 @@ from .client import (
 _CANCEL_TIMEOUT = 10  # 等 agent 确认 cancelled 的有限超时（秒）
 _INACTIVITY_TIMEOUT = 120  # prompt 连续无任何 ACP 事件的上限（秒）
 _TOOL_INACTIVITY_TIMEOUT = 900  # 活跃工具允许更长的无输出窗口（秒）
+_AUTH_TIMEOUT = 300  # 浏览器登录的有限等待上限（秒）
+_BROWSER_OPEN_TIMEOUT = 10  # 系统 URL launcher 自身的有限等待上限（秒）
 _FALLBACK_SESSION_PREFIX = "fallback:jsonl:"
 _TERMINAL_TOOL_STATUSES = {
     "completed", "succeeded", "success", "failed", "error",
@@ -109,6 +116,127 @@ QWEN_ACP_READ_ONLY_CMD = (
     "qwen", "--acp", "--approval-mode", "plan",
 )
 
+_WORKBUDDY_CLI_ENV = "MYAGENTS_WORKBUDDY_CLI"
+WORKBUDDY_ACP_DEFAULT_ARGS = (
+    "--acp", "--acp-transport", "stdio",
+    "--permission-mode", "default",
+    "--subagent-permission-mode", "dontAsk",
+    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+    "--setting-sources", "",
+)
+WORKBUDDY_ACP_READ_ONLY_ARGS = (
+    "--acp", "--acp-transport", "stdio",
+    "--permission-mode", "dontAsk",
+    "--subagent-permission-mode", "dontAsk",
+    "--tools", "Read,Glob,Grep",
+    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+    "--setting-sources", "",
+)
+
+
+def _validated_workbuddy_cli(candidate: str, source: str) -> str:
+    """解析并校验独立 CLI；拒绝任何 App bundle 内私有可执行文件。"""
+    path = Path(candidate).expanduser()
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise AcpError(f"{source} 指定的 WorkBuddy CLI 不存在：{path}") from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise AcpError(f"{source} 指定的 WorkBuddy CLI 不可执行：{resolved}")
+    parts = resolved.parts
+    if any(
+        part.lower().endswith(".app")
+        and index + 1 < len(parts)
+        and parts[index + 1].lower() == "contents"
+        for index, part in enumerate(parts)
+    ):
+        raise AcpError(
+            f"{source} 指向 App 包内私有 CLI，已拒绝：{resolved}；"
+            "请安装官方独立 CodeBuddy CLI"
+        )
+    return str(resolved)
+
+
+def _resolve_workbuddy_cli() -> str:
+    """仅使用可独立运行的官方 CLI，不借用 App 包内私有进程。"""
+    explicit = os.environ.get(_WORKBUDDY_CLI_ENV, "").strip()
+    if explicit:
+        return _validated_workbuddy_cli(explicit, _WORKBUDDY_CLI_ENV)
+    for name in ("codebuddy", "cbc"):
+        resolved = shutil.which(name)
+        if resolved:
+            return _validated_workbuddy_cli(resolved, f"PATH 中的 {name}")
+    # 保持其他可选 agent 的惰性启动语义：TUI 可以正常打开，用户实际点名
+    # WorkBuddy 时由 transport 报出标准的 executable-not-found 错误。
+    return "codebuddy"
+
+
+async def _open_browser(url: str) -> bool:
+    """用独立、可取消的系统 launcher 打开认证页，不阻塞 ACP read loop。"""
+    mac_launcher = Path("/usr/bin/open")
+    launcher = (
+        str(mac_launcher) if mac_launcher.is_file()
+        else shutil.which("xdg-open")
+    )
+    if launcher is None:
+        return False
+    process = await asyncio.create_subprocess_exec(
+        launcher,
+        url,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        return await asyncio.wait_for(
+            process.wait(), timeout=_BROWSER_OPEN_TIMEOUT) == 0
+    except BaseException:
+        # `open`/`xdg-open` 可能派生 helper 后先行退出。因此不能用
+        # leader.returncode 推断整个进程组已回收：宽限期后始终对
+        # 启动时拥有的 pgid 做一次 best-effort KILL。
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGTERM)
+        if process.returncode is None:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=1)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+        await process.wait()
+        raise
+
+
+def _workbuddy_auth_notification(
+    opener: Callable[[str], Awaitable[bool]],
+) -> Callable[[str, dict], Awaitable[None]]:
+    """只处理 WorkBuddy ACP 的登录 URL 通知，并拒绝非官方地址。"""
+    trusted_domains = ("tencent.com", "codebuddy.cn", "codebuddy.ai")
+
+    async def handle(method: str, params: dict) -> None:
+        if method != "_codebuddy.ai/authUrl":
+            return
+        url = params.get("authUrl") if isinstance(params, dict) else None
+        parsed = urlparse(url) if isinstance(url, str) else None
+        hostname = parsed.hostname.lower() if parsed and parsed.hostname else ""
+        trusted = (
+            parsed is not None
+            and parsed.scheme == "https"
+            and any(
+                hostname == domain or hostname.endswith("." + domain)
+                for domain in trusted_domains
+            )
+        )
+        if not trusted:
+            raise AcpError("WorkBuddy 返回了不可信的认证地址，已拒绝打开")
+        try:
+            opened = await opener(url)
+        except Exception as exc:
+            raise AcpError("WorkBuddy 认证页面打开失败") from exc
+        if opened is not True:
+            raise AcpError("WorkBuddy 认证页面打开失败")
+
+    return handle
+
+
 # 通用 agent-aware 权限决策器：async (agent_name, params) -> outcome。
 # orchestrator 用它把 TUI 决策注入所有 ACP adapter（通用 runtime 里弹窗必须
 # 知道权限来自哪个 agent）；名字在 adapter 内绑定，client 层仍只见
@@ -158,6 +286,13 @@ class AcpAdapter:
         execution_cmd_overrides: Mapping[
             ExecutionMode, Sequence[str]
         ] | None = None,
+        auth_method: str | None = None,
+        auth_timeout: float = _AUTH_TIMEOUT,
+        auth_notification_handler: Callable[
+            [str, dict], Awaitable[None]
+        ] | None = None,
+        auth_required: bool = False,
+        authenticate_on_demand: bool = False,
     ) -> None:
         if cancel_timeout <= 0:
             raise ValueError("cancel_timeout 必须大于 0")
@@ -165,6 +300,12 @@ class AcpAdapter:
             raise ValueError("inactivity_timeout 必须大于 0")
         if tool_inactivity_timeout <= 0:
             raise ValueError("tool_inactivity_timeout 必须大于 0")
+        if auth_timeout <= 0:
+            raise ValueError("auth_timeout 必须大于 0")
+        if auth_required and not auth_method:
+            raise ValueError("auth_required=True 时必须提供 auth_method")
+        if authenticate_on_demand and not auth_method:
+            raise ValueError("authenticate_on_demand=True 时必须提供 auth_method")
         self.name = name
         self.session_id: str | None = None
         self._cmd = list(cmd)
@@ -180,6 +321,11 @@ class AcpAdapter:
             mode: list(command)
             for mode, command in (execution_cmd_overrides or {}).items()
         }
+        self._auth_method = auth_method
+        self._auth_timeout = auth_timeout
+        self._auth_notification_handler = auth_notification_handler
+        self._auth_required = auth_required
+        self._authenticate_on_demand = authenticate_on_demand
         self._active_env_overrides = self._env_for_mode(
             ExecutionMode.DEFAULT)
         self._active_cmd = self._cmd_for_mode(ExecutionMode.DEFAULT)
@@ -254,20 +400,56 @@ class AcpAdapter:
             # 让 Orchestrator 按 fresh-session 契约有界 bootstrap。
             resume_session_id = None
         try:
-            await self._client.start()
-            restored = False
-            load_failed = False
-            if (resume_session_id
-                    and self._client.capabilities.get("loadSession")):
+            client = self._client
+            previous_notification_handler = client.on_notification
+            auth_notifications: asyncio.Queue[tuple[str, dict]] = (
+                asyncio.Queue()
+            )
+
+            def collect_auth_notification(method: str, params: dict) -> None:
+                auth_notifications.put_nowait((method, params))
+
+            client.on_notification = collect_auth_notification
+            try:
+                await client.start()
+                if (not self._authenticate_on_demand
+                        and self._auth_method is not None
+                        and (client.auth_methods or self._auth_required)):
+                    await self._authenticate_bounded(
+                        client, auth_notifications)
+
+                async def prepare_session() -> tuple[bool, bool]:
+                    restored = False
+                    load_failed = False
+                    if (resume_session_id
+                            and client.capabilities.get("loadSession")):
+                        try:
+                            await client.session_load(resume_session_id, workdir)
+                            self.session_id = resume_session_id
+                            restored = True
+                        except AcpError:
+                            # 只吞 load 本身的失败：回退 new，结果里如实标记
+                            load_failed = True
+                    if not restored:
+                        self.session_id = await client.session_new(workdir)
+                    return restored, load_failed
+
                 try:
-                    await self._client.session_load(resume_session_id, workdir)
-                    self.session_id = resume_session_id
-                    restored = True
-                except AcpError:
-                    # 只吞 load 本身的失败：回退 new，结果里如实标记
-                    load_failed = True
-            if not restored:
-                self.session_id = await self._client.session_new(workdir)
+                    restored, load_failed = await prepare_session()
+                except AcpRemoteError as exc:
+                    if not (
+                        self._authenticate_on_demand
+                        and self._is_authentication_required(exc)
+                    ):
+                        raise
+                    # WorkBuddy 的独立 CLI 会复用已有登录；只有在
+                    # session prepare 明确返回 Authentication required 时
+                    # 才打开登录页，避免每次启动强制注销已有会话。
+                    await self._authenticate_bounded(
+                        client, auth_notifications)
+                    restored, load_failed = await prepare_session()
+            finally:
+                client.on_notification = previous_notification_handler
         except BaseException:
             # 原子初始化：start 成功但 session/new 失败时，进程和
             # reader/stderr tasks 必须回收，否则下次 stream 会对
@@ -278,6 +460,69 @@ class AcpAdapter:
         return SessionPreparation(
             session_id=self.session_id, restored=restored,
             load_failed=load_failed, fresh=True)
+
+    async def _authenticate_bounded(
+        self,
+        client: AcpClient,
+        notifications: asyncio.Queue[tuple[str, dict]],
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                self._authenticate_with_notifications(client, notifications),
+                timeout=self._auth_timeout,
+            )
+        except TimeoutError as exc:
+            raise AcpError(
+                f"ACP 认证在 {self._auth_timeout:g} 秒内未完成；"
+                "连接已关闭，可重试"
+            ) from exc
+
+    @staticmethod
+    def _is_authentication_required(exc: AcpRemoteError) -> bool:
+        return (
+            type(exc.code) is int
+            and exc.code == -32000
+            and exc.remote_message == "Authentication required"
+        )
+
+    async def _authenticate_with_notifications(
+        self,
+        client: AcpClient,
+        notifications: asyncio.Queue[tuple[str, dict]],
+    ) -> None:
+        """认证与通知并发推进；耗时 UI 动作永远不在 ACP read loop 执行。"""
+        assert self._auth_method is not None
+        auth_task = asyncio.create_task(
+            client.authenticate(self._auth_method))
+        notification_task: asyncio.Task | None = None
+        try:
+            while True:
+                notification_task = asyncio.create_task(notifications.get())
+                done, _pending = await asyncio.wait(
+                    {auth_task, notification_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if notification_task in done:
+                    method, params = notification_task.result()
+                    if self._auth_notification_handler is not None:
+                        await self._auth_notification_handler(method, params)
+                else:
+                    notification_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await notification_task
+                notification_task = None
+                if auth_task in done:
+                    await auth_task
+                    return
+        finally:
+            if notification_task is not None and not notification_task.done():
+                notification_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await notification_task
+            if not auth_task.done():
+                auth_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await auth_task
 
     async def _reset(
         self,
@@ -765,4 +1010,51 @@ class AcpQwenAdapter(AcpAdapter):
             execution_cmd_overrides={
                 ExecutionMode.READ_ONLY: QWEN_ACP_READ_ONLY_CMD,
             },
+        )
+
+
+class AcpWorkBuddyAdapter(AcpAdapter):
+    """WorkBuddy 的 ACP-only 生产 adapter。"""
+
+    def __init__(
+        self,
+        permission: str = "deny",
+        *,
+        auth_timeout: float = _AUTH_TIMEOUT,
+        auth_url_opener: Callable[
+            [str], Awaitable[bool]
+        ] = _open_browser,
+    ) -> None:
+        if not (
+            inspect.iscoroutinefunction(auth_url_opener)
+            or inspect.iscoroutinefunction(
+                getattr(auth_url_opener, "__call__", None))
+        ):
+            raise TypeError("auth_url_opener 必须是 async callable")
+        executable = _resolve_workbuddy_cli()
+        auth_method = (
+            os.environ.get("MYAGENTS_WORKBUDDY_AUTH_METHOD", "internal").strip()
+            or "internal"
+        )
+        default_cmd = (executable, *WORKBUDDY_ACP_DEFAULT_ARGS)
+        # plan 会继承进入前的权限基线，不是硬只读。dontAsk 配合工具闭集
+        # 让 write/edit/bash/network/subagent 在 runtime 层根本不可调用。
+        read_only_cmd = (executable, *WORKBUDDY_ACP_READ_ONLY_ARGS)
+        super().__init__(
+            "workbuddy",
+            default_cmd,
+            permission=permission,
+            env_overrides={
+                "CODEBUDDY_DISABLE_COMPILE_CACHE": "1",
+                "CODEBUDDY_INTERNET_ENVIRONMENT": "internal",
+            },
+            execution_cmd_overrides={
+                ExecutionMode.READ_ONLY: read_only_cmd,
+            },
+            auth_method=auth_method,
+            auth_timeout=auth_timeout,
+            auth_notification_handler=_workbuddy_auth_notification(
+                auth_url_opener),
+            auth_required=True,
+            authenticate_on_demand=True,
         )
