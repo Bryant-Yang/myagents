@@ -230,8 +230,8 @@ prompt/session 初始化共用 adapter 的同一把锁，不竞态杀进程。
 - `tool_call` 保存脱敏后的 title/command；后续 `tool_call_update` 按
   `toolCallId` 继承上下文，只在 title/status/command/kind 的可见指纹变化时
   产出事件。完全相同的高频 `in_progress` 仍被视为协议活动，但不进入 TUI
-  或持久日志；TUI 将同一工具的状态迁移原位更新，命令详情默认折叠并通过
-  `/details` 切换。
+  或持久日志；TUI 将同一 command 的阶段、heartbeat、工具与权限折叠为一张
+  活动卡，命令详情默认隐藏并通过 `/details` 展开。
 - 固定任务区显示 command 总状态、累计耗时及每个 agent 的阶段/终态；
   fan-out 中既有成功又有失败时显示“部分完成”，不抹掉成功 agent 的事实。
 

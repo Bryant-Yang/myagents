@@ -96,10 +96,11 @@ if [ ! -x .venv/bin/python ]; then
 fi
 
 .venv/bin/python -m py_compile \
-  main.py myagents_mcp.py orchestrator.py host.py discussion.py workflow.py session_catalog.py session_manager.py \
+  main.py myagents_mcp.py orchestrator.py host.py discussion.py workflow.py session_catalog.py session_manager.py tui_activity.py \
   acp/*.py codex_app_server/*.py adapters/*.py control/*.py storage/*.py workspace/*.py tests/*.py \
   scripts/e2e-m3-real.py scripts/e2e-m5-real.py
 .venv/bin/python tests/test_basic.py
+.venv/bin/python tests/test_tui_activity.py
 .venv/bin/python tests/test_tui_completion.py
 .venv/bin/python tests/test_discussion.py
 .venv/bin/python tests/test_workflow.py

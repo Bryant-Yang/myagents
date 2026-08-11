@@ -200,16 +200,25 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 - 工具生命周期按 `(command_id, agent, tool_call_id)` 合并；协议缺少 ID 时
   使用脱敏标题作为可见 identity。adapter 继承初始工具标题并只产出状态迁移，
   CommandBus 对完全相同的 status/tool 做防御性去重，但重复协议活动仍刷新
-  静默计时。TUI 对同一工具原位显示“进行中/已完成/失败”，终态后清理索引；
+  静默计时。TUI 再按 command 把阶段、heartbeat、工具与权限合并为一张活动卡，
+  默认只显示终态、当前阶段与工具汇总；`/details` 才展开各工具的
+  “进行中/已完成/失败”和脱敏命令。协议后续补发 tool ID 时必须迁移同一逻辑项，
+  不能重复计数；identity 是否来自标题 fallback 必须显式传递，不能靠字符串值
+  猜测，同名但 ID 不同的工具不得误合并。被窗口裁掉的工具若曾失败、拒绝或
+  取消，摘要必须继续保留该异常事实。每卡工具明细与可展开终态卡
+  必须有上限，超限只归档折叠摘要；后台 runtime 被 idle reap 时同步释放该 room
+  的 UI feed，完整事实仍以 `events.jsonl` 为准；
   `events.jsonl` 只持久化有信息增量的工具状态，不能被高频
   `in_progress` 刷爆。
 - CommandBus 静默 10 秒发 heartbeat，静默时长保持累计且 heartbeat 自身不
-  重置活动时钟；TUI 对同一 command 的 heartbeat 原位更新而不是不断追加。
+  重置活动时钟；TUI 在同一 command 活动卡内原位更新 heartbeat，而不是追加
+  聊天行。用户消息、agent 正文和失败保持主线可见，活动折叠不得隐藏失败事实。
+  活动模型按 room_id 隔离；切换会话和后台完成后切回，近期终态卡仍可展开。
   `completed` 只表示本轮调用正常结束，TUI 使用“本轮响应结束”，不声称用户
   任务已经验收。fan-out 要等待全部 target 收尾；任一 worker 失败时 command
   终态为 `failed`，即使其他 worker 已正常回复，失败 worker 的 partial 也必须
   明确标注调用失败。固定任务区必须保留各 agent 阶段和终态；混合成功/失败
-  显示“部分完成”。工具命令默认折叠，仅由 `/details` 显式切换。active/queued 可精确取消，
+  显示“部分完成”。活动详情默认折叠，仅由 `/details` 显式切换。active/queued 可精确取消，
   terminal cancel 幂等，取消不得杀死 worker。
 - TUI `Ctrl+X`、control `command.cancel`、MCP
   `myagents_cancel_command` 共用一个取消原语；外部可通过

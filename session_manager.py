@@ -44,6 +44,14 @@ class SessionNotice:
 
 
 @dataclass(frozen=True)
+class SessionTerminal:
+    session_id: str
+    command_id: str
+    status: str
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class SessionSnapshot:
     summary: SessionSummary
     status: str
@@ -121,6 +129,7 @@ class SessionManager:
         event_sink: SessionEventSink | None = None,
         permission_handler: SessionPermissionHandler | None = None,
         notification_sink: Callable[[SessionNotice], None] | None = None,
+        terminal_sink: Callable[[SessionTerminal], None] | None = None,
         max_running_sessions: int = 3,
         idle_timeout: float = 600.0,
         clock: Callable[[], float] = time.monotonic,
@@ -148,6 +157,7 @@ class SessionManager:
         self._event_sink = event_sink
         self._permission_handler = permission_handler
         self._notification_sink = notification_sink
+        self._terminal_sink = terminal_sink
         self._gate = asyncio.Semaphore(max_running_sessions)
         self._idle_timeout = float(idle_timeout)
         self._clock = clock
@@ -505,18 +515,26 @@ class SessionManager:
                 break
         runtime.status = result["status"]
         runtime.last_used = self._clock()
-        if command.session_id != self._active_id:
+        if self._terminal_sink is not None:
+            self._terminal_sink(SessionTerminal(
+                session_id=command.session_id,
+                command_id=command.command_id,
+                status=result["status"],
+                error=result.get("error"),
+            ))
+        background = command.session_id != self._active_id
+        if background:
             runtime.unread = True
-            if result["status"] in {"completed", "failed"} \
-                    and self._notification_sink is not None:
-                runtime.summary = self.catalog.get_session(command.session_id)
-                self._notification_sink(SessionNotice(
-                    session_id=command.session_id,
-                    title=runtime.summary.title,
-                    project_name=runtime.summary.project_name,
-                    status=result["status"],
-                    error=result.get("error"),
-                ))
+        if background and result["status"] in {"completed", "failed"} \
+                and self._notification_sink is not None:
+            runtime.summary = self.catalog.get_session(command.session_id)
+            self._notification_sink(SessionNotice(
+                session_id=command.session_id,
+                title=runtime.summary.title,
+                project_name=runtime.summary.project_name,
+                status=result["status"],
+                error=result.get("error"),
+            ))
 
     def _on_event(self, room_id: str, name: str, event: AgentEvent) -> None:
         runtime = self._runtime(room_id)

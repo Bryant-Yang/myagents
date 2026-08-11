@@ -447,6 +447,9 @@ def test_tui_status_and_shutdown() -> None:
             box.value = "@kimi fast round"
             await pilot.press("enter")
             await app.workers.wait_for_complete()
+            assert "ACP session 已建立：fake-session-1" not in _richlog_text(app)
+            app.action_toggle_details()
+            await pilot.pause()
             assert "ACP session 已建立：fake-session-1" in _richlog_text(app)
         # 退出后：所有 closable adapter 被 aclose
         assert codex.closed and opencode.closed

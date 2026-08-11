@@ -1,0 +1,342 @@
+"""聊天室执行活动折叠与展开验收。"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
+
+from adapters.base import AgentEvent
+from main import ChatApp
+from orchestrator import AgentSpec, Orchestrator
+from storage.store import RoomStore
+from test_basic import make_orch
+from textual.widgets import RichLog
+from tui_activity import ActivityFeed
+
+
+def test_activity_feed_coalesces_progress_and_tool_updates() -> None:
+    feed = ActivityFeed()
+    feed.begin("cmd-activity")
+    assert feed.record_status(
+        "cmd-activity", "kimi", "正在分析", state="running"
+    )
+    assert feed.record_status(
+        "cmd-activity", "kimi", "仍在运行（已等待 10 秒）",
+        state="running", heartbeat=True,
+    )
+
+    assert feed.record_tool(
+        "cmd-activity", "kimi", "tool-1", "检查 JavaScript",
+        status="in_progress", detail="node --check demo.js",
+    )
+    assert not feed.record_tool(
+        "cmd-activity", "kimi", "tool-1", "检查 JavaScript",
+        status="in_progress", detail="node --check demo.js",
+    )
+    assert feed.record_tool(
+        "cmd-activity", "kimi", "tool-1", "检查 JavaScript",
+        status="completed", detail="node --check demo.js",
+    )
+    feed.set_command_state("cmd-activity", "completed")
+
+    collapsed = feed.render("cmd-activity", expanded=False)
+    assert "任务 cmd-acti" in collapsed
+    assert "已结束" in collapsed
+    assert "1 个工具" in collapsed
+    assert "node --check demo.js" not in collapsed
+    assert "/details 展开" in collapsed
+
+    expanded = feed.render("cmd-activity", expanded=True)
+    assert "kimi · 检查 JavaScript · 已完成" in expanded
+    assert "node --check demo.js" in expanded
+    assert "仍在运行（已等待 10 秒）" in expanded
+    assert "/details 收起" in expanded
+
+    migrating = ActivityFeed()
+    migrating.begin("cmd-migrate")
+    migrating.record_tool(
+        "cmd-migrate",
+        "kimi",
+        "检查 JavaScript",
+        "检查 JavaScript",
+        identity_is_fallback=True,
+    )
+    migrating.record_tool(
+        "cmd-migrate", "kimi", "tool-late", "检查 JavaScript",
+        status="completed",
+    )
+    assert "1 个工具" in migrating.render("cmd-migrate", expanded=False)
+    migrating.record_tool(
+        "cmd-migrate", "kimi", "tool-second", "检查 JavaScript",
+        status="completed",
+    )
+    assert "2 个工具" in migrating.render("cmd-migrate", expanded=False)
+
+    opaque = ActivityFeed()
+    opaque.begin("cmd-opaque")
+    opaque.record_tool(
+        "cmd-opaque", "kimi", "Build", "Build", status="completed")
+    opaque.record_tool(
+        "cmd-opaque", "kimi", "formal-2", "Build", status="completed")
+    assert "2 个工具" in opaque.render("cmd-opaque", expanded=False)
+
+
+def test_activity_feed_tracks_latest_agent_and_bounds_terminal_details() -> None:
+    feed = ActivityFeed(max_terminal_cards=2, max_tools_per_card=2)
+    feed.begin("cmd-focus")
+    feed.record_status(
+        "cmd-focus", "reviewer", "等待审查", state="queued")
+    feed.record_status(
+        "cmd-focus", "writer", "等待实现", state="queued")
+    feed.record_status(
+        "cmd-focus", "reviewer", "正在审查", state="running")
+    assert "reviewer：正在审查" in feed.render(
+        "cmd-focus", expanded=False)
+
+    for index in range(3):
+        feed.record_tool(
+            "cmd-focus",
+            "reviewer",
+            f"tool-{index}",
+            f"工具 {index}",
+            status="completed",
+            detail=f"command-{index}",
+        )
+    bounded = feed.render("cmd-focus", expanded=True)
+    assert "≥2 个工具" in bounded
+    assert "command-0" not in bounded
+    assert "仅保留最近 2 个工具" in bounded
+
+    truthful = ActivityFeed(max_tools_per_card=2)
+    truthful.begin("cmd-truth")
+    truthful.record_tool(
+        "cmd-truth", "worker", "failed", "首次工具", status="failed")
+    truthful.record_tool(
+        "cmd-truth", "worker", "ok-1", "后续工具一", status="completed")
+    truthful.record_tool(
+        "cmd-truth", "worker", "ok-2", "后续工具二", status="completed")
+    truthful_summary = truthful.render("cmd-truth", expanded=True)
+    assert "≥2 个工具（失败）" in truthful_summary
+    assert "历史工具异常 · 失败" in truthful_summary
+
+    feed.set_command_state("cmd-focus", "completed")
+    for command_id in ("cmd-two", "cmd-three"):
+        feed.begin(command_id)
+        feed.set_command_state(command_id, "completed")
+    assert feed.command_ids() == ("cmd-two", "cmd-three")
+    evicted = feed.take_evicted()
+    assert evicted and evicted[0][0] == "cmd-focus"
+    assert "活动已归档" in evicted[0][1]
+
+    hard_bound = ActivityFeed(max_terminal_cards=2)
+    for index in range(10_000):
+        command_id = f"cmd-{index}"
+        hard_bound.begin(command_id)
+        hard_bound.set_command_state(command_id, "completed")
+    assert len(hard_bound.command_ids()) == 2
+    assert len(hard_bound.take_evicted()) <= 2
+
+
+def test_tui_keeps_one_activity_card_and_primary_messages() -> None:
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=make_orch())
+        async with app.run_test() as pilot:
+            command_id = "cmd-visible"
+            app._on_agent_event(
+                "user",
+                AgentEvent(
+                    "committed", "@kimi 检查项目",
+                    {"command_id": command_id},
+                ),
+            )
+            for seconds in (10, 20, 30):
+                app._on_agent_event(
+                    "system",
+                    AgentEvent(
+                        "status",
+                        f"kimi 仍在运行（已等待 {seconds} 秒）",
+                        {
+                            "command_id": command_id,
+                            "heartbeat": True,
+                            "phase": "kimi",
+                        },
+                    ),
+                )
+            tool_meta = {
+                "command_id": command_id,
+                "tool_call_id": "tool-1",
+                "command": "API_KEY=supersecret python -m unittest",
+            }
+            for status in ("in_progress", "in_progress", "completed"):
+                app._on_agent_event(
+                    "kimi",
+                    AgentEvent(
+                        "tool", "运行测试", {**tool_meta, "status": status}
+                    ),
+                )
+            app._on_agent_event(
+                "kimi", AgentEvent("text", "测试已经通过。", tool_meta)
+            )
+            app._on_agent_event(
+                "kimi", AgentEvent("done", meta={"command_id": command_id})
+            )
+            await pilot.pause()
+
+            lines = [str(line.text) for line in app.query_one(RichLog).lines]
+            activity = [line for line in lines if line.startswith("[activity] ")]
+            assert len(activity) == 1, activity
+            collapsed = "\n".join(lines)
+            assert "1 个工具" in collapsed.replace("\n", "")
+            assert "python -m unittest" not in collapsed
+            assert "[user] @kimi 检查项目" in lines
+            assert "[kimi] 测试已经通过。" in lines
+            assert len([
+                line for line in lines if "仍在运行（已等待" in line
+            ]) == 0
+
+            app.action_toggle_details()
+            await pilot.pause()
+            expanded = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines
+            )
+            assert "python -m unittest" in expanded
+            assert "API_KEY=[已隐藏]" in expanded
+            assert "supersecret" not in expanded
+            assert "kimi 仍在运行（已等待 30 秒）" in expanded
+            assert len([
+                line for line in app.query_one(RichLog).lines
+                if str(line.text).startswith("[activity] ")
+            ]) == 1
+
+    asyncio.run(run())
+
+
+def test_tui_failure_stays_visible_outside_activity_details() -> None:
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=make_orch())
+        async with app.run_test() as pilot:
+            command_id = "cmd-failed"
+            app._on_agent_event(
+                "user",
+                AgentEvent(
+                    "committed", "@kimi 执行危险操作",
+                    {"command_id": command_id},
+                ),
+            )
+            app._on_agent_event(
+                "kimi",
+                AgentEvent("error", "权限被拒绝", {"command_id": command_id}),
+            )
+            app._set_command_status(command_id, "failed", "权限被拒绝")
+            await pilot.pause()
+
+            lines = [str(line.text) for line in app.query_one(RichLog).lines]
+            assert "[kimi] 出错：权限被拒绝" in lines
+            activity = [line for line in lines if line.startswith("[activity] ")]
+            assert len(activity) == 1
+            assert "失败" in "".join(lines)
+
+    asyncio.run(run())
+
+
+class _BackgroundActivityAdapter:
+    name = "worker"
+    session_id = None
+    stateful_session = False
+    started: asyncio.Event
+    release: asyncio.Event
+
+    async def stream(self, prompt: str, workdir: str):
+        del prompt, workdir
+        yield AgentEvent(
+            "tool",
+            "后台测试",
+            {
+                "tool_call_id": "background-tool",
+                "status": "in_progress",
+                "command": "python -m unittest",
+            },
+        )
+        type(self).started.set()
+        await type(self).release.wait()
+        yield AgentEvent(
+            "tool",
+            "后台测试",
+            {"tool_call_id": "background-tool", "status": "completed"},
+        )
+        yield AgentEvent("text", "后台回复已完成")
+        yield AgentEvent("done")
+
+
+def test_activity_card_survives_background_session_switch() -> None:
+    async def run() -> None:
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "project"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            _BackgroundActivityAdapter.started = asyncio.Event()
+            _BackgroundActivityAdapter.release = asyncio.Event()
+            orch = Orchestrator(
+                str(workdir),
+                specs=(
+                    AgentSpec(
+                        "worker", "jsonl", _BackgroundActivityAdapter),
+                ),
+                store=store,
+            )
+            app = ChatApp(workdir=str(workdir), orchestrator=orch)
+            async with app.run_test() as pilot:
+                app._dispatch_from_ui("@worker 后台任务")
+                await asyncio.wait_for(
+                    _BackgroundActivityAdapter.started.wait(), timeout=1)
+                first_id = app.session_manager.active_session_id
+
+                await app.session_manager.create_session()
+                app._bind_active_runtime()
+                app._render_active_session()
+                _BackgroundActivityAdapter.release.set()
+                for _ in range(100):
+                    if app.session_manager.snapshot(first_id).status \
+                            == "completed":
+                        break
+                    await asyncio.sleep(0.01)
+                assert app.session_manager.snapshot(first_id).status \
+                    == "completed"
+
+                await app.session_manager.activate(first_id)
+                app._bind_active_runtime()
+                app._render_active_session()
+                await pilot.pause()
+                rendered = [
+                    str(line.text) for line in app.query_one(RichLog).lines
+                ]
+                assert "[worker] 后台回复已完成" in rendered
+                assert len([
+                    line for line in rendered
+                    if line.startswith("[activity] ")
+                ]) == 1
+                app.action_toggle_details()
+                await pilot.pause()
+                expanded = "\n".join(
+                    str(line.text) for line in app.query_one(RichLog).lines
+                )
+                assert "后台测试 · 已完成" in expanded
+                assert "python -m unittest" in expanded
+
+    asyncio.run(run())
+
+
+if __name__ == "__main__":
+    test_activity_feed_coalesces_progress_and_tool_updates()
+    test_activity_feed_tracks_latest_agent_and_bounds_terminal_details()
+    test_tui_keeps_one_activity_card_and_primary_messages()
+    test_tui_failure_stays_visible_outside_activity_details()
+    test_activity_card_survives_background_session_switch()
+    print("ok  TUI 执行活动折叠、展开与失败可见性")

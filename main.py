@@ -37,7 +37,6 @@ from orchestrator import HOST_NAME, Orchestrator
 from adapters.base import (
     AgentEvent,
     redact_sensitive_text,
-    tool_status_label,
 )
 from control import CommandBus, CommandNotFoundError, ControlServer
 from clipboard_image import (
@@ -60,7 +59,12 @@ from storage.store import (
     normalize_session_name,
     normalize_workdir,
 )
-from session_manager import SessionManager, SessionNotice, SessionSnapshot
+from session_manager import (
+    SessionManager,
+    SessionNotice,
+    SessionSnapshot,
+    SessionTerminal,
+)
 from tui_completion import (
     LOCAL_COMMANDS,
     CompletionContext,
@@ -69,10 +73,12 @@ from tui_completion import (
     unknown_mentions,
 )
 from tui_status import TaskProgress
+from tui_activity import ActivityFeed
 
 # 每个发言者的显示颜色
 _COLORS = {"user": "yellow", "kimi": "cyan", "opencode": "green",
-           "qwen": "bright_blue", "codex": "orange1", "host": "magenta"}
+           "qwen": "bright_blue", "codex": "orange1", "host": "magenta",
+           "activity": "bright_black"}
 
 # 权限弹窗的固定应答：用户取消 / 退出 TUI 兜底
 _CANCELLED = {"outcome": "cancelled"}
@@ -531,6 +537,7 @@ class ChatApp(App):
                 event_sink=self._on_session_event,
                 permission_handler=self._session_permission,
                 notification_sink=self._on_session_notice,
+                terminal_sink=self._on_session_terminal,
                 initial_orchestrator=self.orch,
             )
             initial_runtime = self.session_manager.active_runtime
@@ -551,15 +558,15 @@ class ChatApp(App):
         self._stream_text: dict[str, str] = {}
         self._stream_line_index: dict[str, int] = {}
         self._stream_flush_handles: dict[str, asyncio.TimerHandle] = {}
-        self._heartbeat_line_index: dict[str, int] = {}
-        self._tool_line_index: dict[tuple[str, str, str], int] = {}
-        self._tool_line_fingerprint: dict[
-            tuple[str, str, str], tuple[str, str, str]
-        ] = {}
-        self._tool_latest: dict[
-            tuple[str, str, str], tuple[str, AgentEvent]
-        ] = {}
-        self._show_tool_details = False
+        activity_room_id = (
+            self.orch.store.room_id
+            if self.orch.store is not None else "__nonpersistent__"
+        )
+        self._activity_feeds = {activity_room_id: ActivityFeed()}
+        self._activity_feed = self._activity_feeds[activity_room_id]
+        self._activity_line_index: dict[str, int] = {}
+        self._activity_line_fingerprint: dict[str, tuple[str, str, str]] = {}
+        self._show_activity_details = False
         self._clipboard_image_capture = clipboard_image_capture
         self._image_paste_in_progress = False
         self._task_progresses: dict[str, TaskProgress] = {}
@@ -636,6 +643,10 @@ class ChatApp(App):
         self.bus = runtime.bus
         self.control_server = runtime.control
         self.session_name = runtime.summary.session_name
+        self._activity_feed = self._activity_feeds.setdefault(
+            runtime.summary.room_id, ActivityFeed())
+        # 非活动房间没有可同步的 RichLog 行；只保留 feed 内仍可展开的近期卡。
+        self._activity_feed.take_evicted()
         self.title = f"myagents · {runtime.summary.title}"
 
     def _on_session_event(
@@ -652,6 +663,8 @@ class ChatApp(App):
             self._on_agent_event(name, event)
             if event.kind == "committed" and name == "user":
                 self._bind_active_runtime()
+        else:
+            self._record_background_activity(room_id, name, event)
 
     def _on_session_notice(self, notice: SessionNotice) -> None:
         if not self.is_mounted:
@@ -664,9 +677,118 @@ class ChatApp(App):
             timeout=5,
         )
 
+    def _on_session_terminal(self, terminal: SessionTerminal) -> None:
+        feed = self._activity_feeds.setdefault(
+            terminal.session_id, ActivityFeed())
+        feed.set_command_state(
+            terminal.command_id, terminal.status, terminal.error)
+        if (
+            self.is_mounted
+            and self.session_manager is not None
+            and terminal.session_id == self.session_manager.active_session_id
+            and feed is self._activity_feed
+        ):
+            self._upsert_activity_card(terminal.command_id)
+
+    def _record_background_activity(
+        self, room_id: str, name: str, ev: AgentEvent
+    ) -> None:
+        """更新非活动房间的摘要模型，不把过程行写进当前 RichLog。"""
+        command_value = ev.meta.get("command_id")
+        if not command_value:
+            return
+        command_id = str(command_value)
+        feed = self._activity_feeds.setdefault(room_id, ActivityFeed())
+        if ev.kind == "committed" and name == "user":
+            feed.begin(command_id)
+            roles = ev.meta.get("workflow_roles")
+            if ev.meta.get("workflow") is True and isinstance(roles, dict):
+                reviewer = str(roles.get("reviewer") or "")
+                implementer = str(roles.get("implementer") or "")
+                verifier = str(roles.get("verifier") or "")
+                if implementer:
+                    feed.record_status(
+                        command_id, implementer, "等待实现", state="queued")
+                if verifier and verifier != reviewer:
+                    feed.record_status(
+                        command_id, verifier, "等待复核", state="queued")
+                if reviewer:
+                    feed.record_status(
+                        command_id, reviewer, "审查中", state="running")
+                feed.record_note(
+                    command_id,
+                    "workflow",
+                    "workflow",
+                    "workflow 已创建："
+                    f"审 {reviewer} → 写 {implementer} → 验 {verifier}",
+                )
+            else:
+                targets = self.orch.parse_mentions(ev.text)
+                if targets:
+                    for target in targets:
+                        feed.record_status(
+                            command_id, target, "思考中…", state="queued")
+                else:
+                    feed.record_status(
+                        command_id, HOST_NAME, "处理中…", state="running")
+            return
+        if ev.kind == "text":
+            feed.record_status(command_id, name, "回复中", state="running")
+        elif ev.kind == "info":
+            feed.record_note(
+                command_id, name, "info", ev.text, state="running")
+        elif ev.kind == "status":
+            heartbeat = ev.meta.get("heartbeat") is True
+            activity_agent = (
+                str(ev.meta.get("phase") or "任务")
+                if heartbeat and name == "system" else name
+            )
+            feed.record_status(
+                command_id,
+                activity_agent,
+                ev.text,
+                state=str(ev.meta.get("agent_state") or "running"),
+                heartbeat=heartbeat,
+            )
+        elif ev.kind == "tool":
+            command = ev.meta.get("command")
+            tool_call_id = ev.meta.get("tool_call_id")
+            detail = (
+                redact_sensitive_text(command, limit=4000)
+                if isinstance(command, str) else ""
+            )
+            feed.record_tool(
+                command_id,
+                name,
+                str(tool_call_id or ev.text or "anonymous"),
+                ev.text,
+                status=str(ev.meta.get("status") or ""),
+                detail=detail,
+                identity_is_fallback=not bool(tool_call_id),
+            )
+        elif ev.kind == "permission":
+            state = (
+                "waiting_permission"
+                if "等待权限" in ev.text else "running"
+            )
+            feed.record_note(
+                command_id, name, "permission", ev.text, state=state)
+        elif ev.kind == "cancel_requested":
+            feed.set_command_state(command_id, "cancelling")
+            feed.record_note(
+                command_id, "system", "cancel", ev.text)
+        elif ev.kind == "steering":
+            feed.record_note(command_id, name, "steering", ev.text)
+        elif ev.kind == "error":
+            feed.record_status(command_id, name, ev.text, state="failed")
+        elif ev.kind == "done":
+            feed.record_status(
+                command_id, name, "本轮响应结束", state="completed")
+
     async def _reap_idle_sessions(self) -> None:
         if self.session_manager is not None:
-            await self.session_manager.reap_idle()
+            for room_id in await self.session_manager.reap_idle():
+                self._activity_feeds.pop(room_id, None)
 
     # ---- ACP 权限决策 ----
 
@@ -771,7 +893,6 @@ class ChatApp(App):
 
     def _record_permission_event(
             self, command_id: str | None, agent_name: str, text: str) -> None:
-        self._system(f"{agent_name}: {text}")
         if command_id is not None:
             state = (
                 "waiting_permission"
@@ -779,6 +900,16 @@ class ChatApp(App):
                 else "running"
             )
             self._set_agent_status(command_id, agent_name, state, text)
+            if self._activity_feed.record_note(
+                command_id,
+                agent_name,
+                "permission",
+                text,
+                state=state,
+            ):
+                self._upsert_activity_card(command_id)
+        else:
+            self._system(f"{agent_name}: {text}")
         store = self.orch.store
         if command_id is not None and store is not None:
             store.append_event(
@@ -862,48 +993,66 @@ class ChatApp(App):
         self._stream_text.pop(name, None)
         self._stream_line_index.pop(name, None)
 
-    def _upsert_tool_line(self, name: str, ev: AgentEvent) -> None:
-        """每个 command/tool 只占一条逻辑记录，状态变化原位更新。"""
-        command_id = str(ev.meta.get("command_id") or "current")
-        tool_identity = str(
-            ev.meta.get("tool_call_id") or ev.text or "anonymous")
-        key = (command_id, name, tool_identity)
-        self._tool_latest[key] = (name, ev)
-        status = tool_status_label(ev.meta.get("status"))
-        line = f"{name} 使用工具：{ev.text}"
-        if status:
-            line += f" · {status}"
-        command = ev.meta.get("command")
-        if isinstance(command, str) and command:
-            if self._show_tool_details:
-                line += f"\n  {command}"
-            else:
-                line += " · /details 查看"
-        index = self._tool_line_index.get(key)
-        rendered = ("system", line, "dim")
-        if self._tool_line_fingerprint.get(key) == rendered:
+    def _upsert_activity_card(self, command_id: str) -> None:
+        """同一 command 的过程事件始终只重绘一张逻辑活动卡。"""
+        changed = self._apply_activity_evictions()
+        if not self._activity_feed.has(command_id):
+            if changed:
+                self._render_display_lines()
             return
-        self._tool_line_fingerprint[key] = rendered
+        rendered = (
+            "activity",
+            self._activity_feed.render(
+                command_id, expanded=self._show_activity_details),
+            "dim",
+        )
+        if self._activity_line_fingerprint.get(command_id) == rendered:
+            if changed:
+                self._render_display_lines()
+            return
+        self._activity_line_fingerprint[command_id] = rendered
+        index = self._activity_line_index.get(command_id)
         if index is None:
-            self._tool_line_index[key] = len(self._display_lines)
+            self._activity_line_index[command_id] = len(self._display_lines)
             self._display_lines.append(rendered)
         else:
             self._display_lines[index] = rendered
         self._render_display_lines()
 
-    def _clear_tool_state(
-            self, command_id: object, name: str | None = None) -> None:
-        if not command_id:
-            return
-        target = str(command_id)
-        keys = [
-            key for key in self._tool_line_index
-            if key[0] == target and (name is None or key[1] == name)
-        ]
-        for key in keys:
-            self._tool_line_index.pop(key, None)
-            self._tool_line_fingerprint.pop(key, None)
-            self._tool_latest.pop(key, None)
+    def _apply_activity_evictions(self) -> bool:
+        """近期可展开窗口之外，只留下已折叠的有界归档行。"""
+        changed = False
+        for command_id, snapshot in self._activity_feed.take_evicted():
+            index = self._activity_line_index.pop(command_id, None)
+            self._activity_line_fingerprint.pop(command_id, None)
+            if index is not None:
+                self._display_lines[index] = ("activity", snapshot, "dim")
+                changed = True
+        return changed
+
+    def _refresh_activity_cards(self) -> None:
+        """切换展开态时一次性重建全部活动卡，避免连续整屏闪烁。"""
+        changed = self._apply_activity_evictions()
+        for command_id in self._activity_feed.command_ids():
+            rendered = (
+                "activity",
+                self._activity_feed.render(
+                    command_id, expanded=self._show_activity_details),
+                "dim",
+            )
+            if self._activity_line_fingerprint.get(command_id) == rendered:
+                continue
+            self._activity_line_fingerprint[command_id] = rendered
+            index = self._activity_line_index.get(command_id)
+            if index is None:
+                self._activity_line_index[command_id] = len(
+                    self._display_lines)
+                self._display_lines.append(rendered)
+            else:
+                self._display_lines[index] = rendered
+            changed = True
+        if changed:
+            self._render_display_lines()
 
     def _system(self, text: str) -> None:
         self._write("system", text, "dim")
@@ -1074,11 +1223,9 @@ class ChatApp(App):
             "只在 review/implement/repair 阶段接受，并从下一阶段边界生效。")
 
     def action_toggle_details(self) -> None:
-        """切换工具命令详情，并原位重绘现有工具记录。"""
-        self._show_tool_details = not self._show_tool_details
-        latest = list(self._tool_latest.values())
-        for name, event in latest:
-            self._upsert_tool_line(name, event)
+        """展开或收起执行活动，并原位重绘现有活动卡。"""
+        self._show_activity_details = not self._show_activity_details
+        self._refresh_activity_cards()
 
     def action_paste_image(self) -> None:
         """保存系统剪贴板图片，并把本地附件引用插入当前草稿。"""
@@ -1209,6 +1356,8 @@ class ChatApp(App):
             self, command_id: str, status: str,
             error: str | None = None) -> None:
         self._ensure_task(command_id).set_command(status, error)
+        if self._activity_feed.set_command_state(command_id, status, error):
+            self._upsert_activity_card(command_id)
         self._render_task_status()
 
     def _set_agent_status(
@@ -1439,6 +1588,7 @@ class ChatApp(App):
             except Exception as exc:
                 self._write("system", f"永久删除失败：{exc}", "bold red")
                 return
+            self._activity_feeds.pop(room_id, None)
             self._system("会话已永久删除")
 
         self.run_worker(runner())
@@ -1453,10 +1603,8 @@ class ChatApp(App):
         self._display_lines.clear()
         self._stream_text.clear()
         self._stream_line_index.clear()
-        self._heartbeat_line_index.clear()
-        self._tool_line_index.clear()
-        self._tool_line_fingerprint.clear()
-        self._tool_latest.clear()
+        self._activity_line_index.clear()
+        self._activity_line_fingerprint.clear()
         self._task_progresses.clear()
         self._task_started_at.clear()
         self._latest_task_id = None
@@ -1464,6 +1612,7 @@ class ChatApp(App):
         snapshot = self.session_manager.snapshot()
         for message in sorted(snapshot.history, key=lambda item: item.seq):
             self._write(message.speaker, message.text)
+        self._refresh_activity_cards()
         self._restore_interrupted_executions()
         self._system(
             f"已切换：{snapshot.summary.project_name} / "
@@ -1503,6 +1652,7 @@ class ChatApp(App):
             # 用户消息已持久确认：此时才显示文本和派发状态
             self._write("user", ev.text)
             if command_id is not None:
+                self._activity_feed.begin(command_id)
                 self._set_command_status(command_id, "running")
             roles = ev.meta.get("workflow_roles")
             if ev.meta.get("workflow") is True and isinstance(roles, dict):
@@ -1510,23 +1660,40 @@ class ChatApp(App):
                 implementer = str(roles.get("implementer") or "")
                 verifier = str(roles.get("verifier") or "")
                 if command_id is not None:
+                    reviewer_phase = (
+                        "审查中（后续复核）"
+                        if reviewer and reviewer == verifier else "审查中"
+                    )
                     if reviewer:
-                        phase = (
-                            "审查中（后续复核）"
-                            if reviewer == verifier else "审查中"
-                        )
                         self._set_agent_status(
-                            command_id, reviewer, "running", phase)
+                            command_id, reviewer, "running", reviewer_phase)
                     if implementer:
                         self._set_agent_status(
                             command_id, implementer, "queued", "等待实现")
+                        self._activity_feed.record_status(
+                            command_id, implementer, "等待实现", state="queued")
                     if verifier and verifier != reviewer:
                         self._set_agent_status(
                             command_id, verifier, "queued", "等待复核")
-                self._system(
+                        self._activity_feed.record_status(
+                            command_id, verifier, "等待复核", state="queued")
+                    # 排队角色先入模型，真正已开始的 reviewer 最后成为当前焦点。
+                    if reviewer:
+                        self._activity_feed.record_status(
+                            command_id,
+                            reviewer,
+                            reviewer_phase,
+                            state="running",
+                        )
+                workflow_text = (
                     "workflow 已创建："
                     f"审 {reviewer} → 写 {implementer} → 验 {verifier}"
                 )
+                if command_id is not None:
+                    self._activity_feed.record_note(
+                        command_id, "workflow", "workflow", workflow_text)
+                else:
+                    self._system(workflow_text)
             else:
                 targets = self.orch.parse_mentions(ev.text)
                 if targets:
@@ -1534,16 +1701,36 @@ class ChatApp(App):
                         if command_id is not None:
                             self._set_agent_status(
                                 command_id, target, "queued", "等待派发")
-                        self._system(f"{target} 思考中…")
+                            self._activity_feed.record_status(
+                                command_id,
+                                target,
+                                "思考中…",
+                                state="queued",
+                            )
+                        else:
+                            self._system(f"{target} 思考中…")
                 else:
                     if command_id is not None:
                         self._set_agent_status(
                             command_id, HOST_NAME, "running", "路由中")
-                    self._system("host 处理中…")
+                        self._activity_feed.record_status(
+                            command_id,
+                            HOST_NAME,
+                            "处理中…",
+                            state="running",
+                        )
+                    else:
+                        self._system("host 处理中…")
+            if command_id is not None:
+                self._upsert_activity_card(command_id)
         elif ev.kind == "text":
             if command_id is not None:
                 self._set_agent_status(
                     command_id, name, "running", "回复中")
+                if self._activity_feed.record_status(
+                    command_id, name, "回复中", state="running"
+                ):
+                    self._upsert_activity_card(command_id)
             self._buffer_stream_text(name, ev.text)
         elif ev.kind == "info":
             self._finish_stream_text(name)
@@ -1559,7 +1746,16 @@ class ChatApp(App):
                     self._set_agent_status(
                         command_id, name, "running",
                         str(ev.meta.get("phase") or ev.text))
-            self._system(f"{name}: {ev.text}")
+                if self._activity_feed.record_note(
+                    command_id,
+                    name,
+                    "info",
+                    ev.text,
+                    state="running",
+                ):
+                    self._upsert_activity_card(command_id)
+            else:
+                self._system(f"{name}: {ev.text}")
         elif ev.kind == "status":
             self._finish_stream_text(name)
             if command_id is not None and not ev.meta.get("heartbeat"):
@@ -1569,17 +1765,21 @@ class ChatApp(App):
                     str(ev.meta.get("agent_state") or "running"),
                     str(ev.meta.get("phase") or ev.text),
                 )
-            if ev.meta.get("heartbeat") is True and command_id:
-                index = self._heartbeat_line_index.get(command_id)
-                line = (ev.text if name == "system"
-                        else f"{name}: {ev.text}")
-                if index is None:
-                    self._heartbeat_line_index[command_id] = len(
-                        self._display_lines)
-                    self._display_lines.append(("system", line, "dim"))
-                else:
-                    self._display_lines[index] = ("system", line, "dim")
-                self._render_display_lines()
+            if command_id is not None:
+                heartbeat = ev.meta.get("heartbeat") is True
+                activity_agent = (
+                    str(ev.meta.get("phase") or "任务")
+                    if heartbeat and name == "system"
+                    else name
+                )
+                if self._activity_feed.record_status(
+                    command_id,
+                    activity_agent,
+                    ev.text,
+                    state=str(ev.meta.get("agent_state") or "running"),
+                    heartbeat=heartbeat,
+                ):
+                    self._upsert_activity_card(command_id)
             else:
                 self._system(f"{name}: {ev.text}")
         elif ev.kind == "tool":
@@ -1587,7 +1787,24 @@ class ChatApp(App):
             if command_id is not None:
                 self._set_agent_status(
                     command_id, name, "running", f"工具：{ev.text}")
-            self._upsert_tool_line(name, ev)
+                command = ev.meta.get("command")
+                tool_call_id = ev.meta.get("tool_call_id")
+                detail = (
+                    redact_sensitive_text(command, limit=4000)
+                    if isinstance(command, str) else ""
+                )
+                if self._activity_feed.record_tool(
+                    command_id,
+                    name,
+                    str(tool_call_id or ev.text or "anonymous"),
+                    ev.text,
+                    status=str(ev.meta.get("status") or ""),
+                    detail=detail,
+                    identity_is_fallback=not bool(tool_call_id),
+                ):
+                    self._upsert_activity_card(command_id)
+            else:
+                self._system(f"{name} 使用工具：{ev.text}")
         elif ev.kind == "permission":
             self._finish_stream_text(name)
             if command_id is not None:
@@ -1598,7 +1815,16 @@ class ChatApp(App):
                 )
                 self._set_agent_status(
                     command_id, name, state, ev.text)
-            self._system(f"{name}: {ev.text}")
+                if self._activity_feed.record_note(
+                    command_id,
+                    name,
+                    "permission",
+                    ev.text,
+                    state=state,
+                ):
+                    self._upsert_activity_card(command_id)
+            else:
+                self._system(f"{name}: {ev.text}")
         elif ev.kind == "cancel_requested":
             self._finish_stream_text(name)
             if self.session_manager is None:
@@ -1609,23 +1835,44 @@ class ChatApp(App):
                 )
             # 这里只是请求已发出；真正 terminal 由 CommandBus wait 结果确认。
             # 保留工具状态和运行态，避免取消超时期间短暂显示假成功。
-            self._system(ev.text)
+            if command_id is not None:
+                self._activity_feed.set_command_state(
+                    command_id, "cancelling")
+                self._activity_feed.record_note(
+                    command_id, "system", "cancel", ev.text)
+                self._upsert_activity_card(command_id)
+            else:
+                self._system(ev.text)
         elif ev.kind == "steering":
+            if command_id is not None:
+                self._activity_feed.record_note(
+                    command_id, name, "steering", ev.text)
+                self._upsert_activity_card(command_id)
             self._system(f"steering 已记录：{ev.text}")
         elif ev.kind == "error":
             self._finish_stream_text(name)
-            self._clear_tool_state(ev.meta.get("command_id"), name)
             if command_id is not None:
                 self._set_agent_status(
                     command_id, name, "failed", ev.text)
+                if self._activity_feed.record_status(
+                    command_id, name, ev.text, state="failed"
+                ):
+                    self._upsert_activity_card(command_id)
             self._write(name, f"出错：{ev.text}", "bold red")
         elif ev.kind == "done":
             self._finish_stream_text(name)
-            self._clear_tool_state(ev.meta.get("command_id"), name)
             if command_id is not None:
                 self._set_agent_status(
                     command_id, name, "completed", "本轮响应结束")
-            self._system(f"{name} 本轮响应结束")
+                if self._activity_feed.record_status(
+                    command_id,
+                    name,
+                    "本轮响应结束",
+                    state="completed",
+                ):
+                    self._upsert_activity_card(command_id)
+            else:
+                self._system(f"{name} 本轮响应结束")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

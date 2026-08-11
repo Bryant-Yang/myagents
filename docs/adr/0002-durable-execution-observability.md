@@ -2,6 +2,7 @@
 
 - 状态：Accepted
 - 日期：2026-07-27
+- 补充：2026-08-11（每任务活动摘要卡）
 - Owner：Bryant Yang
 - 里程碑：M3.1
 
@@ -46,16 +47,21 @@ password、authorization 字段在权限 UI 中隐藏。权限弹窗必须显示
   防止任一 producer 刷爆 UI 与 `events.jsonl`；
 - adapter 对没有可见增量的重复工具 update 发内部 activity 事件；
   CommandBus 只刷新静默时钟，不向 UI 转发或持久化；
-- TUI 让同一工具只占一个逻辑项，将协议状态归一为“等待中/进行中/已完成/
-  失败/已拒绝/已取消”并原位更新；命令详情默认折叠，用户通过 `/details`
-  显式切换；
-- 命令终态后清理内存 identity/fingerprint；历史事件保持 append-only，不回写
-  删除旧噪声。
+- TUI 在工具 identity 去重之上，再让同一 command 只占一张活动卡；折叠态只
+  显示 command 终态、当前阶段与工具汇总，`/details` 展开阶段、heartbeat、
+  权限、工具终态和脱敏命令；协议后续补发 tool ID 时只迁移显式标记为标题
+  fallback 的原逻辑项，opaque 正式 ID 不用字符串启发式猜测；被明细窗口裁掉的
+  工具若曾失败、拒绝或取消，卡片继续保留历史异常位；
+- 活动模型按 room_id 隔离，非活动房间的事件也更新其模型；命令终态后近期卡
+  冻结为可展开安全摘要。每卡最多保留最近 50 个工具明细，每 room 最多保留
+  最近 100 张可展开终态卡，更早卡只留折叠归档；历史事件保持 append-only，
+  是完整事实源。后台 runtime 被 idle reap 时一并释放其 UI feed。用户消息、
+  agent 正文和失败仍留在聊天主线，不能被折叠卡隐藏。
 
 CommandBus 在连续 10 秒没有 agent 事件时发 heartbeat，并持续记录累计静默
-时长。heartbeat 不是 agent 活动，不得重置静默计时；TUI 对同一 command 的
-heartbeat 原位更新，避免每 10 秒追加一条重复记录。heartbeat 同时标明最近
-活动阶段（host 或 worker）。
+时长。heartbeat 不是 agent 活动，不得重置静默计时；TUI 在同一 command 活动
+卡内原位更新，避免每 10 秒追加一条聊天记录。heartbeat 同时标明最近活动阶段
+（host 或 worker）。
 
 `completed` 是 CommandBus 的调用终态，只表示本轮 agent/host 调用正常结束，
 不证明自然语言任务已经验收。TUI 对 adapter `done` 显示“本轮响应结束”，不得
@@ -101,7 +107,7 @@ MCP bridge 对应新增 `myagents_read_events` 与
 ## 3. 验收
 
 1. ACP thought 正文不可见；阶段、工具标题和命令上下文可见。
-2. 静默任务产生累计 heartbeat；同一 command 在 TUI 只占一条状态记录；
+2. 静默任务产生累计 heartbeat；同一 command 在 TUI 只占一张活动卡；
    事件经重启仍可读取。
 3. 权限请求前 TUI 显示工具上下文，请求与结果均写入事件日志。
 4. active/queued 可精确取消，bus worker 继续服务下一条命令。
@@ -117,6 +123,10 @@ MCP bridge 对应新增 `myagents_read_events` 与
     不再显示取消提示。
 13. 活跃工具超过普通 120 秒阈值不会被误杀；独立工具 watchdog 到期仍按
     no-replay 失败处理。
+14. `/details` 展开前不显示工具命令；展开后显示脱敏命令和最近过程，错误仍
+    作为独立聊天正文可见。
+15. 多 agent 交错更新时摘要焦点跟随最后活动者；切走会话、后台完成再切回后
+    近期活动卡仍可展开；工具和终态卡超限后按固定窗口有界归档。
 
 ## 4. 后果
 

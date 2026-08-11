@@ -24,6 +24,7 @@
 | M4.5 | 完成 | OpenCode ACP-first、ask-by-default 权限收口与只读 JSONL fallback |
 | M4.6 | 完成 | Qwen Code `qwen --acp` 接入、TUI 点名与 ACP-only 安全边界 |
 | M4.7 | 完成 | 多项目会话目录、后台执行、资源 gate、未读通知与图片短引用 |
+| M4.8 | 完成 | 聊天主线降噪、每任务活动摘要卡与 `/details` 展开 |
 | M5.1 | 完成 | `/discuss` 指定成员、1–3 轮有界讨论与终局 moderator |
 | M5 | 完成 | review → 单 writer 修改 → 独立复核、一次修复上限与阶段边界 steering |
 
@@ -494,9 +495,17 @@
 - **高频分支**：adapter 继承初始 tool title/command 并压缩重复 update；
   CommandBus 再做 producer-independent 防御性去重。重复 update 仍刷新
   activity 时钟，但 activity-only 事件不进入 UI/events，不会误触发
-  heartbeat/inactivity；TUI 只在可见状态变化时
-  重绘同一逻辑工具项，命令详情默认折叠、由 `/details` 切换，命令终态后清理
-  内存索引。活跃工具使用 15 分钟独立 watchdog，普通分析仍使用 120 秒阈值。
+  heartbeat/inactivity；TUI 只在可见状态变化时重绘同一 command 的活动卡，
+  将阶段、最新 heartbeat、工具与权限合并，默认只显示终态、当前阶段和工具
+  汇总，由 `/details` 展开脱敏明细。协议后续补发 tool ID 时迁移原逻辑项，
+  不重复计数；fallback identity 来源显式传递，正式 ID 即使恰等于标题也不被
+  误迁移。窗口裁掉旧工具后仍保留历史失败/拒绝/取消事实。每个 room 独立保留
+  近期终态的可展开安全摘要，切走期间的后台
+  更新继续进入该 room 的活动模型。每卡只保留最近 50 个工具明细、每 room
+  只保留最近 100 张可展开终态卡，更早内容在当前视图冻结成折叠归档；完整事实仍从
+  `events.jsonl` 读取；后台 runtime 经过 10 分钟 idle reap 后同步释放该 room
+  的 UI 活动模型。活跃工具使用 15 分钟独立 watchdog，普通分析仍使用 120 秒
+  阈值。
 - **重启分支**：最后事件非 terminal 的 command 显示为上次中断及最后状态。
 - **完成语义**：`completed` 只表示本轮调用正常结束，不等同于用户任务验收；
   TUI 显示“本轮响应结束”，不显示“agent 完成”。fan-out 任一 worker
@@ -504,10 +513,14 @@
   agent 终态并把混合成功/失败显示为“部分完成”。
 - **验收**：`events.read` 可分页读取；heartbeat 累计且界面不刷行；200 条相同
   tool update 在 ACP 层压成“创建/进行中/完成”三个状态，在防御性 bus
-  fixture 中只转发并持久化一次，TUI 只占一个逻辑项且只重绘状态迁移；旧房间
-  安全补建；损坏日志 fail loudly。
+  fixture 中只转发并持久化一次；TUI 对一个 command 始终只占一张活动卡，
+  折叠态不泄露命令，展开态可见最新 heartbeat、工具终态与脱敏命令，错误仍在
+  聊天主线单独可见；多 agent 交错更新时焦点跟随最后真实活动，会话切走、后台
+  完成再切回后卡片仍在；工具/终态窗口超限后有界归档；旧房间安全补建；损坏
+  日志 fail loudly。
 - **证据**：`tests/test_storage.py`、`tests/test_acp.py`、
-  `tests/test_phase2.py`、`tests/test_basic.py`、`tests/test_tui_status.py`、
+  `tests/test_phase2.py`、`tests/test_basic.py`、`tests/test_tui_activity.py`、
+  `tests/test_tui_status.py`、
   `tests/test_m3_bus.py`、
   `tests/test_m3_control.py`、`tests/test_m3_mcp.py`。
 - **真实回放证据**：2026-07-28 命名房间 `99a294ef32695cef` 的同一 command

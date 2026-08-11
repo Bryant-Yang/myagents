@@ -111,6 +111,11 @@ def test_tui_status_panel_tracks_agent_lifecycle() -> None:
             assert "codex 进行中 · 审查中" in workflow_panel
             assert "kimi 排队 · 等待实现" in workflow_panel
             assert "opencode 排队 · 等待复核" in workflow_panel
+            collapsed = "".join(
+                str(line.text) for line in log.lines[workflow_line_start:])
+            assert "codex：审查中" in collapsed
+            app.action_toggle_details()
+            await pilot.pause()
             rendered = "\n".join(
                 str(line.text) for line in log.lines[workflow_line_start:])
             assert "workflow 已创建" in rendered

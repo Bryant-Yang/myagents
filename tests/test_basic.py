@@ -446,10 +446,19 @@ def test_tui() -> None:
             await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()
-            lines = "\n".join(str(line.text) for line in app.query_one(RichLog).lines)
-            assert "host 处理中" in lines          # 无 @ → host 判断或回答
-            assert "路由 → kimi" in lines          # 路由结果提示
-            assert "[kimi] kimi 收到" in lines
+            rendered = [
+                str(line.text) for line in app.query_one(RichLog).lines
+            ]
+            assert len([
+                line for line in rendered
+                if line.startswith("[activity] ")
+            ]) == 2
+            assert "[kimi] kimi 收到" in rendered
+            app.action_toggle_details()
+            expanded = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines
+            )
+            assert "路由 → kimi" in expanded
 
     asyncio.run(run())
     print("ok  TUI（Textual pilot）")
@@ -496,7 +505,7 @@ def test_tui_coalesces_stream_chunks() -> None:
 
 
 def test_tui_coalesces_heartbeat_and_avoids_false_success_copy() -> None:
-    """同一命令的 heartbeat 只占一行；done 只表示本轮响应结束。"""
+    """heartbeat 折叠进一张活动卡；done 不伪装任务验收。"""
     from textual.widgets import RichLog
     from main import ChatApp
 
@@ -514,21 +523,25 @@ def test_tui_coalesces_heartbeat_and_avoids_false_success_copy() -> None:
             lines = [
                 str(line.text) for line in app.query_one(RichLog).lines
             ]
-            heartbeat_lines = [
-                line for line in lines if "正在路由（已等待" in line
+            activity = [
+                line for line in lines if line.startswith("[activity] ")
             ]
-            assert heartbeat_lines == [
-                "[system] host 正在路由（已等待 20 秒）"
-            ], heartbeat_lines
-            assert "[system] kimi 本轮响应结束" in lines
-            assert "[system] kimi 完成" not in lines
+            assert len(activity) == 1, activity
+            assert not [line for line in lines if "已等待 20 秒" in line]
+            app.action_toggle_details()
+            expanded = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines
+            )
+            assert "host 正在路由（已等待 20 秒）" in expanded
+            assert "本轮响应结束" in expanded
+            assert "kimi 完成" not in expanded
 
     asyncio.run(run())
     print("ok  TUI 合并 heartbeat + done 不伪装任务成功")
 
 
-def test_tui_updates_one_line_per_tool() -> None:
-    """同一 command/tool 的状态迁移原位更新，重复 in_progress 不刷屏。"""
+def test_tui_updates_one_activity_card_per_command() -> None:
+    """工具状态原位更新，完成后仍可展开历史活动卡。"""
     from textual.widgets import RichLog
     from main import ChatApp
 
@@ -569,7 +582,7 @@ def test_tui_updates_one_line_per_tool() -> None:
             await pilot.pause()
             logical = [
                 text for _speaker, text, _style in app._display_lines
-                if "检查 JavaScript" in text
+                if _speaker == "activity"
             ]
             assert len(logical) == 1, logical
             assert "node --check demo.js" not in logical[0], logical
@@ -578,27 +591,28 @@ def test_tui_updates_one_line_per_tool() -> None:
             app.action_toggle_details()
             logical = [
                 text for _speaker, text, _style in app._display_lines
-                if "检查 JavaScript" in text
+                if _speaker == "activity"
             ]
             assert "node --check demo.js" in logical[0], logical
             lines = [
                 str(line.text) for line in app.query_one(RichLog).lines
                 if "检查 JavaScript" in str(line.text)
             ]
-            assert len(lines) == 1, lines
-            assert "已完成" in lines[0], lines
+            assert len([
+                line for line in app.query_one(RichLog).lines
+                if str(line.text).startswith("[activity] ")
+            ]) == 1
+            assert "已完成" in "\n".join(lines), lines
             assert render_count == 4, render_count
             app._on_agent_event(
                 "kimi", AgentEvent(
                     "done", meta={"command_id": "cmd-tool"}))
-            assert not [
-                key for key in app._tool_line_index
-                if key[0] == "cmd-tool"
+            after_done = [
+                text for speaker, text, _style in app._display_lines
+                if speaker == "activity"
             ]
-            assert not [
-                key for key in app._tool_line_fingerprint
-                if key[0] == "cmd-tool"
-            ]
+            assert len(after_done) == 1
+            assert "本轮响应结束" in after_done[0]
 
     asyncio.run(run())
     print("ok  TUI 工具状态原位更新")
@@ -673,7 +687,7 @@ if __name__ == "__main__":
     test_qwen_has_distinct_tui_color()
     test_tui_coalesces_stream_chunks()
     test_tui_coalesces_heartbeat_and_avoids_false_success_copy()
-    test_tui_updates_one_line_per_tool()
+    test_tui_updates_one_activity_card_per_command()
     test_main_loop_reopens_requested_session()
     test_cli_room_busy_is_actionable_without_traceback()
     print("\n全部通过")
