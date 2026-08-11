@@ -28,7 +28,7 @@
 | C4 | 取消与退出不留进程 | HARNESS §4.3；`acp-migration.md` 取消/生命周期 | basic/ACP/Phase 2 回收测试；SPEC UC-LIFE-001 人工边界 | 阻断交付；清理进程并定位锁/进程组问题 | Bryant Yang |
 | C5 | Harness 入口与引用不漂移 | `AGENTS.md`；`workflow.md` | `scripts/check-harness.sh` 文档/marker/link Sensor | 修正文档或引用；不得复制多份规则 | Bryant Yang |
 | C6 | 关键行为证据可信 | `SPEC.md` | fake fixture + 既有 tests + 授权的真实 E2E/人工验收 | 报告证据缺口，不以新生成测试代替验收 | Bryant Yang |
-| C7 | 持久化、命名会话、session restore 与单写者 lease | HARNESS §4.4；`acp-migration.md` 持久化与 session restore；ADR-0001、ADR-0005 | `test_storage.py`、`test_m25.py`（含本地 `/new` 与 no-replay）；SPEC UC-ROOM-001/UC-SESSION-001/UC-ACP-002 | fail loudly 不假提交；本地命令不入 timeline；会话切换先标准关闭旧 owner；修复后重跑 storage/M2.5 回归 | Bryant Yang |
+| C7 | 持久化、多会话 runtime、session restore 与单写者 lease | HARNESS §4.4；`acp-migration.md`；ADR-0001、ADR-0005、ADR-0010 | storage/M2.5 与 `test_session_catalog.py`、`test_session_manager.py`、`test_session_tui.py`；SPEC UC-ROOM-001/UC-SESSION-001/UC-ACP-002 | fail loudly 不假提交；本地命令不入 timeline；事件/权限按 room_id 归属；只回收合格的后台空闲 runtime | Bryant Yang |
 | C8 | 外部入口保持单写者、权限不绕过且失败终态真实 | HARNESS §4.5–4.6；ADR-0001 §2.4–2.6 | `test_m3_bus.py`（含 fan-out worker failure）、`test_m3_control.py`、`test_m3_mcp.py`；SPEC UC-CTRL-001/UC-CTRL-002 | 阻断；bridge 不得创建 Orchestrator/获取 lease/绕过 TUI 权限；worker 失败不得报 completed；修复后重跑 M3 回归 | Bryant Yang |
 | C9 | 执行状态有界、可读且不刷屏 | HARNESS §4.6；ADR-0002；`acp-migration.md` 可见状态 | `test_acp.py` tool-spam/long-tool watchdog、`test_m3_bus.py` 防御性去重、`test_basic.py` 工具折叠、`test_tui_status.py` 分 agent 状态；SPEC UC-OBS-001 | 阻断交付；在 adapter/bus/UI 正确边界恢复状态迁移、去重和索引清理，不删除 append-only 历史 | Bryant Yang |
 | C10 | 图片附件私有、有界且不污染工作区 | HARNESS §4.8；SPEC UC-IMAGE-001 | `test_clipboard_image.py` 权限/格式/大小/草稿 fixture；真实截图由用户人工验收 | 阻断交付；删除不完整附件，恢复 0700/0600、20 MiB 和不自动提交边界 | Bryant Yang |

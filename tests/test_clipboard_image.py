@@ -19,6 +19,7 @@ from acp.client import AcpClient
 from clipboard_image import (
     ClipboardImageError,
     TrustedImage,
+    attachment_reference,
     capture_clipboard_png,
     prompt_images,
 )
@@ -72,6 +73,29 @@ def test_capture_clipboard_png_validates_and_secures_file() -> None:
         assert os.stat(destination).st_mode & 0o777 == 0o700
         assert os.stat(path).st_mode & 0o777 == 0o600
     print("ok  剪贴板 PNG 安全落盘")
+
+
+def test_capture_uses_short_monotonic_names_and_references() -> None:
+    def fake_run(command, **_kwargs):
+        Path(command[-1]).write_bytes(_PNG)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with TemporaryDirectory() as tmp:
+        destination = Path(tmp) / "attachments"
+        first = capture_clipboard_png(
+            destination, run_command=fake_run, system="Darwin")
+        second = capture_clipboard_png(
+            destination, run_command=fake_run, system="Darwin")
+
+        assert first.name == "img-0001.png"
+        assert second.name == "img-0002.png"
+        assert attachment_reference(first) == "[图片 1]"
+        assert attachment_reference(second) == "[图片 2]"
+        assert [image.path for image in prompt_images(
+            "比较 [图片 1] 和 [图片 2]", destination
+        )] == [first.resolve(), second.resolve()]
+
+    print("ok  图片使用短编号名称和引用")
 
 
 def test_capture_clipboard_png_rejects_missing_image() -> None:
@@ -239,7 +263,7 @@ def test_tui_paste_image_inserts_reference_without_submitting() -> None:
                 if fail_capture[0]:
                     raise ClipboardImageError("测试图片读取失败")
                 destination.mkdir(parents=True, exist_ok=True)
-                image = destination / "pasted-test.png"
+                image = destination / "img-0001.png"
                 image.write_bytes(_PNG)
                 os.chmod(image, 0o600)
                 return image
@@ -262,8 +286,7 @@ def test_tui_paste_image_inserts_reference_without_submitting() -> None:
                 assert captured_destinations == [
                     store.room_dir / "attachments"
                 ]
-                assert "[图片附件：" in box.value
-                assert "pasted-test.png" in box.value
+                assert "[图片 1]" in box.value
                 assert orch.history == []
                 assert box.has_focus
 
@@ -280,7 +303,7 @@ def test_tui_paste_image_inserts_reference_without_submitting() -> None:
                 box.action_paste()
                 await app.workers.wait_for_complete()
                 assert box.value.startswith("@kimi 看一下 ")
-                assert "[图片附件：" in box.value
+                assert "[图片 1]" in box.value
                 assert orch.history == []
 
                 # 读取失败保持原草稿，不自动发送。
@@ -297,6 +320,7 @@ def test_tui_paste_image_inserts_reference_without_submitting() -> None:
 
 if __name__ == "__main__":
     test_capture_clipboard_png_validates_and_secures_file()
+    test_capture_uses_short_monotonic_names_and_references()
     test_capture_clipboard_png_rejects_missing_image()
     test_capture_clipboard_png_enforces_size_limit()
     test_capture_rejects_corrupt_png_and_symlink_root()

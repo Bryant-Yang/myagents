@@ -29,6 +29,7 @@ APP_NAME = "myagents"
 STATE_SCHEMA_VERSION = 1
 DEFAULT_SESSION_NAME = "default"
 MAX_SESSION_NAME_CHARS = 64
+MAX_SESSION_TITLE_CHARS = 80
 
 DEFAULT_READ_LIMIT = 50
 MAX_READ_LIMIT = 200
@@ -93,6 +94,21 @@ def normalize_session_name(session_name: str) -> str:
     if any(unicodedata.category(char).startswith("C") for char in name):
         raise ValueError("session_name 不能包含控制或不可见格式字符")
     return name
+
+
+def normalize_session_title(title: str) -> str:
+    """规范可变展示标题；标题不参与路径或 room_id 计算。"""
+    if not isinstance(title, str):
+        raise ValueError("session_title 必须是字符串")
+    value = " ".join(title.split())
+    if not value:
+        raise ValueError("session_title 不能为空")
+    if len(value) > MAX_SESSION_TITLE_CHARS:
+        raise ValueError(
+            f"session_title 不能超过 {MAX_SESSION_TITLE_CHARS} 个字符")
+    if any(unicodedata.category(char).startswith("C") for char in value):
+        raise ValueError("session_title 不能包含控制或不可见格式字符")
+    return value
 
 
 def room_id_for(
@@ -451,6 +467,24 @@ class RoomStore:
                 f"与本次打开的 {self.session_name!r} 不一致")
         if not isinstance(data.get("agents"), dict):
             raise CorruptedStorageError("state.json 缺少合法的 agents 映射")
+        if "session_title" in data:
+            try:
+                normalize_session_title(data["session_title"])
+            except ValueError as exc:
+                raise CorruptedStorageError(
+                    f"state.json 的 session_title 非法：{exc}"
+                ) from exc
+        if not isinstance(data.get("session_title_pending", False), bool):
+            raise CorruptedStorageError(
+                "state.json 的 session_title_pending 非 bool"
+            )
+        updated_at = data.get("session_updated_at")
+        if updated_at is not None and (
+            not isinstance(updated_at, str) or not _is_utc_iso(updated_at)
+        ):
+            raise CorruptedStorageError(
+                "state.json 的 session_updated_at 非法"
+            )
         # 打开时全量校验 agents entry：损坏状态在构造阶段立即 fail loudly，
         # 而不是等该 agent 首次访问才发现
         for agent_name, entry in data["agents"].items():
@@ -592,6 +626,39 @@ class RoomStore:
         if name not in self._state["agents"]:
             return {"cursor": 0, "session_id": None}
         return self._validate_agent_entry(name, self._state["agents"][name])
+
+    @property
+    def session_title(self) -> str:
+        raw = self._state.get("session_title", self.session_name)
+        if not isinstance(raw, str):
+            raise CorruptedStorageError("state.json 的 session_title 非字符串")
+        try:
+            return normalize_session_title(raw)
+        except ValueError as exc:
+            raise CorruptedStorageError(
+                f"state.json 的 session_title 非法：{exc}") from exc
+
+    @property
+    def session_title_pending(self) -> bool:
+        value = self._state.get("session_title_pending", False)
+        if not isinstance(value, bool):
+            raise CorruptedStorageError(
+                "state.json 的 session_title_pending 非 bool")
+        return value
+
+    def set_session_title(self, title: str, *, pending: bool = False) -> None:
+        """原子更新展示标题；不改变稳定 session_name/room_id。"""
+        normalized = normalize_session_title(title)
+        if not isinstance(pending, bool):
+            raise ValueError("pending 必须是 bool")
+        new_state = {
+            **self._state,
+            "session_title": normalized,
+            "session_title_pending": pending,
+            "session_updated_at": _utc_now_iso(),
+        }
+        self._write_state(new_state)
+        self._state = new_state
 
     def set_agent_state(self, name: str, *, cursor: int | None = None,
                         session_id: str | None = None) -> None:

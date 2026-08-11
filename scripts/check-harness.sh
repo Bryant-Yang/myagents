@@ -22,6 +22,7 @@ required=(
   docs/adr/0007-opencode-hybrid-transport-policy.md
   docs/adr/0008-bounded-multi-agent-discussion.md
   docs/adr/0009-bounded-milestone-workflow-steering.md
+  docs/adr/0010-multi-session-tui-management.md
   scripts/check-redlines.sh
 )
 
@@ -63,6 +64,7 @@ docs = [
     root / "docs/adr/0007-opencode-hybrid-transport-policy.md",
     root / "docs/adr/0008-bounded-multi-agent-discussion.md",
     root / "docs/adr/0009-bounded-milestone-workflow-steering.md",
+    root / "docs/adr/0010-multi-session-tui-management.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -94,7 +96,7 @@ if [ ! -x .venv/bin/python ]; then
 fi
 
 .venv/bin/python -m py_compile \
-  main.py myagents_mcp.py orchestrator.py host.py discussion.py workflow.py \
+  main.py myagents_mcp.py orchestrator.py host.py discussion.py workflow.py session_catalog.py session_manager.py \
   acp/*.py codex_app_server/*.py adapters/*.py control/*.py storage/*.py workspace/*.py tests/*.py \
   scripts/e2e-m3-real.py scripts/e2e-m5-real.py
 .venv/bin/python tests/test_basic.py
@@ -103,6 +105,9 @@ fi
 .venv/bin/python tests/test_workflow.py
 .venv/bin/python tests/test_tui_status.py
 .venv/bin/python tests/test_clipboard_image.py
+.venv/bin/python tests/test_session_catalog.py
+.venv/bin/python tests/test_session_manager.py
+.venv/bin/python tests/test_session_tui.py
 .venv/bin/python tests/test_acp.py
 .venv/bin/python tests/test_kimi_hybrid.py
 .venv/bin/python tests/test_opencode_hybrid.py

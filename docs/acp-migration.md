@@ -51,7 +51,13 @@ M4.3 图片附件沿用同一个 `session/prompt`：只有 Kimi 明确声明
 `promptCapabilities.image=true` 时，客户端才在 text block 后追加
 `{"type":"image","mimeType":"image/png","data":"<base64>"}`。图片只从当前
 房间的私有 `attachments/` 信任根提取；聊天文本中的任意外部路径不会升级为
-image block。二进制不进入共享 timeline。
+image block。新消息使用 `[图片 N]` 映射当前房间的 `img-NNNN.png`；旧绝对
+路径引用只在同一信任根内兼容。二进制不进入共享 timeline。
+
+M4.7 由 SessionManager 为每个已加载房间独立持有 Orchestrator/CommandBus 和
+ACP/app-server runtime。切换可见会话不迁移或复用 native session writer；后台
+权限请求携带 room_id，并在弹窗显示项目、会话、agent 与工具。空闲回收只关闭
+非当前、无 command 且无权限等待的完整 runtime。
 
 ## 架构（Phase 2 现状）
 

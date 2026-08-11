@@ -23,9 +23,6 @@ import contextlib
 import json
 import shlex
 import time
-import uuid
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -42,8 +39,12 @@ from adapters.base import (
     redact_sensitive_text,
     tool_status_label,
 )
-from control import CommandBus, ControlServer
-from clipboard_image import ClipboardImageError, capture_clipboard_png
+from control import CommandBus, CommandNotFoundError, ControlServer
+from clipboard_image import (
+    ClipboardImageError,
+    attachment_reference,
+    capture_clipboard_png,
+)
 from discussion import DISCUSSION_USAGE
 from workflow import (
     STEER_USAGE,
@@ -59,6 +60,7 @@ from storage.store import (
     normalize_session_name,
     normalize_workdir,
 )
+from session_manager import SessionManager, SessionNotice, SessionSnapshot
 from tui_completion import (
     LOCAL_COMMANDS,
     CompletionContext,
@@ -116,9 +118,18 @@ class PermissionScreen(ModalScreen):
         ("ctrl+x", "cancel_task", "取消任务"),
     ]
 
-    def __init__(self, agent_name: str, params: dict) -> None:
+    def __init__(
+        self,
+        agent_name: str,
+        params: dict,
+        *,
+        session_id: str | None = None,
+        session_label: str = "",
+    ) -> None:
         super().__init__()
         self._agent_name = agent_name
+        self._session_id = session_id
+        self._session_label = session_label
         tool = params.get("toolCall", {})
         if not isinstance(tool, dict):
             tool = {}
@@ -133,7 +144,8 @@ class PermissionScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="perm-dialog"):
-            text = f"{self._agent_name} 请求权限：{self._title}"
+            prefix = f"{self._session_label} · " if self._session_label else ""
+            text = f"{prefix}{self._agent_name} 请求权限：{self._title}"
             if self._detail:
                 text += f"\n{self._detail}"
             yield Label(text)
@@ -153,41 +165,238 @@ class PermissionScreen(ModalScreen):
         self.dismiss(dict(_CANCELLED))
 
     def action_cancel_task(self) -> None:
-        self.app.action_cancel_active()
+        self.app.action_cancel_session(self._session_id)
 
 
-@dataclass(frozen=True)
-class NewSessionRequest:
-    """ChatApp 正常退出后，由顶层循环打开的新会话。"""
+class SessionPickerScreen(ModalScreen[str | None]):
+    """当前/全部项目的可搜索会话选择器。"""
 
-    session_name: str
+    BINDINGS = [
+        Binding("escape", "cancel", "关闭", priority=True),
+        Binding("up", "previous", "上一个", priority=True),
+        Binding("down", "next", "下一个", priority=True),
+        Binding("enter", "select", "切换", priority=True),
+        Binding("tab", "toggle_scope", "切换范围", priority=True),
+        Binding("ctrl+n", "new", "新会话", priority=True),
+        Binding("f2", "rename", "重命名", priority=True),
+        Binding("ctrl+d", "delete", "删除", priority=True),
+    ]
+
+    _STATUS_LABELS = {
+        "idle": "空闲",
+        "queued": "排队",
+        "waiting_resource": "等待资源",
+        "running": "运行中",
+        "waiting_permission": "等待权限",
+        "completed": "已完成",
+        "failed": "失败",
+        "cancelled": "已取消",
+    }
+
+    def __init__(self, manager: SessionManager) -> None:
+        super().__init__()
+        self._manager = manager
+        self._include_all = False
+        self._items: tuple[SessionSnapshot, ...] = ()
+        self._selected = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="session-picker"):
+            yield Label("会话 · 当前项目", id="session-scope")
+            yield Input(
+                placeholder="搜索会话名、最后消息、项目或路径",
+                id="session-search",
+            )
+            yield Static(id="session-options")
+            yield Label(
+                "↑↓ 选择 · Enter 切换 · Tab 当前/全部 · Ctrl+N 新建 · "
+                "F2 重命名 · Ctrl+D 删除 · Esc 关闭",
+                id="session-help",
+            )
+
+    def on_mount(self) -> None:
+        self._refresh()
+        self.query_one("#session-search", Input).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "session-search":
+            self._selected = 0
+            self._refresh()
+
+    def _refresh(self) -> None:
+        query = self.query_one("#session-search", Input).value
+        items = self._manager.list_sessions(
+            include_all=self._include_all,
+            query=query,
+        )
+        if self._include_all:
+            grouped: dict[str, list[SessionSnapshot]] = {}
+            for item in items:
+                grouped.setdefault(item.summary.workdir, []).append(item)
+            items = tuple(
+                item
+                for workdir in sorted(grouped, key=str.casefold)
+                for item in grouped[workdir]
+            )
+        self._items = items
+        if self._items:
+            self._selected = max(0, min(self._selected, len(self._items) - 1))
+        else:
+            self._selected = 0
+        scope = "全部项目" if self._include_all else "当前项目"
+        self.query_one("#session-scope", Label).update(f"会话 · {scope}")
+        self.query_one("#session-options", Static).update(self._render_items())
+
+    def _render_items(self) -> str:
+        if not self._items:
+            return "没有匹配的会话"
+        lines: list[str] = []
+        last_workdir = ""
+        for index, item in enumerate(self._items):
+            summary = item.summary
+            if self._include_all and summary.workdir != last_workdir:
+                if lines:
+                    lines.append("")
+                lines.append(f"{summary.project_name} · {summary.workdir}")
+                last_workdir = summary.workdir
+            marker = ">" if index == self._selected else " "
+            current = " · 当前" if summary.room_id \
+                == self._manager.active_session_id else ""
+            unread = " · 未读" if item.unread else ""
+            status = self._STATUS_LABELS.get(item.status, item.status)
+            activity = (
+                summary.last_active_at[:16].replace("T", " ")
+                if summary.last_active_at else "暂无活动"
+            )
+            lines.append(
+                f"{marker} {summary.title}  [{status}{unread}{current}]  "
+                f"{summary.message_count} 条 · {activity}"
+            )
+            preview = " ".join(summary.last_user_message.split())
+            if preview:
+                lines.append(f"    {preview[:88]}")
+        return "\n".join(lines)
+
+    def selected(self) -> SessionSnapshot | None:
+        if not self._items:
+            return None
+        return self._items[self._selected]
+
+    def action_previous(self) -> None:
+        if self._items:
+            self._selected = (self._selected - 1) % len(self._items)
+            self._refresh()
+
+    def action_next(self) -> None:
+        if self._items:
+            self._selected = (self._selected + 1) % len(self._items)
+            self._refresh()
+
+    def action_select(self) -> None:
+        selected = self.selected()
+        if selected is not None:
+            self.dismiss(selected.summary.room_id)
+
+    def action_toggle_scope(self) -> None:
+        self._include_all = not self._include_all
+        self._selected = 0
+        self._refresh()
+
+    def action_new(self) -> None:
+        self.dismiss("__new__")
+
+    def action_rename(self) -> None:
+        selected = self.selected()
+        if selected is not None:
+            self.dismiss(f"__rename__:{selected.summary.room_id}")
+
+    def action_delete(self) -> None:
+        selected = self.selected()
+        if selected is not None:
+            self.dismiss(f"__delete__:{selected.summary.room_id}")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
-class NewSessionScreen(ModalScreen[str | None]):
-    """新会话命名弹窗；空名称由 ChatApp 生成稳定可见的默认名。"""
+class RenameSessionScreen(ModalScreen[str | None]):
+    """只修改展示标题；稳定 session selector 不随标题变化。"""
 
-    BINDINGS = [("escape", "cancel", "取消")]
+    BINDINGS = [Binding("escape", "cancel", "取消", priority=True)]
+
+    def __init__(self, snapshot: SessionSnapshot) -> None:
+        super().__init__()
+        self._snapshot = snapshot
 
     def compose(self) -> ComposeResult:
         with Vertical(id="session-dialog"):
-            yield Label("新会话名称（留空自动生成）")
-            yield Input(
-                placeholder="例如：game-review",
-                id="session-name",
+            yield Label(
+                f"重命名会话\n{self._snapshot.summary.project_name} · "
+                f"{self._snapshot.summary.session_name}"
             )
-            yield Button("创建", id="session-create", variant="primary")
-            yield Button("取消", id="session-cancel")
+            yield Input(
+                value=self._snapshot.summary.title,
+                placeholder="会话标题",
+                id="session-title",
+            )
+            yield Button("保存", id="session-rename", variant="primary")
+            yield Button("取消", id="session-rename-cancel")
 
     def on_mount(self) -> None:
-        self.query_one("#session-name", Input).focus()
+        field = self.query_one("#session-title", Input)
+        field.focus()
+        field.select_all()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         event.stop()
         self.dismiss(event.value)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "session-create":
-            value = self.query_one("#session-name", Input).value
+        if event.button.id == "session-rename":
+            self.dismiss(self.query_one("#session-title", Input).value)
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class DeleteSessionScreen(ModalScreen[str | None]):
+    """永久删除二次确认；必须逐字输入当前展示标题。"""
+
+    BINDINGS = [Binding("escape", "cancel", "取消", priority=True)]
+
+    def __init__(self, snapshot: SessionSnapshot) -> None:
+        super().__init__()
+        self._snapshot = snapshot
+
+    def compose(self) -> ComposeResult:
+        summary = self._snapshot.summary
+        with Vertical(id="session-dialog"):
+            yield Label(
+                "永久删除会话（不可恢复）\n"
+                f"{summary.project_name} / {summary.title}\n"
+                f"{summary.message_count} 条消息 · "
+                f"{summary.attachment_count} 个附件\n"
+                f"请输入完整标题：{summary.title}"
+            )
+            yield Input(
+                placeholder=summary.title,
+                id="delete-confirmation",
+            )
+            yield Button("永久删除", id="session-delete", variant="error")
+            yield Button("取消", id="session-delete-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#delete-confirmation", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self.dismiss(event.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "session-delete":
+            value = self.query_one("#delete-confirmation", Input).value
             self.dismiss(value)
         else:
             self.dismiss(None)
@@ -235,6 +444,7 @@ class ComposerInput(Input):
 class ChatApp(App):
     BINDINGS = [
         ("ctrl+n", "new_session", "新会话"),
+        ("ctrl+o", "show_sessions", "会话"),
         ("ctrl+x", "cancel_active", "取消当前任务"),
     ]
     CSS = """
@@ -256,6 +466,7 @@ class ChatApp(App):
         background: $surface;
     }
     PermissionScreen { align: center middle; }
+    SessionPickerScreen { align: center middle; }
     #perm-dialog {
         width: 60; height: auto; padding: 1 2;
         border: round $warning; background: $surface;
@@ -266,6 +477,16 @@ class ChatApp(App):
         border: round $primary; background: $surface;
     }
     #session-dialog Button { width: 100%; margin-top: 1; }
+    #session-picker {
+        width: 100; height: 80%; padding: 1 2;
+        border: round $primary; background: $surface;
+    }
+    #session-options {
+        height: 1fr; padding: 1;
+        border: round $secondary;
+        overflow-y: auto;
+    }
+    #session-help { color: $text-muted; margin-top: 1; }
     """
 
     def __init__(self, workdir: str, persistent: bool = True, *,
@@ -300,16 +521,30 @@ class ChatApp(App):
                 session_name=requested_session,
             )
         self.session_name = self.orch.session_name
-        # 唯一命令入口：TUI 输入和未来外部控制统一经 CommandBus FIFO 派发；
-        # bus 不拥有 orch（aclose 只停自己的 worker）
-        self.bus = CommandBus(self.orch, self._on_agent_event)
-        self.control_server = (
-            ControlServer(self.orch, self.bus)
-            if self.orch.store is not None else None
-        )
+        # 持久模式由 SessionManager 集中拥有多个隔离 runtime；非持久测试仍沿用
+        # 单 Orchestrator/CommandBus，不伪造可切换会话。
+        self.session_manager: SessionManager | None = None
+        if self.orch.store is not None:
+            self.session_manager = SessionManager(
+                self.orch.workdir,
+                specs=self.orch.specs,
+                event_sink=self._on_session_event,
+                permission_handler=self._session_permission,
+                notification_sink=self._on_session_notice,
+                initial_orchestrator=self.orch,
+            )
+            initial_runtime = self.session_manager.active_runtime
+            self.bus = initial_runtime.bus
+            self.control_server = initial_runtime.control
+        else:
+            self.bus = CommandBus(self.orch, self._on_agent_event)
+            self.control_server = None
         # 等待用户决策的权限 Future：退出时必须全部按 cancelled 收尾，
         # 不留挂起的 Future（adapter 侧的 prompt 才不会傻等）。
         self._permission_futures: set[asyncio.Future] = set()
+        self._permission_future_sessions: dict[
+            asyncio.Future, str | None
+        ] = {}
         # RichLog 只能 append，直接写 ACP token/chunk 会变成“一词一行”。
         # 这里保留逻辑时间线，并按最多 20fps 把同一回复更新到同一条记录。
         self._display_lines: list[tuple[str, str, str]] = []
@@ -341,7 +576,7 @@ class ChatApp(App):
         yield ComposerInput(
             placeholder=(
                 "@kimi @opencode 点名派发；/new 或 Ctrl+N 新会话；"
-                "Ctrl+X 取消当前任务；Ctrl+C 退出"
+                "Ctrl+O 会话；Ctrl+X 取消当前任务；Ctrl+C 退出"
             ),
             id="composer",
         )
@@ -349,12 +584,18 @@ class ChatApp(App):
 
     async def on_mount(self) -> None:
         self.title = "myagents"
-        # TUI 权限决策器注入所有 ACP adapter；未注入时 ACP 一律 deny
-        self.orch.set_permission_handler(self._acp_permission)
-        self.bus.start()
+        if self.session_manager is not None:
+            await self.session_manager.start()
+            self._bind_active_runtime()
+        else:
+            # 非持久单会话仍由当前 TUI 注入权限；未注入时 ACP 一律 deny。
+            self.orch.set_permission_handler(self._acp_permission)
+            self.bus.start()
         self.set_interval(1.0, self._render_task_status)
+        if self.session_manager is not None:
+            self.set_interval(30.0, self._reap_idle_sessions)
         self._render_task_status()
-        if self.control_server is not None:
+        if self.session_manager is None and self.control_server is not None:
             await self.control_server.start()
         # 恢复显示：按 seq 顺序渲染持久化历史（只渲染，不 append）
         restored = sorted(self.orch.history, key=lambda m: m.seq)
@@ -376,20 +617,93 @@ class ChatApp(App):
             handle.cancel()
         self._stream_flush_handles.clear()
         self._cancel_pending_permissions()
-        try:
-            if self.control_server is not None:
-                await self.control_server.aclose()
-            await self.bus.aclose()
-        finally:
-            # 控制层或事件日志收尾失败，也不能跳过 adapter/进程组回收。
-            await self.orch.aclose()
+        if self.session_manager is not None:
+            await self.session_manager.aclose()
+        else:
+            try:
+                if self.control_server is not None:
+                    await self.control_server.aclose()
+                await self.bus.aclose()
+            finally:
+                # 控制层或事件日志收尾失败，也不能跳过 adapter/进程组回收。
+                await self.orch.aclose()
+
+    def _bind_active_runtime(self) -> None:
+        if self.session_manager is None:
+            return
+        runtime = self.session_manager.active_runtime
+        self.orch = runtime.orch
+        self.bus = runtime.bus
+        self.control_server = runtime.control
+        self.session_name = runtime.summary.session_name
+        self.title = f"myagents · {runtime.summary.title}"
+
+    def _on_session_event(
+        self,
+        room_id: str,
+        name: str,
+        event: AgentEvent,
+    ) -> None:
+        if self.session_manager is None:
+            return
+        if event.kind == "cancel_requested":
+            self._cancel_permissions_for(room_id)
+        if room_id == self.session_manager.active_session_id:
+            self._on_agent_event(name, event)
+            if event.kind == "committed" and name == "user":
+                self._bind_active_runtime()
+
+    def _on_session_notice(self, notice: SessionNotice) -> None:
+        if not self.is_mounted:
+            return
+        label = "已完成" if notice.status == "completed" else "失败"
+        severity = "information" if notice.status == "completed" else "error"
+        self.notify(
+            f"{notice.project_name} / {notice.title}：{label}",
+            severity=severity,
+            timeout=5,
+        )
+
+    async def _reap_idle_sessions(self) -> None:
+        if self.session_manager is not None:
+            await self.session_manager.reap_idle()
 
     # ---- ACP 权限决策 ----
 
     async def _acp_permission(self, agent_name: str, params: dict) -> dict:
         """ACP adapter 的权限决策回调：弹窗等用户选，返回 ACP outcome。"""
-        active = self.bus.active()
-        command_id = active.command_id if active is not None else None
+        return await self._permission_dialog(agent_name, params)
+
+    async def _session_permission(
+        self,
+        room_id: str,
+        agent_name: str,
+        params: dict,
+    ) -> dict:
+        assert self.session_manager is not None
+        summary = self.session_manager.snapshot(room_id).summary
+        return await self._permission_dialog(
+            agent_name,
+            params,
+            room_id=room_id,
+            session_label=f"{summary.project_name} / {summary.title}",
+            record_events=False,
+        )
+
+    async def _permission_dialog(
+        self,
+        agent_name: str,
+        params: dict,
+        *,
+        room_id: str | None = None,
+        session_label: str = "",
+        record_events: bool = True,
+    ) -> dict:
+        if room_id is not None and self.session_manager is not None:
+            command_id = self.session_manager.active_command_id(room_id)
+        else:
+            active = self.bus.active()
+            command_id = active.command_id if active is not None else None
         tool = params.get("toolCall", {})
         if not isinstance(tool, dict):
             tool = {}
@@ -400,13 +714,19 @@ class ChatApp(App):
         mirrors_events = (
             params.get("_myagents_mirrors_permission_events") is True
         )
-        if not mirrors_events:
+        if record_events and not mirrors_events:
             self._record_permission_event(
                 command_id, agent_name, f"等待权限：{title}")
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._permission_futures.add(fut)
+        self._permission_future_sessions[fut] = room_id
         self.push_screen(
-            PermissionScreen(agent_name, params),
+            PermissionScreen(
+                agent_name,
+                params,
+                session_id=room_id,
+                session_label=session_label,
+            ),
             lambda outcome: self._resolve_permission(fut, outcome),
         )
         try:
@@ -416,12 +736,13 @@ class ChatApp(App):
                 text = f"权限已选择：{option_id}"
             else:
                 text = "权限已取消或拒绝"
-            if not mirrors_events:
+            if record_events and not mirrors_events:
                 self._record_permission_event(
                     command_id, agent_name, text)
             return outcome
         finally:
             self._permission_futures.discard(fut)
+            self._permission_future_sessions.pop(fut, None)
             if not fut.done():
                 fut.cancel()
 
@@ -435,6 +756,16 @@ class ChatApp(App):
                 fut.set_result(dict(_CANCELLED))
         for screen in list(self.screen_stack):
             if isinstance(screen, PermissionScreen):
+                with contextlib.suppress(Exception):
+                    screen.dismiss(dict(_CANCELLED))
+
+    def _cancel_permissions_for(self, room_id: str | None) -> None:
+        for fut, owner in list(self._permission_future_sessions.items()):
+            if owner == room_id and not fut.done():
+                fut.set_result(dict(_CANCELLED))
+        for screen in list(self.screen_stack):
+            if isinstance(screen, PermissionScreen) \
+                    and screen._session_id == room_id:
                 with contextlib.suppress(Exception):
                     screen.dismiss(dict(_CANCELLED))
 
@@ -455,15 +786,28 @@ class ChatApp(App):
                 kind="permission", text=text)
 
     def _restore_interrupted_executions(self) -> None:
-        """启动时诚实显示上轮未留下 terminal 事件的命令。"""
+        """恢复执行状态；本进程仍拥有的活任务绝不能标成上次中断。"""
         store = self.orch.store
         if store is None or not hasattr(store, "read_events"):
             return
         terminal = {"completed", "failed", "cancelled"}
-        interrupted = [
-            item for item in store.latest_execution_events()
-            if item.kind not in terminal]
-        for item in interrupted:
+        for item in store.latest_execution_events():
+            if item.kind in terminal:
+                continue
+            try:
+                live = self.bus.get(item.command_id)
+            except CommandNotFoundError:
+                live = None
+            if live is not None:
+                state = live.status.value
+                progress = self._ensure_task(item.command_id)
+                progress.set_command(state, live.error)
+                progress.set_agent(
+                    item.agent,
+                    "queued" if state == "queued" else "running",
+                    item.text,
+                )
+                continue
             progress = self._ensure_task(item.command_id)
             progress.set_command("interrupted", item.text)
             progress.set_agent(item.agent, "interrupted", item.text)
@@ -763,7 +1107,11 @@ class ChatApp(App):
             finally:
                 self._image_paste_in_progress = False
             box = self.query_one("#composer", ComposerInput)
-            reference = f"[图片附件：{path}]"
+            try:
+                reference = attachment_reference(path)
+            except ClipboardImageError as exc:
+                self._write("system", str(exc), "bold red")
+                return
             start, end = box.selection
             prefix = "" if start == 0 or box.value[start - 1].isspace() else " "
             suffix = "" if end == len(box.value) or (
@@ -803,14 +1151,40 @@ class ChatApp(App):
             return
 
         async def runner() -> None:
+            if self.session_manager is not None:
+                try:
+                    managed = await self.session_manager.submit(text)
+                except Exception as exc:
+                    self._write("system", f"派发失败：{exc}", "bold red")
+                    return
+                if managed.session_id == self.session_manager.active_session_id:
+                    self._set_command_status(managed.command_id, "queued")
+                while True:
+                    result = await self.session_manager.wait(managed)
+                    if not result["timed_out"]:
+                        break
+                if managed.session_id != self.session_manager.active_session_id:
+                    return
+                self._set_command_status(
+                    managed.command_id,
+                    result["status"],
+                    result.get("error"),
+                )
+                if result["status"] == "failed":
+                    self._write(
+                        "system", f"派发失败：{result['error']}", "bold red"
+                    )
+                return
+
+            bus = self.bus
             try:
-                snap = await self.bus.submit(text)
+                snap = await bus.submit(text)
             except Exception as exc:
                 self._write("system", f"派发失败：{exc}", "bold red")
                 return
             self._set_command_status(snap.command_id, snap.status.value)
             while True:  # agent 长任务可能超过单次 wait 上限，等到 terminal
-                result = await self.bus.wait(snap.command_id)
+                result = await bus.wait(snap.command_id)
                 if not result["timed_out"]:
                     break
             self._set_command_status(
@@ -881,6 +1255,11 @@ class ChatApp(App):
         panel.update(progress.render(time.monotonic() - started))
 
     def action_cancel_active(self) -> None:
+        if self.session_manager is not None:
+            self.action_cancel_session(
+                self.session_manager.active_session_id
+            )
+            return
         active = self.bus.active()
         if active is None:
             self._system("当前没有可取消的任务")
@@ -901,52 +1280,219 @@ class ChatApp(App):
                         f"{result.status.value}，无需取消")
         self.run_worker(runner())
 
-    def action_new_session(self) -> None:
-        """请求创建全新持久会话；切换由顶层 App 循环在 unmount 后完成。"""
-        if self.bus.has_pending() or self._permission_futures:
-            self._system("先完成或取消当前任务，再新建会话")
+    def action_cancel_session(self, session_id: str | None) -> None:
+        """取消指定会话任务；权限弹窗只影响其所属会话。"""
+        if self.session_manager is None:
+            self.action_cancel_active()
             return
-        if self.orch.store is None:
-            self._system("非持久模式不支持新建会话")
+        target = session_id or self.session_manager.active_session_id
+        self._cancel_permissions_for(target)
+
+        async def runner() -> None:
+            assert self.session_manager is not None
+            try:
+                result = await self.session_manager.cancel(target)
+            except Exception as exc:
+                self._write("system", f"取消失败：{exc}", "bold red")
+                return
+            if result is None:
+                self._system("该会话没有可取消的任务")
+            elif result.status.value == "cancelled":
+                self._system(f"任务 {result.command_id[:8]} 已取消")
+            else:
+                self._system(
+                    f"任务 {result.command_id[:8]} 已是 "
+                    f"{result.status.value}，无需取消"
+                )
+
+        self.run_worker(runner())
+
+    def action_show_sessions(self) -> None:
+        if self.session_manager is None:
+            self._system("非持久模式不支持会话选择器")
             return
+        self._save_active_draft()
         self.push_screen(
-            NewSessionScreen(),
-            self._accept_new_session_name,
+            SessionPickerScreen(self.session_manager),
+            self._accept_session_picker_action,
         )
 
-    @staticmethod
-    def _generated_session_name() -> str:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        return f"chat-{stamp}-{uuid.uuid4().hex[:6]}"
+    def _save_active_draft(self) -> None:
+        if self.session_manager is None or not self.is_mounted:
+            return
+        box = self.query_one("#composer", ComposerInput)
+        self.session_manager.save_draft(
+            box.value,
+            cursor_position=box.cursor_position,
+        )
 
-    def _accept_new_session_name(self, value: str | None) -> None:
+    def _accept_session_picker_action(self, value: str | None) -> None:
         if value is None:
             return
-        if self.bus.has_pending() or self._permission_futures:
-            self._system("当前状态已变化；先完成或取消当前任务")
+        if value == "__new__":
+            self.action_new_session()
             return
-        store = self.orch.store
-        if store is None:
-            self._system("非持久模式不支持新建会话")
-            return
-        candidate = value if value.strip() else self._generated_session_name()
-        try:
-            name = normalize_session_name(candidate)
-        except ValueError as exc:
-            self._write("system", f"新会话名称无效：{exc}", "bold red")
-            return
-        if RoomStore.session_exists(
-                self.orch.workdir,
-                name,
-                state_root=store.state_root):
-            self._write(
-                "system",
-                f"会话已存在：{name}；请换一个名称，"
-                f"恢复该会话请使用 --session {name}",
-                "bold red",
+        if value.startswith("__rename__:"):
+            room_id = value.removeprefix("__rename__:")
+            snapshot = self._session_picker_snapshot(room_id)
+            if snapshot is None:
+                self._write("system", "会话已不存在", "bold red")
+                return
+            self.push_screen(
+                RenameSessionScreen(snapshot),
+                lambda title: self._accept_session_rename(room_id, title),
             )
             return
-        self.exit(NewSessionRequest(name))
+        if value.startswith("__delete__:"):
+            room_id = value.removeprefix("__delete__:")
+            snapshot = self._session_picker_snapshot(room_id)
+            if snapshot is None:
+                self._write("system", "会话已不存在", "bold red")
+                return
+            if room_id == self.session_manager.active_session_id:
+                self._write(
+                    "system", "当前会话不能永久删除；请先切换", "bold red"
+                )
+                return
+            if snapshot.status in {
+                "queued", "waiting_resource", "running", "waiting_permission"
+            }:
+                self._write(
+                    "system", "运行中或等待权限的会话不能永久删除", "bold red"
+                )
+                return
+            self.push_screen(
+                DeleteSessionScreen(snapshot),
+                lambda confirmation: self._accept_session_delete(
+                    room_id, confirmation
+                ),
+            )
+            return
+
+        async def runner() -> None:
+            assert self.session_manager is not None
+            try:
+                await self.session_manager.activate(value)
+            except Exception as exc:
+                self._write("system", f"切换会话失败：{exc}", "bold red")
+                return
+            self._bind_active_runtime()
+            self._render_active_session()
+
+        self.run_worker(runner())
+
+    def _session_picker_snapshot(
+        self,
+        room_id: str,
+    ) -> SessionSnapshot | None:
+        if self.session_manager is None:
+            return None
+        return next(
+            (
+                item
+                for item in self.session_manager.list_sessions(
+                    include_all=True
+                )
+                if item.summary.room_id == room_id
+            ),
+            None,
+        )
+
+    def _accept_session_rename(
+        self,
+        room_id: str,
+        title: str | None,
+    ) -> None:
+        if title is None:
+            return
+
+        async def runner() -> None:
+            assert self.session_manager is not None
+            try:
+                renamed = await self.session_manager.rename_session(
+                    room_id, title
+                )
+            except Exception as exc:
+                self._write("system", f"重命名失败：{exc}", "bold red")
+                return
+            if room_id == self.session_manager.active_session_id:
+                self._bind_active_runtime()
+            self._system(f"会话已重命名：{renamed.summary.title}")
+
+        self.run_worker(runner())
+
+    def _accept_session_delete(
+        self,
+        room_id: str,
+        confirmation: str | None,
+    ) -> None:
+        if confirmation is None:
+            return
+
+        async def runner() -> None:
+            assert self.session_manager is not None
+            try:
+                await self.session_manager.delete_session(
+                    room_id,
+                    confirmation=confirmation,
+                )
+            except Exception as exc:
+                self._write("system", f"永久删除失败：{exc}", "bold red")
+                return
+            self._system("会话已永久删除")
+
+        self.run_worker(runner())
+
+    def _render_active_session(self) -> None:
+        """从持久 history 重建当前可见时间线，不混入其他会话的临时日志。"""
+        if self.session_manager is None:
+            return
+        for handle in self._stream_flush_handles.values():
+            handle.cancel()
+        self._stream_flush_handles.clear()
+        self._display_lines.clear()
+        self._stream_text.clear()
+        self._stream_line_index.clear()
+        self._heartbeat_line_index.clear()
+        self._tool_line_index.clear()
+        self._tool_line_fingerprint.clear()
+        self._tool_latest.clear()
+        self._task_progresses.clear()
+        self._task_started_at.clear()
+        self._latest_task_id = None
+        self.query_one(RichLog).clear()
+        snapshot = self.session_manager.snapshot()
+        for message in sorted(snapshot.history, key=lambda item: item.seq):
+            self._write(message.speaker, message.text)
+        self._restore_interrupted_executions()
+        self._system(
+            f"已切换：{snapshot.summary.project_name} / "
+            f"{snapshot.summary.title}；工作目录：{snapshot.summary.workdir}"
+        )
+        box = self.query_one("#composer", ComposerInput)
+        box.value = snapshot.draft
+        box.cursor_position = min(snapshot.cursor_position, len(box.value))
+        box.focus()
+        self._render_task_status()
+
+    def action_new_session(self) -> None:
+        """立即创建并切换到空白会话；原会话任务继续在后台运行。"""
+        if self.session_manager is None:
+            self._system("非持久模式不支持新建会话")
+            return
+        self._save_active_draft()
+
+        async def runner() -> None:
+            assert self.session_manager is not None
+            try:
+                await self.session_manager.create_session()
+            except Exception as exc:
+                self._write("system", f"新建会话失败：{exc}", "bold red")
+                return
+            self._bind_active_runtime()
+            self._render_active_session()
+
+        self.run_worker(runner())
 
     def _on_agent_event(self, name: str, ev: AgentEvent) -> None:
         command_value = ev.meta.get("command_id")
@@ -1055,7 +1601,12 @@ class ChatApp(App):
             self._system(f"{name}: {ev.text}")
         elif ev.kind == "cancel_requested":
             self._finish_stream_text(name)
-            self._cancel_pending_permissions()
+            if self.session_manager is None:
+                self._cancel_pending_permissions()
+            else:
+                self._cancel_permissions_for(
+                    self.session_manager.active_session_id
+                )
             # 这里只是请求已发出；真正 terminal 由 CommandBus wait 结果确认。
             # 保留工具状态和运行态，避免取消超时期间短暂显示假成功。
             self._system(ev.text)
@@ -1092,16 +1643,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def run_chat_loop(
         workdir: str, session_name: str, *,
         app_factory=ChatApp) -> None:
-    """同进程切换：旧 App 完整 unmount 后才构造下一会话。"""
-    current = normalize_session_name(session_name)
-    while True:
-        result = app_factory(
-            workdir,
-            session_name=current,
-        ).run()
-        if not isinstance(result, NewSessionRequest):
-            return
-        current = result.session_name
+    """启动一个 App；其内部 SessionManager 管理全部会话 runtime。"""
+    app_factory(
+        workdir,
+        session_name=normalize_session_name(session_name),
+    ).run()
 
 
 def run_cli(

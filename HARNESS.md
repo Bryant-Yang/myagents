@@ -145,9 +145,13 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 - 房间身份由 `(规范化 workdir, session_name)` 决定；`default` 保持历史
   room_id 兼容。命名会话的 timeline/events/cursor/原生 agent session 完全
   隔离；`Ctrl+N` 和精确输入 `/new` 是同一个本地新会话动作，命令不得写入
-  timeline、不得交给 host/worker。它们只能在无 queued/running command 和
-  权限等待时请求切换，且必须先完成旧 App 的标准关闭顺序再构造新
-  Orchestrator（ADR-0005）。
+  timeline、不得交给 host/worker。TUI 内由 SessionManager 为每个已加载房间
+  独立持有 lease、Orchestrator、CommandBus 和 ControlServer；切换只改变可见
+  会话，后台任务与权限等待继续运行（ADR-0010）。
+- `Ctrl+O` 或精确 `/sessions` 打开当前/全部项目会话目录；标题与稳定
+  session_name/room_id 分离。运行中/当前会话不得永久删除，删除必须逐字确认
+  展示标题。最多三个会话实际 dispatch，第四个保持可取消的等待资源状态；
+  后台空闲 runtime 十分钟后按标准关闭顺序回收。
 - RoomStore timeline 记录带单调 `seq`；cursor 是 seq 而非 list 下标，
   成功交付后先落盘再更新内存；明确未提交的失败不推进，已提交但结果不确定的
   失败建立 no-replay 边界，不假提交成功，也不重复执行。
@@ -247,6 +251,8 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
   `image` block 和 Codex app-server `localImage` 原生发送；文本引用仍保留
   在共享 timeline。手写的房间外路径不得升级成协议图片；host 遇图片附件
   必须路由给 worker。
+- 新附件使用 `img-NNNN.png` 和 `[图片 N]` 短引用；旧
+  `[图片附件：绝对路径]` 仅在同一房间信任根内兼容读取。
 - 失败不得改变草稿或残留不完整文件。终端内图片预览、转换、删除与跨机器同步
   不在本阶段。
 
@@ -260,6 +266,7 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 | OpenCode hybrid transport | `tests/test_opencode_hybrid.py` + `tests/fake_acp_server.py` |
 | Qwen Code ACP-only 注册 | `tests/test_phase2.py` + `tests/fake_acp_server.py` |
 | TUI/增量/权限/回收 | `tests/test_phase2.py` |
+| 多会话目录/生命周期/TUI | `tests/test_session_catalog.py` + `tests/test_session_manager.py` + `tests/test_session_tui.py` |
 | RoomStore 持久化 | `tests/test_storage.py` |
 | M2.5 恢复/lease/时序 | `tests/test_m25.py` |
 | M3 command bus | `tests/test_m3_bus.py` |

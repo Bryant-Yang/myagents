@@ -2,7 +2,7 @@
 
 <!-- harness:behaviour-evidence=canonical-source -->
 
-> 作者：Bryant Yang　最近更新：2026-08-09
+> 作者：Bryant Yang　最近更新：2026-08-11
 >
 > 本文是关键用户行为与独立证据的唯一事实源。工程边界见
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -23,6 +23,7 @@
 | M4.4 | 完成 | Kimi ACP-first、prepare-only 只读 JSONL fallback 与 no-replay |
 | M4.5 | 完成 | OpenCode ACP-first、ask-by-default 权限收口与只读 JSONL fallback |
 | M4.6 | 完成 | Qwen Code `qwen --acp` 接入、TUI 点名与 ACP-only 安全边界 |
+| M4.7 | 完成 | 多项目会话目录、后台执行、资源 gate、未读通知与图片短引用 |
 | M5.1 | 完成 | `/discuss` 指定成员、1–3 轮有界讨论与终局 moderator |
 | M5 | 完成 | review → 单 writer 修改 → 独立复核、一次修复上限与阶段边界 steering |
 
@@ -288,36 +289,51 @@
   尚未验收。
 - **里程碑**：M2.5。
 
-### UC-SESSION-001 同一项目独立会话
+### UC-SESSION-001 多项目会话与后台执行
 
-- **角色 / 触发**：用户在空闲 TUI 按 `Ctrl+N`、精确输入 `/new`，或启动时
-  传入 `--session NAME`。
-- **前置条件**：当前没有 queued/running command 或权限等待；会话名合法且
-  新建时尚不存在。
-- **主流程**：房间身份由 `(规范化 workdir, session_name)` 决定；当前 App
-  返回 `NewSessionRequest` 并按标准顺序关闭 control server、CommandBus、
-  adapters 和 lease；同一进程随后构造新 App。新会话拥有独立 timeline、
-  events、cursor 与原生 agent session。`--session NAME` 可恢复同名会话。
+- **角色 / 触发**：用户按 `Ctrl+N` 或精确输入 `/new` 新建会话；按 `Ctrl+O`
+  或精确输入 `/sessions` 浏览、搜索和切换会话；启动时仍可传
+  `--session NAME` 选择稳定 selector。
+- **主流程**：房间身份仍由 `(规范化 workdir, session_name)` 决定；自动生成
+  的 session_name 与可变展示标题分离。新会话初始标题为“新会话”，第一条
+  用户消息经本地确定性清理后生成标题。SessionManager 为每个已加载会话持有
+  独立 store/lease/orchestrator/bus/control/runtime；切换只替换当前可见历史和
+  草稿，原会话 command、权限等待与持久化继续在后台运行。
+- **目录与整理**：选择器默认列当前项目，Tab 切换全部项目并按 workdir 分组；
+  搜索标题、最后用户消息、项目名和路径。标题可重命名且不改变 room_id。
+  永久删除要求完整输入标题，且拒绝当前、运行中或等待权限的会话。
+- **资源与通知**：最多三个会话实际 dispatch；第四个显示等待资源并可取消。
+  后台完成/失败产生非阻塞通知和未读标记。后台空闲 runtime 十分钟后关闭，
+  当前、pending 与权限等待 runtime 保留。草稿按 room_id 在进程内隔离。
 - **兼容分支**：`default` 沿用旧 `sha256(workdir)[:16]` room_id；旧
-  `state.json` 缺少 `session_name` 时只在默认房间兼容读取。
-- **异常分支**：非法名称、命名房间 state 不匹配、同名新建、活跃任务或权限
-  等待全部明确拒绝；不删除、不覆盖旧会话，也不在同一 Orchestrator 上清空
-  history/cursor。除精确 `/new` 外的普通文本（如 `hi`）不做本地语义猜测。
+  `state.json` 缺少 `session_name` 时只在默认房间兼容读取；缺展示标题时以
+  session_name 展示。目录名与 state 身份必须一致，损坏项 fail loudly。
+- **异常分支**：切换/新建不取消后台任务；删除不使用 glob 或用户标题拼路径；
+  超过全局容量只排队，不偷开第四个执行槽。除精确本地命令外的普通文本不做
+  本地语义猜测。
 - **外部入口**：ControlClient 与 MCP bridge 使用同一可选 session selector；
   `room.get` 返回实际 `session_name`，default client 不误连命名会话。
-- **验收**：默认 room_id 与现有状态兼容；命名会话互相隔离且同名可恢复；
-  `Ctrl+N` 与精确 `/new` 只产生安全切换请求，`/new` 不持久化、不路由；
-  顶层循环在旧 App 退出后重建目标会话。
+- **验收**：默认 room_id 与旧历史兼容；新建/切换/搜索/重命名/确认删除可用；
+  两个会话同时运行时事件、权限、草稿、时间线和未读不串房；全局容量、取消、
+  空闲回收与关闭无残留。`/new`、`/sessions` 不持久化、不路由。
 - **自动化证据**：`tests/test_storage.py`（身份/隔离/名称与 state 校验）、
-  `tests/test_m25.py`（Ctrl+N、同名/active 拒绝）、`tests/test_basic.py`
-  （顶层重建循环/CLI）、`tests/test_m3_control.py` 与 `tests/test_m3_mcp.py`
-  （命名会话发现与 bridge selector）。
+  `tests/test_session_catalog.py`、`tests/test_session_manager.py`、
+  `tests/test_session_tui.py`（目录、生命周期和 Textual pilot）、
+  `tests/test_m25.py`（本地命令/no-replay）、`tests/test_basic.py`（CLI），以及
+  M3 control/MCP 的命名 selector 回归。
+- **真实验收证据**：2026-08-11 在 `/tmp` 隔离工作目录并发运行两个真实会话：
+  Qwen ACP 房间 `2201750c4c38b770` / command
+  `263614a2-3753-4ae2-b428-b58db844b73e` 返回 `SESSION_QWEN_OK`；OpenCode ACP
+  房间 `fefb82a9f52ee98e` / command
+  `a971f090-4221-4dda-a42f-2fb98b42efa2` 返回 `SESSION_OPENCODE_OK`。两条 command
+  均 completed，切回 Qwen 后 OpenCode 会话保持未读，双方历史无 marker 串房；
+  临时工作目录自动删除，退出后无 owned Qwen/OpenCode ACP 进程残留。
 - **独立兼容证据**：实现前已存在的默认房间
   `c249bb5584b575a2` 仍由规范化 workdir 的旧哈希得到；现有 timeline/state
   未迁移、未重写。
-- **人工验收边界**：真实 TUI 中 Ctrl+N 后的视觉连续性、命名体验和真实
-  Kimi/Codex 新 session 由用户验收；会话列表、删除和重命名不在本用例。
-- **里程碑**：M4.2。
+- **人工验收边界**：真实终端中的窄窗口排版、桌面通知样式和十分钟真实等待
+  仍由人工验收；自动化用注入时钟证明回收条件。
+- **里程碑**：M4.7。
 
 ### UC-ACP-002 ACP session 恢复与原子 checkpoint
 
@@ -517,14 +533,15 @@
 - **角色 / 触发**：macOS TUI 用户在草稿中按 `Ctrl+V` 且 Textual 文本剪贴板
   为空，或精确输入 `/paste-image`。
 - **主流程**：系统读取 macOS 剪贴板的 PNG 表示，保存到当前命名房间的
-  `attachments/`，再在光标位置插入 `[图片附件：绝对路径]`；不自动提交，
+  `attachments/img-NNNN.png`，再在光标位置插入 `[图片 N]`；不自动提交，
   用户可继续补充文字和 `@agent`。消息正常进入共享 timeline，被调用 agent
   收到图片读取提示；Kimi ACP 使用原生 `image` block，Codex app-server
   使用原生 `localImage`。无 mention 时仍按既有规则交给 host 决定。
 - **安全边界**：附件目录为 0700、文件为 0600；文件必须是普通 PNG，单张
   不超过 20 MiB；不把二进制写入 timeline/events，也不写入目标工作区。
   只有解析后仍位于当前房间 `attachments/` 的路径才能升级为协议图片，
-  防止手写标记读取任意本地文件。
+  防止手写标记读取任意本地文件。旧 `[图片附件：绝对路径]` 只在同一信任根
+  内兼容读取。
 - **异常分支**：非 macOS、剪贴板没有 PNG、读取超时、格式错误或大小超限时，
   显示可操作错误，不改变草稿、不提交消息、不留下不完整 PNG。
 - **生命周期**：附件随房间保留；当前版本不提供预览、删除、跨机器传输或

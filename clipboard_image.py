@@ -9,17 +9,18 @@ import re
 import stat
 import struct
 import subprocess
-import uuid
 import zlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 
 MAX_CLIPBOARD_IMAGE_BYTES = 20 * 1024 * 1024
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-_ATTACHMENT_REFERENCE_RE = re.compile(r"\[图片附件：([^\]\r\n]+)\]")
+_ATTACHMENT_REFERENCE_RE = re.compile(
+    r"\[图片\s+([1-9]\d*)\]|\[图片附件：([^\]\r\n]+)\]"
+)
+_SHORT_IMAGE_NAME_RE = re.compile(r"^img-([0-9]+)\.png$")
 _APPLE_SCRIPT = r"""
 on run argv
     set outputPath to item 1 of argv
@@ -58,6 +59,24 @@ class TrustedImage:
     attachment_root: Path
     relative_path: Path
     data: bytes
+
+
+def attachment_reference(path: Path) -> str:
+    """把受管短文件名转换为草稿/时间线中的稳定用户引用。"""
+    number = _short_image_number(Path(path).name)
+    if number is None:
+        raise ClipboardImageError("图片附件不是受管短编号文件")
+    return f"[图片 {number}]"
+
+
+def _short_image_number(name: str) -> int | None:
+    match = _SHORT_IMAGE_NAME_RE.fullmatch(name)
+    if match is None:
+        return None
+    number = int(match.group(1))
+    if number < 1 or name != f"img-{number:04d}.png":
+        return None
+    return number
 
 
 def _validate_png_data(data: bytes, info: os.stat_result, max_bytes: int) -> None:
@@ -210,13 +229,21 @@ def prompt_images(
         os.close(directory_fd)
     found: list[TrustedImage] = []
     seen: set[Path] = set()
-    for raw in _ATTACHMENT_REFERENCE_RE.findall(prompt):
+    for match in _ATTACHMENT_REFERENCE_RE.finditer(prompt):
         try:
-            candidate = Path(raw).expanduser()
-            if not candidate.is_absolute():
-                continue
-            resolved = candidate.resolve(strict=True)
-            relative = resolved.relative_to(root)
+            short_number, legacy_path = match.groups()
+            if short_number is not None:
+                if len(short_number) > 12:
+                    continue
+                relative = Path(f"img-{int(short_number):04d}.png")
+                resolved = (root / relative).resolve(strict=True)
+                relative = resolved.relative_to(root)
+            else:
+                candidate = Path(legacy_path).expanduser()
+                if not candidate.is_absolute():
+                    continue
+                resolved = candidate.resolve(strict=True)
+                relative = resolved.relative_to(root)
             if relative in seen:
                 continue
             data = _read_attachment_png(root, relative)
@@ -265,8 +292,24 @@ def capture_clipboard_png(
         parent.resolve(strict=True)
         destination.mkdir(mode=0o700)
     os.chmod(destination, 0o700)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    path = destination / f"paste-{stamp}-{uuid.uuid4().hex[:8]}.png"
+    highest = 0
+    for entry in destination.iterdir():
+        existing_number = _short_image_number(entry.name)
+        if existing_number is not None:
+            highest = max(highest, existing_number)
+    number = highest + 1
+    while True:
+        path = destination / f"img-{number:04d}.png"
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            reserved_fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            number += 1
+            continue
+        else:
+            os.close(reserved_fd)
+            break
     try:
         result = run_command(
             ["/usr/bin/osascript", "-e", _APPLE_SCRIPT, str(path)],

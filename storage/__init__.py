@@ -23,6 +23,7 @@ from storage.store import (
     default_state_root,
     normalize_workdir,
     normalize_session_name,
+    normalize_session_title,
     room_id_for,
 )
 
@@ -49,5 +50,6 @@ __all__ = [
     "default_state_root",
     "normalize_workdir",
     "normalize_session_name",
+    "normalize_session_title",
     "room_id_for",
 ]

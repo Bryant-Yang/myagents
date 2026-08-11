@@ -562,12 +562,10 @@ def test_tui_restore_display() -> None:
 
 
 def test_tui_ctrl_n_requests_fresh_named_session() -> None:
-    """Ctrl+N 生成切换请求；同名和 active command 不允许覆盖/切换。"""
-    from textual.widgets import Input, RichLog
-    from main import ChatApp, NewSessionRequest, NewSessionScreen
+    """Ctrl+N 在 App 内创建稳定 selector 与“新会话”展示标题。"""
+    from main import ChatApp
 
     room = _Room()
-    # 预建同名会话，验证 /new 不会把已有历史当成“新”会话覆盖。
     existing = RoomStore(
         room.workdir, state_root=room.state_root, session_name="existing")
     existing.append("user", "保留我")
@@ -575,52 +573,28 @@ def test_tui_ctrl_n_requests_fresh_named_session() -> None:
     async def run() -> None:
         orch = Orchestrator(room.workdir, store=room.open_store())
         app = ChatApp(workdir=room.workdir, orchestrator=orch)
-        exits: list[NewSessionRequest] = []
-        app.exit = lambda result=None, **_: exits.append(result)  # type: ignore
 
         async with app.run_test() as pilot:
+            old_id = app.session_manager.active_session_id
             await pilot.press("ctrl+n")
-            assert isinstance(app.screen, NewSessionScreen)
-            field = app.screen.query_one(Input)
-            field.value = "fresh"
-            await pilot.press("enter")
-            await pilot.pause()
-            assert exits == [NewSessionRequest("fresh")]
-
-            # 已存在名称只报错，不发第二个切换请求。
-            await pilot.press("ctrl+n")
-            assert isinstance(app.screen, NewSessionScreen)
-            app.screen.query_one(Input).value = "existing"
-            await pilot.press("enter")
-            await pilot.pause()
-            assert exits == [NewSessionRequest("fresh")]
-            rendered = "\n".join(
-                str(line.text) for line in app.query_one(RichLog).lines)
-            assert "会话已存在" in rendered
-
-            # 活跃任务期间甚至不打开弹窗。
-            app.bus.has_pending = lambda: True  # type: ignore[method-assign]
-            await pilot.press("ctrl+n")
-            await pilot.pause()
-            assert not isinstance(app.screen, NewSessionScreen)
-            rendered = "\n".join(
-                str(line.text) for line in app.query_one(RichLog).lines)
-            assert "先完成或取消当前任务" in rendered
+            await app.workers.wait_for_complete()
+            created = app.session_manager.snapshot()
+            assert created.summary.room_id != old_id
+            assert created.summary.title == "新会话"
+            assert created.summary.session_name.startswith("chat-")
 
     try:
         asyncio.run(run())
         assert [item.text for item in existing.read()["items"]] == ["保留我"]
-        assert not RoomStore.session_exists(
-            room.workdir, "fresh", state_root=room.state_root)
     finally:
         room.cleanup()
-    print("ok  TUI Ctrl+N 新会话请求（同名/active 安全拒绝）")
+    print("ok  TUI Ctrl+N App 内创建稳定新会话")
 
 
 def test_tui_slash_new_is_local_command() -> None:
     """`/new` 与 Ctrl+N 同义，绝不写 timeline 或交给 host。"""
     from textual.widgets import Input
-    from main import ChatApp, NewSessionScreen
+    from main import ChatApp
 
     room = _Room()
 
@@ -636,11 +610,12 @@ def test_tui_slash_new_is_local_command() -> None:
         app = ChatApp(workdir=room.workdir, orchestrator=orch)
 
         async with app.run_test() as pilot:
+            old_id = app.session_manager.active_session_id
             box = app.query_one(Input)
             box.value = "/new"
             await pilot.press("enter")
-            await pilot.pause()
-            assert isinstance(app.screen, NewSessionScreen)
+            await app.workers.wait_for_complete()
+            assert app.session_manager.active_session_id != old_id
             assert orch.history == []
 
     try:

@@ -4,7 +4,7 @@
 Codex、OpenCode、Qwen Code 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M5.1 与 M5 已完成。
+> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M5.1 与 M5 已完成。
 > 共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
 > stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
@@ -51,6 +51,8 @@ Codex、OpenCode、Qwen Code 等 coding agent，共享时间线、流式接收�
   后恢复显示历史。
 - 独立会话：同一工作目录可通过 `Ctrl+N` 或精确输入 `/new` 新建完全隔离的
   timeline、events、cursor 与原生 agent session；默认会话继续兼容已有历史。
+- 会话工作台：`Ctrl+O` 或 `/sessions` 搜索当前/全部项目会话，任务运行时也能
+  切换；每个会话保留独立草稿、状态与未读标记，并支持重命名和确认后永久删除。
 - ACP session 恢复：重启后优先 `session/load` 续接旧 session，保留已持久化
   cursor；load 失败或不支持时回退新 session 并有界 bootstrap。
 - 原子 checkpoint：cursor/session_id 在 prompt 前一次性落盘，失败不伪装
@@ -189,10 +191,11 @@ implementer 可写。未指定 `--verifier` 时由 reviewer 复核。`/steer` �
 是否仍可用。完整契约见
 [ADR-0009](docs/adr/0009-bounded-milestone-workflow-steering.md)。
 
-空闲时按 `Ctrl+N` 或精确输入 `/new` 可新建会话：输入名称，或留空自动命名。
-`/new` 是本地命令，不会写入时间线，也不会发送给 host 或 worker。已有名称
-不会被覆盖；恢复已有会话请退出后使用 `--session NAME`。任务正在排队、运行
-或等待权限时，必须先完成或按 `Ctrl+X` 取消后再切换。
+按 `Ctrl+N` 或精确输入 `/new` 会直接创建“新会话”；第一条消息会自动生成本地
+标题。按 `Ctrl+O` 或输入 `/sessions` 打开会话选择器：默认当前项目，Tab 查看
+全部项目，输入文字搜索，Enter 切换，F2 重命名，Ctrl+D 永久删除。切换不会
+取消正在运行的任务；后台完成/失败会通知并标记未读。当前或运行中的会话不能
+删除，删除其他会话必须完整输入标题确认。
 
 粘贴 macOS 剪贴板中的截图或图片：
 
@@ -204,8 +207,8 @@ implementer 可写。未指定 `--verifier` 时由 reviewer 复核。`/steer` �
 
 图片必须能由 macOS 剪贴板提供 PNG 表示，单张不超过 20 MiB。文件保存到当前
 房间的私有 `attachments/` 目录（目录 0700、文件 0600），不会写入项目工作区；
-TUI 目前显示附件文件名而不是终端内预览。Kimi ACP 与 Codex app-server 会
-使用各自的原生图片输入发送可信附件，而不是要求 agent 越界读取该绝对路径。
+草稿只显示 `[图片 1]` 这类短引用。Kimi ACP 与 Codex app-server 会使用各自的
+原生图片输入发送可信附件；旧绝对路径引用仍只在原房间信任根内兼容。
 
 路由规则：
 
@@ -440,6 +443,8 @@ myagents/
 - [docs/adr/0006-kimi-hybrid-transport-policy.md](docs/adr/0006-kimi-hybrid-transport-policy.md)：Kimi ACP-first 与只读降级。
 - [docs/adr/0007-opencode-hybrid-transport-policy.md](docs/adr/0007-opencode-hybrid-transport-policy.md)：OpenCode ACP 权限收口与只读降级。
 - [docs/adr/0008-bounded-multi-agent-discussion.md](docs/adr/0008-bounded-multi-agent-discussion.md)：有界讨论状态机与失败收口。
+- [docs/adr/0009-bounded-milestone-workflow-steering.md](docs/adr/0009-bounded-milestone-workflow-steering.md)：有界里程碑 workflow 与 steering。
+- [docs/adr/0010-multi-session-tui-management.md](docs/adr/0010-multi-session-tui-management.md)：会话目录、后台任务、资源上限与图片短引用。
 - [docs/concepts.md](docs/concepts.md)：相关协议与编排模式。
 - [docs/knowledge-map.html](docs/knowledge-map.html)：可交互知识地图。
 
@@ -456,6 +461,8 @@ myagents/
 - [x] M4.3：macOS 真实截图、私有附件与 Kimi ACP 原生视觉输入已验收。
 - [x] M4.4：Kimi ACP-first + prepare-only 只读 JSONL fallback。
 - [x] M4.5：OpenCode ACP-first + ask-by-default 权限 + 隔离只读 JSONL fallback。
+- [x] M4.6：Qwen Code ACP-only、default/plan profile 与 TUI 点名接入。
+- [x] M4.7：多项目会话目录、后台执行、资源 gate、未读通知与图片短引用。
 - [x] M5.1：`/discuss` 指定成员、1–3 轮有界讨论与终局 moderator。
 - [x] M5：干净 Git fixed point、review → 单 writer 修改 → 独立复核、最多
   一次 repair/reverify、阶段边界 steering 与 TUI 阶段状态。
@@ -491,7 +498,12 @@ myagents/
   Codex 作为唯一 writer 在临时 Git repo 增加 `subtract` 与两个测试，host 最终
   汇总；时间线恰为 user/Kimi/Codex/Kimi/host，HEAD、branch、index 保持 baseline，
   最终 3 个 unittest 全部通过。真实模型探针不进入默认快速 gate。
+- M4.7 双会话真实探针已于 2026-08-11 在 `/tmp` 通过：Qwen ACP 与 OpenCode
+  ACP 在两个隔离房间并发返回 `SESSION_QWEN_OK` / `SESSION_OPENCODE_OK`，两条
+  command 均 completed；切换后后台会话正确标未读，历史不串房，临时目录删除且
+  退出后无 owned ACP 子进程残留。具体 room/command id 见 SPEC UC-SESSION-001。
 - 独立 ACP client 写入已有 Kimi session 不会让已打开的 native Kimi TUI
   实时刷新；一个前端应独占该 session。
-- 当前只支持新建会话和用 `--session NAME` 恢复；TUI 内的会话列表、删除和
-  重命名尚未实现。
+- 同一 LM Studio 后端并发启动两个 Qwen ACP 的一次探针中，一路正常返回、一路
+  `end_turn` 但零正文；跨 Qwen/OpenCode 的双会话探针稳定通过。当前不对同一
+  本地模型的并发吞吐作质量承诺，零正文仍会诚实记录而不会伪造成回答。

@@ -605,27 +605,25 @@ def test_tui_updates_one_line_per_tool() -> None:
 
 
 def test_main_loop_reopens_requested_session() -> None:
-    """Ctrl+N 的 App result 使顶层循环重建会话；普通退出停止循环。"""
-    from main import NewSessionRequest, parse_args, run_chat_loop
+    """顶层只启动一个 App；会话切换由 App 内 SessionManager 完成。"""
+    from main import parse_args, run_chat_loop
 
     calls = []
-    results = [NewSessionRequest("fresh"), None]
 
     class FakeApp:
         def __init__(self, workdir: str, *, session_name: str) -> None:
             calls.append((workdir, session_name))
 
         def run(self):
-            return results.pop(0)
+            return None
 
     args = parse_args(["--session", "review", "/tmp"])
     assert (args.workdir, args.session) == ("/tmp", "review")
     run_chat_loop("/tmp", "default", app_factory=FakeApp)
     assert calls == [
         ("/tmp", "default"),
-        ("/tmp", "fresh"),
     ]
-    print("ok  顶层 App 循环切换会话 + --session 解析")
+    print("ok  顶层单 App 启动 + --session 解析")
 
 
 def test_cli_room_busy_is_actionable_without_traceback() -> None:

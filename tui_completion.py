@@ -24,6 +24,7 @@ class LocalCommand:
 
 LOCAL_COMMANDS: tuple[LocalCommand, ...] = (
     LocalCommand("new", "新建独立会话", "action_new_session"),
+    LocalCommand("sessions", "浏览、搜索和切换会话", "action_show_sessions"),
     LocalCommand("cancel", "取消当前任务", "action_cancel_active"),
     LocalCommand(
         "discuss", "查看有界多智能体讨论用法", "action_show_discuss_help"),

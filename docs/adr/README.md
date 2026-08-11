@@ -10,8 +10,9 @@
 | [0002](0002-durable-execution-observability.md) | Accepted | M3.1 持久执行事件、心跳、权限上下文与精确取消 |
 | [0003](0003-codex-app-server-transport.md) | Accepted | M4 Codex app-server 长连接、默认配置继承与安全 fallback |
 | [0004](0004-ephemeral-codex-host-threads.md) | Accepted | M4.1 Codex host 使用不落盘的 ephemeral thread |
-| [0005](0005-project-conversation-sessions.md) | Accepted | M4.2 同一项目的独立命名会话与安全切换 |
+| [0005](0005-project-conversation-sessions.md) | Superseded | M4.2 独立命名会话身份；TUI 生命周期由 ADR-0010 取代 |
 | [0006](0006-kimi-hybrid-transport-policy.md) | Accepted | M4.4 Kimi ACP-first、prepare-only 只读 JSONL fallback 与 no-replay |
 | [0007](0007-opencode-hybrid-transport-policy.md) | Accepted | M4.5 OpenCode ACP-first、ask-by-default 权限收口与只读 JSONL fallback |
 | [0008](0008-bounded-multi-agent-discussion.md) | Accepted | M5.1 `/discuss` 有界轮次、失败收口与终局主持 |
 | [0009](0009-bounded-milestone-workflow-steering.md) | Accepted | M5 review → 修改 → 复核闭环与阶段边界 steering |
+| [0010](0010-multi-session-tui-management.md) | Accepted | M4.7 会话目录、后台执行、资源 gate 与图片短引用 |
