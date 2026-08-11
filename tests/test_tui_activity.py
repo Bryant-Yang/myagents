@@ -245,6 +245,135 @@ def test_tui_failure_stays_visible_outside_activity_details() -> None:
     asyncio.run(run())
 
 
+def test_details_toggles_only_the_latest_activity_card() -> None:
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=make_orch())
+        async with app.run_test() as pilot:
+            for command_id, title, command in (
+                ("cmd-first", "第一项检查", "python first.py"),
+                ("cmd-second", "第二项检查", "python second.py"),
+            ):
+                app._on_agent_event(
+                    "user",
+                    AgentEvent(
+                        "committed",
+                        f"@kimi {title}",
+                        {"command_id": command_id},
+                    ),
+                )
+                app._on_agent_event(
+                    "kimi",
+                    AgentEvent(
+                        "tool",
+                        title,
+                        {
+                            "command_id": command_id,
+                            "tool_call_id": f"tool-{command_id}",
+                            "status": "completed",
+                            "command": command,
+                        },
+                    ),
+                )
+                app._on_agent_event(
+                    "kimi",
+                    AgentEvent("done", meta={"command_id": command_id}),
+                )
+
+            app.action_toggle_details()
+            await pilot.pause()
+            expanded = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines
+            )
+            assert "python second.py" in expanded
+            assert "python first.py" not in expanded
+
+            app.action_toggle_details()
+            await pilot.pause()
+            collapsed = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines
+            )
+            assert "python second.py" not in collapsed
+            assert "python first.py" not in collapsed
+
+    asyncio.run(run())
+
+
+def test_keyboard_navigates_and_toggles_one_activity_card() -> None:
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=make_orch())
+        async with app.run_test() as pilot:
+            for command_id, title, command in (
+                ("cmd-first", "第一项检查", "python first.py"),
+                ("cmd-second", "第二项检查", "python second.py"),
+            ):
+                app._on_agent_event(
+                    "user",
+                    AgentEvent(
+                        "committed",
+                        f"@kimi {title}",
+                        {"command_id": command_id},
+                    ),
+                )
+                app._on_agent_event(
+                    "kimi",
+                    AgentEvent(
+                        "tool",
+                        title,
+                        {
+                            "command_id": command_id,
+                            "tool_call_id": f"tool-{command_id}",
+                            "status": "completed",
+                            "command": command,
+                        },
+                    ),
+                )
+                app._on_agent_event(
+                    "kimi",
+                    AgentEvent("done", meta={"command_id": command_id}),
+                )
+
+            await pilot.press("ctrl+g")
+            await pilot.pause()
+            log = app.query_one(RichLog)
+            assert log.has_focus
+            selected = "\n".join(str(line.text) for line in log.lines)
+            assert "▶ 任务 cmd-seco" in selected
+
+            await pilot.press("up")
+            await pilot.pause()
+            selected = "\n".join(str(line.text) for line in log.lines)
+            assert "▶ 任务 cmd-firs" in selected
+            assert "▶ 任务 cmd-seco" not in selected
+
+            await pilot.press("enter")
+            await pilot.pause()
+            expanded = "\n".join(str(line.text) for line in log.lines)
+            assert "python first.py" in expanded
+            assert "python second.py" not in expanded
+
+            await pilot.press("down", "enter")
+            await pilot.pause()
+            both_expanded = "\n".join(str(line.text) for line in log.lines)
+            assert "python first.py" in both_expanded
+            assert "python second.py" in both_expanded
+
+            await pilot.press("up", "enter")
+            await pilot.pause()
+            first_collapsed = "\n".join(
+                str(line.text) for line in log.lines
+            )
+            assert "python first.py" not in first_collapsed
+            assert "python second.py" in first_collapsed
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.query_one("#composer").has_focus
+            closed = "\n".join(str(line.text) for line in log.lines)
+            assert "▶ 任务" not in closed
+
+    asyncio.run(run())
+
+
 class _BackgroundActivityAdapter:
     name = "worker"
     session_id = None
@@ -297,6 +426,12 @@ def test_activity_card_survives_background_session_switch() -> None:
                 await asyncio.wait_for(
                     _BackgroundActivityAdapter.started.wait(), timeout=1)
                 first_id = app.session_manager.active_session_id
+                app.action_toggle_details()
+                await pilot.pause()
+                before_switch = "\n".join(
+                    str(line.text) for line in app.query_one(RichLog).lines
+                )
+                assert "python -m unittest" in before_switch
 
                 await app.session_manager.create_session()
                 app._bind_active_runtime()
@@ -322,8 +457,6 @@ def test_activity_card_survives_background_session_switch() -> None:
                     line for line in rendered
                     if line.startswith("[activity] ")
                 ]) == 1
-                app.action_toggle_details()
-                await pilot.pause()
                 expanded = "\n".join(
                     str(line.text) for line in app.query_one(RichLog).lines
                 )
@@ -333,10 +466,73 @@ def test_activity_card_survives_background_session_switch() -> None:
     asyncio.run(run())
 
 
+def test_background_churn_does_not_reuse_stale_expansion_state() -> None:
+    async def run() -> None:
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "project"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            app = ChatApp(
+                workdir=str(workdir),
+                orchestrator=Orchestrator(str(workdir), store=store),
+            )
+            async with app.run_test() as pilot:
+                first_id = app.session_manager.active_session_id
+                first_feed = app._activity_feed
+                first_feed.begin("cmd-reused")
+                first_feed.record_tool(
+                    "cmd-reused",
+                    "kimi",
+                    "tool-original",
+                    "原任务",
+                    status="completed",
+                    detail="python original.py",
+                )
+                app._upsert_activity_card("cmd-reused")
+                app.action_toggle_details()
+                first_feed.set_command_state("cmd-reused", "completed")
+
+                await app.session_manager.create_session()
+                app._bind_active_runtime()
+                app._render_active_session()
+
+                # 后台淘汰量超过通知队列容量，旧实现会漏清最早的展开 ID。
+                for index in range(250):
+                    command_id = f"cmd-churn-{index}"
+                    first_feed.begin(command_id)
+                    first_feed.set_command_state(command_id, "completed")
+
+                await app.session_manager.activate(first_id)
+                app._bind_active_runtime()
+                app._render_active_session()
+
+                first_feed.begin("cmd-reused")
+                first_feed.record_tool(
+                    "cmd-reused",
+                    "kimi",
+                    "tool-new",
+                    "新任务",
+                    status="completed",
+                    detail="python new.py",
+                )
+                app._upsert_activity_card("cmd-reused")
+                await pilot.pause()
+                rendered = "\n".join(
+                    str(line.text) for line in app.query_one(RichLog).lines
+                )
+                assert "python new.py" not in rendered
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     test_activity_feed_coalesces_progress_and_tool_updates()
     test_activity_feed_tracks_latest_agent_and_bounds_terminal_details()
     test_tui_keeps_one_activity_card_and_primary_messages()
     test_tui_failure_stays_visible_outside_activity_details()
+    test_details_toggles_only_the_latest_activity_card()
+    test_keyboard_navigates_and_toggles_one_activity_card()
     test_activity_card_survives_background_session_switch()
+    test_background_churn_does_not_reuse_stale_expansion_state()
     print("ok  TUI 执行活动折叠、展开与失败可见性")

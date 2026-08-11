@@ -447,10 +447,34 @@ class ComposerInput(Input):
             self.app.action_paste_image()
 
 
+class ActivityLog(RichLog):
+    """活动卡获得焦点后，用方向键选择，避免复用聊天输入语义。"""
+
+    BINDINGS = [
+        Binding("up", "activity_previous", show=False, priority=True),
+        Binding("down", "activity_next", show=False, priority=True),
+        Binding("enter", "activity_toggle", show=False, priority=True),
+        Binding("escape", "activity_close", show=False, priority=True),
+    ]
+
+    def action_activity_previous(self) -> None:
+        self.app.move_activity_selection(-1)
+
+    def action_activity_next(self) -> None:
+        self.app.move_activity_selection(1)
+
+    def action_activity_toggle(self) -> None:
+        self.app.action_toggle_details()
+
+    def action_activity_close(self) -> None:
+        self.app.close_activity_navigation()
+
+
 class ChatApp(App):
     BINDINGS = [
         ("ctrl+n", "new_session", "新会话"),
         ("ctrl+o", "show_sessions", "会话"),
+        ("ctrl+g", "focus_activities", "活动"),
         ("ctrl+x", "cancel_active", "取消当前任务"),
     ]
     CSS = """
@@ -564,9 +588,12 @@ class ChatApp(App):
         )
         self._activity_feeds = {activity_room_id: ActivityFeed()}
         self._activity_feed = self._activity_feeds[activity_room_id]
+        self._activity_room_id = activity_room_id
+        self._expanded_activity_ids = {activity_room_id: set()}
+        self._expanded_activity = self._expanded_activity_ids[activity_room_id]
         self._activity_line_index: dict[str, int] = {}
         self._activity_line_fingerprint: dict[str, tuple[str, str, str]] = {}
-        self._show_activity_details = False
+        self._selected_activity_id: str | None = None
         self._clipboard_image_capture = clipboard_image_capture
         self._image_paste_in_progress = False
         self._task_progresses: dict[str, TaskProgress] = {}
@@ -577,13 +604,13 @@ class ChatApp(App):
         self._suppress_completion_value: str | None = None
 
     def compose(self) -> ComposeResult:
-        yield RichLog(wrap=True)
+        yield ActivityLog(wrap=True)
         yield Static(id="task-status")
         yield Static(id="completion-list")
         yield ComposerInput(
             placeholder=(
                 "@kimi @opencode 点名派发；/new 或 Ctrl+N 新会话；"
-                "Ctrl+O 会话；Ctrl+X 取消当前任务；Ctrl+C 退出"
+                "Ctrl+O 会话；Ctrl+G 活动；Ctrl+X 取消当前任务；Ctrl+C 退出"
             ),
             id="composer",
         )
@@ -639,14 +666,22 @@ class ChatApp(App):
         if self.session_manager is None:
             return
         runtime = self.session_manager.active_runtime
+        previous_room_id = self._activity_room_id
         self.orch = runtime.orch
         self.bus = runtime.bus
         self.control_server = runtime.control
         self.session_name = runtime.summary.session_name
+        self._activity_room_id = runtime.summary.room_id
+        if previous_room_id != self._activity_room_id:
+            self._selected_activity_id = None
         self._activity_feed = self._activity_feeds.setdefault(
             runtime.summary.room_id, ActivityFeed())
+        self._expanded_activity = self._expanded_activity_ids.setdefault(
+            runtime.summary.room_id, set())
         # 非活动房间没有可同步的 RichLog 行；只保留 feed 内仍可展开的近期卡。
-        self._activity_feed.take_evicted()
+        for command_id, _snapshot in self._activity_feed.take_evicted():
+            self._expanded_activity.discard(command_id)
+        self._discard_stale_activity_selection()
         self.title = f"myagents · {runtime.summary.title}"
 
     def _on_session_event(
@@ -789,6 +824,7 @@ class ChatApp(App):
         if self.session_manager is not None:
             for room_id in await self.session_manager.reap_idle():
                 self._activity_feeds.pop(room_id, None)
+                self._expanded_activity_ids.pop(room_id, None)
 
     # ---- ACP 权限决策 ----
 
@@ -1000,12 +1036,7 @@ class ChatApp(App):
             if changed:
                 self._render_display_lines()
             return
-        rendered = (
-            "activity",
-            self._activity_feed.render(
-                command_id, expanded=self._show_activity_details),
-            "dim",
-        )
+        rendered = self._render_activity_card(command_id)
         if self._activity_line_fingerprint.get(command_id) == rendered:
             if changed:
                 self._render_display_lines()
@@ -1023,23 +1054,42 @@ class ChatApp(App):
         """近期可展开窗口之外，只留下已折叠的有界归档行。"""
         changed = False
         for command_id, snapshot in self._activity_feed.take_evicted():
+            self._expanded_activity.discard(command_id)
+            if self._selected_activity_id == command_id:
+                self._selected_activity_id = None
             index = self._activity_line_index.pop(command_id, None)
             self._activity_line_fingerprint.pop(command_id, None)
             if index is not None:
                 self._display_lines[index] = ("activity", snapshot, "dim")
                 changed = True
+        self._discard_stale_activity_selection()
         return changed
+
+    def _discard_stale_activity_selection(self) -> None:
+        """以当前 feed 为准收口选择状态，不依赖可能被截断的淘汰通知。"""
+        command_ids = set(self._activity_feed.command_ids())
+        self._expanded_activity.intersection_update(command_ids)
+        if self._selected_activity_id not in command_ids:
+            self._selected_activity_id = None
+
+    def _render_activity_card(self, command_id: str) -> tuple[str, str, str]:
+        expanded = command_id in self._expanded_activity
+        text = self._activity_feed.render(command_id, expanded=expanded)
+        style = "dim"
+        if command_id == self._selected_activity_id:
+            text = "▶ " + text.replace(
+                f"/details {'收起' if expanded else '展开'}",
+                f"Enter {'收起' if expanded else '展开'} · Esc 返回",
+                1,
+            )
+            style = "bold cyan"
+        return ("activity", text, style)
 
     def _refresh_activity_cards(self) -> None:
         """切换展开态时一次性重建全部活动卡，避免连续整屏闪烁。"""
         changed = self._apply_activity_evictions()
         for command_id in self._activity_feed.command_ids():
-            rendered = (
-                "activity",
-                self._activity_feed.render(
-                    command_id, expanded=self._show_activity_details),
-                "dim",
-            )
+            rendered = self._render_activity_card(command_id)
             if self._activity_line_fingerprint.get(command_id) == rendered:
                 continue
             self._activity_line_fingerprint[command_id] = rendered
@@ -1223,9 +1273,63 @@ class ChatApp(App):
             "只在 review/implement/repair 阶段接受，并从下一阶段边界生效。")
 
     def action_toggle_details(self) -> None:
-        """展开或收起执行活动，并原位重绘现有活动卡。"""
-        self._show_activity_details = not self._show_activity_details
+        """展开或收起当前选中、否则最近一张执行活动卡。"""
+        command_ids = self._activity_feed.command_ids()
+        if not command_ids:
+            self._system("当前没有可展开的执行活动")
+            return
+        command_id = (
+            self._selected_activity_id
+            if self._selected_activity_id in command_ids
+            else command_ids[-1]
+        )
+        if command_id in self._expanded_activity:
+            self._expanded_activity.remove(command_id)
+        else:
+            self._expanded_activity.add(command_id)
+        self._upsert_activity_card(command_id)
+
+    def action_focus_activities(self) -> None:
+        """进入活动卡键盘导航，并默认选中最近一张。"""
+        command_ids = self._activity_feed.command_ids()
+        if not command_ids:
+            self._system("当前没有可浏览的执行活动")
+            return
+        self.close_completion()
+        self._selected_activity_id = command_ids[-1]
         self._refresh_activity_cards()
+        self.query_one(ActivityLog).focus()
+        self._scroll_selected_activity_into_view()
+
+    def move_activity_selection(self, delta: int) -> None:
+        command_ids = self._activity_feed.command_ids()
+        if not command_ids:
+            return
+        if self._selected_activity_id not in command_ids:
+            index = len(command_ids) - 1
+        else:
+            index = command_ids.index(self._selected_activity_id)
+            index = (index + delta) % len(command_ids)
+        self._selected_activity_id = command_ids[index]
+        self._refresh_activity_cards()
+        self._scroll_selected_activity_into_view()
+
+    def _scroll_selected_activity_into_view(self) -> None:
+        command_id = self._selected_activity_id
+        if command_id is None:
+            return
+        log = self.query_one(ActivityLog)
+        needle = f"任务 {command_id[:8]}"
+        for index, line in enumerate(log.lines):
+            if needle in str(line.text):
+                log.scroll_to(y=index, immediate=True, force=True)
+                return
+
+    def close_activity_navigation(self) -> None:
+        """退出活动卡导航，清除选中标记并把焦点还给输入框。"""
+        self._selected_activity_id = None
+        self._refresh_activity_cards()
+        self.query_one("#composer", ComposerInput).focus()
 
     def action_paste_image(self) -> None:
         """保存系统剪贴板图片，并把本地附件引用插入当前草稿。"""
@@ -1589,6 +1693,7 @@ class ChatApp(App):
                 self._write("system", f"永久删除失败：{exc}", "bold red")
                 return
             self._activity_feeds.pop(room_id, None)
+            self._expanded_activity_ids.pop(room_id, None)
             self._system("会话已永久删除")
 
         self.run_worker(runner())
@@ -1605,6 +1710,7 @@ class ChatApp(App):
         self._stream_line_index.clear()
         self._activity_line_index.clear()
         self._activity_line_fingerprint.clear()
+        self._selected_activity_id = None
         self._task_progresses.clear()
         self._task_started_at.clear()
         self._latest_task_id = None

@@ -454,7 +454,8 @@ def test_tui() -> None:
                 if line.startswith("[activity] ")
             ]) == 2
             assert "[kimi] kimi 收到" in rendered
-            app.action_toggle_details()
+            await pilot.press("ctrl+g", "up", "enter")
+            await pilot.pause()
             expanded = "\n".join(
                 str(line.text) for line in app.query_one(RichLog).lines
             )

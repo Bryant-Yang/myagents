@@ -32,7 +32,8 @@ LOCAL_COMMANDS: tuple[LocalCommand, ...] = (
         "workflow", "查看有界 review→实现→复核用法", "action_show_workflow_help"),
     LocalCommand(
         "steer", "查看运行中 workflow 补充指令用法", "action_show_steer_help"),
-    LocalCommand("details", "展开或收起执行活动", "action_toggle_details"),
+    LocalCommand(
+        "details", "展开或收起当前活动卡", "action_toggle_details"),
     LocalCommand(
         "paste-image", "粘贴 macOS 剪贴板图片", "action_paste_image"),
     LocalCommand("agents", "查看已注册 agent", "action_show_agents"),

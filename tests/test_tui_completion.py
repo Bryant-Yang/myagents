@@ -48,6 +48,7 @@ def test_completion_parser_and_command_boundary() -> None:
     assert local_command_for("/discuss") is not None
     assert local_command_for("/workflow") is not None
     assert local_command_for("/steer") is not None
+    assert local_command_for("/details").description == "展开或收起当前活动卡"
     assert local_command_for("/discuss @kimi @opencode -- 主题") is None
     assert local_command_for(
         "/workflow --reviewer @host --implementer @kimi -- 主题") is None

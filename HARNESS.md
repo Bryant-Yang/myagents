@@ -201,7 +201,9 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
   使用脱敏标题作为可见 identity。adapter 继承初始工具标题并只产出状态迁移，
   CommandBus 对完全相同的 status/tool 做防御性去重，但重复协议活动仍刷新
   静默计时。TUI 再按 command 把阶段、heartbeat、工具与权限合并为一张活动卡，
-  默认只显示终态、当前阶段与工具汇总；`/details` 才展开各工具的
+  默认只显示终态、当前阶段与工具汇总；活动卡逐张维护展开态，`Ctrl+G` 进入
+  活动区后由 `↑↓` 选择、`Enter` 展开或收起、`Esc` 返回输入框；`/details`
+  切换当前选中卡，否则只切换最近一张卡。展开后显示各工具的
   “进行中/已完成/失败”和脱敏命令。协议后续补发 tool ID 时必须迁移同一逻辑项，
   不能重复计数；identity 是否来自标题 fallback 必须显式传递，不能靠字符串值
   猜测，同名但 ID 不同的工具不得误合并。被窗口裁掉的工具若曾失败、拒绝或
@@ -218,7 +220,8 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
   任务已经验收。fan-out 要等待全部 target 收尾；任一 worker 失败时 command
   终态为 `failed`，即使其他 worker 已正常回复，失败 worker 的 partial 也必须
   明确标注调用失败。固定任务区必须保留各 agent 阶段和终态；混合成功/失败
-  显示“部分完成”。活动详情默认折叠，仅由 `/details` 显式切换。active/queued 可精确取消，
+  显示“部分完成”。活动详情默认折叠，仅由上述显式操作逐卡切换；展开态按
+  room_id 隔离并在会话切换后恢复。active/queued 可精确取消，
   terminal cancel 幂等，取消不得杀死 worker。
 - TUI `Ctrl+X`、control `command.cancel`、MCP
   `myagents_cancel_command` 共用一个取消原语；外部可通过
