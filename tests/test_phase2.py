@@ -102,7 +102,9 @@ class FakeHost(FakeJsonl):
         super().__init__("host")
         self.route = HostDecision(["kimi"], "测试路由")
 
-    async def decide(self, transcript: str, workdir: str, on_event=None):
+    async def decide(
+        self, transcript: str, workdir: str, on_event=None, *, choices=None,
+    ):
         return self.route
 
 
@@ -429,7 +431,7 @@ def test_tui_permission_cancel_with_ctrl_x() -> None:
 
 
 def test_tui_status_and_shutdown() -> None:
-    """启动行可见各 agent 传输协议；退出统一 aclose，fake ACP 无残留。"""
+    """启动摘要与 /agents 可见传输协议；退出统一回收 fake ACP。"""
     async def run() -> None:
         from textual.widgets import Input
 
@@ -443,10 +445,14 @@ def test_tui_status_and_shutdown() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
             lines = _richlog_text(app)
-            assert "kimi(ACP+JSONL)" in lines
-            assert "codex(APP-SERVER)" in lines
-            assert "opencode(ACP+JSONL)" in lines
-            assert "qwen(ACP)" in lines
+            assert "聊天室已就绪" in lines
+            assert "6/6" in lines
+            app.action_show_agents()
+            lines = _richlog_text(app)
+            assert "@kimi · 可用 · ACP+JSONL" in lines
+            assert "@codex · 可用 · APP-SERVER" in lines
+            assert "@opencode · 可用 · ACP+JSONL" in lines
+            assert "@qwen · 可用 · ACP" in lines
             # 跑一轮，让 kimi acp 进程真的起来；session id 应展示一次
             box = app.query_one(Input)
             box.value = "@kimi fast round"

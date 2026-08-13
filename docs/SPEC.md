@@ -2,7 +2,7 @@
 
 <!-- harness:behaviour-evidence=canonical-source -->
 
-> 作者：Bryant Yang　最近更新：2026-08-12
+> 作者：Bryant Yang　最近更新：2026-08-13
 >
 > 本文是关键用户行为与独立证据的唯一事实源。工程边界见
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -26,9 +26,11 @@
 | M4.7 | 完成 | 多项目会话目录、后台执行、资源 gate、未读通知与图片短引用 |
 | M4.8 | 完成 | 聊天主线降噪、每任务活动摘要卡与逐卡键盘展开 |
 | M4.9 | 完成 | WorkBuddy ACP-only 接入、按需有界认证与读写 profile 隔离 |
-| M5.1 | 完成 | `/discuss` 指定成员、1–3 轮有界讨论与终局 moderator |
+| M4.10 | 完成 | Agent 被动就绪探测、原子派发门与 `/agents` 设置体验 |
+| M5.1 | 完成 | 自然语言或 `/discuss` 进入 1–3 轮有界讨论与终局 moderator |
 | M5 | 完成 | review → 单 writer 修改 → 独立复核、一次修复上限与阶段边界 steering |
 | M6 | 完成 | 自然语言指定会话级角色、跨任务持续、房间隔离与状态可见 |
+| M7 | 完成 | 自然语言有序协作、2–4 步串行接力与失败/取消收口 |
 
 ## 1. 角色
 
@@ -76,6 +78,40 @@
   只证明委托没有在协议层丢失。
 - **里程碑**：M4。
 
+### UC-COLLAB-001 自然语言有序协作
+
+- **角色 / 触发**：用户不用新命令，直接表达有依赖的多 agent 接力，例如
+  “先让 Kimi 调研，再让 OpenCode 基于结果设计，最后让 Qwen 复核并交付”。
+  明确多 mention 且含先后线索时，普通代码只决定是否进入计划提取；无 mention
+  时复用既有 host 单次路由。`一起、分别、各自` 等无依赖表达仍是并发 fan-out。
+- **计划合同**：host 只能返回直接回答、既有并行路由或 `CollaborationPlan` 三者
+  之一。计划固定 2–4 步、至少两个不同且 ready 的 worker；每步只有固定 agent
+  与非空 assignment。同一 worker 可在后续步骤再次出现，但 host 不得增员、漏掉
+  显式 mention、改变权限或添加重试。模型输出未知 agent、空任务、单 agent 循环、
+  缺步、超限或畸形 JSON 一律 fail-closed。
+- **主流程**：整个计划只占一个 CommandBus command 和一条 user timeline。
+  Orchestrator 用普通代码严格串行推进；每步回复按同一 command id 写回共享
+  timeline，下一步从最新 timeline 读取前序真实结果。assignment 不伪装成 user
+  消息。最后一步必须直接产生面向用户的最终交付，不自动追加 host 总结。
+- **角色组合**：若同一句显式消息还明确设置/取消会话角色，host 在同一次提取中
+  返回受 mention 闭集约束的 `role_changes`；Orchestrator 仍按既有先持久化、后
+  更新内存和派发的原子入口处理，角色不能改变计划成员、步骤或权限。
+- **失败 / 取消**：任一步失败使 command failed 并立即停止，后续 adapter 不得
+  启动；取消当前 command 会取消当前步骤并阻止后续步骤。不得自动重试、换人、
+  跳步或用成功的前序回复覆盖失败。调用上限为一次 host 识别加最多四个 worker。
+- **权限与生命周期**：每一步沿用该 adapter 普通轮 execution mode、权限 UI、
+  session/cursor、no-replay 与进程回收契约；协作不扩权、不跨协议重放，也不让
+  agent 递归调用 Orchestrator。显式计划在 timeline 前原子要求全部参与者和 host
+  ready；无 mention 时 host 只能从 ready worker 候选中选人。
+- **验收**：`tests/test_collaboration.py` 使用纯内存 fake host/adapter 覆盖计划
+  边界、host 三路解析、显式 mention 闭集、普通 fan-out 兼容、严格顺序、前序
+  结果可见、唯一 user、统一 command id、同轮角色、失败和 CommandBus 取消。
+  默认门禁不启动任何真实 agent。
+- **人工验收边界**：真实模型能否稳定把开放式自然语言拆成高质量步骤、成本与
+  最终内容质量由用户验收；自动化只证明计划边界、执行时序和安全终态。
+- **事实源**：ADR-0013、`collaboration.py`、`host.py`、`orchestrator.py`。
+- **里程碑**：M7。
+
 ### UC-ROLE-001 会话级自然语言角色
 
 - **角色 / 触发**：用户在普通消息或 `/discuss` 主题中自然表达“让 Qwen 在这个
@@ -110,15 +146,23 @@
   跨会话复制和可视化角色编辑器不在本里程碑。
 - **里程碑**：M6。
 
-### UC-DISCUSS-001 指定成员的有界多智能体讨论
+### UC-DISCUSS-001 自然语言与精确命令的有界多智能体讨论
 
-- **角色 / 触发**：用户在 TUI 或 MCP 提交
+- **角色 / 触发**：用户可自然表达“@A @B 你们讨论两轮……”“让合适的两个
+  agent 辩论并由 host 总结”，或在 TUI/MCP 提交
   `/discuss @agent1 @agent2 [@agent3] [--rounds 1..3]
-  [--moderator host|agent] -- 主题`；MCP/API 也可在首行参数后换行提供主题。
+  [--moderator host|agent] -- 主题`。显式自然语言 mention 固定参与者闭集；无
+  mention 时 host 在现有单次路由中只能从 ready worker 选择。自然语言默认两轮、
+  moderator 固定为 host；精确命令仍可选择未参会 moderator。
 - **前置条件**：参与者是 `AGENT_SPECS` 中 2–3 个不同 worker；默认两轮、
   默认 moderator 为 `host`，主持人不能同时参会。
 - **输入边界**：主题必须非空且不超过 3000 个字符；参数和主题在任何 timeline
-  写入前完成确定性校验。
+  写入前完成确定性校验。自然语言中的“讨论、辩论、互相点评、交叉评议”是讨论
+  候选；“一起分析、分别回答、各自建议”以及“不要/不用讨论”等明确否定表达
+  保持单轮 fan-out；明确的跨 agent“先……再……”优先作为有序协作。自然语言
+  轮数使用 `讨论三轮：主题`、`讨论三轮，主题`、`讨论三轮 关于主题` 等有边界
+  写法；无边界的“三轮融资/一轮明月”等保留为主题并使用默认两轮。需要无歧义
+  的机器输入时使用 `/discuss --rounds N`。
 - **主流程**：整个讨论只占一个 CommandBus command 并写一条 user timeline；
   第一轮参与者并发独立提案，后续轮等待前轮全部收尾后并发交叉评议，最后
   moderator 单次仲裁。轮次目标由普通代码生成 assignment，不额外伪造 user
@@ -134,8 +178,9 @@
   所有 worker/moderator 失败都保留在 `DispatchOutcome`，CommandBus 最终为
   `failed`。取消任一轮即取消整个 command，不再进入下一轮或主持总结。
 - **验收**：parser 在 timeline 写入前拒绝缺主题、人数/轮数越界、重复/未知成员
-  和主持人冲突；同轮并发、跨轮可见、唯一 user、终局主持及失败收口均有 fake
-  contract；TUI 精确 `/discuss` 显示用法，带参数命令与 MCP 共用 CommandBus。
+  和主持人冲突；自然语言显式点名与无点名 host 路由均复用同一状态机；同轮并发、
+  跨轮可见、唯一 user、终局主持及失败收口均有 fake contract；TUI 会显示
+  “已识别为讨论 · N 人 × N 轮 · host 总结”，精确 `/discuss` 仍显示用法。
 - **独立证据来源**：`tests/test_discussion.py`、
   `tests/test_tui_completion.py`、`tests/test_m3_bus.py` 既有 command 终态契约；
   ADR-0008 的授权真实模型回放不进入默认 gate。
@@ -298,6 +343,32 @@
   `session/load`、取消时延、图片与长期 session 稳定性尚未验收。国际版与私有化
   region profile 尚无独立安全证据，当前产品只启用已验收的中国区 `internal`。
 - **里程碑**：M4.9。
+
+### UC-AGENT-001 本机 Agent 就绪状态与设置入口
+
+- **角色 / 触发**：用户启动 TUI、输入 `/agents` 或 `/agents rescan`，或提交
+  指向一个或多个注册 agent 的任务。
+- **主流程**：生产 TUI 为每个 `AgentSpec` 执行被动 readiness probe，只读取
+  环境变量、当前进程 PATH、文件类型与可执行位。启动摘要区分注册数与 ready
+  数；`@` 候选保留所有注册项但 ready 优先；`/agents` 显示状态、transport、
+  原因和人工设置提示；`/agents rescan` 重新读取环境、同步所有已加载会话，并为
+  新 ready 的目标惰性构造 adapter，不重启 TUI。新建会话继承同一 probe 配置。
+- **原子边界**：显式多目标、discussion 全体与 moderator、workflow 全部固定
+  角色及 final host 必须同时 ready，否则在 timeline/Git baseline/adapter 调用前
+  整条拒绝。无 mention 消息要求 host ready；host 只看 ready worker 候选。
+  TUI 在清空输入前调用同一资格门，因此错误后草稿与焦点保持。
+- **安全边界**：probe 不得启动 CLI、联网、打开浏览器、读取登录态、执行包管理器
+  或修改 shell/PATH；产品不自动安装、卸载、移动或替换 agent。`not_found` 只表述
+  “当前进程 PATH 未检测到”，不得推断用户没有安装。WorkBuddy 候选继续受独立
+  CLI canonical path 与 App bundle 拒绝规则约束。
+- **异常分支**：probe 异常、不可执行文件、无效显式路径或 adapter 构造失败记为
+  `invalid` 并 fail-closed；状态错误不删除角色、cursor、session id 或历史事实。
+- **验收**：`tests/test_agent_readiness.py` 使用 fake resolver、临时文件与符号链接
+  覆盖零/部分/新增 CLI、原子门和 host 候选；`tests/test_tui_completion.py` 覆盖
+  ready 排序、状态文案、rescan 及草稿保留。完整 Harness 不调用真实 agent。
+- **人工验收边界**：安装器、包管理器选择、登录和 shell 配置仍由用户在产品外
+  完成；myagents 只给出可操作提示并在用户要求时重新检测。
+- **里程碑**：M4.10。
 
 ### UC-PERM-001 权限请求与选择
 
@@ -567,6 +638,10 @@
   `(command_id, agent, tool_call_id)` 聚合，缺 ID 时使用脱敏标题作为可见
   identity；同一状态不重复转发或持久化，状态迁移与其他安全摘要实时显示。
   固定任务区显示 command 状态、耗时和每个 agent 的当前阶段。
+- **正文呈现**：agent/host 回复中的常用 Markdown（强调、行内代码、标题、
+  列表、引用和 fenced code block）转换成安全的终端 `Text` 样式；不解释 Rich
+  markup。用户原文、system 状态与活动卡保持字面值，持久历史和流式重绘使用
+  同一呈现路径，未闭合的 Markdown 在流式阶段保留为普通文本。
 - **安全分支**：thought 正文不显示；常见凭据字段隐藏；执行事件不进入
   agent 对话 history。
 - **高频分支**：adapter 继承初始 tool title/command 并压缩重复 update；
@@ -593,6 +668,7 @@
 - **验收**：`events.read` 可分页读取；heartbeat 累计且界面不刷行；200 条相同
   tool update 在 ACP 层压成“创建/进行中/完成”三个状态，在防御性 bus
   fixture 中只转发并持久化一次；TUI 对一个 command 始终只占一张活动卡，
+  agent Markdown 控制符不裸露且样式可见，用户/system/activity 文本不被解释；
   折叠态不泄露命令；`Ctrl+G`、`↑↓`、`Enter`、`Esc` 可完成逐卡键盘浏览，
   `/details` 只切换当前或最近卡；展开态可见最新 heartbeat、工具终态与脱敏命令，错误仍在
   聊天主线单独可见；多 agent 交错更新时焦点跟随最后真实活动，会话切走、后台

@@ -5,7 +5,7 @@
   主持人负责"理解消息 → 决定谁来处理"。这是 AutoGen GroupChat Manager、
   LangGraph supervisor pattern 的最小实现。
 - **单次判断或回答**：不带 @ 的消息交给主持人处理。需要 worker 时输出
-  路由 JSON；主持人能处理时直接给最终回答。
+  并行路由或有序协作 JSON；主持人能处理时直接给最终回答。
   **显式 @ 永远优先**——主持人的判断只在用户没点名时生效。
 - **代价**：需要 worker 的无 @ 消息仍比显式 @ 多一次 LLM 路由调用；
   主持人直接回答的消息只调用一次。路由 JSON 必须可解析、可校验、有兜底。
@@ -22,9 +22,19 @@ from typing import AsyncIterator, Callable
 
 from adapters.base import AgentAdapter, AgentEvent, ExecutionMode
 from adapters.kimi_adapter import KimiAdapter
+from collaboration import (
+    CollaborationPlan,
+    CollaborationValidationError,
+    parse_collaboration_payload,
+)
+from discussion import (
+    DiscussionRequest,
+    DiscussionValidationError,
+    parse_discussion_payload,
+)
 from session_roles import SessionRoleChanges
 
-# host 一次调用完成二选一：需要 worker 才输出路由 JSON；能自己处理就直接回答。
+# host 一次调用完成四选一：讨论、并行路由、有序协作，或直接回答。
 # 这样闲聊、问候、总结等不再经历“先路由给 host，再调用 host 回答”的双重延迟。
 _ROUTE_TEMPLATE = """\
 你是多 agent 聊天室的主持人。聊天室里有人类用户、你自己（host），
@@ -34,8 +44,25 @@ _ROUTE_TEMPLATE = """\
 
 {transcript}
 
-请直接处理用户最新的消息，只能二选一：
-1. 需要写代码、改文件、跑命令、查看图片附件、调研具体技术问题，或明确要求某个
+请直接处理用户最新的消息，只能选择以下四种结果之一：
+1. 用户明确要求多个 agent 互相讨论、辩论、交叉评议或达成共识：只输出一行
+   JSON：
+   {{"discussion": {{"participants": ["{first_worker}", "另一候选 agent"],
+     "rounds": 2, "moderator": "host", "topic": "忠实提取的讨论主题"}},
+     "reason": "一句话理由"}}
+   participants 只能从 [{choices}] 选择 2~3 个不同 agent；rounds 只能是 1~3，
+   用户没明确说轮数时必须为 2；moderator 必须是 host。只有“互相讨论/辩论/
+   交叉评议”等需要读取对方观点的请求才使用此模式；“分别回答/各自分析”不是讨论。
+2. 用户要求多个 agent 按先后依赖接力完成同一件事：只输出一行 JSON：
+   {{"collaboration": {{"steps": [
+     {{"agent": "{first_worker}", "assignment": "该步骤的完整任务"}},
+     {{"agent": "另一候选 agent", "assignment": "基于前序结果完成最终交付"}}
+   ]}}, "reason": "一句话理由",
+   "role_changes": {{"set": {{}}, "clear": []}}}}
+   steps 必须有 2~4 步、至少两个不同 agent，agent 只能来自 [{choices}]；可以让
+   同一 agent 在后续步骤再次出现。最后一步必须直接产出面向用户的最终交付。
+   仅当用户同时明确设置/取消会话角色时填写 role_changes，不得自行推断。
+3. 需要写代码、改文件、跑命令、查看图片附件、调研具体技术问题，或明确要求某个
    agent 在当前会话担任/取消角色：只输出一行 JSON，
    不要输出其他文字：
    {{"targets": ["{first_worker}"], "reason": "一句话理由",
@@ -48,11 +75,23 @@ _ROUTE_TEMPLATE = """\
    仅当用户明确要求某个 target 在当前会话中担任或取消角色时，填写
    role_changes：set 的值必须包含简短 label 和忠实复述的 instructions；clear
    只列需要取消角色的 target。不得推测、扩展或改变 targets。
-2. 你自己可以处理（包括问候、闲聊、一般讨论、总结、比较和仲裁）：
+4. 你自己可以处理（包括问候、闲聊、一般讨论、总结、比较和仲裁）：
    直接输出给用户的最终回答，不要输出 JSON，不要自我介绍或复述记录。
 
 这是纯路由与任务改写步骤：禁止调用工具、命令、文件、网络或 skill。
 拿不准时直接回答。
+"""
+
+_NO_WORKER_ROUTE_TEMPLATE = """\
+你是多 agent 聊天室的主持人 host。当前没有可派发的 worker。
+
+对话记录（格式 [发言者] 内容）：
+
+{transcript}
+
+请直接回答用户，不要输出路由 JSON。如果请求必须由 worker 执行，请简洁说明
+当前没有就绪 worker，并请用户使用 /agents 查看状态、修复后执行
+/agents rescan。禁止调用工具、命令、文件、网络或 skill。
 """
 
 _ROLE_EXTRACTION_TEMPLATE = """\
@@ -73,6 +112,27 @@ _ROLE_EXTRACTION_TEMPLATE = """\
 - 没有有效变化时输出 {{"set": {{}}, "clear": []}}。
 """
 
+_COLLABORATION_EXTRACTION_TEMPLATE = """\
+你只负责把用户明确表达的多 agent 先后接力转换成有界执行计划。
+候选 agent（固定闭集）：{choices}
+用户原文：
+{text}
+
+只输出一行 JSON，不要输出其他文字：
+{{"steps": [
+  {{"agent": "候选 agent", "assignment": "该步骤完整、可执行的任务"}},
+  {{"agent": "候选 agent", "assignment": "基于前序结果完成最终交付"}}
+], "role_changes": {{"set": {{}}, "clear": []}}}}
+
+规则：
+- 只能使用全部候选 agent，不能遗漏、增员或改名；允许某个候选在后续再次出现。
+- 只能有 2~4 步，严格忠实于用户要求的先后关系。
+- 每步 assignment 必须独立完整；最后一步必须面向用户产生最终交付。
+- 仅当原文同时明确设置或取消会话角色时填写 role_changes；不得自行推断。
+- 不得添加重试、动态路由、权限、工具或用户未要求的工作。
+- 这是纯语义提取：禁止调用工具、命令、文件、网络或 skill。
+"""
+
 # 主持人被 `@host` 显式点名时使用的 prompt。
 MODERATOR_TEMPLATE = """\
 你在一个名叫 myagents 的多 agent 聊天室里，身份是主持人 "host"。
@@ -88,16 +148,35 @@ MODERATOR_TEMPLATE = """\
 """
 
 _JSON_RE = re.compile(r"\{.*\}", re.S)
+_COLLABORATION_MARKER_RE = re.compile(
+    r"(?:\{|,)\s*[\"']?collaboration[\"']?\s*(?::|\}|\{|$)",
+    re.IGNORECASE,
+)
+_DISCUSSION_MARKER_RE = re.compile(
+    r"(?:\{|,)\s*[\"']?discussion[\"']?\s*(?::|\}|\{|$)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
 class HostDecision:
-    """host 单次调用的结果：派发给 workers，或直接给出最终回答。"""
+    """host 单次调用的结果：并行派发、有序协作或直接回答。"""
 
     targets: list[str]
     reason: str
     answer: str | None = None
     tasks: dict[str, str] = field(default_factory=dict)
+    role_changes: SessionRoleChanges = field(
+        default_factory=SessionRoleChanges.empty)
+    collaboration: CollaborationPlan | None = None
+    discussion: DiscussionRequest | None = None
+
+
+@dataclass(frozen=True)
+class HostCollaboration:
+    """One explicit-message extraction: ordered plan plus optional roles."""
+
+    plan: CollaborationPlan
     role_changes: SessionRoleChanges = field(
         default_factory=SessionRoleChanges.empty)
 
@@ -119,10 +198,12 @@ class HostAgent:
     async def decide(
             self, transcript: str, workdir: str,
             on_event: Callable[[AgentEvent], None] | None = None,
+            *,
+            choices: list[str] | None = None,
     ) -> HostDecision:
         """一次 LLM 调用返回路由/回答，并公开安全的非正文进度事件。"""
-        choices = self.workers
-        prompt = self._build_route_prompt(transcript, choices)
+        selected = self.workers if choices is None else choices
+        prompt = self._build_route_prompt(transcript, selected)
         buf: list[str] = []
         async for ev in self.adapter.stream(prompt, workdir):
             if ev.kind == "text":
@@ -130,7 +211,7 @@ class HostAgent:
             elif ev.kind not in {"done", "delivery_committed"}:
                 if on_event is not None:
                     on_event(ev)
-        return self._parse("".join(buf), choices)
+        return self._parse("".join(buf), selected)
 
     async def extract_session_roles(
         self,
@@ -154,13 +235,67 @@ class HostAgent:
         return SessionRoleChanges.from_model_output(
             "".join(parts), choices)
 
+    async def extract_collaboration(
+        self,
+        text: str,
+        choices: list[str],
+        workdir: str,
+        on_event: Callable[[AgentEvent], None] | None = None,
+    ) -> HostCollaboration:
+        """Extract plan and roles in one call inside the mention closure."""
+        prompt = _COLLABORATION_EXTRACTION_TEMPLATE.format(
+            choices="、".join(choices),
+            text=text[:12000],
+        )
+        parts: list[str] = []
+        async for event in self.adapter.stream(prompt, workdir):
+            if event.kind == "text":
+                parts.append(event.text)
+            elif event.kind not in {"done", "delivery_committed"}:
+                if on_event is not None:
+                    on_event(event)
+        raw = "".join(parts).strip()
+        match = _JSON_RE.search(raw)
+        if match is None:
+            raise CollaborationValidationError("host 未返回协作计划 JSON")
+        try:
+            payload = json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            raise CollaborationValidationError(
+                "host 返回的协作计划不是合法 JSON") from exc
+        plan = parse_collaboration_payload(
+            payload,
+            choices,
+            require_all=choices,
+        )
+        role_changes = SessionRoleChanges.from_payload(
+            payload.get("role_changes", {})
+            if isinstance(payload, dict) else {},
+            choices,
+        )
+        return HostCollaboration(plan, role_changes)
+
+    async def extract_collaboration_plan(
+        self,
+        text: str,
+        choices: list[str],
+        workdir: str,
+        on_event: Callable[[AgentEvent], None] | None = None,
+    ) -> CollaborationPlan:
+        """Compatibility facade for callers that only need the plan."""
+        result = await self.extract_collaboration(
+            text, choices, workdir, on_event)
+        return result.plan
+
     def _build_route_prompt(
             self, transcript: str, choices: list[str] | None = None) -> str:
         """构造纯路由 prompt；保留为可直接测试的协议边界。"""
         selected = self.workers if choices is None else choices
+        if not selected:
+            return _NO_WORKER_ROUTE_TEMPLATE.format(transcript=transcript)
         return _ROUTE_TEMPLATE.format(
-            workers="、".join(self.workers),
-            first_worker=selected[0] if selected else "host",
+            workers="、".join(selected),
+            first_worker=selected[0],
             choices=", ".join(selected),
             transcript=transcript,
         )
@@ -168,10 +303,34 @@ class HostAgent:
     def _parse(self, raw: str, choices: list[str]) -> HostDecision:
         """有效路由 JSON 才派发；其余非空输出就是 host 的最终回答。"""
         raw = raw.strip()
+        collaboration_marker = _COLLABORATION_MARKER_RE.search(raw) is not None
+        discussion_marker = _DISCUSSION_MARKER_RE.search(raw) is not None
         m = _JSON_RE.search(raw)
         if m:
             try:
                 data = json.loads(m.group(0))
+                if isinstance(data, dict) and "discussion" in data:
+                    request = parse_discussion_payload(
+                        data["discussion"], choices)
+                    reason = str(data.get("reason", ""))[:80]
+                    return HostDecision(
+                        [],
+                        reason or "主持人识别为有界讨论",
+                        discussion=request,
+                    )
+                if isinstance(data, dict) and "collaboration" in data:
+                    plan = parse_collaboration_payload(
+                        data["collaboration"], choices)
+                    reason = str(data.get("reason", ""))[:80]
+                    role_changes = SessionRoleChanges.from_payload(
+                        data.get("role_changes", {}),
+                        list(plan.participants),
+                    )
+                    return HostDecision(
+                        [], reason or "主持人识别为有序协作",
+                        role_changes=role_changes,
+                        collaboration=plan,
+                    )
                 # 校验 + 按序去重：LLM 可能返回 ["kimi", "kimi"]，
                 # 不去重会在同一工作目录并发跑两遍相同任务
                 targets: list[str] = []
@@ -193,8 +352,21 @@ class HostAgent:
                         targets[:2], reason or "主持人判断",
                         tasks=tasks,
                         role_changes=role_changes)
-            except (json.JSONDecodeError, AttributeError, TypeError):
-                pass
+            except DiscussionValidationError:
+                raise
+            except (json.JSONDecodeError, AttributeError, TypeError) as exc:
+                if discussion_marker:
+                    raise DiscussionValidationError(
+                        "host 返回的讨论意图不是合法 JSON") from exc
+                if collaboration_marker:
+                    raise CollaborationValidationError(
+                        "host 返回的协作计划不是合法 JSON") from exc
+        if collaboration_marker:
+            raise CollaborationValidationError(
+                "host 返回的协作计划不是合法 JSON")
+        if discussion_marker:
+            raise DiscussionValidationError(
+                "host 返回的讨论意图不是合法 JSON")
         if raw:
             return HostDecision([], "host 直接回答", raw)
         # 空输出没有可展示答案；确定性回退到首个 worker 保持可用性。

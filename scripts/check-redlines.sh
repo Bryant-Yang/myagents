@@ -100,7 +100,9 @@ for path in [ROOT / "orchestrator.py", ROOT / "acp/client.py"]:
                  "transport 或 adapter 能力")
 
 # R3: UI/orchestration/host may not spawn shell or subprocesses directly.
-for path in [ROOT / "main.py", ROOT / "orchestrator.py", ROOT / "host.py"]:
+for path in [
+        ROOT / "main.py", ROOT / "orchestrator.py", ROOT / "host.py",
+        ROOT / "agent_readiness.py"]:
     tree = parse(path)
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -130,19 +132,33 @@ for node in ast.walk(tree):
                 "adapters.kimi_adapter", "adapters.opencode_adapter"}):
         fail("R4", orchestrator, node,
              "生产 orchestrator 不得直接导入 worker JSONL adapter")
-if 'AgentSpec("kimi", "acp+jsonl", AcpKimiAdapter)' not in source:
-    errors.append("[R4] orchestrator.py: Kimi 生产注册必须是 "
-                  'AgentSpec("kimi", "acp+jsonl", AcpKimiAdapter)')
-if 'AgentSpec("opencode", "acp+jsonl", AcpOpenCodeAdapter)' not in source:
-    errors.append("[R4] orchestrator.py: OpenCode 生产注册必须是 "
-                  'AgentSpec("opencode", "acp+jsonl", '
-                  "AcpOpenCodeAdapter)")
-if 'AgentSpec("qwen", "acp", AcpQwenAdapter)' not in source:
-    errors.append("[R4] orchestrator.py: Qwen 生产注册必须是 "
-                  'AgentSpec("qwen", "acp", AcpQwenAdapter)')
-if 'AgentSpec("workbuddy", "acp", AcpWorkBuddyAdapter)' not in source:
-    errors.append("[R4] orchestrator.py: WorkBuddy 生产注册必须是 "
-                  'AgentSpec("workbuddy", "acp", AcpWorkBuddyAdapter)')
+registered_specs: set[tuple[str, str, str]] = set()
+for node in ast.walk(tree):
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "AgentSpec"
+        and len(node.args) >= 3
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[1], ast.Constant)
+        and isinstance(node.args[2], ast.Name)
+    ):
+        continue
+    registered_specs.add((
+        str(node.args[0].value),
+        str(node.args[1].value),
+        node.args[2].id,
+    ))
+expected_specs = {
+    ("kimi", "acp+jsonl", "AcpKimiAdapter"),
+    ("opencode", "acp+jsonl", "AcpOpenCodeAdapter"),
+    ("qwen", "acp", "AcpQwenAdapter"),
+    ("workbuddy", "acp", "AcpWorkBuddyAdapter"),
+}
+for name, transport, factory in sorted(expected_specs - registered_specs):
+    errors.append(
+        f"[R4] orchestrator.py: {name} 生产注册必须是 "
+        f'AgentSpec("{name}", "{transport}", {factory}, ...)')
 
 acp_adapter = ROOT / "acp/adapter.py"
 acp_source = acp_adapter.read_text(encoding="utf-8")
@@ -347,6 +363,12 @@ workbuddy_resolver = next(
      and node.name == "_resolve_workbuddy_cli"),
     None,
 )
+workbuddy_finder = next(
+    (node for node in parse(acp_adapter).body
+     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+     and node.name == "_find_workbuddy_cli"),
+    None,
+)
 workbuddy_validator = next(
     (node for node in parse(acp_adapter).body
      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -357,11 +379,15 @@ workbuddy_resolver_source = (
     ast.get_source_segment(acp_source, workbuddy_resolver)
     if workbuddy_resolver is not None else ""
 )
+workbuddy_finder_source = (
+    ast.get_source_segment(acp_source, workbuddy_finder)
+    if workbuddy_finder is not None else ""
+)
 workbuddy_validator_source = (
     ast.get_source_segment(acp_source, workbuddy_validator)
     if workbuddy_validator is not None else ""
 )
-if workbuddy_resolver_source.count("_validated_workbuddy_cli") < 2:
+if workbuddy_finder_source.count("_validated_workbuddy_cli") < 2:
     errors.append(
         "[R4] acp/adapter.py: WorkBuddy 显式 CLI 与 PATH 候选都必须经过"
         "独立可执行文件校验")
@@ -444,13 +470,30 @@ else:
                 "[R4] adapters/opencode_readonly_fallback.json: permission "
                 "必须精确为 deny-all + read/glob/grep/list allow")
 
-# R5: discussion scheduling is explicit and hard-bounded.  Models produce
-# content only; the orchestrator must not recursively dispatch another command.
+# R5: natural discussion, explicit discussion, and natural-language
+# collaboration are hard-bounded. Models produce content/plans only;
+# deterministic state machines never redispatch.
 discussion = ROOT / "discussion.py"
 if not discussion.is_file():
     errors.append("[R5] discussion.py: 缺少有界讨论状态定义")
 else:
     discussion_tree = parse(discussion)
+    discussion_functions = {
+        node.name for node in discussion_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    required_discussion_functions = {
+        "parse_discussion_request",
+        "parse_natural_discussion_request",
+        "parse_discussion_payload",
+    }
+    missing_discussion_functions = (
+        required_discussion_functions - discussion_functions)
+    if missing_discussion_functions:
+        errors.append(
+            "[R5] discussion.py: 自然语言、精确命令与 host payload "
+            "必须收口到同一讨论请求，缺少 "
+            + ", ".join(sorted(missing_discussion_functions)))
     expected_bounds = {
         "MIN_DISCUSSION_PARTICIPANTS": 2,
         "MAX_DISCUSSION_PARTICIPANTS": 3,
@@ -500,6 +543,70 @@ else:
             <= called_names:
         errors.append(
             "[R5] orchestrator.py: 讨论必须由确定性参与者轮次和终局主持收口")
+
+collaboration = ROOT / "collaboration.py"
+if not collaboration.is_file():
+    errors.append("[R5] collaboration.py: 缺少有界有序协作状态定义")
+else:
+    collaboration_tree = parse(collaboration)
+    expected_collaboration_bounds = {
+        "MIN_COLLABORATION_STEPS": 2,
+        "MAX_COLLABORATION_STEPS": 4,
+        "MAX_COLLABORATION_ASSIGNMENT_CHARS": 4000,
+    }
+    found_collaboration_bounds: dict[str, object] = {}
+    for node in collaboration_tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if (isinstance(target, ast.Name)
+                    and target.id in expected_collaboration_bounds):
+                try:
+                    found_collaboration_bounds[target.id] = ast.literal_eval(
+                        node.value)
+                except (ValueError, TypeError):
+                    found_collaboration_bounds[target.id] = None
+    if found_collaboration_bounds != expected_collaboration_bounds:
+        errors.append(
+            "[R5] collaboration.py: 协作边界必须保持 2..4 步且任务文本有界")
+
+collaboration_dispatch = None
+for node in ast.walk(tree):
+    if (isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_dispatch_collaboration"):
+        collaboration_dispatch = node
+        break
+if collaboration_dispatch is None:
+    errors.append(
+        "[R5] orchestrator.py: 缺少 _dispatch_collaboration 串行状态机")
+else:
+    calls_run_one = False
+    has_serial_loop = any(
+        isinstance(node, ast.For)
+        for node in ast.walk(collaboration_dispatch)
+    )
+    for node in ast.walk(collaboration_dispatch):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        if (isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+                and target.attr == "dispatch"):
+            fail("R5", orchestrator, node,
+                 "有序协作不得递归 dispatch；必须在单 command 内推进")
+        if (isinstance(target, ast.Attribute)
+                and target.attr in {"gather", "create_task"}):
+            fail("R5", orchestrator, node,
+                 "有序协作步骤必须严格串行，不得 gather/create_task")
+        if (isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+                and target.attr == "_run_one"):
+            calls_run_one = True
+    if not has_serial_loop or not calls_run_one:
+        errors.append(
+            "[R5] orchestrator.py: 有序协作必须以普通循环串行调用 _run_one")
 
 # R6: milestone workflow keeps fixed roles/stages, one writer, one repair,
 # strict steering bounds, and execution modes at the adapter seam.
@@ -607,6 +714,6 @@ print("✓ R1 权限默认 fail-closed")
 print("✓ R2 通用层无 agent-name 协议分支")
 print("✓ R3 子进程仅由 transport 层启动")
 print("✓ R4 Kimi/OpenCode 受限 ACP-first + Qwen/WorkBuddy ACP-only 固定 profile")
-print("✓ R5 /discuss 参与者/轮次有界且不递归 dispatch")
+print("✓ R5 自然语言讨论、/discuss 与有序协作均有界且不递归 dispatch")
 print("✓ R6 /workflow 固定阶段/单 writer/一次 repair/steering 有界")
 PY

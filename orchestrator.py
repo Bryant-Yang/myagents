@@ -17,6 +17,8 @@
     或服务端明确拒绝的失败不推进，下一轮补发；提交后结果不确定的失败先
     建立 no-replay cursor，防止重复执行工具任务。
 - **并发扇出（fan-out）**：一条消息 @多个 agent 时并行派发，互不等待。
+- **有序协作（pipeline）**：自然语言表达明确依赖时，host 只提取 2–4 步
+  固定计划，编排器串行推进并把前序真实回复交给后续步骤。
 - **Supervisor（中心协调者）**：注册表里的 host 是一个由 LLM 扮演的
   主持人。显式 @ 永远优先；用户没点名时，host 用一次调用直接回答或
   决定派发给谁（见 host.py）。
@@ -35,6 +37,15 @@ from acp.adapter import (
     AcpQwenAdapter,
     AcpWorkBuddyAdapter,
     AgentPermissionHandler,
+    workbuddy_readiness_probe,
+)
+from agent_readiness import (
+    AgentReadiness,
+    AgentReadinessRegistry,
+    AgentUnavailableError,
+    ReadinessProbe,
+    ReadinessState,
+    executable_probe,
 )
 from adapters.base import (
     AgentAdapter,
@@ -44,10 +55,18 @@ from adapters.base import (
     ExecutionMode,
 )
 from codex_app_server.adapter import CodexAppServerAdapter
+from collaboration import (
+    CollaborationPlan,
+    CollaborationValidationError,
+    MAX_COLLABORATION_STEPS,
+    has_ordered_collaboration_cue,
+)
 from discussion import (
     MIN_DISCUSSION_PARTICIPANTS,
     DiscussionRequest,
+    DiscussionValidationError,
     moderator_assignment,
+    parse_natural_discussion_request,
     parse_discussion_request,
     participant_assignment,
 )
@@ -63,6 +82,7 @@ from workflow import (
     MilestoneWorkflow,
     StageDelivery,
     WorkflowValidationError,
+    parse_steer_instruction,
     parse_workflow_request,
 )
 from workspace import GitWorkspaceInspector
@@ -99,6 +119,7 @@ class AgentSpec:
     name: str
     transport: str  # "acp" | "acp+jsonl" | "app-server" | "jsonl"
     factory: Callable[[], AgentAdapter]
+    probe: ReadinessProbe | None = None
 
 
 @dataclass(frozen=True)
@@ -128,13 +149,48 @@ class DispatchOutcome:
 # Qwen Code 使用 ACP-only；Codex 使用官方 app-server 长连接；旧 Codex JSONL
 # adapter 保留为 fallback。
 AGENT_SPECS: tuple[AgentSpec, ...] = (
-    AgentSpec("kimi", "acp+jsonl", AcpKimiAdapter),
-    AgentSpec("opencode", "acp+jsonl", AcpOpenCodeAdapter),
-    AgentSpec("qwen", "acp", AcpQwenAdapter),
-    AgentSpec("workbuddy", "acp", AcpWorkBuddyAdapter),
-    AgentSpec("codex", "app-server", CodexAppServerAdapter),
+    AgentSpec(
+        "kimi", "acp+jsonl", AcpKimiAdapter,
+        executable_probe("kimi", ("kimi",), "安装 Kimi Code CLI"),
+    ),
+    AgentSpec(
+        "opencode", "acp+jsonl", AcpOpenCodeAdapter,
+        executable_probe("opencode", ("opencode",), "安装 OpenCode CLI"),
+    ),
+    AgentSpec(
+        "qwen", "acp", AcpQwenAdapter,
+        executable_probe("qwen", ("qwen",), "安装 Qwen Code CLI"),
+    ),
+    AgentSpec(
+        "workbuddy", "acp", AcpWorkBuddyAdapter,
+        workbuddy_readiness_probe,
+    ),
+    AgentSpec(
+        "codex", "app-server", CodexAppServerAdapter,
+        executable_probe("codex", ("codex",), "安装 Codex CLI"),
+    ),
 )
 AGENTS: dict[str, AgentSpec] = {spec.name: spec for spec in AGENT_SPECS}
+
+_HOST_READINESS_PROBE = executable_probe(
+    HOST_NAME,
+    ("codex",),
+    "安装 Codex CLI；host 依赖 codex app-server",
+)
+
+
+def _ready_probe(name: str) -> ReadinessProbe:
+    """嵌入/测试模式的兼容 probe：注册即视为可用。"""
+
+    def probe() -> AgentReadiness:
+        return AgentReadiness(
+            name,
+            ReadinessState.READY,
+            "调用方已提供 adapter",
+            "无需本机 CLI 探测",
+        )
+
+    return probe
 
 # 发给 JSONL agent 的 prompt 模板：身份 + 对话记录 + 工作目录约定
 _PROMPT_TEMPLATE = """\
@@ -210,16 +266,49 @@ class Orchestrator:
                  store: RoomStore | None = None,
                  persistent: bool = True,
                  session_name: str = DEFAULT_SESSION_NAME,
-                 workspace_inspector=None) -> None:
+                 workspace_inspector=None,
+                 discover_agents: bool = False,
+                 host_probe: ReadinessProbe | None = None) -> None:
         self.workdir = workdir
         self.session_name = normalize_session_name(session_name)
         self.history_limit = history_limit
         self.specs = specs
+        self.discover_agents = discover_agents
+        self._registered_names = tuple(
+            dict.fromkeys((*[spec.name for spec in specs], HOST_NAME)))
+        probes: dict[str, ReadinessProbe] = {
+            spec.name: (
+                spec.probe
+                if discover_agents and spec.probe is not None
+                else _ready_probe(spec.name)
+            )
+            for spec in specs
+        }
+        self._host_readiness_probe = (
+            (host_probe or _HOST_READINESS_PROBE)
+            if discover_agents else _ready_probe(HOST_NAME)
+        )
+        probes[HOST_NAME] = self._host_readiness_probe
+        self._readiness = AgentReadinessRegistry(probes)
+        readiness = {
+            item.name: item for item in self._readiness.refresh()
+        }
         self.workspace_inspector = (
             workspace_inspector or GitWorkspaceInspector())
-        self.adapters: dict[str, AgentAdapter] = {
-            spec.name: spec.factory() for spec in specs
-        }
+        self._permission_handler: AgentPermissionHandler | None = None
+        self.adapters: dict[str, AgentAdapter] = {}
+        for spec in specs:
+            if not readiness[spec.name].ready:
+                continue
+            try:
+                self.adapters[spec.name] = spec.factory()
+            except Exception as exc:
+                if not discover_agents:
+                    raise
+                self._readiness.mark_invalid(
+                    spec.name,
+                    f"adapter 初始化失败：{exc}",
+                )
         # 主持人也注册进 adapters：@host 时和工人走同一条派发路径，
         # 只是 _build_prompt 会给它主持人角色的 prompt。
         # 主持人由 codex 扮演，用 read-only 沙箱：总结/仲裁/路由只需要看，不需要写。
@@ -334,6 +423,123 @@ class Orchestrator:
         """当前房间角色快照；调用方不能修改内部状态。"""
         return dict(self._session_roles)
 
+    def agent_readiness_snapshot(self) -> tuple[AgentReadiness, ...]:
+        """返回注册顺序稳定的本机就绪状态快照。"""
+        return self._readiness.snapshot()
+
+    @property
+    def host_readiness_probe(self) -> ReadinessProbe:
+        """供同一 TUI 创建的新 room 复用完全相同的 host 探测契约。"""
+        return self._host_readiness_probe
+
+    def ready_worker_names(self) -> list[str]:
+        """返回可安全派发且 adapter 已构造的 worker，保持注册顺序。"""
+        ready = {
+            item.name for item in self._readiness.snapshot()
+            if item.ready
+        }
+        return [
+            spec.name for spec in self.specs
+            if spec.name in ready and spec.name in self.adapters
+        ]
+
+    def refresh_agent_readiness(self) -> tuple[AgentReadiness, ...]:
+        """重新执行被动探测，并为新就绪的 agent 惰性构造 adapter。"""
+        if self._closed:
+            raise OrchestratorClosedError("Orchestrator 已关闭，拒绝重新探测")
+        if not self.discover_agents:
+            return self._readiness.snapshot()
+        statuses = self._readiness.refresh()
+        by_name = {item.name: item for item in statuses}
+        for spec in self.specs:
+            if not by_name[spec.name].ready or spec.name in self.adapters:
+                continue
+            try:
+                adapter = spec.factory()
+                cursor: int | None = None
+                if getattr(adapter, "stateful_session", False):
+                    cursor = 0
+                    if self.store is not None:
+                        cursor = self.store.get_agent_state(
+                            spec.name)["cursor"]
+                        max_seq = self.history[-1].seq if self.history else 0
+                        if cursor > max_seq:
+                            raise CorruptedStorageError(
+                                f"agent {spec.name!r} 的持久化 cursor={cursor} "
+                                f"超出当前 timeline 最大 seq={max_seq}")
+                permission_setter = getattr(
+                    adapter, "set_permission_handler", None)
+                if permission_setter is not None:
+                    permission_setter(self._permission_handler)
+                attachment_setter = getattr(
+                    adapter, "set_attachment_root", None)
+                if attachment_setter is not None:
+                    attachment_setter(self._attachment_root)
+            except CorruptedStorageError as exc:
+                self._readiness.mark_invalid(
+                    spec.name,
+                    f"会话状态恢复失败：{exc}",
+                    setup_hint="检查当前会话状态或新建会话",
+                )
+                raise
+            except Exception as exc:
+                self._readiness.mark_invalid(
+                    spec.name,
+                    f"adapter 初始化失败：{exc}",
+                )
+                continue
+            # adapter 构造、注入和 cursor 校验全部成功后才公开；这些构造器
+            # 按项目契约是惰性的，此前不会启动真实 agent 进程。
+            self.adapters[spec.name] = adapter
+            if cursor is not None:
+                self._cursors[spec.name] = cursor
+        return self._readiness.snapshot()
+
+    def require_message_agents(self, text: str) -> None:
+        """在任何 timeline/workspace 副作用前原子校验本轮所需 agent。"""
+        if parse_steer_instruction(text) is not None:
+            return
+        workers = tuple(spec.name for spec in self.specs)
+        workflow_request = parse_workflow_request(
+            text, workers, host_name=HOST_NAME)
+        if workflow_request is not None:
+            self._readiness.require(
+                (*workflow_request.roles.values(), HOST_NAME),
+                purpose="workflow",
+            )
+            return
+        discussion_request = parse_discussion_request(
+            text, workers, host_name=HOST_NAME)
+        if discussion_request is not None:
+            self._readiness.require(
+                (*discussion_request.participants,
+                 discussion_request.moderator),
+                purpose="讨论",
+            )
+            return
+        targets = self.parse_mentions(text)
+        if self._is_explicit_collaboration_candidate(text, targets):
+            if len(targets) > MAX_COLLABORATION_STEPS:
+                raise CollaborationValidationError(
+                    f"有序协作最多点名 {MAX_COLLABORATION_STEPS} 个 agent")
+            self._readiness.require(
+                (*targets, HOST_NAME),
+                purpose="有序协作",
+            )
+            return
+        natural_discussion = parse_natural_discussion_request(text, targets)
+        if natural_discussion is not None:
+            self._readiness.require(
+                (*natural_discussion.participants,
+                 natural_discussion.moderator),
+                purpose="讨论",
+            )
+            return
+        self._readiness.require(
+            targets or [HOST_NAME],
+            purpose="任务",
+        )
+
     def clear_session_roles(self) -> tuple[str, ...]:
         """原子清空当前房间角色，返回实际清除的 agent 名。"""
         cleared = tuple(self._session_roles)
@@ -398,6 +604,7 @@ class Orchestrator:
         """把 TUI 的权限决策器注入所有支持它的 adapter（ACP）。
         handler 签名：async (agent_name, params) -> outcome。
         未注入时 ACP 一律 deny——这是安全契约，不是默认值偷懒。"""
+        self._permission_handler = handler
         for adapter in self.adapters.values():
             setter = getattr(adapter, "set_permission_handler", None)
             if setter is not None:
@@ -429,9 +636,18 @@ class Orchestrator:
         """从消息里提取 @agent，按出现顺序去重，忽略未注册的名字。"""
         seen: list[str] = []
         for name in _MENTION_RE.findall(text):
-            if name in self.adapters and name not in seen:
+            if name in self._registered_names and name not in seen:
                 seen.append(name)
         return seen
+
+    @staticmethod
+    def _is_explicit_collaboration_candidate(
+        text: str,
+        targets: list[str],
+    ) -> bool:
+        """Only workers may enter ordered collaboration; host stays a router."""
+        return HOST_NAME not in targets and has_ordered_collaboration_cue(
+            text, targets)
 
     # ---- 上下文组装 ----
 
@@ -520,10 +736,11 @@ class Orchestrator:
 
     async def dispatch(self, user_text: str, on_event: EventCallback,
                        command_id: str | None = None) -> DispatchOutcome:
-        """处理一条用户消息：记录 → 路由 → 并发派发 → 收回回复。
+        """处理一条用户消息：记录 → 路由/计划 → 派发 → 收回回复。
 
-        路由规则：**显式 @ 永远优先**；用户没点名时交给 host 一次处理
-        （它直接回答，或返回需要派发的 worker）。
+        路由规则：显式 @ 普通情况下直接 fan-out；明确先后关系时，host 只在
+        mention 闭集内提取计划。用户没点名时交给 host 一次处理（直接回答、
+        并行路由或返回有序协作计划）。
 
         command_id：调用方（CommandBus）的命令 id；本轮 user 消息和所有
         agent 最终 timeline 记录（正常回复、失败占位、无文本占位）都带它，
@@ -540,6 +757,7 @@ class Orchestrator:
         """
         if self._closed:
             raise OrchestratorClosedError("Orchestrator 已关闭，拒绝 dispatch")
+        self.require_message_agents(user_text)
         workflow_request = parse_workflow_request(
             user_text,
             tuple(spec.name for spec in self.specs),
@@ -562,6 +780,26 @@ class Orchestrator:
         if discussion is not None:
             return await self._dispatch_discussion(
                 discussion, user_text, on_event, command_id)
+        targets = self.parse_mentions(user_text)
+        explicit_collaboration = self._is_explicit_collaboration_candidate(
+            user_text, targets)
+        natural_discussion = (
+            None
+            if explicit_collaboration
+            else parse_natural_discussion_request(
+                user_text,
+                targets,
+                host_name=HOST_NAME,
+            )
+        )
+        if natural_discussion is not None:
+            return await self._dispatch_discussion(
+                natural_discussion,
+                user_text,
+                on_event,
+                command_id,
+                recognized_naturally=True,
+            )
         committed = self._append_message("user", user_text,
                                          command_id=command_id)
         on_event("user", AgentEvent("committed", user_text,
@@ -574,9 +812,9 @@ class Orchestrator:
         # 内、拿到锁之后才读取，见 _run_one。
         snapshot = list(self.history)
         snapshot_text = self._format(snapshot[-self.history_limit:])
-        targets = self.parse_mentions(user_text)
         assignments: dict[str, str] = {}
         role_changes = SessionRoleChanges.empty()
+        collaboration: CollaborationPlan | None = None
         routed_by_host = not targets
         if routed_by_host:
             # decide 不在 _run_one 的异常保护里，自己兜底。契约：
@@ -589,19 +827,35 @@ class Orchestrator:
                 meta={"agent_state": "running", "phase": "路由"},
             ))
             try:
+                ready_workers = self.ready_worker_names()
                 decision = await self.host.decide(
                     snapshot_text,
                     self.workdir,
                     lambda event: self._emit_adapter_event(
                         on_event, HOST_NAME, event),
+                    choices=ready_workers,
                 )
             except _EventCallbackError as exc:
                 # host 进度事件与 worker 事件使用同一持久化失败契约：
                 # sink 失败必须穿透，不能伪装成路由失败后继续派发。
                 raise exc.cause from exc
+            except (CollaborationValidationError,
+                    DiscussionValidationError) as exc:
+                on_event(HOST_NAME, AgentEvent(
+                    "error", f"路由计划无效：{exc}",
+                    meta={"phase": "路由计划无效"},
+                ))
+                return DispatchOutcome((AgentFailure(HOST_NAME, str(exc)),))
             except Exception as exc:
                 on_event(HOST_NAME, AgentEvent("error", f"host 处理失败：{exc}"))
-                targets = [self.specs[0].name]
+                ready_workers = self.ready_worker_names()
+                if not ready_workers:
+                    return DispatchOutcome((AgentFailure(
+                        HOST_NAME,
+                        "host 路由失败，且当前没有可用 worker；"
+                        "请执行 /agents 查看状态",
+                    ),))
+                targets = ready_workers[:1]
                 reason = f"路由失败，回退到 {targets[0]}"
             else:
                 if decision.answer is not None:
@@ -618,32 +872,129 @@ class Orchestrator:
                     on_event(HOST_NAME, AgentEvent(
                         "done", meta={"hostAnswered": True}))
                     return DispatchOutcome()
+                if decision.discussion is not None:
+                    discussion = DiscussionRequest(
+                        decision.discussion.participants,
+                        decision.discussion.rounds,
+                        decision.discussion.moderator,
+                        user_text.strip(),
+                    )
+                    on_event(HOST_NAME, AgentEvent(
+                        "info",
+                        "讨论路由 → "
+                        f"{'、'.join(discussion.participants)} · "
+                        f"{discussion.rounds} 轮 · "
+                        f"{discussion.moderator} 总结",
+                        meta={
+                            "route_targets": list(discussion.participants),
+                            "phase": "讨论路由完成",
+                            "discussion": True,
+                            "discussion_rounds": discussion.rounds,
+                            "discussion_moderator": discussion.moderator,
+                        },
+                    ))
+                    return await self._dispatch_discussion(
+                        discussion,
+                        user_text,
+                        on_event,
+                        command_id,
+                        recognized_naturally=True,
+                        user_already_committed=True,
+                    )
+                collaboration = decision.collaboration
                 targets, reason = decision.targets, decision.reason
                 role_changes = decision.role_changes
-                assignments = {
-                    name: decision.tasks.get(name)
-                    or self._fallback_assignment(user_text)
-                    for name in targets
-                }
-            on_event(HOST_NAME, AgentEvent(
-                "info",
-                f"路由 → {'、'.join(targets)}（{reason}）",
-                meta={
-                    "route_targets": list(targets),
-                    "phase": "路由完成",
-                },
-            ))
-            for name in targets:
-                assignments.setdefault(
-                    name, self._fallback_assignment(user_text))
+                if collaboration is None:
+                    assignments = {
+                        name: decision.tasks.get(name)
+                        or self._fallback_assignment(user_text)
+                        for name in targets
+                    }
+            if collaboration is not None:
+                on_event(HOST_NAME, AgentEvent(
+                    "info",
+                    "协作计划 → " + " → ".join(
+                        step.agent for step in collaboration.steps)
+                    + f"（{reason}）",
+                    meta={
+                        "route_targets": list(collaboration.participants),
+                        "collaboration_steps": [
+                            step.agent for step in collaboration.steps],
+                        "phase": "协作计划就绪",
+                        "collaboration": True,
+                        "collaboration_total": len(collaboration.steps),
+                    },
+                ))
+            else:
+                on_event(HOST_NAME, AgentEvent(
+                    "info",
+                    f"路由 → {'、'.join(targets)}（{reason}）",
+                    meta={
+                        "route_targets": list(targets),
+                        "phase": "路由完成",
+                    },
+                ))
+                for name in targets:
+                    assignments.setdefault(
+                        name, self._fallback_assignment(user_text))
         else:
-            role_changes = await self._extract_session_role_changes(
-                user_text,
-                targets,
-                on_event,
-                host_will_continue=HOST_NAME in targets,
-            )
+            if explicit_collaboration:
+                on_event(HOST_NAME, AgentEvent(
+                    "status",
+                    "正在提取有序协作计划",
+                    meta={
+                        "agent_state": "running",
+                        "phase": "协作计划识别",
+                        "collaboration": True,
+                    },
+                ))
+                try:
+                    extraction = await self.host.extract_collaboration(
+                        user_text,
+                        targets,
+                        self.workdir,
+                        lambda event: self._emit_adapter_event(
+                            on_event, HOST_NAME, event),
+                    )
+                except _EventCallbackError as exc:
+                    raise exc.cause from exc
+                except CollaborationValidationError as exc:
+                    on_event(HOST_NAME, AgentEvent(
+                        "error", f"协作计划无效：{exc}",
+                        meta={"phase": "协作计划无效"},
+                    ))
+                    return DispatchOutcome((
+                        AgentFailure(HOST_NAME, str(exc)),
+                    ))
+                collaboration = extraction.plan
+                role_changes = extraction.role_changes
+                on_event(HOST_NAME, AgentEvent(
+                    "info",
+                    "协作计划 → " + " → ".join(
+                        step.agent for step in collaboration.steps),
+                    meta={
+                        "route_targets": list(collaboration.participants),
+                        "collaboration_steps": [
+                            step.agent for step in collaboration.steps],
+                        "phase": "协作计划就绪",
+                        "collaboration": True,
+                        "collaboration_total": len(collaboration.steps),
+                    },
+                ))
+            else:
+                role_changes = await self._extract_session_role_changes(
+                    user_text,
+                    targets,
+                    on_event,
+                    host_will_continue=HOST_NAME in targets,
+                )
         self._apply_session_role_changes(role_changes)
+        if collaboration is not None:
+            return await self._dispatch_collaboration(
+                collaboration,
+                on_event,
+                command_id,
+            )
         for name in targets:
             on_event(name, AgentEvent(
                 "status",
@@ -666,6 +1017,122 @@ class Orchestrator:
             if error is not None
         )
         return DispatchOutcome(failures)
+
+    async def _dispatch_collaboration(
+        self,
+        plan: CollaborationPlan,
+        on_event: EventCallback,
+        command_id: str | None,
+    ) -> DispatchOutcome:
+        """Run a validated plan serially; later steps see earlier replies."""
+        total = len(plan.steps)
+        for index, step in enumerate(plan.steps, start=1):
+            meta = {
+                "agent_state": "running",
+                "phase": f"协作 {index}/{total}",
+                "collaboration": True,
+                "collaboration_step": index,
+                "collaboration_total": total,
+                "collaboration_agent": step.agent,
+                **self._session_role_meta(step.agent),
+            }
+            on_event(step.agent, AgentEvent(
+                "status",
+                f"协作第 {index}/{total} 步：已接收任务，准备执行",
+                meta=meta,
+            ))
+
+            def step_event(
+                name: str,
+                event: AgentEvent,
+                *,
+                _meta: dict = meta,
+            ) -> None:
+                on_event(name, AgentEvent(
+                    event.kind,
+                    event.text,
+                    {**event.meta, **_meta},
+                ))
+
+            try:
+                error = await self._run_one(
+                    step.agent,
+                    step_event,
+                    list(self.history),
+                    command_id,
+                    step.assignment,
+                )
+            except asyncio.CancelledError:
+                on_event(step.agent, AgentEvent(
+                    "status",
+                    f"协作第 {index}/{total} 步已取消",
+                    meta={
+                        **meta,
+                        "agent_state": "cancelled",
+                        "phase": "当前步骤已取消",
+                    },
+                ))
+                self._emit_skipped_collaboration_steps(
+                    plan,
+                    index,
+                    on_event,
+                    phase="因任务取消未执行",
+                    reason="任务已取消",
+                )
+                raise
+            if error is not None:
+                on_event(step.agent, AgentEvent(
+                    "status",
+                    f"协作在第 {index}/{total} 步停止，后续步骤未执行",
+                    meta={
+                        **meta,
+                        "agent_state": "failed",
+                        "phase": "协作已停止",
+                    },
+                ))
+                self._emit_skipped_collaboration_steps(
+                    plan,
+                    index,
+                    on_event,
+                    phase="因前序失败未执行",
+                    reason="前序步骤失败",
+                )
+                return DispatchOutcome((AgentFailure(step.agent, error),))
+        return DispatchOutcome()
+
+    def _emit_skipped_collaboration_steps(
+        self,
+        plan: CollaborationPlan,
+        completed_count: int,
+        on_event: EventCallback,
+        *,
+        phase: str,
+        reason: str,
+    ) -> None:
+        """Publish honest terminal state for steps that will never start."""
+        total = len(plan.steps)
+        prior_agents = {
+            step.agent for step in plan.steps[:completed_count]
+        }
+        for step_index, step in enumerate(
+            plan.steps[completed_count:],
+            start=completed_count + 1,
+        ):
+            on_event(step.agent, AgentEvent(
+                "status",
+                f"协作第 {step_index}/{total} 步未执行：{reason}",
+                meta={
+                    "agent_state": "skipped",
+                    "phase": phase,
+                    "collaboration": True,
+                    "collaboration_step": step_index,
+                    "collaboration_total": total,
+                    "collaboration_agent": step.agent,
+                    "collaboration_preserve_agent_state": (
+                        step.agent in prior_agents),
+                    **self._session_role_meta(step.agent),
+                },
+            ))
 
     async def _dispatch_workflow(
         self,
@@ -812,6 +1279,9 @@ class Orchestrator:
             user_text: str,
             on_event: EventCallback,
             command_id: str | None,
+            *,
+            recognized_naturally: bool = False,
+            user_already_committed: bool = False,
     ) -> DispatchOutcome:
         """Execute one bounded discussion without recursively dispatching.
 
@@ -819,12 +1289,27 @@ class Orchestrator:
         per-turn assignments, so internal rounds never impersonate the user or
         create nested CommandBus commands.
         """
-        committed = self._append_message(
-            "user", user_text, command_id=command_id)
-        on_event("user", AgentEvent(
-            "committed", user_text,
-            meta={"seq": committed.seq, "command_id": command_id},
-        ))
+        if not user_already_committed:
+            committed = self._append_message(
+                "user", user_text, command_id=command_id)
+            on_event("user", AgentEvent(
+                "committed", user_text,
+                meta={"seq": committed.seq, "command_id": command_id},
+            ))
+        if recognized_naturally:
+            on_event("system", AgentEvent(
+                "status",
+                "已识别为讨论 · "
+                f"{len(request.participants)} 人 × {request.rounds} 轮 · "
+                f"{request.moderator} 总结",
+                meta={
+                    "phase": "讨论意图识别",
+                    "discussion": True,
+                    "discussion_rounds": request.rounds,
+                    "discussion_participants": list(request.participants),
+                    "discussion_moderator": request.moderator,
+                },
+            ))
         role_targets = list(dict.fromkeys(
             (*request.participants, request.moderator)))
         role_changes = await self._extract_session_role_changes(

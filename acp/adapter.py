@@ -50,6 +50,7 @@ from adapters.base import (
     ReadOnlyFallbackError,
     redact_sensitive_text,
 )
+from agent_readiness import AgentReadiness, ReadinessState
 from clipboard_image import prompt_images
 
 from .client import (
@@ -157,8 +158,8 @@ def _validated_workbuddy_cli(candidate: str, source: str) -> str:
     return str(resolved)
 
 
-def _resolve_workbuddy_cli() -> str:
-    """仅使用可独立运行的官方 CLI，不借用 App 包内私有进程。"""
+def _find_workbuddy_cli() -> str | None:
+    """被动查找独立 CLI；不启动进程，也不借用 App 包内私有文件。"""
     explicit = os.environ.get(_WORKBUDDY_CLI_ENV, "").strip()
     if explicit:
         return _validated_workbuddy_cli(explicit, _WORKBUDDY_CLI_ENV)
@@ -166,6 +167,45 @@ def _resolve_workbuddy_cli() -> str:
         resolved = shutil.which(name)
         if resolved:
             return _validated_workbuddy_cli(resolved, f"PATH 中的 {name}")
+    return None
+
+
+def workbuddy_readiness_probe() -> AgentReadiness:
+    """供 AgentSpec 使用的 WorkBuddy 被动就绪探测。"""
+    setup_hint = (
+        "安装官方独立 CodeBuddy CLI，或用 MYAGENTS_WORKBUDDY_CLI "
+        "指向该可执行文件"
+    )
+    try:
+        executable = _find_workbuddy_cli()
+    except AcpError as exc:
+        return AgentReadiness(
+            "workbuddy",
+            ReadinessState.INVALID,
+            str(exc),
+            setup_hint,
+        )
+    if executable is None:
+        return AgentReadiness(
+            "workbuddy",
+            ReadinessState.NOT_FOUND,
+            "当前进程 PATH 未检测到 codebuddy / cbc",
+            setup_hint,
+        )
+    return AgentReadiness(
+        "workbuddy",
+        ReadinessState.READY,
+        f"已检测到 CLI：{executable}",
+        setup_hint,
+        executable,
+    )
+
+
+def _resolve_workbuddy_cli() -> str:
+    """仅使用可独立运行的官方 CLI，不借用 App 包内私有进程。"""
+    executable = _find_workbuddy_cli()
+    if executable is not None:
+        return executable
     # 保持其他可选 agent 的惰性启动语义：TUI 可以正常打开，用户实际点名
     # WorkBuddy 时由 transport 报出标准的 executable-not-found 错误。
     return "codebuddy"

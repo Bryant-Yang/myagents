@@ -877,7 +877,9 @@ class FakeHostAdapter(FakeAgentAdapter):
     def __init__(self) -> None:
         super().__init__("host")
 
-    async def decide(self, transcript: str, workdir: str, on_event=None):
+    async def decide(
+        self, transcript: str, workdir: str, on_event=None, *, choices=None,
+    ):
         return HostDecision(["kimi"], "测试路由")
 
 

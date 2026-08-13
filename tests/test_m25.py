@@ -599,7 +599,9 @@ def test_tui_slash_new_is_local_command() -> None:
     room = _Room()
 
     class GuardHost(FakeJsonl):
-        async def decide(self, transcript: str, workdir: str, on_event=None):
+        async def decide(
+            self, transcript: str, workdir: str, on_event=None, *, choices=None,
+        ):
             raise AssertionError("/new 不得到达 host")
 
     async def run() -> None:

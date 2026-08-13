@@ -13,8 +13,10 @@ from adapters.base import AgentEvent
 from control import CommandBus, CommandStatus
 from discussion import (
     DiscussionValidationError,
+    parse_natural_discussion_request,
     parse_discussion_request,
 )
+from host import HostAgent, HostDecision
 from orchestrator import Orchestrator
 from session_roles import SessionRole, SessionRoleChanges
 
@@ -78,6 +80,187 @@ def test_parser_bounds_and_command_boundary() -> None:
     assert "未知参数" in raises_validation(
         "/discuss @kimi @opencode --dynamic -- 主题")
     print("ok  /discuss parser（边界、上限、主题分隔、非命令不误判）")
+
+
+def test_natural_discussion_intent_is_conservative_and_bounded() -> None:
+    request = parse_natural_discussion_request(
+        "@opencode @kimi 你们讨论一下为什么游戏越来越不好玩了",
+        ("opencode", "kimi"),
+    )
+    assert request is not None
+    assert request.participants == ("opencode", "kimi")
+    assert request.rounds == 2
+    assert request.moderator == "host"
+    assert request.topic == "为什么游戏越来越不好玩了"
+
+    three_rounds = parse_natural_discussion_request(
+        "请 @kimi @opencode 讨论三轮：这个方案是否可靠",
+        ("kimi", "opencode"),
+    )
+    assert three_rounds is not None and three_rounds.rounds == 3
+    assert three_rounds.topic == "这个方案是否可靠"
+
+    three_rounds_without_separator = parse_natural_discussion_request(
+        "@kimi @opencode 讨论三轮，人工智能伦理",
+        ("kimi", "opencode"),
+    )
+    assert three_rounds_without_separator is not None
+    assert three_rounds_without_separator.rounds == 3
+    assert three_rounds_without_separator.topic == "人工智能伦理"
+
+    tricycle = parse_natural_discussion_request(
+        "@kimi @opencode 讨论一下三轮车为何减少",
+        ("kimi", "opencode"),
+    )
+    assert tricycle is not None
+    assert tricycle.rounds == 2
+    assert tricycle.topic == "三轮车为何减少"
+
+    four_wheel_drive = parse_natural_discussion_request(
+        "@kimi @opencode 讨论四轮驱动的优缺点",
+        ("kimi", "opencode"),
+    )
+    assert four_wheel_drive is not None
+    assert four_wheel_drive.rounds == 2
+    assert four_wheel_drive.topic == "四轮驱动的优缺点"
+
+    for compound, expected_topic in (
+        ("@kimi @opencode 讨论三轮融资的风险", "三轮融资的风险"),
+        ("@kimi @opencode 讨论一轮明月的意象", "一轮明月的意象"),
+        ("@kimi @opencode 讨论二轮摩托的政策", "二轮摩托的政策"),
+    ):
+        request_with_compound = parse_natural_discussion_request(
+            compound,
+            ("kimi", "opencode"),
+        )
+        assert request_with_compound is not None
+        assert request_with_compound.rounds == 2
+        assert request_with_compound.topic == expected_topic
+
+    assert parse_natural_discussion_request(
+        "@kimi @opencode 一起分析并分别回答",
+        ("kimi", "opencode"),
+    ) is None
+    for negated in (
+        "@kimi @opencode 不要讨论，分别回答就行",
+        "@kimi @opencode 你们不用讨论，各自给建议",
+        "@kimi @opencode 别辩论，分别说结论",
+    ):
+        assert parse_natural_discussion_request(
+            negated,
+            ("kimi", "opencode"),
+        ) is None
+    assert parse_natural_discussion_request(
+        "@kimi 讨论一下这个问题",
+        ("kimi",),
+    ) is None
+
+    try:
+        parse_natural_discussion_request(
+            "@kimi @ghost @opencode 你们讨论一下这个问题",
+            ("kimi", "opencode"),
+        )
+        raise AssertionError("unknown discussion mention should fail")
+    except DiscussionValidationError as exc:
+        assert "未知" in str(exc) and "ghost" in str(exc)
+
+    try:
+        parse_natural_discussion_request(
+            "@kimi @opencode @host 你们讨论一下这个问题",
+            ("kimi", "opencode", "host"),
+        )
+        raise AssertionError("host must not become a discussion participant")
+    except DiscussionValidationError as exc:
+        assert "host" in str(exc)
+
+    try:
+        parse_natural_discussion_request(
+            "@kimi @opencode 讨论四轮这个问题",
+            ("kimi", "opencode"),
+        )
+        raise AssertionError("natural discussion rounds overflow should fail")
+    except DiscussionValidationError as exc:
+        assert "轮数" in str(exc)
+
+    for overflow in (
+        "@kimi @opencode 讨论四轮：人工智能伦理",
+        "@kimi @opencode 讨论五轮，人工智能伦理",
+        "@kimi @opencode 讨论十轮 关于人工智能伦理",
+        "@kimi @opencode 讨论一百轮这个人工智能问题",
+        "@kimi @opencode 讨论99轮；人工智能伦理",
+    ):
+        try:
+            parse_natural_discussion_request(
+                overflow,
+                ("kimi", "opencode"),
+            )
+            raise AssertionError("natural discussion rounds overflow should fail")
+        except DiscussionValidationError as exc:
+            assert "轮数" in str(exc)
+
+
+def test_host_route_can_return_a_bounded_discussion_intent() -> None:
+    class RouteAdapter:
+        session_id = None
+
+        async def stream(self, prompt: str, workdir: str):
+            assert "四种结果" in prompt
+            yield AgentEvent(
+                "text",
+                '{"discussion":{"participants":["kimi","opencode"],'
+                '"rounds":2,"moderator":"host",'
+                '"topic":"为什么游戏越来越不好玩"},'
+                '"reason":"用户要求参与者交叉讨论"}',
+            )
+            yield AgentEvent("done")
+
+    decision = asyncio.run(HostAgent(
+        RouteAdapter(), workers=["kimi", "opencode"]
+    ).decide(
+        "[user] 让你们讨论为什么游戏越来越不好玩",
+        ".",
+        choices=["kimi", "opencode"],
+    ))
+    assert decision.discussion is not None
+    assert decision.discussion.participants == ("kimi", "opencode")
+    assert decision.discussion.rounds == 2
+    assert decision.answer is None and decision.targets == []
+
+
+def test_host_discussion_intent_rejects_untrusted_or_malformed_routes() -> None:
+    class InvalidRouteAdapter:
+        session_id = None
+
+        def __init__(self, raw: str) -> None:
+            self.raw = raw
+
+        async def stream(self, prompt: str, workdir: str):
+            yield AgentEvent("text", self.raw)
+            yield AgentEvent("done")
+
+    invalid = (
+        '{"discussion":{"participants":["kimi","ghost"],'
+        '"rounds":2,"moderator":"host","topic":"x"}}',
+        '{"discussion":{"participants":["kimi","opencode"],'
+        '"rounds":true,"moderator":"host","topic":"x"}}',
+        '{"discussion":{"participants":["kimi","opencode"],'
+        '"rounds":2,"moderator":"kimi","topic":"x"}}',
+        '{discussion:{participants:["kimi","opencode"]}}',
+    )
+    for raw in invalid:
+        host = HostAgent(
+            InvalidRouteAdapter(raw),
+            workers=["kimi", "opencode"],
+        )
+        try:
+            asyncio.run(host.decide(
+                "[user] 讨论一个问题",
+                ".",
+                choices=["kimi", "opencode"],
+            ))
+            raise AssertionError(f"invalid discussion route accepted: {raw}")
+        except DiscussionValidationError:
+            pass
 
 
 class RoundBarrier:
@@ -215,6 +398,87 @@ def test_bounded_rounds_share_timeline_and_finish_with_moderator() -> None:
 
     asyncio.run(run())
     print("ok  有界讨论（同轮并发、跨轮共享、单 user、最终 host）")
+
+
+def test_natural_multi_mention_enters_the_same_bounded_discussion() -> None:
+    async def run() -> None:
+        orch, adapters = make_orch()
+        events: list[tuple[str, AgentEvent]] = []
+        original = "@opencode @kimi 你们讨论一下为什么游戏越来越不好玩了"
+        outcome = await orch.dispatch(
+            original,
+            lambda name, event: events.append((name, event)),
+            command_id="natural-discussion",
+        )
+
+        assert not outcome.failures
+        assert len(adapters["kimi"].prompts) == 2
+        assert len(adapters["opencode"].prompts) == 2
+        assert len(adapters["host"].prompts) == 1
+        assert "为什么游戏越来越不好玩了" in adapters["kimi"].prompts[0]
+        assert sum(item.speaker == "user" for item in orch.history) == 1
+        assert orch.history[0].text == original
+        assert any(
+            name == "system"
+            and "已识别为讨论" in event.text
+            and event.meta.get("discussion") is True
+            for name, event in events
+        )
+        await orch.aclose()
+
+    asyncio.run(run())
+    print("ok  自然语言多点名进入同一有界讨论状态机")
+
+
+def test_host_routed_discussion_uses_one_user_record_and_bounded_rounds() -> None:
+    class DiscussionRouteHost(RoundAdapter):
+        def __init__(self) -> None:
+            super().__init__("host")
+            self.decide_calls = 0
+
+        async def decide(
+            self, transcript: str, workdir: str, on_event=None, *, choices=None
+        ) -> HostDecision:
+            self.decide_calls += 1
+            assert choices is not None
+            return HostDecision(
+                [],
+                "需要交叉讨论",
+                discussion=parse_natural_discussion_request(
+                    "@kimi @opencode 讨论两轮：游戏为何越来越不好玩",
+                    ("kimi", "opencode"),
+                ),
+            )
+
+    async def run() -> None:
+        orch, adapters = make_orch()
+        route_host = DiscussionRouteHost()
+        orch.host = route_host
+        orch.adapters["host"] = route_host
+        adapters["host"] = route_host
+        events: list[tuple[str, AgentEvent]] = []
+        original = "让合适的两个智能体讨论为什么游戏越来越不好玩"
+        outcome = await orch.dispatch(
+            original,
+            lambda name, event: events.append((name, event)),
+            command_id="host-natural-discussion",
+        )
+
+        assert not outcome.failures
+        assert route_host.decide_calls == 1
+        assert len(adapters["kimi"].prompts) == 2
+        assert len(adapters["opencode"].prompts) == 2
+        assert len(route_host.prompts) == 1
+        assert sum(item.speaker == "user" for item in orch.history) == 1
+        assert orch.history[0].text == original
+        assert any(
+            event.meta.get("discussion") is True
+            for _name, event in events
+        )
+        await orch.aclose()
+
+    asyncio.run(run())
+    print("ok  无点名 host 路由复用同一有界讨论状态机")
 
 
 def test_failure_exits_later_rounds_but_moderator_runs_and_bus_fails() -> None:
@@ -364,12 +628,41 @@ def test_invalid_discussion_does_not_enter_timeline() -> None:
         pass
     assert orch.history == []
     asyncio.run(orch.aclose())
+
+    natural, _ = make_orch()
+    try:
+        asyncio.run(natural.dispatch(
+            "@kimi @opencode 你们讨论四轮这个问题",
+            lambda _name, _event: None,
+        ))
+        raise AssertionError("invalid natural discussion should fail")
+    except DiscussionValidationError:
+        pass
+    assert natural.history == []
+    asyncio.run(natural.aclose())
+
+    unknown, _ = make_orch()
+    try:
+        asyncio.run(unknown.dispatch(
+            "@kimi @ghost @opencode 你们讨论一下这个问题",
+            lambda _name, _event: None,
+        ))
+        raise AssertionError("unknown natural discussion mention should fail")
+    except DiscussionValidationError as exc:
+        assert "ghost" in str(exc)
+    assert unknown.history == []
+    asyncio.run(unknown.aclose())
     print("ok  无效讨论在 timeline 写入前拒绝")
 
 
 if __name__ == "__main__":
     test_parser_bounds_and_command_boundary()
+    test_natural_discussion_intent_is_conservative_and_bounded()
+    test_host_route_can_return_a_bounded_discussion_intent()
+    test_host_discussion_intent_rejects_untrusted_or_malformed_routes()
     test_bounded_rounds_share_timeline_and_finish_with_moderator()
+    test_natural_multi_mention_enters_the_same_bounded_discussion()
+    test_host_routed_discussion_uses_one_user_record_and_bounded_rounds()
     test_failure_exits_later_rounds_but_moderator_runs_and_bus_fails()
     test_cancel_stops_later_rounds_and_moderator()
     test_registered_nonparticipant_can_moderate()

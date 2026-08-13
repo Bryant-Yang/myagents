@@ -1,6 +1,6 @@
 # myagents 工作流
 
-> 作者：Bryant Yang　最近更新：2026-07-26
+> 作者：Bryant Yang　最近更新：2026-08-13
 >
 > 每次任务先在本表定位场景，再按需加载文档。顶层契约是
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -18,6 +18,8 @@
 | 7 | 改 Codex app-server、thread、approval 或 fallback | [`adr/0003-codex-app-server-transport.md`](adr/0003-codex-app-server-transport.md)、[`adr/0004-ephemeral-codex-host-threads.md`](adr/0004-ephemeral-codex-host-threads.md)；[`SPEC.md`](SPEC.md) Codex 用例 | R1–R4、默认配置继承、已发送 `turn/start` 不重放 | `codex_app_server/`、fake server、M4 tests、注册表 | worker 两轮同 PID/thread；host thread 不落盘；取消确认；断线失败；close 无残留；真实 E2E 单独登记 |
 | 8 | 实现里程碑 workflow 或运行中 steering | [`adr/0009-bounded-milestone-workflow-steering.md`](adr/0009-bounded-milestone-workflow-steering.md)；[`SPEC.md`](SPEC.md) UC-WORKFLOW-001；`../HARNESS.md` §4 | R1–R4、R6、干净 Git fixed point、单 writer、固定阶段/角色/修复上限、read-only review/verify | workspace inspector、`workflow.py`、adapter execution mode、Orchestrator/CommandBus、control/MCP/TUI、对应 fake tests | baseline/candidate 指纹固定且漂移 fail-closed；最多六次调用；阶段结果 fail-closed；steering 只在阶段边界生效；写入只由 implementer 串行发生；取消/no-replay/回收契约通过 |
 | 9 | 新增或修改会话级自然语言角色 | [`adr/0011-session-scoped-natural-language-roles.md`](adr/0011-session-scoped-natural-language-roles.md)；`../HARNESS.md` §4.1 | R1–R6、固定 target 闭集、room 级原子状态、角色不扩权 | `session_roles.py`、host/Orchestrator、RoomStore、TUI、对应 tests | 设置/取消、跨任务持续、讨论跨轮、命名会话隔离与重启恢复；写失败不假提交；活动区明确标注本会话；`/roles` 查看/清空不进 timeline，运行中不跨阶段清空 |
+| 10 | 改 agent 安装探测、可用性或 setup 引导 | [`adr/0012-agent-readiness-and-setup-ux.md`](adr/0012-agent-readiness-and-setup-ux.md)；`../HARNESS.md` §4 | R2、R3、R5、R6 | `agent_readiness.py`、`AgentSpec`、Orchestrator/TUI、fake tests | 启动 probe 无进程/网络/安装副作用；未就绪在 timeline 前原子拒绝；host 只看 ready worker；rescan 无需重启 |
+| 11 | 改自然语言有序协作或步骤接力 | [`adr/0013-natural-language-sequential-collaboration.md`](adr/0013-natural-language-sequential-collaboration.md)；[`SPEC.md`](SPEC.md) UC-COLLAB-001；`../HARNESS.md` §4.1 | R1–R5 | `collaboration.py`、host/Orchestrator、TUI 状态、fake tests | 2–4 步、至少两个 worker、严格串行、前序产物可见、失败/取消即停、无递归/扩员 |
 
 不在表内且会改变协议、安全或外部接口的任务，先向用户确认范围。
 
@@ -29,7 +31,7 @@
 | R2 | 通用层不按 agent 名分支 |
 | R3 | 子进程只在 transport 层启动 |
 | R4 | Kimi/OpenCode 保持受限 hybrid；Qwen Code/WorkBuddy 保持 ACP-only + 固定 runtime profile |
-| R5 | `/discuss` 固定 2–3 人、1–3 轮，不由 agent 自主续轮 |
+| R5 | 自然语言讨论与 `/discuss` 固定 2–3 人、1–3 轮，不由 agent 自主续轮 |
 | R6 | `/workflow` 固定角色/阶段、单 writer、一次 repair 上限和有界 steering |
 
 ## 3. 上下文按需载入

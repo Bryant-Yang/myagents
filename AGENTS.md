@@ -2,7 +2,7 @@
 
 <!-- harness:controls-read-policy=on-demand -->
 
-> 作者：Bryant Yang　最近更新：2026-08-12
+> 作者：Bryant Yang　最近更新：2026-08-13
 >
 > 本文是所有编码 agent 的项目级入场入口，也是唯一的协作规则源。详细工程契约见
 > [`HARNESS.md`](HARNESS.md)，按任务选读规则见
@@ -54,10 +54,13 @@ hub-and-spoke 方式维护统一时间线，以 ACP 作为有状态 coding agent
   复用，只有明确的 `Authentication required` 才按需认证；认证只能使用 server
   公布的 ACP method，登录 URL 必须是官方 HTTPS 地址且等待有界，在独立
   fallback 安全契约获证前不得自动降级。
-- **R5 多智能体讨论必须显式且有界**：`/discuss` 只允许 2–3 个已注册
-  worker、1–3 轮和一个终局 moderator；轮次由普通代码推进，禁止 agent
-  自主递归派发、动态扩员或形成无界对话。会话级自然语言角色只能绑定已固定的
-  实际 agent，不得改变参与者、moderator、轮数、工具权限或 runtime。
+- **R5 多智能体协作必须有界**：自然语言讨论与 `/discuss` 只允许 2–3 个
+  已注册 worker、1–3 轮和一个终局 moderator，并复用同一确定性状态机。
+  自然语言有序协作只允许 2–4 个串行步骤、至少
+  两个 ready worker；host 只能在 ready/显式 mention 闭集内给出固定计划。
+  两类调度均由普通代码推进，禁止 agent 自主递归派发、动态扩员、自动重试或
+  形成无界对话。会话级自然语言角色只能绑定已固定的实际 agent，不得改变
+  参与者、moderator、步骤/轮数、工具权限或 runtime。
 - **R6 里程碑 workflow 必须固定且单写者**：`/workflow` 固定 review →
   implement → verify，最多一次同 writer repair/reverify 和一次 host final；
   review/verify/final 必须 read-only，steering 只允许在阶段边界按冻结上限追加，
@@ -69,6 +72,9 @@ hub-and-spoke 方式维护统一时间线，以 ACP 作为有状态 coding agent
   [`docs/acp-migration.md`](docs/acp-migration.md)；改持久化、恢复或
   lease 前，先读
   [`docs/adr/0001-persistent-room-command-bus-mcp.md`](docs/adr/0001-persistent-room-command-bus-mcp.md)。
+- 改 agent 可用性、安装探测或 setup 引导前，先读
+  [`docs/adr/0012-agent-readiness-and-setup-ux.md`](docs/adr/0012-agent-readiness-and-setup-ux.md)；
+  probe 只能被动读取环境/PATH/文件属性，不得安装、卸载或启动真实 agent。
 - 新增 agent 时实现统一 `AgentAdapter`，在 `AGENT_SPECS` 注册；不要把
   name-specific 逻辑散进编排器。
 - 权限处理器返回值必须绑定本次 `params.options` 校验；异常、空值或未知
@@ -82,7 +88,10 @@ hub-and-spoke 方式维护统一时间线，以 ACP 作为有状态 coding agent
 - 有界讨论遵守
   [`ADR-0008`](docs/adr/0008-bounded-multi-agent-discussion.md)：同轮并发、
   跨轮串行，一条 command 只有一条 user 记录；参与者失败不自动重试，最终
-  moderator 不能掩盖失败终态。
+  moderator 不能掩盖失败终态；自然语言识别不得改变这些边界。
+- 自然语言有序协作遵守
+  [`ADR-0013`](docs/adr/0013-natural-language-sequential-collaboration.md)：
+  不新增 `/task`，固定计划严格串行，后一步读取前序真实回复，失败/取消即停。
 - 测试必须使用本地 fake server/fixture；普通自动化测试不得调用真实外部 agent。
 - 只修改任务直接需要的文件，不顺手重构；保留用户已有改动。
 

@@ -42,12 +42,14 @@ _NOTE_LABELS = {
     "workflow": "流程",
     "steering": "补充",
     "cancel": "控制",
+    "collaboration": "协作",
 }
 
 _MAX_NOTES = 12
 _DEFAULT_MAX_TERMINAL_CARDS = 100
 _DEFAULT_MAX_TOOLS_PER_CARD = 50
-_TERMINAL_STATES = {"completed", "failed", "cancelled", "interrupted"}
+_TERMINAL_STATES = {
+    "completed", "failed", "cancelled", "interrupted", "skipped"}
 
 
 @dataclass(frozen=True)

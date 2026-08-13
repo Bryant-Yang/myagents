@@ -24,6 +24,8 @@ required=(
   docs/adr/0009-bounded-milestone-workflow-steering.md
   docs/adr/0010-multi-session-tui-management.md
   docs/adr/0011-session-scoped-natural-language-roles.md
+  docs/adr/0012-agent-readiness-and-setup-ux.md
+  docs/adr/0013-natural-language-sequential-collaboration.md
   scripts/check-redlines.sh
 )
 
@@ -67,6 +69,8 @@ docs = [
     root / "docs/adr/0009-bounded-milestone-workflow-steering.md",
     root / "docs/adr/0010-multi-session-tui-management.md",
     root / "docs/adr/0011-session-scoped-natural-language-roles.md",
+    root / "docs/adr/0012-agent-readiness-and-setup-ux.md",
+    root / "docs/adr/0013-natural-language-sequential-collaboration.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -98,14 +102,16 @@ if [ ! -x .venv/bin/python ]; then
 fi
 
 .venv/bin/python -m py_compile \
-  main.py myagents_mcp.py orchestrator.py host.py discussion.py workflow.py session_roles.py session_catalog.py session_manager.py tui_activity.py \
+  main.py myagents_mcp.py orchestrator.py host.py discussion.py collaboration.py workflow.py session_roles.py session_catalog.py session_manager.py tui_activity.py agent_readiness.py \
   acp/*.py codex_app_server/*.py adapters/*.py control/*.py storage/*.py workspace/*.py tests/*.py \
   scripts/e2e-m3-real.py scripts/e2e-m5-real.py
+.venv/bin/python tests/test_agent_readiness.py
 .venv/bin/python tests/test_basic.py
 .venv/bin/python tests/test_session_roles.py
 .venv/bin/python tests/test_tui_activity.py
 .venv/bin/python tests/test_tui_completion.py
 .venv/bin/python tests/test_discussion.py
+.venv/bin/python tests/test_collaboration.py
 .venv/bin/python tests/test_workflow.py
 .venv/bin/python tests/test_tui_status.py
 .venv/bin/python tests/test_clipboard_image.py

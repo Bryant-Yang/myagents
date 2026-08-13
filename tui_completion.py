@@ -36,7 +36,9 @@ LOCAL_COMMANDS: tuple[LocalCommand, ...] = (
         "details", "展开或收起当前活动卡", "action_toggle_details"),
     LocalCommand(
         "paste-image", "粘贴 macOS 剪贴板图片", "action_paste_image"),
-    LocalCommand("agents", "查看已注册 agent", "action_show_agents"),
+    LocalCommand("agents", "查看 agent 就绪状态", "action_show_agents"),
+    LocalCommand(
+        "agents rescan", "重新检测本机 agent", "action_rescan_agents"),
     LocalCommand("roles", "查看当前会话角色", "action_show_roles"),
     LocalCommand("roles clear", "清空当前会话角色", "action_clear_roles"),
     LocalCommand("help", "查看本地命令与快捷键", "action_show_help"),

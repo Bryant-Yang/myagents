@@ -1,6 +1,6 @@
 # myagents 工程契约（HARNESS）
 
-> 作者：Bryant Yang　最近更新：2026-08-12
+> 作者：Bryant Yang　最近更新：2026-08-13
 > Harness Framework：2.1.0（来源 commit：
 > `b3b8fd47ebc49b57abdc365f327688b33970d54c`）
 
@@ -22,6 +22,7 @@
 | 一个编排中心 | agent 不直接互调，消息与 history 统一经过 Orchestrator。 |
 | 原生长连接优先，JSONL fallback | 有官方可靠长连接时优先使用；Kimi/OpenCode/Qwen Code/WorkBuddy 走 ACP，Codex 走 app-server；Qwen/WorkBuddy 在只读降级契约获证前保持 ACP-only。 |
 | 协议通用、差异下沉 | 通用 runtime 不按 agent 名分支，具体差异进入 adapter/spec。 |
+| 注册不等于就绪 | 生产 TUI 被动探测当前进程可见的 CLI；缺失目标在副作用前原子拒绝，不自动安装或修改用户环境。 |
 | 权限 fail-closed | 无处理器、异常或畸形选择一律拒绝；auto 必须显式授权。 |
 | 生命周期负责到底 | 启动的进程组必须能 cancel、close 并被独立验证已回收。 |
 | 行为证据优先 | fake contract tests 之外，关键真实协议边界保留人工/E2E 证据。 |
@@ -61,6 +62,8 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 ## 3. 分层与依赖
 
 - `main.py` 只负责 UI、权限交互和生命周期入口，不直接启动 agent 进程。
+- `agent_readiness.py` 只读取环境/PATH/文件属性，集中提供 agent 状态快照、重扫
+  与资格门；不得启动 CLI、联网、读取登录态或执行安装器。
 - `orchestrator.py` 只面向 adapter 能力和 `AgentSpec`，不解析厂商协议。
 - `acp/client.py` 负责通用 ACP framing、request/response、反向权限请求和进程回收。
 - `acp/adapter.py` 把 ACP session 转成 `AgentEvent`，并将可选的
@@ -86,6 +89,12 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 
 ### 4.1 路由与上下文
 
+- `AgentSpec` 注册能力不等于本机 ready。生产 TUI 启动及新 runtime 创建时执行
+  被动 probe；显式多目标、discussion、workflow 和无 mention host 都必须在
+  timeline/workspace 副作用前通过统一资格门。host 路由候选只包含 ready worker。
+- `/agents` 与 `/agents rescan` 是本地状态命令；rescan 只重新读取当前进程环境并
+  同步所有已加载 room，不安装、卸载、移动或启动真实 agent。TUI 的资格错误
+  必须保留原草稿和原光标位置。
 - 显式 `@agent` 永远优先；无 `@` 时 host 单次调用直接回答或返回 worker
   路由，本地代码不维护自然语言关键词白名单。
 - host 路由结果包含每个 target 的一次性明确任务；Orchestrator 将任务直接
@@ -110,11 +119,20 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
   允许下轮补发；prompt 已提交后的静默超时属于结果不确定，必须先持久化
   no-replay cursor 再公开失败，不能自动重放。
 - 首次 ACP bootstrap 最多发送 `history_limit` 条共享历史。
-- `/discuss` 是 Orchestrator 内的确定性有界状态机：2–3 个显式 worker、
-  1–3 轮、一个终局 moderator。同轮复用 fan-out，跨轮等待全部收尾；内部
-  assignment 不写成 user timeline，不递归 `dispatch`，agent 不决定下一轮。
+- 自然语言讨论与 `/discuss` 复用 Orchestrator 内同一个确定性有界状态机：
+  2–3 个 worker、1–3 轮、一个终局 moderator。同轮复用 fan-out，跨轮等待全部
+  收尾；内部 assignment 不写成 user timeline，不递归 `dispatch`，agent 不决定
+  下一轮。显式自然语言只使用 mention 闭集；未点名时 host 只能从 ready worker
+  中选择。`一起分析/分别回答/各自建议` 仍是单轮 fan-out，明确跨 agent 先后
+  关系优先进入有序协作。
 - 讨论参与者失败后退出后续轮次，避免把不确定投递当作安全重试；moderator
   仍总结已有证据，但 `DispatchOutcome` 保留失败，CommandBus 不得报 completed。
+- 自然语言有序协作由 `CollaborationPlan` 与 Orchestrator 的确定性串行状态机
+  执行：2–4 步、至少两个 ready worker、一个 command 和一条 user timeline。
+  host 只在 ready worker 或显式 mention 闭集内做一次语义提取；普通
+  `一起/分别/各自` 继续 fan-out。后一步读取前序真实回复，中间失败/取消后不得
+  启动后续步骤；禁止递归 dispatch、动态扩员、自动重试、换人、跳步或追加
+  host 伪造成功总结。计划不改变 adapter 权限、execution mode 或 no-replay。
 
 ### 4.2 权限
 
@@ -293,7 +311,10 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 | OpenCode hybrid transport | `tests/test_opencode_hybrid.py` + `tests/fake_acp_server.py` |
 | Qwen Code ACP-only 注册 | `tests/test_phase2.py` + `tests/fake_acp_server.py` |
 | WorkBuddy ACP-only 注册/认证/profile | `tests/test_workbuddy_acp.py` + `tests/fake_acp_server.py` |
+| Agent 被动就绪探测/原子资格门/TUI | `tests/test_agent_readiness.py` + `tests/test_tui_completion.py`（仅 fake resolver/临时文件） |
 | 会话级自然语言角色 | `tests/test_session_roles.py` + `tests/test_discussion.py` + `tests/test_tui_completion.py` + TUI 纯状态模型 |
+| 自然语言有界讨论 | `tests/test_discussion.py`（显式 mention、host 路由、边界与同一状态机） |
+| 自然语言有序协作 | `tests/test_collaboration.py`（纯内存 fake host/adapter + CommandBus 取消） |
 | TUI/增量/权限/回收 | `tests/test_phase2.py` |
 | 多会话目录/生命周期/TUI | `tests/test_session_catalog.py` + `tests/test_session_manager.py` + `tests/test_session_tui.py` |
 | RoomStore 持久化 | `tests/test_storage.py` |
@@ -313,7 +334,7 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 当前本地门禁顺序：
 
 ```text
-harness 文档引用 → redlines → py_compile → basic → 会话角色 → ACP → Phase 2
+harness 文档引用 → redlines → py_compile → readiness → basic → 会话角色 → ACP → Phase 2
 → Kimi hybrid
 → OpenCode hybrid
 → WorkBuddy ACP
@@ -377,7 +398,7 @@ branch protection / required checks 需要单独配置后才能宣称生效。
 | R2 | 通用 orchestration/ACP 层不得按具体 agent 名做条件分支 | `bash scripts/check-redlines.sh` 的 AST name-branch gate |
 | R3 | UI、orchestrator、host 不得直接启动 shell/子进程 | `bash scripts/check-redlines.sh` 的 AST process-boundary gate |
 | R4 | Kimi/OpenCode 必须受限 ACP-first；Qwen/WorkBuddy 必须 ACP-only 且固定 runtime profile；OpenCode 普通轮风险工具 ask、只读轮 runtime deny；WorkBuddy 只用独立 CLI、固定已验收 region、按需有界认证且登录 URL fail-closed；JSONL 仅获证的 prepare-only 只读降级 | `bash scripts/check-redlines.sh` 的 registry/policy/profile gate |
-| R5 | `/discuss` 必须保持 2–3 人、1–3 轮、终局主持且不得递归 dispatch；会话角色不得改变参与者、轮数、权限或 runtime | `bash scripts/check-redlines.sh` 的 discussion bounds/AST gate + `tests/test_session_roles.py` |
+| R5 | 自然语言讨论与 `/discuss` 必须共用 2–3 人、1–3 轮、终局主持状态机；自然语言协作必须保持 2–4 步、至少两个 worker、严格串行且失败/取消即停；两者均不得递归 dispatch/动态扩员；会话角色不得改变参与者、步骤/轮数、权限或 runtime | `bash scripts/check-redlines.sh` 的 discussion/collaboration bounds 与 AST gate + `tests/test_discussion.py` + `tests/test_session_roles.py` + `tests/test_collaboration.py` |
 | R6 | `/workflow` 必须保持固定角色/阶段、单 writer、最多一次 repair/reverify、read-only 复核和有界 steering | `bash scripts/check-redlines.sh` 的 workflow bounds/mode/AST gate |
 
 红线变更必须同步本文、`AGENTS.md`、`docs/workflow.md`、enforcement 与
@@ -400,6 +421,10 @@ branch protection / required checks 需要单独配置后才能宣称生效。
   [`docs/adr/0008-bounded-multi-agent-discussion.md`](docs/adr/0008-bounded-multi-agent-discussion.md)。
 - M5 有界里程碑工作流事实源：
   [`docs/adr/0009-bounded-milestone-workflow-steering.md`](docs/adr/0009-bounded-milestone-workflow-steering.md)。
+- M4.10 Agent 就绪与 setup UX 事实源：
+  [`docs/adr/0012-agent-readiness-and-setup-ux.md`](docs/adr/0012-agent-readiness-and-setup-ux.md)。
+- M7 自然语言有序协作事实源：
+  [`docs/adr/0013-natural-language-sequential-collaboration.md`](docs/adr/0013-natural-language-sequential-collaboration.md)。
 - 当前路线图：[`README.md`](README.md)“路线图”。
 - 重大协议/安全边界改变先形成可评审设计记录，再修改本契约。
 - Steering 只在同类失败至少两次或已有趋势证据时建立；单次失败只修当前问题。

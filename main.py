@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import re
 import shlex
 import time
 from pathlib import Path
@@ -30,10 +31,21 @@ from typing import Callable
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
+from textual.events import Resize
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Input, Label, RichLog, Static
+from textual.widgets import (
+    Button,
+    Footer,
+    Input,
+    Label,
+    OptionList,
+    RichLog,
+    Static,
+)
+from textual.widgets.option_list import Option
 
+from agent_readiness import AgentUnavailableError
 from orchestrator import HOST_NAME, Orchestrator
 from adapters.base import (
     AgentEvent,
@@ -45,7 +57,7 @@ from clipboard_image import (
     attachment_reference,
     capture_clipboard_png,
 )
-from discussion import DISCUSSION_USAGE
+from discussion import DISCUSSION_USAGE, DiscussionValidationError
 from workflow import (
     STEER_USAGE,
     WORKFLOW_USAGE,
@@ -74,6 +86,7 @@ from tui_completion import (
     unknown_mentions,
 )
 from tui_status import TaskProgress
+from tui_markdown import render_chat_markdown
 from tui_activity import ActivityFeed
 
 # 每个发言者的显示颜色
@@ -88,6 +101,9 @@ _STREAM_RENDER_INTERVAL = 0.05
 _SENSITIVE_DETAIL_KEYS = {
     "token", "secret", "password", "authorization", "api_key", "apikey",
     "credential", "private_key"}
+_LEGACY_IMAGE_PREVIEW_RE = re.compile(
+    r"\[图片附件：\s*[^\]\r\n]+\]"
+)
 
 
 def _tool_detail(tool: object) -> str:
@@ -200,6 +216,16 @@ class SessionPickerScreen(ModalScreen[str | None]):
         "failed": "失败",
         "cancelled": "已取消",
     }
+    _STATUS_STYLES = {
+        "idle": "bright_black",
+        "queued": "yellow",
+        "waiting_resource": "yellow",
+        "running": "bold green",
+        "waiting_permission": "bold yellow",
+        "completed": "green",
+        "failed": "bold red",
+        "cancelled": "bright_black",
+    }
 
     def __init__(self, manager: SessionManager) -> None:
         super().__init__()
@@ -207,24 +233,36 @@ class SessionPickerScreen(ModalScreen[str | None]):
         self._include_all = False
         self._items: tuple[SessionSnapshot, ...] = ()
         self._selected = 0
+        self._selection_initialized = False
+        self._option_indexes: dict[str, int] = {}
+        self._item_indexes: dict[str, int] = {}
 
     def compose(self) -> ComposeResult:
         with Vertical(id="session-picker"):
-            yield Label("会话 · 当前项目", id="session-scope")
+            with Horizontal(id="session-header"):
+                yield Label("会话", id="session-heading")
+                yield Label("当前项目", id="session-scope")
             yield Input(
-                placeholder="搜索会话名、最后消息、项目或路径",
+                placeholder="搜索标题、消息或项目",
                 id="session-search",
             )
-            yield Static(id="session-options")
+            yield OptionList(id="session-options", compact=True)
             yield Label(
-                "↑↓ 选择 · Enter 切换 · Tab 当前/全部 · Ctrl+N 新建 · "
-                "F2 重命名 · Ctrl+D 删除 · Esc 关闭",
+                "↑↓ 选择  Enter 打开  Tab 范围  Esc 关闭\n"
+                "Ctrl+N 新建  F2 重命名  Ctrl+D 删除",
                 id="session-help",
             )
 
     def on_mount(self) -> None:
         self._refresh()
+        # on_mount 时 OptionList 尚可能没有最终宽度；布局完成后再按真实列宽
+        # 截断两行内容，避免初次打开只显示极短摘要。
+        self.call_after_refresh(self._refresh)
         self.query_one("#session-search", Input).focus()
+
+    def on_resize(self, _: Resize) -> None:
+        if self.is_mounted:
+            self.call_after_refresh(self._refresh)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "session-search":
@@ -248,42 +286,121 @@ class SessionPickerScreen(ModalScreen[str | None]):
             )
         self._items = items
         if self._items:
-            self._selected = max(0, min(self._selected, len(self._items) - 1))
+            if not self._selection_initialized:
+                self._selected = next(
+                    (
+                        index for index, item in enumerate(self._items)
+                        if item.summary.room_id
+                        == self._manager.active_session_id
+                    ),
+                    0,
+                )
+                self._selection_initialized = True
+            else:
+                self._selected = max(
+                    0,
+                    min(self._selected, len(self._items) - 1),
+                )
         else:
             self._selected = 0
         scope = "全部项目" if self._include_all else "当前项目"
-        self.query_one("#session-scope", Label).update(f"会话 · {scope}")
-        self.query_one("#session-options", Static).update(self._render_items())
+        count = f"{len(self._items)} 个会话"
+        self.query_one("#session-scope", Label).update(f"{scope}  ·  {count}")
+        option_list = self.query_one("#session-options", OptionList)
+        prompt_width = max(16, option_list.size.width - 6)
+        option_list.set_options(self._render_options(prompt_width))
+        self._sync_selection()
 
-    def _render_items(self) -> str:
+    @staticmethod
+    def _activity_label(value: str | None) -> str:
+        if not value:
+            return "刚创建"
+        compact = value[:16].replace("T", " ")
+        if len(compact) == 16 and compact[4] == "-":
+            return compact[5:]
+        return compact
+
+    @staticmethod
+    def _preview(value: str) -> str:
+        compact = _LEGACY_IMAGE_PREVIEW_RE.sub("[图片]", value)
+        compact = " ".join(compact.split())
+        return compact or "还没有消息"
+
+    def _session_prompt(self, item: SessionSnapshot, width: int) -> Text:
+        summary = item.summary
+        current = summary.room_id == self._manager.active_session_id
+        status = self._STATUS_LABELS.get(item.status, item.status)
+        status_style = self._STATUS_STYLES.get(item.status, "bright_black")
+
+        title = Text(no_wrap=True, overflow="ellipsis")
+        title.append(summary.title, "bold")
+        if current:
+            title.append("  当前", "bold cyan")
+        if item.unread:
+            title.append("  ● 未读", "bold magenta")
+        title.truncate(width, overflow="ellipsis")
+
+        meta = Text(no_wrap=True, overflow="ellipsis")
+        meta.append("●", status_style)
+        meta.append(f" {status}", status_style)
+        meta.append(
+            f"  ·  {summary.message_count} 条  ·  "
+            f"{self._activity_label(summary.last_active_at)}  ",
+            "bright_black",
+        )
+        preview = self._preview(summary.last_user_message)
+        preview_style = (
+            "bright_black" if summary.last_user_message
+            else "bright_black italic"
+        )
+        meta.append(preview, preview_style)
+        meta.truncate(width, overflow="ellipsis")
+
+        prompt = Text()
+        prompt.append_text(title)
+        prompt.append("\n")
+        prompt.append_text(meta)
+        return prompt
+
+    def _render_options(self, prompt_width: int) -> list[Option | None]:
+        self._option_indexes = {}
+        self._item_indexes = {
+            item.summary.room_id: index
+            for index, item in enumerate(self._items)
+        }
         if not self._items:
-            return "没有匹配的会话"
-        lines: list[str] = []
+            return [Option("没有匹配的会话", id="empty", disabled=True)]
+        options: list[Option | None] = []
         last_workdir = ""
-        for index, item in enumerate(self._items):
+        for item in self._items:
             summary = item.summary
             if self._include_all and summary.workdir != last_workdir:
-                if lines:
-                    lines.append("")
-                lines.append(f"{summary.project_name} · {summary.workdir}")
+                if options:
+                    options.append(None)
+                project = Text()
+                project.append(summary.project_name, "bold")
+                project.append(f"  {summary.workdir}", "bright_black")
+                options.append(Option(
+                    project,
+                    id=f"project:{len(options)}",
+                    disabled=True,
+                ))
                 last_workdir = summary.workdir
-            marker = ">" if index == self._selected else " "
-            current = " · 当前" if summary.room_id \
-                == self._manager.active_session_id else ""
-            unread = " · 未读" if item.unread else ""
-            status = self._STATUS_LABELS.get(item.status, item.status)
-            activity = (
-                summary.last_active_at[:16].replace("T", " ")
-                if summary.last_active_at else "暂无活动"
-            )
-            lines.append(
-                f"{marker} {summary.title}  [{status}{unread}{current}]  "
-                f"{summary.message_count} 条 · {activity}"
-            )
-            preview = " ".join(summary.last_user_message.split())
-            if preview:
-                lines.append(f"    {preview[:88]}")
-        return "\n".join(lines)
+            self._option_indexes[summary.room_id] = len(options)
+            options.append(Option(
+                self._session_prompt(item, prompt_width),
+                id=summary.room_id,
+            ))
+        return options
+
+    def _sync_selection(self) -> None:
+        option_list = self.query_one("#session-options", OptionList)
+        if not self._items:
+            option_list.highlighted = None
+            return
+        room_id = self._items[self._selected].summary.room_id
+        option_list.highlighted = self._option_indexes[room_id]
+        option_list.scroll_to_highlight()
 
     def selected(self) -> SessionSnapshot | None:
         if not self._items:
@@ -293,12 +410,29 @@ class SessionPickerScreen(ModalScreen[str | None]):
     def action_previous(self) -> None:
         if self._items:
             self._selected = (self._selected - 1) % len(self._items)
-            self._refresh()
+            self._sync_selection()
 
     def action_next(self) -> None:
         if self._items:
             self._selected = (self._selected + 1) % len(self._items)
-            self._refresh()
+            self._sync_selection()
+
+    def on_option_list_option_highlighted(
+            self, event: OptionList.OptionHighlighted) -> None:
+        if event.option_list.id != "session-options":
+            return
+        index = self._item_indexes.get(event.option_id or "")
+        if index is not None:
+            self._selected = index
+
+    def on_option_list_option_selected(
+            self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id != "session-options":
+            return
+        index = self._item_indexes.get(event.option_id or "")
+        if index is not None:
+            self._selected = index
+            self.action_select()
 
     def action_select(self) -> None:
         selected = self.selected()
@@ -498,7 +632,10 @@ class ChatApp(App):
         background: $surface;
     }
     PermissionScreen { align: center middle; }
-    SessionPickerScreen { align: center middle; }
+    SessionPickerScreen {
+        align: center middle;
+        background: $background 70%;
+    }
     #perm-dialog {
         width: 60; height: auto; padding: 1 2;
         border: round $warning; background: $surface;
@@ -510,15 +647,57 @@ class ChatApp(App):
     }
     #session-dialog Button { width: 100%; margin-top: 1; }
     #session-picker {
-        width: 100; height: 80%; padding: 1 2;
-        border: round $primary; background: $surface;
+        width: 94%; max-width: 104;
+        height: 82%; min-height: 24;
+        padding: 1 2;
+        border: round $primary;
+        background: $surface;
+    }
+    #session-header {
+        height: 1;
+        margin-bottom: 1;
+    }
+    #session-heading {
+        width: 1fr;
+        text-style: bold;
+    }
+    #session-scope {
+        width: auto;
+        color: $accent;
+        text-style: bold;
+    }
+    #session-search {
+        margin-bottom: 1;
     }
     #session-options {
-        height: 1fr; padding: 1;
-        border: round $secondary;
+        height: 1fr;
+        padding: 0;
+        border: none;
+        background: $surface-darken-1;
         overflow-y: auto;
     }
-    #session-help { color: $text-muted; margin-top: 1; }
+    #session-options > .option-list--option {
+        padding: 0 2;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+    #session-options > .option-list--option-highlighted {
+        background: $accent 22%;
+        color: $text;
+        text-style: none;
+    }
+    #session-options > .option-list--option-disabled {
+        padding: 0 2;
+        color: $text-muted;
+    }
+    #session-options > .option-list--separator {
+        color: $surface-lighten-2;
+    }
+    #session-help {
+        color: $text-muted;
+        margin-top: 1;
+        text-align: center;
+    }
     """
 
     def __init__(self, workdir: str, persistent: bool = True, *,
@@ -551,6 +730,7 @@ class ChatApp(App):
                 workdir,
                 persistent=persistent,
                 session_name=requested_session,
+                discover_agents=True,
             )
         self.session_name = self.orch.session_name
         # 持久模式由 SessionManager 集中拥有多个隔离 runtime；非持久测试仍沿用
@@ -581,6 +761,7 @@ class ChatApp(App):
         # RichLog 只能 append，直接写 ACP token/chunk 会变成“一词一行”。
         # 这里保留逻辑时间线，并按最多 20fps 把同一回复更新到同一条记录。
         self._display_lines: list[tuple[str, str, str]] = []
+        self._rendered_display_lines: list[Text | None] = []
         self._stream_text: dict[str, str] = {}
         self._stream_line_index: dict[str, int] = {}
         self._stream_flush_handles: dict[str, asyncio.TimerHandle] = {}
@@ -640,9 +821,19 @@ class ChatApp(App):
         if restored:
             self._system(f"已恢复 {len(restored)} 条历史消息")
         self._restore_interrupted_executions()
-        agents = " ".join(f"@{s.name}({s.transport.upper()})" for s in self.orch.specs)
-        self._system(f"聊天室已就绪：{agents} @host；不带 @ 的消息由 host 处理；"
-                     f"会话：{self.session_name}；工作目录：{self.orch.workdir}")
+        statuses = self.orch.agent_readiness_snapshot()
+        ready = [item.name for item in statuses if item.ready]
+        pending = [item.name for item in statuses if not item.ready]
+        rows = [f"聊天室已就绪：已就绪 {len(ready)}/{len(statuses)}"]
+        if ready:
+            rows.append("可用：" + "、".join(f"@{name}" for name in ready))
+        if pending:
+            rows.append(
+                "待处理：" + "、".join(f"@{name}" for name in pending))
+        rows.append("详情：/agents")
+        rows.append(
+            f"会话：{self.session_name}；工作目录：{self.orch.workdir}")
+        self._system("\n".join(rows))
         self.query_one("#composer", ComposerInput).focus()
 
     async def on_unmount(self) -> None:
@@ -772,9 +963,36 @@ class ChatApp(App):
         if ev.kind == "text":
             feed.record_status(command_id, name, "回复中", state="running")
         elif ev.kind == "info":
+            targets = ev.meta.get("route_targets")
+            if (ev.meta.get("collaboration") is True
+                    and isinstance(targets, list)):
+                for index, target in enumerate(targets):
+                    feed.record_status(
+                        command_id,
+                        str(target),
+                        "准备执行" if index == 0 else "等待前序步骤",
+                        state="running" if index == 0 else "queued",
+                    )
             feed.record_note(
-                command_id, name, "info", ev.text, state="running")
+                command_id,
+                name,
+                "info",
+                ev.text,
+                state=(
+                    "completed"
+                    if name == HOST_NAME and isinstance(targets, list)
+                    else "running"
+                ),
+            )
         elif ev.kind == "status":
+            if ev.meta.get("collaboration_preserve_agent_state") is True:
+                feed.record_note(
+                    command_id,
+                    name,
+                    "collaboration",
+                    ev.text,
+                )
+                return
             heartbeat = ev.meta.get("heartbeat") is True
             activity_agent = (
                 str(ev.meta.get("phase") or "任务")
@@ -995,18 +1213,34 @@ class ChatApp(App):
     @staticmethod
     def _line(speaker: str, text: str, style: str = "") -> Text:
         color = _COLORS.get(speaker, "white")
-        return Text.assemble((f"[{speaker}] ", f"bold {color}"), (text, style))
+        prefix = Text(f"[{speaker}] ", style=f"bold {color}")
+        body = (
+            Text(text, style=style)
+            if speaker in {"user", "system", "activity"}
+            else render_chat_markdown(text, style)
+        )
+        return Text.assemble(prefix, body)
 
     def _write(self, speaker: str, text: str, style: str = "") -> None:
         self._display_lines.append((speaker, text, style))
-        self.query_one(RichLog).write(self._line(speaker, text, style))
+        rendered = self._line(speaker, text, style)
+        self._rendered_display_lines.append(rendered)
+        self.query_one(RichLog).write(rendered)
 
     def _render_display_lines(self) -> None:
         """重绘逻辑时间线，让正在流式增长的回复仍只占一条记录。"""
         log = self.query_one(RichLog)
         log.clear()
-        for speaker, text, style in self._display_lines:
-            log.write(self._line(speaker, text, style))
+        if len(self._rendered_display_lines) > len(self._display_lines):
+            del self._rendered_display_lines[len(self._display_lines):]
+        while len(self._rendered_display_lines) < len(self._display_lines):
+            self._rendered_display_lines.append(None)
+        for index, (speaker, text, style) in enumerate(self._display_lines):
+            rendered = self._rendered_display_lines[index]
+            if rendered is None:
+                rendered = self._line(speaker, text, style)
+                self._rendered_display_lines[index] = rendered
+            log.write(rendered)
 
     def _buffer_stream_text(self, name: str, text: str) -> None:
         self._stream_text[name] = self._stream_text.get(name, "") + text
@@ -1026,8 +1260,10 @@ class ChatApp(App):
         if index is None:
             self._stream_line_index[name] = len(self._display_lines)
             self._display_lines.append((name, text, ""))
+            self._rendered_display_lines.append(None)
         else:
             self._display_lines[index] = (name, text, "")
+            self._rendered_display_lines[index] = None
         self._render_display_lines()
 
     def _finish_stream_text(self, name: str) -> None:
@@ -1053,8 +1289,10 @@ class ChatApp(App):
         if index is None:
             self._activity_line_index[command_id] = len(self._display_lines)
             self._display_lines.append(rendered)
+            self._rendered_display_lines.append(None)
         else:
             self._display_lines[index] = rendered
+            self._rendered_display_lines[index] = None
         self._render_display_lines()
 
     def _apply_activity_evictions(self) -> bool:
@@ -1068,6 +1306,7 @@ class ChatApp(App):
             self._activity_line_fingerprint.pop(command_id, None)
             if index is not None:
                 self._display_lines[index] = ("activity", snapshot, "dim")
+                self._rendered_display_lines[index] = None
                 changed = True
         self._discard_stale_activity_selection()
         return changed
@@ -1105,8 +1344,10 @@ class ChatApp(App):
                 self._activity_line_index[command_id] = len(
                     self._display_lines)
                 self._display_lines.append(rendered)
+                self._rendered_display_lines.append(None)
             else:
                 self._display_lines[index] = rendered
+                self._rendered_display_lines[index] = None
             changed = True
         if changed:
             self._render_display_lines()
@@ -1117,10 +1358,26 @@ class ChatApp(App):
     # ---- 消息处理 ----
 
     def _completion_agents(self) -> tuple[tuple[str, str], ...]:
-        agents = [(spec.name, spec.transport.upper())
-                  for spec in self.orch.specs]
+        status_by_name = {
+            item.name: item
+            for item in self.orch.agent_readiness_snapshot()
+        }
+        agents = [
+            (
+                spec.name,
+                f"{spec.transport.upper()} · "
+                f"{status_by_name[spec.name].state.label}",
+            )
+            for spec in self.orch.specs
+        ]
         if all(name != HOST_NAME for name, _ in agents):
-            agents.append((HOST_NAME, "MODERATOR"))
+            host = status_by_name[HOST_NAME]
+            agents.append((
+                HOST_NAME,
+                f"MODERATOR · {host.state.label}",
+            ))
+        agents.sort(
+            key=lambda item: not status_by_name[item[0]].ready)
         return tuple(agents)
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -1216,6 +1473,7 @@ class ChatApp(App):
         text = event.value.strip()
         if not text:
             return
+        original_cursor = event.input.cursor_position
 
         valid_agents = [spec.name for spec in self.orch.specs]
         valid_agents.append(HOST_NAME)
@@ -1228,28 +1486,63 @@ class ChatApp(App):
                 "bold red",
             )
             event.input.value = event.value
-            event.input.cursor_position = len(event.value)
+            event.input.cursor_position = original_cursor
             event.input.focus()
             return
 
-        event.input.value = ""
-        self.close_completion()
         command = local_command_for(text)
         if command is not None:
             # 本地命令必须在持久化/路由之前截获；未注册的 slash 文本仍按
             # 普通消息提交，避免猜测用户语义。
+            event.input.value = ""
+            self.close_completion()
             getattr(self, command.handler)()
             return
+        try:
+            self.orch.require_message_agents(text)
+        except (
+            AgentUnavailableError,
+            DiscussionValidationError,
+            WorkflowValidationError,
+        ) as exc:
+            self._write("system", str(exc), "bold red")
+            event.input.value = event.value
+            event.input.cursor_position = original_cursor
+            event.input.focus()
+            return
+        event.input.value = ""
+        self.close_completion()
         # 不预先显示用户文本/思考状态：等 orchestrator 持久确认
         # （committed 事件）后再显示；append 失败时什么都不出现。
         self._dispatch_from_ui(text)
 
     def action_show_agents(self) -> None:
-        agents = " ".join(
-            f"@{name}({transport})"
-            for name, transport in self._completion_agents()
-        )
-        self._system(f"可用 agent：{agents}")
+        transport_by_name = {
+            spec.name: spec.transport.upper() for spec in self.orch.specs
+        }
+        transport_by_name[HOST_NAME] = "MODERATOR"
+        rows = ["Agent 就绪状态："]
+        for status in self.orch.agent_readiness_snapshot():
+            rows.append(
+                f"@{status.name} · {status.state.label} · "
+                f"{transport_by_name[status.name]}")
+            rows.append(f"  {status.detail}")
+            if not status.ready:
+                rows.append(f"  建议：{status.setup_hint}")
+        rows.append("重新检测：/agents rescan（不会安装或改动任何 agent）")
+        self._system("\n".join(rows))
+
+    def action_rescan_agents(self) -> None:
+        try:
+            if self.session_manager is not None:
+                self.session_manager.refresh_agent_readiness()
+            else:
+                self.orch.refresh_agent_readiness()
+        except Exception as exc:
+            self._write("system", f"重新检测失败：{exc}", "bold red")
+            return
+        self._system("已重新检测；未安装或改动任何 agent")
+        self.action_show_agents()
 
     def action_show_roles(self) -> None:
         roles = self.orch.session_roles
@@ -1502,9 +1795,15 @@ class ChatApp(App):
     def _set_agent_status(
             self, command_id: str, name: str,
             state: str, phase: str = "",
-            *, session_role: str | None = None) -> None:
+            *, session_role: str | None = None,
+            allow_reentry: bool = False) -> None:
         self._ensure_task(command_id).set_agent(
-            name, state, phase, session_role=session_role)
+            name,
+            state,
+            phase,
+            session_role=session_role,
+            allow_reentry=allow_reentry,
+        )
         self._render_task_status()
 
     def _set_workflow_status(self, command_id: str, meta: dict) -> None:
@@ -1743,6 +2042,7 @@ class ChatApp(App):
             handle.cancel()
         self._stream_flush_handles.clear()
         self._display_lines.clear()
+        self._rendered_display_lines.clear()
         self._stream_text.clear()
         self._stream_line_index.clear()
         self._activity_line_index.clear()
@@ -1882,9 +2182,26 @@ class ChatApp(App):
                 if name == HOST_NAME and isinstance(targets, list):
                     self._set_agent_status(
                         command_id, HOST_NAME, "completed", "路由完成")
-                    for target in targets:
+                    collaboration = ev.meta.get("collaboration") is True
+                    for index, target in enumerate(targets):
+                        state = (
+                            "running"
+                            if not collaboration or index == 0 else "queued"
+                        )
+                        phase = (
+                            "准备执行"
+                            if not collaboration or index == 0
+                            else "等待前序步骤"
+                        )
                         self._set_agent_status(
-                            command_id, str(target), "running", "准备执行")
+                            command_id, str(target), state, phase)
+                        if collaboration:
+                            self._activity_feed.record_status(
+                                command_id,
+                                str(target),
+                                phase,
+                                state=state,
+                            )
                 else:
                     self._set_agent_status(
                         command_id, name, "running",
@@ -1894,14 +2211,22 @@ class ChatApp(App):
                     name,
                     "info",
                     ev.text,
-                    state="running",
+                    state=(
+                        "completed"
+                        if name == HOST_NAME and isinstance(targets, list)
+                        else "running"
+                    ),
                 ):
                     self._upsert_activity_card(command_id)
             else:
                 self._system(f"{name}: {ev.text}")
         elif ev.kind == "status":
             self._finish_stream_text(name)
-            if command_id is not None and not ev.meta.get("heartbeat"):
+            preserve_agent_state = (
+                ev.meta.get("collaboration_preserve_agent_state") is True)
+            if (command_id is not None
+                    and not ev.meta.get("heartbeat")
+                    and not preserve_agent_state):
                 self._set_agent_status(
                     command_id,
                     name,
@@ -1912,8 +2237,18 @@ class ChatApp(App):
                         if isinstance(ev.meta.get("session_role"), str)
                         else None
                     ),
+                    allow_reentry=ev.meta.get("collaboration") is True,
                 )
             if command_id is not None:
+                if preserve_agent_state:
+                    if self._activity_feed.record_note(
+                        command_id,
+                        name,
+                        "collaboration",
+                        ev.text,
+                    ):
+                        self._upsert_activity_card(command_id)
+                    return
                 heartbeat = ev.meta.get("heartbeat") is True
                 activity_agent = (
                     str(ev.meta.get("phase") or "任务")

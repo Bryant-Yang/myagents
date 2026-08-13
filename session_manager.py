@@ -15,6 +15,7 @@ from typing import Awaitable, Callable
 
 from adapters.base import AgentEvent, redact_sensitive_text
 from control import CommandBus, ControlServer
+from agent_readiness import AgentReadiness
 from orchestrator import AGENT_SPECS, AgentSpec, Message, Orchestrator
 from session_catalog import (
     SessionCatalog,
@@ -163,6 +164,14 @@ class SessionManager:
         self._clock = clock
         self._enable_control = enable_control
         self._initial_orchestrator = initial_orchestrator
+        self._discover_agents = (
+            initial_orchestrator.discover_agents
+            if initial_orchestrator is not None else False
+        )
+        self._host_probe = (
+            initial_orchestrator.host_readiness_probe
+            if initial_orchestrator is not None else None
+        )
         self._runtimes: dict[str, _Runtime] = {}
         self._drafts: dict[str, tuple[str, int]] = {}
         self._detached_states: dict[str, tuple[str, bool]] = {}
@@ -188,6 +197,27 @@ class SessionManager:
     def active_runtime(self) -> _Runtime:
         return self._runtime(self.active_session_id)
 
+    def refresh_agent_readiness(self) -> tuple[AgentReadiness, ...]:
+        """重扫所有已加载 room；本机 CLI 就绪事实不随会话分叉。"""
+        self._require_started()
+        active_statuses: tuple[AgentReadiness, ...] | None = None
+        errors: list[Exception] = []
+        for room_id, runtime in self._runtimes.items():
+            try:
+                statuses = runtime.orch.refresh_agent_readiness()
+            except Exception as exc:
+                errors.append(exc)
+                continue
+            if room_id == self._active_id:
+                active_statuses = statuses
+        if errors:
+            if len(errors) == 1:
+                raise errors[0]
+            raise ExceptionGroup("部分会话的 agent 重新检测失败", errors)
+        if active_statuses is None:
+            raise RuntimeError("活动会话未完成 agent 重新检测")
+        return active_statuses
+
     async def start(self) -> SessionSnapshot:
         if self._closed:
             raise RuntimeError("SessionManager 已关闭")
@@ -205,6 +235,8 @@ class SessionManager:
                 specs=self._specs,
                 store=store,
                 session_name=self.initial_session_name,
+                discover_agents=self._discover_agents,
+                host_probe=self._host_probe,
             )
             self._build_runtime(summary, orch)
             self._active_id = summary.room_id
@@ -256,6 +288,8 @@ class SessionManager:
                 specs=self._specs,
                 store=store,
                 session_name=summary.session_name,
+                discover_agents=self._discover_agents,
+                host_probe=self._host_probe,
             )
             runtime = self._build_runtime(summary, orch)
             try:

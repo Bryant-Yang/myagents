@@ -4,7 +4,7 @@
 Codex、OpenCode、Qwen Code、WorkBuddy 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M5.1 与 M5 已完成。
+> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M5.1、M5、M6 与 M7 已完成。
 > 共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
 > stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
@@ -41,11 +41,18 @@ Codex、OpenCode、Qwen Code、WorkBuddy 等 coding agent，共享时间线、�
   复用；只有 CLI 明确返回需要认证时才在系统浏览器打开官方登录页，认证等待
   有限超时；不提供 JSONL fallback。
 - `@host`：由只读 Codex adapter 扮演主持人，负责总结和仲裁。
+- Agent 就绪中心：启动时只读取当前进程的 PATH、环境变量和可执行文件属性，
+  不启动或安装 agent。`/agents` 显示注册项的可用状态和设置提示，
+  `/agents rescan` 在用户修复 PATH 或安装后被动重扫；缺失目标会在时间线写入前
+  整条拒绝并保留输入草稿。
 - 无显式 mention：host 用一次调用决定“直接回答”或输出结构化 worker
   路由；直接回答时不再发起第二次 host 调用。
 - 多 agent fan-out：同一消息可同时点名多个 agent，并发执行。
-- 有界讨论：`/discuss` 在一个 command 内安排 2–3 个指定 worker 做 1–3 轮
-  独立提案与交叉评议，再由 `host` 或另一个未参会 worker 最终仲裁。
+- 自然语言有序协作：直接说“先让 A 调研，再让 B 基于结果设计，最后让 C
+  复核并交付”，host 会生成 2–4 步固定计划；Orchestrator 严格串行执行，后一步
+  能看到前序真实回复。无需 `/task`，中间失败或取消后不再启动后续步骤。
+- 有界讨论：可直接说“@A @B 你们讨论两轮……”，或使用 `/discuss` 精确指定
+  参与者、轮数和 moderator；两种入口都复用同一个 2–3 人、1–3 轮状态机。
 - 有界工作流：`/workflow` 固定 reviewer、唯一 implementer 和 verifier，依次
   review → implement → verify；复核不通过时最多一次 repair/reverify，最后由
   host 如实汇总。Git baseline/candidate、execution mode 和失败终态由普通代码
@@ -78,9 +85,13 @@ Codex、OpenCode、Qwen Code、WorkBuddy 等 coding agent，共享时间线、�
 - 执行活动卡：同一任务的路由、阶段、heartbeat、工具与权限过程合并成一张
   原位更新的摘要卡；默认只显示终态、当前阶段和工具汇总。按 `Ctrl+G` 进入
   活动区，使用 `↑↓` 选择、`Enter` 独立展开或收起当前卡、`Esc` 返回输入框；
-  `/details` 可直接切换当前选中卡，否则切换最近一张卡。用户消息、agent 回复和失败仍保持在聊天主线上，
+  `/details` 可直接切换当前选中卡，否则切换最近一张卡。用户消息、agent 回复
+  和失败仍保持在聊天主线上，
   会话切走和后台完成不会丢卡；近期明细有界保留，独立执行日志继续完整记录
   状态迁移。
+- 聊天正文呈现：agent/host 回复中的加粗、斜体、行内代码、标题、列表、引用与
+  fenced code block 会转换成安全的终端样式，不再显示 Markdown 控制符；用户
+  输入、系统状态和活动卡保持原文，流式回复仍原位合并。
 - 明确委托：host 路由同时给每个 worker 生成完整 task，消解“你/让 Kimi”
   等角色关系，并直接注入本轮 prompt，不再只显示路由理由。
 - 权限弹窗：显示来源 agent、工具标题、命令上下文和 agent 提供的 options。
@@ -154,6 +165,10 @@ WorkBuddy 当前固定使用官方文档中的中国区环境 `internal`。连�
 只使用某一个 agent 时，不要求安装其他 worker CLI；但无 mention 路由和
 `@host` 当前依赖 Codex CLI。
 
+myagents 不会自动安装、卸载或修改这些 CLI。聊天室启动后可输入 `/agents`
+查看“当前进程检测到的状态”；完成外部安装或 PATH 调整后输入
+`/agents rescan` 即可，无需重启聊天室。
+
 ## 快速开始
 
 ```bash
@@ -210,18 +225,33 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
 @kimi 解释这个模块，并给出最小修改方案
 @codex review 当前实现，只报告可复现问题
 @kimi @opencode 分别提出一个方案
+先让 @kimi 调研现状，再让 @opencode 基于结果提出方案，最后让 @qwen 复核并交付
 @qwen 检查当前模块并给出最小修复
 @qwen 接下来担任产品研究员，汇总现有证据并列出未知项
 @host 总结上面两个方案的分歧
+@kimi @opencode 你们讨论两轮为什么这个方案有风险
 /discuss @kimi @opencode --rounds 2 --moderator host -- 讨论新增 adapter 的协议选择
 /workflow --reviewer @kimi --implementer @codex -- 给解析器补边界测试并验收
 /steer -- 额外覆盖空输入，保持现有公开 API
 ```
 
-`/discuss` 默认两轮、默认由 `host` 主持。参与者必须是 2–3 个不同 worker，
-主持人不能同时参会；轮次由 Orchestrator 的普通代码推进，agent 不能自行加轮或
-拉人。讨论模式只要求文字观点，不用于并发修改代码。MCP/API 也可把主题写在
-首行参数后的下一行。完整契约见
+自然语言协作与普通多点名是两种不同语义：`一起、分别、各自` 保持并发 fan-out；
+明确的“先…再/然后…最后…”进入有序接力。未点名时 host 也可在 ready worker
+闭集内识别有序计划；显式点名时参与者闭集不可增删。计划固定为 2–4 步且至少
+两个不同 worker，同一 worker 可在后续再次修订。整个接力只有一个 command 和
+一条 user timeline，失败/取消即停，不自动重试、换人、跳步或追加 host 总结。
+最后一步直接产生面向用户的交付。完整契约见
+[ADR-0013](docs/adr/0013-natural-language-sequential-collaboration.md)。
+
+自然语言中的“你们讨论、辩论、互相点评、交叉评议”会进入有界讨论；显式点名
+固定 2–3 个参与者，未点名时 host 只能从 ready worker 中选择。默认两轮并由
+`host` 总结，用户可明确说一至三轮。`一起分析、分别回答、各自给建议` 以及
+`不要/不用讨论` 等否定表达仍是一次 fan-out；明确“先 A 再 B”优先进入有序
+协作。需要精确自定义 moderator 时继续使用
+`/discuss`。自然语言轮数建议写成“讨论三轮：主题”；`三轮融资/一轮明月` 等
+无边界复合词会保留为主题并使用默认两轮。两种入口的轮次都由普通代码推进，
+agent 不能自行加轮或拉人；讨论
+只要求文字观点，不用于并发修改代码。完整契约见
 [ADR-0008](docs/adr/0008-bounded-multi-agent-discussion.md)。
 
 `/workflow` 只接受干净 Git 工作区；reviewer/verifier 默认只读，只有固定的
@@ -253,13 +283,14 @@ implementer 可写。未指定 `--verifier` 时由 reviewer 复核。`/steer` �
 路由规则：
 
 1. 显式 `@agent` 永远优先。
-2. 同一条消息中的多个有效 mention 会并发派发。
+2. 同一条消息中的多个有效 mention 默认并发；明确讨论意图时进入有界讨论，
+   明确跨 agent 先后关系时进入有序协作。
 3. 不带 mention 时，host 在一次调用中直接回答，或根据最近对话选择
    1–2 个 worker；自然语言内容不由本地关键词白名单判断。
 4. 单个 agent 失败会写入时间线，不会中断其他 agent；fan-out 全部收尾后，
    只要任一 worker 失败，该 command 终态就是 `failed`。
-5. `/discuss` 同轮并发、跨轮串行；失败参与者不自动重试，主持人仍总结已有
-   证据，但不能把失败 command 洗成 completed。
+5. 自然语言讨论与 `/discuss` 复用同一状态机：同轮并发、跨轮串行；失败参与者
+   不自动重试，主持人仍总结已有证据，但不能把失败 command 洗成 completed。
 6. `/workflow` 固定阶段串行推进，任何阶段、Git 漂移或最终汇总失败都会保留
    独立失败证据，host 不能把失败洗成 completed。
 
@@ -487,6 +518,7 @@ myagents/
 - [docs/adr/0009-bounded-milestone-workflow-steering.md](docs/adr/0009-bounded-milestone-workflow-steering.md)：有界里程碑 workflow 与 steering。
 - [docs/adr/0010-multi-session-tui-management.md](docs/adr/0010-multi-session-tui-management.md)：会话目录、后台任务、资源上限与图片短引用。
 - [docs/adr/0011-session-scoped-natural-language-roles.md](docs/adr/0011-session-scoped-natural-language-roles.md)：自然语言指定、会话生命周期与安全边界。
+- [docs/adr/0013-natural-language-sequential-collaboration.md](docs/adr/0013-natural-language-sequential-collaboration.md)：自然语言固定计划、串行接力与失败收口。
 - [docs/concepts.md](docs/concepts.md)：相关协议与编排模式。
 - [docs/knowledge-map.html](docs/knowledge-map.html)：可交互知识地图。
 
@@ -505,10 +537,11 @@ myagents/
 - [x] M4.5：OpenCode ACP-first + ask-by-default 权限 + 隔离只读 JSONL fallback。
 - [x] M4.6：Qwen Code ACP-only、default/plan profile 与 TUI 点名接入。
 - [x] M4.7：多项目会话目录、后台执行、资源 gate、未读通知与图片短引用。
-- [x] M5.1：`/discuss` 指定成员、1–3 轮有界讨论与终局 moderator。
+- [x] M5.1：自然语言或 `/discuss` 进入 1–3 轮有界讨论与终局 moderator。
 - [x] M5：干净 Git fixed point、review → 单 writer 修改 → 独立复核、最多
   一次 repair/reverify、阶段边界 steering 与 TUI 阶段状态。
 - [x] M6：自然语言指定会话级角色、跨任务持续、房间隔离与状态可见。
+- [x] M7：自然语言 2–4 步有序协作、前序结果接力、失败/取消即停。
 - [ ] Later：只有出现跨机器、跨组织 agent 协作需求时再评估 A2A。
 
 ## 当前限制

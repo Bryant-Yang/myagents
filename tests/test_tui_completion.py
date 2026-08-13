@@ -11,8 +11,10 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 from adapters.base import AgentEvent
+from agent_readiness import AgentReadiness, ReadinessState
 from main import ChatApp, ComposerInput
 from host import HostDecision
+from orchestrator import AgentSpec, Orchestrator
 from session_roles import SessionRole, SessionRoleChanges
 from test_basic import make_orch
 from tui_completion import (
@@ -57,6 +59,7 @@ def test_completion_parser_and_command_boundary() -> None:
     assert local_command_for("/steer") is not None
     assert local_command_for("/roles").description == "查看当前会话角色"
     assert local_command_for("/roles clear").description == "清空当前会话角色"
+    assert local_command_for("/agents rescan").description == "重新检测本机 agent"
     assert local_command_for("/details").description == "展开或收起当前活动卡"
     assert local_command_for("/discuss @kimi @opencode -- 主题") is None
     assert local_command_for(
@@ -187,6 +190,138 @@ def test_slash_commands_unknown_agent_and_submit_behaviour() -> None:
     print("ok  /command 补全/本地执行/未知 agent/命令误判")
 
 
+def test_agent_readiness_status_rescan_and_draft_preservation() -> None:
+    from textual.widgets import RichLog
+
+    class Adapter:
+        session_id = None
+
+        async def stream(self, _prompt, _workdir):
+            yield AgentEvent("text", "ok")
+            yield AgentEvent("done")
+
+    states = {
+        "ready": ReadinessState.READY,
+        "missing": ReadinessState.NOT_FOUND,
+    }
+
+    def probe(name: str):
+        return lambda: AgentReadiness(
+            name,
+            states[name],
+            "fake 已找到" if states[name] is ReadinessState.READY
+            else "当前进程 PATH 未检测到 fake",
+            f"安装 fake {name}",
+            f"/tmp/fake-{name}"
+            if states[name] is ReadinessState.READY else None,
+        )
+
+    specs = (
+        AgentSpec("missing", "acp", Adapter, probe("missing")),
+        AgentSpec("ready", "jsonl", Adapter, probe("ready")),
+    )
+    orch = Orchestrator(
+        ".",
+        specs=specs,
+        persistent=False,
+        discover_agents=True,
+        host_probe=lambda: AgentReadiness(
+            "host", ReadinessState.READY, "fake host", "setup host"),
+    )
+
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test() as pilot:
+            box = app.query_one("#composer", ComposerInput)
+            completion = app._completion_agents()
+            assert [name for name, _ in completion] == [
+                "ready", "host", "missing"]
+            assert "可用" in completion[0][1]
+            assert "未检测到 CLI" in completion[-1][1]
+
+            box.value = "@missing 请处理"
+            original_cursor = len("@missing 请")
+            box.cursor_position = original_cursor
+            await pilot.press("enter")
+            await pilot.pause()
+            assert box.value == "@missing 请处理"
+            assert box.cursor_position == original_cursor
+            assert box.has_focus
+            assert orch.history == []
+
+            states["missing"] = ReadinessState.READY
+            box.value = "/agents rescan"
+            box.cursor_position = len(box.value)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert box.value == ""
+            assert orch.history == []
+            assert [name for name, _ in app._completion_agents()] == [
+                "missing", "ready", "host"]
+            rendered = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines)
+            assert "Agent 就绪状态" in rendered
+            assert "@missing · 可用" in rendered
+            assert "未安装或改动任何 agent" in rendered
+
+    asyncio.run(run())
+    print("ok  Agent 状态/重新检测/缺失目标草稿保留")
+
+
+def test_tui_starts_with_zero_or_all_fake_clis() -> None:
+    class Adapter:
+        session_id = None
+
+        async def stream(self, _prompt, _workdir):
+            yield AgentEvent("done")
+
+    async def scenario(state: ReadinessState, expected: str) -> None:
+        created: list[str] = []
+
+        def factory(name: str):
+            def build():
+                created.append(name)
+                return Adapter()
+            return build
+
+        def probe(name: str):
+            return lambda: AgentReadiness(
+                name,
+                state,
+                "fake ready" if state is ReadinessState.READY
+                else "当前进程 PATH 未检测到 fake",
+                "安装 fake",
+            )
+
+        specs = tuple(
+            AgentSpec(name, "acp", factory(name), probe(name))
+            for name in ("one", "two")
+        )
+        orch = Orchestrator(
+            ".",
+            specs=specs,
+            persistent=False,
+            discover_agents=True,
+            host_probe=probe("host"),
+        )
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert expected in "\n".join(
+                text for _speaker, text, _style in app._display_lines)
+            if state is ReadinessState.READY:
+                assert created == ["one", "two"]
+            else:
+                assert created == []
+
+    async def run() -> None:
+        await scenario(ReadinessState.NOT_FOUND, "已就绪 0/3")
+        await scenario(ReadinessState.READY, "已就绪 3/3")
+
+    asyncio.run(run())
+    print("ok  零 CLI/全 CLI fake 环境均可启动 TUI")
+
+
 def test_roles_commands_view_and_clear_without_dispatch() -> None:
     from textual.widgets import RichLog
 
@@ -307,6 +442,8 @@ if __name__ == "__main__":
     test_completion_parser_and_command_boundary()
     test_agent_completion_keyboard_and_focus()
     test_slash_commands_unknown_agent_and_submit_behaviour()
+    test_agent_readiness_status_rescan_and_draft_preservation()
+    test_tui_starts_with_zero_or_all_fake_clis()
     test_roles_commands_view_and_clear_without_dispatch()
     test_roles_clear_waits_for_current_command_boundary()
     print("\nTUI completion 全部通过")

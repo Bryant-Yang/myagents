@@ -169,8 +169,124 @@ def test_interrupted_execution_restores_into_status_panel() -> None:
     print("ok  重启中断任务恢复到固定状态栏")
 
 
+def test_collaboration_status_queues_future_steps_and_allows_reentry() -> None:
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=make_orch())
+        async with app.run_test() as pilot:
+            command_id = "cmd-collaboration"
+            app._on_agent_event("user", AgentEvent(
+                "committed",
+                "先调查，再审查，最后修订",
+                {"command_id": command_id},
+            ))
+            app._on_agent_event("host", AgentEvent(
+                "info",
+                "协作计划 → kimi → opencode → kimi",
+                {
+                    "command_id": command_id,
+                    "route_targets": ["kimi", "opencode"],
+                    "collaboration_steps": ["kimi", "opencode", "kimi"],
+                    "collaboration": True,
+                    "collaboration_total": 3,
+                },
+            ))
+            progress = app._task_progresses[command_id]
+            assert progress.agents["kimi"].state == "running"
+            assert progress.agents["opencode"].state == "queued"
+            assert progress.agents["opencode"].phase == "等待前序步骤"
+
+            app._on_agent_event("kimi", AgentEvent(
+                "done", meta={
+                    "command_id": command_id,
+                    "collaboration": True,
+                    "collaboration_step": 1,
+                    "collaboration_total": 3,
+                },
+            ))
+            assert progress.agents["kimi"].state == "completed"
+            app._on_agent_event("kimi", AgentEvent(
+                "status",
+                "协作第 3/3 步：已接收任务，准备执行",
+                {
+                    "command_id": command_id,
+                    "agent_state": "running",
+                    "phase": "协作 3/3",
+                    "collaboration": True,
+                    "collaboration_step": 3,
+                    "collaboration_total": 3,
+                },
+            ))
+            assert progress.agents["kimi"].state == "running"
+            assert progress.agents["kimi"].phase == "协作 3/3"
+            app._on_agent_event("opencode", AgentEvent(
+                "status",
+                "协作第 2/3 步未执行：前序步骤失败",
+                {
+                    "command_id": command_id,
+                    "agent_state": "skipped",
+                    "phase": "因前序失败未执行",
+                    "collaboration": True,
+                    "collaboration_step": 2,
+                    "collaboration_total": 3,
+                },
+            ))
+            assert progress.agents["opencode"].state == "skipped"
+            await pilot.pause()
+            panel = str(app.query_one("#task-status").render())
+            assert "kimi 进行中 · 协作 3/3" in panel
+            assert "opencode 未执行 · 因前序失败未执行" in panel, panel
+
+    asyncio.run(run())
+    print("ok  有序协作 TUI 排队与重复 agent 再进入")
+
+
+def test_future_duplicate_skipped_does_not_overwrite_executed_truth() -> None:
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=make_orch())
+        async with app.run_test():
+            for command_id, executed_state in (
+                ("cmd-duplicate-completed", "completed"),
+                ("cmd-duplicate-cancelled", "cancelled"),
+            ):
+                app._on_agent_event("user", AgentEvent(
+                    "committed", "重复 agent 协作",
+                    {"command_id": command_id},
+                ))
+                app._on_agent_event("kimi", AgentEvent(
+                    "status", "已发生步骤终态", {
+                        "command_id": command_id,
+                        "agent_state": executed_state,
+                        "phase": "首个步骤已结束",
+                        "collaboration": True,
+                        "collaboration_step": 1,
+                        "collaboration_total": 3,
+                    },
+                ))
+                app._on_agent_event("kimi", AgentEvent(
+                    "status", "协作第 3/3 步未执行：前序停止", {
+                        "command_id": command_id,
+                        "agent_state": "skipped",
+                        "phase": "因前序失败未执行",
+                        "collaboration": True,
+                        "collaboration_step": 3,
+                        "collaboration_total": 3,
+                        "collaboration_preserve_agent_state": True,
+                    },
+                ))
+                progress = app._task_progresses[command_id]
+                assert progress.agents["kimi"].state == executed_state
+                card = app._activity_feed.render(command_id, expanded=True)
+                assert "协作第 3/3 步未执行" in card
+                assert "已发生步骤终态" in card, card
+
+    asyncio.run(run())
+    print("ok  重复 agent 的未来 skipped 不覆盖已执行终态")
+
+
 if __name__ == "__main__":
     test_partial_completion_keeps_per_agent_truth()
     test_tui_status_panel_tracks_agent_lifecycle()
     test_interrupted_execution_restores_into_status_panel()
+    test_collaboration_status_queues_future_steps_and_allows_reentry()
+    test_future_duplicate_skipped_does_not_overwrite_executed_truth()
     print("\nTUI status 全部通过")

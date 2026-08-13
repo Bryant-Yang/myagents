@@ -1,15 +1,16 @@
-"""Bounded, deterministic multi-agent discussion command.
+"""Bounded, deterministic multi-agent discussion routing.
 
-``/discuss`` is parsed by ordinary code and executed by the Orchestrator.  The
-models only produce each round's content; they never decide who speaks next or
-whether another round should run.
+Natural-language discussion intent and ``/discuss`` converge on the same
+Orchestrator state machine.  Models only produce each round's content; they
+never decide who speaks next or whether another round should run.
 """
 
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Mapping, Sequence
 
 
 MIN_DISCUSSION_PARTICIPANTS = 2
@@ -20,6 +21,29 @@ DEFAULT_DISCUSSION_ROUNDS = 2
 DEFAULT_DISCUSSION_MODERATOR = "host"
 MAX_DISCUSSION_TOPIC_CHARS = 3000
 
+_NATURAL_DISCUSSION_CUE_RE = re.compile(
+    r"(?:你们|大家)?\s*(?:一起|来)?\s*"
+    r"(?:讨论|辩论|交锋)(?:一下)?"
+    r"|(?:互相|相互)\s*(?:讨论|点评|质疑|评议)"
+    r"|交叉评议|达成共识",
+    re.IGNORECASE,
+)
+_NEGATED_DISCUSSION_CUE_RE = re.compile(
+    r"(?:你们|大家)?\s*"
+    r"(?:不要|不用|不必|无需|别(?:再)?|停止|取消|不需要|不想|不是(?:要|让)?)"
+    r"\s*(?:你们|大家)?\s*(?:一起|来)?\s*"
+    r"(?:讨论|辩论|交锋|(?:互相|相互)\s*(?:讨论|点评|质疑|评议)|"
+    r"交叉评议|达成共识)",
+    re.IGNORECASE,
+)
+_NATURAL_DISCUSSION_ROUNDS_RE = re.compile(
+    r"(?P<rounds>[零〇一二两三四五六七八九十百千万亿\d]+)\s*"
+    r"轮(?=$|[\s：:，,。；;、]|关于|围绕|针对|这个|该|是否|为什么|为何|"
+    r"如何|怎样|怎么)"
+)
+_MENTION_RE = re.compile(r"(?<!\w)@(?P<name>\w+)")
+_CHINESE_ROUNDS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4}
+
 DISCUSSION_USAGE = (
     "/discuss @agent1 @agent2 [@agent3] "
     "[--rounds 1..3] [--moderator host|agent] -- 讨论主题\n"
@@ -28,7 +52,7 @@ DISCUSSION_USAGE = (
 
 
 class DiscussionValidationError(ValueError):
-    """The user supplied a ``/discuss`` command with invalid structure."""
+    """A discussion request has invalid structure or exceeds fixed bounds."""
 
 
 @dataclass(frozen=True)
@@ -37,6 +61,128 @@ class DiscussionRequest:
     rounds: int
     moderator: str
     topic: str
+
+
+def parse_discussion_payload(
+        payload: object,
+        allowed_workers: Sequence[str],
+        *,
+        host_name: str = DEFAULT_DISCUSSION_MODERATOR,
+        require_all: Sequence[str] = (),
+) -> DiscussionRequest:
+    """校验 host 返回的自然语言讨论意图；候选名单是权限边界。"""
+    if not isinstance(payload, Mapping):
+        raise DiscussionValidationError("讨论意图必须是 JSON object")
+    raw_participants = payload.get("participants")
+    if not isinstance(raw_participants, list):
+        raise DiscussionValidationError("讨论意图 participants 必须是 array")
+    allowed = set(allowed_workers)
+    participants: list[str] = []
+    for name in raw_participants:
+        if not isinstance(name, str) or name not in allowed:
+            raise DiscussionValidationError("讨论意图包含未知或未就绪参与者")
+        if name in participants:
+            raise DiscussionValidationError("讨论意图参与者不得重复")
+        participants.append(name)
+    if not MIN_DISCUSSION_PARTICIPANTS <= len(participants) \
+            <= MAX_DISCUSSION_PARTICIPANTS:
+        raise DiscussionValidationError(
+            "讨论意图参与者数量必须是 "
+            f"{MIN_DISCUSSION_PARTICIPANTS}..{MAX_DISCUSSION_PARTICIPANTS}"
+        )
+    if require_all and set(participants) != set(require_all):
+        raise DiscussionValidationError("讨论意图必须使用全部已点名参与者")
+
+    rounds = payload.get("rounds", DEFAULT_DISCUSSION_ROUNDS)
+    if type(rounds) is not int or not MIN_DISCUSSION_ROUNDS <= rounds \
+            <= MAX_DISCUSSION_ROUNDS:
+        raise DiscussionValidationError(
+            "讨论意图轮数必须是 "
+            f"{MIN_DISCUSSION_ROUNDS}..{MAX_DISCUSSION_ROUNDS}"
+        )
+    moderator = payload.get("moderator", host_name)
+    if moderator != host_name:
+        raise DiscussionValidationError("自然语言讨论固定由 host 总结")
+    topic = payload.get("topic")
+    if not isinstance(topic, str) or not topic.strip():
+        raise DiscussionValidationError("讨论意图 topic 不能为空")
+    topic = topic.strip()
+    if len(topic) > MAX_DISCUSSION_TOPIC_CHARS:
+        raise DiscussionValidationError(
+            f"讨论意图 topic 不能超过 {MAX_DISCUSSION_TOPIC_CHARS} 个字符"
+        )
+    return DiscussionRequest(tuple(participants), rounds, moderator, topic)
+
+
+def parse_natural_discussion_request(
+        text: str,
+        participants: Iterable[str],
+        *,
+        host_name: str = DEFAULT_DISCUSSION_MODERATOR,
+) -> DiscussionRequest | None:
+    """把明确的多 mention 讨论表达收口到既有有界状态机。
+
+    本函数只负责保守触发和确定性边界，不选择参与者。调用方必须先按显式
+    mention 固定闭集；普通的“一起分析/分别回答”不会进入讨论。
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    members = tuple(dict.fromkeys(participants))
+    if _NEGATED_DISCUSSION_CUE_RE.search(text) is not None:
+        return None
+    cue = _NATURAL_DISCUSSION_CUE_RE.search(text)
+    if cue is None:
+        return None
+    mentioned = tuple(dict.fromkeys(
+        match.group("name") for match in _MENTION_RE.finditer(text)))
+    unknown = tuple(name for name in mentioned if name not in members)
+    if unknown:
+        raise DiscussionValidationError(
+            "自然语言讨论包含未知参与者："
+            + "、".join(f"@{name}" for name in unknown)
+        )
+    if len(members) < MIN_DISCUSSION_PARTICIPANTS:
+        return None
+    if host_name in members:
+        raise DiscussionValidationError(
+            "自然语言讨论的 host 只能总结，不能同时作为参与者"
+        )
+    if len(members) > MAX_DISCUSSION_PARTICIPANTS:
+        raise DiscussionValidationError(
+            "自然语言讨论参与者数量必须是 "
+            f"{MIN_DISCUSSION_PARTICIPANTS}..{MAX_DISCUSSION_PARTICIPANTS}"
+        )
+
+    round_matches = list(_NATURAL_DISCUSSION_ROUNDS_RE.finditer(text))
+    rounds = DEFAULT_DISCUSSION_ROUNDS
+    if round_matches:
+        values: list[int] = []
+        for match in round_matches:
+            raw = match.group("rounds")
+            value = int(raw) if raw.isdigit() else _CHINESE_ROUNDS.get(raw, 0)
+            values.append(value)
+        if len(set(values)) != 1:
+            raise DiscussionValidationError("自然语言讨论包含冲突的轮数")
+        rounds = values[0]
+    if not MIN_DISCUSSION_ROUNDS <= rounds <= MAX_DISCUSSION_ROUNDS:
+        raise DiscussionValidationError(
+            "自然语言讨论轮数必须是 "
+            f"{MIN_DISCUSSION_ROUNDS}..{MAX_DISCUSSION_ROUNDS}"
+        )
+
+    topic = _MENTION_RE.sub(" ", text)
+    topic = _NATURAL_DISCUSSION_CUE_RE.sub(" ", topic, count=1)
+    topic = _NATURAL_DISCUSSION_ROUNDS_RE.sub(" ", topic)
+    topic = " ".join(topic.split())
+    topic = re.sub(r"^(?:请|让)\s*", "", topic)
+    topic = topic.strip(" ：:，,。；;—-")
+    if not topic:
+        raise DiscussionValidationError("自然语言讨论主题不能为空")
+    if len(topic) > MAX_DISCUSSION_TOPIC_CHARS:
+        raise DiscussionValidationError(
+            f"自然语言讨论主题不能超过 {MAX_DISCUSSION_TOPIC_CHARS} 个字符"
+        )
+    return DiscussionRequest(members, rounds, host_name, topic)
 
 
 def parse_discussion_request(

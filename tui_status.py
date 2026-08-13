@@ -21,9 +21,10 @@ _AGENT_LABELS = {
     "failed": "失败",
     "cancelled": "已取消",
     "interrupted": "已中断",
+    "skipped": "未执行",
 }
 _TERMINAL_AGENT_STATES = {
-    "completed", "failed", "cancelled", "interrupted",
+    "completed", "failed", "cancelled", "interrupted", "skipped",
 }
 
 
@@ -58,13 +59,16 @@ class TaskProgress:
         phase: str = "",
         *,
         session_role: str | None = None,
+        allow_reentry: bool = False,
     ) -> None:
         current = self.agents.get(name)
         # 迟到的普通状态或 done 不得把已经记录的失败洗掉。
         if current is not None and current.state == "failed" \
                 and state != "failed":
             return
-        if current is not None and current.state in _TERMINAL_AGENT_STATES \
+        if not allow_reentry \
+                and current is not None \
+                and current.state in _TERMINAL_AGENT_STATES \
                 and state in {"queued", "running", "waiting_permission"}:
             return
         clean_phase = " ".join(str(phase).split())[:120]

@@ -20,7 +20,12 @@ from main import (
 from orchestrator import AgentSpec, Orchestrator
 from adapters.base import AgentEvent, ExecutionMode
 from storage.store import RoomStore
-from textual.widgets import Input, RichLog, Static
+from textual.widgets import Input, OptionList, RichLog, Static
+
+
+def _picker_text(screen: SessionPickerScreen) -> str:
+    options = screen.query_one("#session-options", OptionList)
+    return "\n".join(str(option.prompt) for option in options.options)
 
 
 def test_ctrl_o_opens_searchable_current_project_picker() -> None:
@@ -37,7 +42,11 @@ def test_ctrl_o_opens_searchable_current_project_picker() -> None:
                 state_root=state_root,
                 session_name="talk",
             )
-            talk.append("user", "讨论 Qwen 本地模型")
+            talk.append(
+                "user",
+                "讨论 Qwen 本地模型 "
+                "[图片附件：/Users/example/a/very/long/path/image.png]",
+            )
             orch = Orchestrator(str(workdir), store=default)
             app = ChatApp(workdir=str(workdir), orchestrator=orch)
 
@@ -45,21 +54,91 @@ def test_ctrl_o_opens_searchable_current_project_picker() -> None:
                 await pilot.press("ctrl+o")
                 await pilot.pause()
                 assert isinstance(app.screen, SessionPickerScreen)
-                rendered = str(
-                    app.screen.query_one("#session-options", Static).content
-                )
+                rendered = _picker_text(app.screen)
                 assert "default" in rendered, rendered
                 assert "talk" in rendered
                 assert "讨论 Qwen 本地模型" in rendered
+                assert "● 空闲" in rendered
+                assert "当前" in rendered
+                assert "[图片]" in rendered
+                assert "/Users/example" not in rendered
+
+                options = app.screen.query_one("#session-options", OptionList)
+                session_options = [
+                    option for option in options.options
+                    if option.id in {
+                        default.room_id,
+                        talk.room_id,
+                    }
+                ]
+                assert all(
+                    str(option.prompt).count("\n") == 1
+                    for option in session_options
+                )
+                assert app.screen.selected().summary.room_id == default.room_id
+                selected_before = app.screen.selected().summary.room_id
+                await pilot.press("down")
+                assert app.screen.selected().summary.room_id != selected_before
+                assert options.highlighted_option.id \
+                    == app.screen.selected().summary.room_id
 
                 search = app.screen.query_one("#session-search", Input)
                 search.value = "qwen"
                 await pilot.pause()
-                filtered = str(
-                    app.screen.query_one("#session-options", Static).content
-                )
+                filtered = _picker_text(app.screen)
                 assert "talk" in filtered
                 assert "default" not in filtered
+
+    asyncio.run(run())
+
+
+def test_picker_keeps_two_line_rows_and_scrolls_in_narrow_terminals() -> None:
+    async def run() -> None:
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "project"
+            workdir.mkdir()
+            state_root = root / "state"
+            first: RoomStore | None = None
+            for index in range(12):
+                store = RoomStore(
+                    workdir,
+                    state_root=state_root,
+                    session_name=f"session-{index}",
+                )
+                store.set_session_title(
+                    f"第 {index + 1} 个窄窗口会话",
+                    pending=False,
+                )
+                store.append(
+                    "user",
+                    "@kimi @opencode 一段很长的预览，"
+                    "不应该把会话卡片挤成第三行",
+                )
+                first = first or store
+            assert first is not None
+            orch = Orchestrator(
+                str(workdir),
+                store=first,
+                session_name=first.session_name,
+            )
+            app = ChatApp(workdir=str(workdir), orchestrator=orch)
+
+            async with app.run_test(size=(80, 28)) as pilot:
+                await pilot.press("ctrl+o")
+                await pilot.pause()
+                options = app.screen.query_one(
+                    "#session-options", OptionList
+                )
+                assert options.option_count == 12
+                assert options.virtual_size.height == 24
+                initial = options.highlighted
+                assert initial is not None
+                for _ in range(10):
+                    await pilot.press("down")
+                await pilot.pause()
+                assert options.highlighted == (initial + 10) % 12
+                assert options.scroll_y > 0
 
     asyncio.run(run())
 
@@ -212,14 +291,10 @@ def test_picker_can_search_all_projects_grouped_by_workdir() -> None:
                 search = app.screen.query_one("#session-search", Input)
                 search.value = "跨项目检索词"
                 await pilot.pause()
-                assert "没有匹配" in str(
-                    app.screen.query_one("#session-options", Static).content
-                )
+                assert "没有匹配" in _picker_text(app.screen)
                 await pilot.press("tab")
                 await pilot.pause()
-                rendered = str(
-                    app.screen.query_one("#session-options", Static).content
-                )
+                rendered = _picker_text(app.screen)
                 assert "beta" in rendered
                 assert str(other_workdir.resolve()) in rendered
 
@@ -399,6 +474,7 @@ def test_background_external_cancel_resolves_its_permission_future() -> None:
 
 if __name__ == "__main__":
     test_ctrl_o_opens_searchable_current_project_picker()
+    test_picker_keeps_two_line_rows_and_scrolls_in_narrow_terminals()
     test_picker_switches_history_and_restores_per_session_drafts()
     test_ctrl_n_creates_untitled_session_without_name_dialog()
     test_picker_renames_and_exact_title_deletes_inactive_session()

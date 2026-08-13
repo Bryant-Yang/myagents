@@ -37,7 +37,9 @@ class FakeHost(FakeAdapter):
         self.decide_calls = 0
         self.route = HostDecision(["kimi"], "测试路由")
 
-    async def decide(self, transcript: str, workdir: str, on_event=None):
+    async def decide(
+        self, transcript: str, workdir: str, on_event=None, *, choices=None,
+    ):
         self.decide_calls += 1
         return self.route
 
@@ -179,7 +181,9 @@ def test_transcript_snapshot() -> None:
     gate = asyncio.Event()
 
     async def run() -> None:
-        async def decide_slow(transcript: str, workdir: str, on_event=None):
+        async def decide_slow(
+            transcript: str, workdir: str, on_event=None, *, choices=None,
+        ):
             await gate.wait()  # 模拟 codex 路由要几秒钟
             return HostDecision(["kimi"], "慢路由")
         orch.host.decide = decide_slow
@@ -203,7 +207,9 @@ def test_decide_failure_fallback() -> None:
     """P2 回归：host 路由抛异常 → error 事件 + 确定性回退到第一个工人。"""
     orch = make_orch()
 
-    async def boom(transcript: str, workdir: str, on_event=None):
+    async def boom(
+        transcript: str, workdir: str, on_event=None, *, choices=None,
+    ):
         raise RuntimeError("codex 挂了")
     orch.host.decide = boom
 
@@ -220,7 +226,9 @@ def test_persistent_failure() -> None:
     """P2 契约回归：路由和工人持续故障时，history 诚实记录"调用失败"。"""
     orch = make_orch()
 
-    async def boom(transcript: str, workdir: str, on_event=None):
+    async def boom(
+        transcript: str, workdir: str, on_event=None, *, choices=None,
+    ):
         raise RuntimeError("codex 挂了")
     orch.host.decide = boom
 
@@ -287,7 +295,9 @@ def test_host_decide_surfaces_safe_progress_events() -> None:
 def test_host_progress_sink_failure_propagates() -> None:
     """host 进度写盘失败必须停止派发，不能伪装成路由失败继续执行。"""
     class ProgressHost(FakeHost):
-        async def decide(self, transcript: str, workdir: str, on_event=None):
+        async def decide(
+            self, transcript: str, workdir: str, on_event=None, *, choices=None,
+        ):
             assert on_event is not None
             on_event(AgentEvent("status", "内部进度"))
             return HostDecision(["kimi"], "不应继续")
@@ -507,6 +517,126 @@ def test_tui_coalesces_stream_chunks() -> None:
     print("ok  TUI 合并同一回复的流式 chunk")
 
 
+def test_tui_renders_agent_markdown_without_visible_delimiters() -> None:
+    """Agent 的常用 Markdown 应转成终端样式，而不是泄露控制符。"""
+    from textual.widgets import Input, RichLog
+    from main import ChatApp
+    from tui_markdown import render_chat_markdown
+
+    class MarkdownAdapter(FakeAdapter):
+        async def stream(self, prompt: str, workdir: str):
+            yield AgentEvent("text", "**共识：** 保留探索，使用 `KPI` 验证。\n")
+            yield AgentEvent("text", "## 关键分歧\n- 供给侧\n> 玩家侧")
+            yield AgentEvent("done")
+
+    async def run() -> None:
+        orch = make_orch()
+        orch.adapters["kimi"] = MarkdownAdapter("kimi")
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test() as pilot:
+            box = app.query_one(Input)
+            box.value = "@kimi 测试 Markdown 显示"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            lines = [
+                line.text for line in app.query_one(RichLog).lines
+                if str(line.text).startswith("[kimi] ")
+                or str(line.text).startswith("关键分歧")
+                or str(line.text).startswith("• ")
+                or str(line.text).startswith("│ ")
+            ]
+            plain = "\n".join(str(line) for line in lines)
+            assert "**" not in plain and "`" not in plain and "##" not in plain
+            assert "[kimi] 共识： 保留探索，使用 KPI 验证。" in plain
+            assert "关键分歧\n• 供给侧\n│ 玩家侧" in plain
+            rendered = render_chat_markdown(
+                "**共识：** 保留探索，使用 `KPI` 验证。")
+            styles = {str(span.style) for span in rendered.spans}
+            assert "bold" in styles
+            assert "bold cyan on grey15" in styles
+            chinese_emphasis = render_chat_markdown(
+                "这是**重点**内容，中文*强调*中文。")
+            assert chinese_emphasis.plain == "这是重点内容，中文强调中文。"
+            assert [str(span.style) for span in chinese_emphasis.spans] == [
+                "bold", "italic"]
+
+            fenced = render_chat_markdown(
+                "```python\nprint('hello')\n```\n**尚未结束")
+            assert fenced.plain == "print('hello')\n**尚未结束"
+            assert "cyan on grey15" in {
+                str(span.style) for span in fenced.spans
+            }
+            incomplete_fence = render_chat_markdown(
+                "回答前缀\n```python\nprint('still streaming')")
+            assert incomplete_fence.plain == (
+                "回答前缀\n```python\nprint('still streaming')")
+            assert "cyan on grey15" not in {
+                str(span.style) for span in incomplete_fence.spans
+            }
+            assert ChatApp._line(
+                "user", "**保持原样**").plain == "[user] **保持原样**"
+            assert ChatApp._line(
+                "system", "`状态` 保持原样").plain == "[system] `状态` 保持原样"
+            prose_with_code_names = render_chat_markdown(
+                "实现 __init__，计算 2 * 3 * 4")
+            assert prose_with_code_names.plain == "实现 __init__，计算 2 * 3 * 4"
+            for source, expected in (
+                (r"\*literal\*", "*literal*"),
+                (r"\**literal\**", "**literal**"),
+                (r"\`literal\`", "`literal`"),
+                ("src/*/test*", "src/*/test*"),
+                ("glob **/*.py", "glob **/*.py"),
+                ("a*b*c", "a*b*c"),
+                ("https://example.test/*/docs*", "https://example.test/*/docs*"),
+            ):
+                technical = render_chat_markdown(source)
+                assert technical.plain == expected
+                assert not technical.spans
+
+    asyncio.run(run())
+    print("ok  TUI 常用 Markdown 转成终端样式")
+
+
+def test_tui_reuses_rendered_markdown_during_stream_redraw() -> None:
+    """流式增长只能重算活动回复，不能反复解析全部历史。"""
+    from textual.widgets import RichLog
+    import main
+    from main import ChatApp
+
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=make_orch())
+        async with app.run_test() as pilot:
+            original = main.render_chat_markdown
+            rendered_values: list[str] = []
+
+            def counted(value: str, style: str = ""):
+                rendered_values.append(value)
+                return original(value, style)
+
+            main.render_chat_markdown = counted
+            try:
+                old_reply = "**历史结论** " + "x" * 200_000
+                app._write("kimi", old_reply)
+                app._buffer_stream_text("opencode", "**新")
+                app._flush_stream_text("opencode")
+                app._buffer_stream_text("opencode", "回复**")
+                app._flush_stream_text("opencode")
+                await pilot.pause()
+            finally:
+                main.render_chat_markdown = original
+
+            assert rendered_values.count(old_reply) == 1
+            assert rendered_values[-2:] == ["**新", "**新回复**"]
+            plain = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines)
+            assert "[opencode] 新回复" in plain
+
+    asyncio.run(run())
+    print("ok  TUI 流式重绘复用历史 Markdown")
+
+
 def test_tui_coalesces_heartbeat_and_avoids_false_success_copy() -> None:
     """heartbeat 折叠进一张活动卡；done 不伪装任务验收。"""
     from textual.widgets import RichLog
@@ -689,6 +819,8 @@ if __name__ == "__main__":
     test_tui()
     test_qwen_has_distinct_tui_color()
     test_tui_coalesces_stream_chunks()
+    test_tui_renders_agent_markdown_without_visible_delimiters()
+    test_tui_reuses_rendered_markdown_during_stream_redraw()
     test_tui_coalesces_heartbeat_and_avoids_false_success_copy()
     test_tui_updates_one_activity_card_per_command()
     test_main_loop_reopens_requested_session()
