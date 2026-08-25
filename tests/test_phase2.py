@@ -1,7 +1,7 @@
 """Phase 2 里程碑测试：通用 ACP runtime 接入统一 TUI。
 
 覆盖：
-- AgentSpec 注册：kimi/opencode=ACP+JSONL、qwen/workbuddy=ACP、codex=app-server
+- AgentSpec 注册：kimi/opencode=ACP+JSONL、qwen/workbuddy=ACP、pi=RPC、codex=app-server
 - ACP 增量上下文：不重复完整 transcript、跳过自己回复、失败不丢增量
 - 权限：默认拒绝 / TUI 选择 / 等待可取消
 - 生命周期：TUI 退出统一 aclose，fake ACP 无残留
@@ -111,7 +111,7 @@ class FakeHost(FakeJsonl):
 def make_orch(**adapters) -> Orchestrator:
     """真实 Orchestrator + 假 adapter；未指定的工人用 FakeJsonl 占位。"""
     orch = Orchestrator(workdir="/tmp", persistent=False)
-    for name in ("kimi", "opencode", "qwen", "workbuddy", "codex"):
+    for name in ("kimi", "opencode", "qwen", "workbuddy", "pi", "codex"):
         orch.adapters[name] = adapters.get(name, FakeJsonl(name))
     orch.host = FakeHost()
     orch.adapters["host"] = orch.host
@@ -126,6 +126,7 @@ def test_agent_specs() -> None:
     assert AGENTS["opencode"].transport == "acp+jsonl"
     assert AGENTS["qwen"].transport == "acp"
     assert AGENTS["workbuddy"].transport == "acp"
+    assert AGENTS["pi"].transport == "rpc"
 
     orch = Orchestrator("/tmp", persistent=False)
     kimi = orch.adapters["kimi"]
@@ -154,7 +155,7 @@ def test_agent_specs() -> None:
     assert isinstance(kimi._fallback, KimiAdapter)
     assert isinstance(opencode._fallback, OpenCodeAdapter)
     print("ok  AgentSpec 注册（kimi/opencode=ACP+JSONL，"
-          "qwen/workbuddy=ACP，codex=app-server）")
+          "qwen/workbuddy=ACP，pi=RPC，codex=app-server）")
 
 
 # ---- 2. ACP 增量上下文 ----
@@ -446,13 +447,14 @@ def test_tui_status_and_shutdown() -> None:
             await pilot.pause()
             lines = _richlog_text(app)
             assert "聊天室已就绪" in lines
-            assert "6/6" in lines
+            assert "7/7" in lines
             app.action_show_agents()
             lines = _richlog_text(app)
             assert "@kimi · 可用 · ACP+JSONL" in lines
             assert "@codex · 可用 · APP-SERVER" in lines
             assert "@opencode · 可用 · ACP+JSONL" in lines
             assert "@qwen · 可用 · ACP" in lines
+            assert "@pi · 可用 · RPC" in lines
             # 跑一轮，让 kimi acp 进程真的起来；session id 应展示一次
             box = app.query_one(Input)
             box.value = "@kimi fast round"

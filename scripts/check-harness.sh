@@ -26,6 +26,7 @@ required=(
   docs/adr/0011-session-scoped-natural-language-roles.md
   docs/adr/0012-agent-readiness-and-setup-ux.md
   docs/adr/0013-natural-language-sequential-collaboration.md
+  docs/adr/0014-pi-rpc-permission-bridge.md
   scripts/check-redlines.sh
 )
 
@@ -71,6 +72,7 @@ docs = [
     root / "docs/adr/0011-session-scoped-natural-language-roles.md",
     root / "docs/adr/0012-agent-readiness-and-setup-ux.md",
     root / "docs/adr/0013-natural-language-sequential-collaboration.md",
+    root / "docs/adr/0014-pi-rpc-permission-bridge.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -103,7 +105,7 @@ fi
 
 .venv/bin/python -m py_compile \
   main.py myagents_mcp.py orchestrator.py host.py discussion.py collaboration.py workflow.py session_roles.py session_catalog.py session_manager.py tui_activity.py agent_readiness.py \
-  acp/*.py codex_app_server/*.py adapters/*.py control/*.py storage/*.py workspace/*.py tests/*.py \
+  acp/*.py pi_rpc/*.py codex_app_server/*.py adapters/*.py control/*.py storage/*.py workspace/*.py tests/*.py \
   scripts/e2e-m3-real.py scripts/e2e-m5-real.py
 .venv/bin/python tests/test_agent_readiness.py
 .venv/bin/python tests/test_basic.py
@@ -120,6 +122,9 @@ fi
 .venv/bin/python tests/test_session_tui.py
 .venv/bin/python tests/test_acp.py
 .venv/bin/python tests/test_workbuddy_acp.py
+.venv/bin/python tests/test_pi_rpc_client.py
+.venv/bin/python tests/test_pi_adapter.py
+.venv/bin/python tests/test_pi_permission_bridge.py
 .venv/bin/python tests/test_kimi_hybrid.py
 .venv/bin/python tests/test_opencode_hybrid.py
 .venv/bin/python tests/test_phase2.py

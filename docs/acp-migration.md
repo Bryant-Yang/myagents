@@ -1,26 +1,33 @@
 # ACP 迁移设计（最小方案）
 
-状态：**Phase 4.5、Phase 4.6、Phase 4.9、Phase 5.1 与 Phase 5 已完成**。
+状态：**Phase 4.5、Phase 4.6、Phase 4.9、Phase 4.11、Phase 5.1 与 Phase 5 已完成**。
 `AgentAdapter` 是 TUI 与不同 coding agent 的
 统一行为契约；wire protocol 按厂商能力选择：`acp/` 是通用 ACP runtime，
 Kimi/OpenCode 分别走 `kimi acp` / `opencode acp`，只在 ACP prepare
 失败前使用各自受限 JSONL fallback；Qwen Code 走 `qwen --acp`、WorkBuddy
 走官方独立 CodeBuddy CLI `--acp --acp-transport stdio`，两者保持 ACP-only；
-Codex 走官方 `codex app-server`，旧
+Pi 走官方 `pi --mode rpc` 与 myagents 权限 bridge，保持 RPC-only；Codex 走官方
+`codex app-server`，旧
 Codex adapter 保留 JSONL fallback。app-server 不是 ACP，各协议只在
-adapter 层统一。
+adapter 层统一。Pi RPC 与 app-server 都不是 ACP。
 Phase 2.5 落地了共享 history 持久化、ACP
 session 映射与重启恢复、房间单写者 lease；Phase 3 落地了内部
 command bus（`control/`）、私有 Unix 控制 socket 与 stdio MCP 外部入口
 （`myagents_mcp.py`）——本机其他 agent 可以向运行中的同一房间注入
 消息，单写者与 TUI 权限决策不变。多-agent 路由仍由
-orchestrator 管——ACP 只负责传输，不参与"派给谁"的决策。
+orchestrator 管——具体协议只负责传输，不参与"派给谁"的决策。
 
 ## 为什么迁移
 
 私有 JSONL adapter（`kimi -p` 等无头模式）是"一次性命令"：每次调用新进程、
 新会话，上下文靠 transcript 转发（token 线性膨胀），无法中断、无法恢复会话、
 权限只能一把梭。ACP 是有状态协议，一次解决这四件事。
+
+Pi 同样提供官方有状态入口，但 wire contract 不同：`pi --mode rpc` 使用 LF
+分隔 JSON request/event，支持 session、stream、图片、steer/follow_up 与 abort；
+`--mode json` 仍是一次性输出。Pi 没有 ACP 权限请求和内置 sandbox，因此必须由
+独立 `pi_rpc/` adapter 与显式 permission bridge 建立安全边界，不能塞进通用 ACP
+runtime。完整决策见 [ADR-0014](adr/0014-pi-rpc-permission-bridge.md)。
 
 ## 实测确认的协议形状（kimi acp，protocolVersion 1）
 
@@ -56,7 +63,7 @@ image block。新消息使用 `[图片 N]` 映射当前房间的 `img-NNNN.png`�
 路径引用只在同一信任根内兼容。二进制不进入共享 timeline。
 
 M4.7 由 SessionManager 为每个已加载房间独立持有 Orchestrator/CommandBus 和
-ACP/app-server runtime。切换可见会话不迁移或复用 native session writer；后台
+ACP/Pi RPC/app-server runtime。切换可见会话不迁移或复用 native session writer；后台
 权限请求携带 room_id，并在弹窗显示项目、会话、agent 与工具。空闲回收只关闭
 非当前、无 command 且无权限等待的完整 runtime。
 
@@ -73,6 +80,7 @@ orchestrator.py（AgentAdapter 接口不变；AGENT_SPECS 注册表）
    │                         └→ OpenCodeAdapter（prepare-only，隔离只读配置）
    │    qwen     → acp       → AcpQwenAdapter（default/plan，无自动降级）
    │    workbuddy→ acp       → AcpWorkBuddyAdapter（default/受限只读，无自动降级）
+   │    pi       → rpc       → PiRpcAdapter（唯一 permission bridge，三 profile，无降级）
    │
    ├─ acp/adapter.py  AcpAdapter（通用：name + cmd 即一个 ACP agent；
    │     │            stateful_session = True 声明"会话在 agent 侧保持"）
@@ -83,10 +91,12 @@ orchestrator.py（AgentAdapter 接口不变；AGENT_SPECS 注册表）
    │
    ├─ codex_app_server/  Codex 专用 JSONL-over-stdio client/adapter
    │                     （不是 ACP；无 jsonrpc header）
+   ├─ pi_rpc/  Pi 专用 LF-JSON client/adapter + 唯一显式 permission bridge
+   │           （不是 ACP；关闭自动发现/原生命名 tools，启动先 attestation）
    └─ adapters/*_adapter.py  一次性 JSONL fallback
 ```
 
-新增一个 ACP agent 不需要改编排器：写一行 `AgentSpec` 即可。会话中的自然语言
+新增一个 agent 不需要改编排器：写一行 `AgentSpec` 并在具体 adapter 隔离协议即可。会话中的自然语言
 角色不创建新 agent 或 runtime，只在实际 agent 的 assignment 前注入受限工作视角，
 具体约束见 [ADR-0011](adr/0011-session-scoped-natural-language-roles.md)。
 协议判断只看 `transport` / adapter 能力声明（`stateful_session`、
@@ -107,18 +117,24 @@ sources + strict 空 MCP 配置阻断用户/项目配置扩权；profile 切换�
 fresh session。进程环境固定为已验收的中国区 `internal`；session prepare 优先
 复用已有登录，只有服务端明确返回 `-32000 Authentication required` 才进入有界
 浏览器认证。
+Pi 保持 RPC-only：`PiRpcAdapter` 只显式加载固定 bridge，关闭自动发现且不激活
+原生命名 built-in tools，按 `DEFAULT` / `READ_ONLY` / `WORKSPACE_WRITE` 启动
+精确 wrapper 闭集。
+第一条 prompt 前必须完成 nonce/profile/workspace/policy/source/tool-set attestation；
+profile 切换重建进程并建立 fresh session。写入与 shell 每次只接受与本次 call
+绑定的 `allow_once`，且 client 没有 raw RPC passthrough/`type: "bash"` 入口。
 
 ## 铁律：会话唯一持有者
 
 一个 session 同一时刻只能有一个 writer。违反就会话损坏：
 
-- `AcpAdapter` 实例是它 session 的唯一 writer（`_lock` 串行化轮次）
-- 该 session id 不得交给普通 kimi TUI 或另一个进程并发使用
-- `session/load` 恢复旧会话前，确认没有别的进程持有它
+- 每个 stateful adapter 实例是它 native session 的唯一 writer（adapter lock 串行化轮次）
+- session id/checkpoint 不得交给对应 native TUI 或另一个进程并发使用
+- 恢复旧会话前必须确认没有别的进程持有它；Pi 还必须精确核验 session 文件和 cwd
 
 ## 增量上下文契约（Phase 2 新增）
 
-ACP session 是持久上下文，编排器**不再**每轮转发完整 transcript：
+stateful native session 是持久上下文，编排器**不再**每轮转发完整 transcript：
 
 - 编排器为每个有状态 agent 维护一个 history cursor
   （`Orchestrator._cursors`），记录已交付到共享时间线的哪个位置。
@@ -214,11 +230,46 @@ profile 前后同样重建进程与 fresh session。WorkBuddy 先尝试 `session
 CLI 既有登录态；只在明确的认证错误后发送标准 ACP `authenticate(methodId)`。
 默认 method 是 `internal`，可由环境变量覆盖，但必须属于 server 当次公布的集合。私有
 `_codebuddy.ai/authUrl` 通知只允许打开官方 HTTPS 域名，认证等待最多 300 秒，
-失败时整条连接原子回收。等待仍可取消——TUI 退出时所有挂起的权限 Future 按 cancelled 收尾
+失败时整条连接原子回收。
+
+Pi 不使用 ACP `session/request_permission`。固定 extension 以
+`MYAGENTS_PI_ATTEST_V1:` 完成启动 attestation，并以
+`MYAGENTS_PI_PERMISSION_V1:` 把风险 wrapper 的 tool call 映射成同一个 TUI
+权限 handler。普通/写 profile 激活七个唯一命名 wrapper，只读 profile 只激活
+四个读取 wrapper并在 hook 内再次 hard-deny 风险工具；未知工具与非法路径在
+extension 内执行前阻断。权限选项绑定
+一次性 call nonce，仅支持 `allow_once` / `reject_once`。无 handler、超时、取消、
+异常、未知/复用 nonce 或 attestation 不匹配全部拒绝。该 bridge 是应用层权限
+边界，不提供 OS sandbox；用户批准 bash 后仍由本机进程权限执行。权限 UI 的
+input 只携带最多 4096 UTF-8 bytes 的展示摘要，再由共享 PermissionScreen 脱敏；
+完整 canonical args 只以 `argsHash` + tool/call nonce + one-time permit + 路径
+快照绑定，避免大 write/edit 因展示上限被误拒绝。超限 bash 因无法安全隐藏尾部而
+直接 block，不做截断审批。最终 stable JSON 仍必须不超过 4096 bytes；未知 schema
+或无法安全截断的内容 fail-closed。
+
+Pi 的 permission request 还受 adapter 侧 checkpoint gate 约束：即使 extension UI
+request 与 prompt success frame 并发到达，也必须先把内部 `delivery_committed`
+交给 Orchestrator，并等其同步持久化 no-replay cursor 后，才允许调用共享权限
+handler、显示弹窗或返回 `allow_once`。profile 工具闭集不匹配的 request 在弹窗前
+直接 cancelled。
+
+Pi 0.84.3 在安装 RPC stdin reader 前会 await 初始 `session_start` handler，故
+attestation 不能在 handler 内同步等待 UI select。bridge 必须立即返回并用后台 task
+完成握手；session generation guard 保证旧 task 的迟到 ACK/异常不能改变新 session
+的 ready 状态。第一条 prompt 仍由 adapter 侧 attestation gate 阻断，不能把
+fire-and-forget 误解成先运行模型再补验权。
+
+myagents 启动 Pi 时同时固定 `--offline` 与 `PI_OFFLINE=1`，避免 `grep/find` 在
+缺少 `rg/fd` 时通过 stock tool manager 隐式下载、写盘或更新。Pi 预留但尚未落盘的
+session path 由私有、fsync 的 reserved/materialized sidecar 精确绑定完整 checkpoint、
+native id、workspace 与 profile；只有精确 reserved 且文件仍不存在时可保留 no-replay
+cursor 并 fresh，materialized 后文件或 marker 缺失一律 fail-closed。
+
+等待仍可取消——TUI 退出时所有挂起的权限 Future 按 cancelled 收尾
 （`on_unmount` →
 `_cancel_pending_permissions` → `orch.aclose()`，顺序不能反：aclose
-等的锁可能被等权限的 prompt 持有），不留挂起 Future 或 `kimi acp`
-／`opencode acp` 子进程。权限后台 task 的异常由 done callback 消费（连接断开导致应答
+等的锁可能被等权限的 prompt 持有），不留挂起 Future、`kimi acp`
+／`opencode acp` 或 `pi --mode rpc` 子进程。权限后台 task 的异常由 done callback 消费（连接断开导致应答
 发不出去时不会留下 "Task exception was never retrieved"）。
 
 ## 取消契约（Phase 1 建立，Phase 2 不变）
@@ -227,6 +278,17 @@ CLI 既有登录态；只在明确的认证错误后发送标准 ACP `authentica
 结束（默认 10s 有限超时）；超时说明连接不可信，关闭并标记必须重建
 （下轮 stream 重新 start + session/new）。adapter 的锁只在确认停止或
 连接关闭后释放——下一轮 prompt 绝不与仍在执行的上一轮重叠。
+
+Pi 对应动作是 `abort` 并等待 `agent_settled`；`agent_end` 后仍可能发生 retry、
+compaction 或 continuation，不能提前释放 writer lock。abort/settle 超时则关闭整个
+进程组。prompt 成功 response 前到达的事件先缓冲，成功后先发布
+`delivery_committed`；prompt 已写入但无 response 或提交后断线均为结果不确定，
+严格 no-replay，并作废可能仍在执行的连接。Pi 不跨协议重试。
+Pi 必须看到最终 assistant `message_end`，且 stop reason 属于
+`stop/length/toolUse/deferred` 才可成功；缺失/未知 terminal 或 provider error/abort，
+以及权限拒绝造成的
+`tool_execution_end.result.terminate=true` 也属于已提交失败，而不是成功的空回复。
+自动重试后的最后一条 assistant 成功可覆盖中间 error。
 
 不在等待人工权限且没有活跃工具时，prompt 连续 120 秒无 ACP 通知或终止响应
 会触发 inactivity cancel；工具已创建且尚未进入终态时改用独立 15 分钟
@@ -243,8 +305,11 @@ prompt/session 初始化共用 adapter 的同一把锁，不竞态杀进程。
 ## 可见状态（Phase 2 新增）
 
 - TUI 启动行显示每个 agent 的传输协议：`@kimi(ACP+JSONL) @opencode(ACP+JSONL)
-  @qwen(ACP) @workbuddy(ACP) @codex(APP-SERVER)`。
-- ACP session id 建立后通过 info 事件展示一次（每次建立一次，不刷屏）。
+  @qwen(ACP) @workbuddy(ACP) @pi(RPC) @codex(APP-SERVER)`。
+- native session id 建立后通过 info 事件展示一次（每次建立一次，不刷屏）。Pi 的
+  session info 只能在 `delivery_committed` 已被消费后显示；其可信图片每轮最多
+  16 张、读取前合计最多 20 MiB。Pi attestation 只显示可操作状态，不泄漏 nonce
+  或内部完整策略载荷。
 - `tool_call` 保存脱敏后的 title/command；后续 `tool_call_update` 按
   `toolCallId` 继承上下文，只在 title/status/command/kind 的可见指纹变化时
   产出事件。完全相同的高频 `in_progress` 仍被视为协议活动，但不进入 TUI
@@ -255,7 +320,7 @@ prompt/session 初始化共用 adapter 的同一把锁，不竞态杀进程。
 
 ## 有界讨论（M5.1）
 
-`/discuss` 不改变 ACP wire protocol，也不让 ACP agent 直接互发消息。它在
+`/discuss` 不改变任何 agent wire protocol，也不让 agent 直接互发消息。它在
 Orchestrator 内用普通代码执行 1–3 轮状态机：同轮不同 adapter 并发，跨轮等待
 全部收尾，最后调用一次 moderator。整个讨论仍是一个 CommandBus command，
 因此沿用同一个取消、事件、权限和失败终态。
@@ -269,7 +334,7 @@ Orchestrator 内用普通代码执行 1–3 轮状态机：同轮不同 adapter 
 
 ## 有界里程碑工作流（M5）
 
-M5 不改变 ACP wire protocol，也不向 agent 暴露自主派发能力。`/workflow`
+M5 不改变任何 wire protocol，也不向 agent 暴露自主派发能力。`/workflow`
 由普通代码严格推进 review → 单 writer implement → 独立 verify；首次复核要求
 修改时最多允许同一 writer repair 一次并 reverify，最后由 host 汇总，最大六次
 模型调用。全部阶段仍属于一个 CommandBus command 和一个 `command_id`。
@@ -281,11 +346,12 @@ seam 内实现，Orchestrator 不按 agent 名分支。ACP 从普通轮次进入
 时关闭旧进程、禁止 load 旧 session 并建立隔离 session，避免继承历史
 `allow_always`；OpenCode 同时切换到 runtime deny-all + 安全读取白名单，退出
 只读 mode 时再重建并恢复普通 ask；Qwen 切换到 `plan`，退出时恢复强制
-`default`。Kimi/OpenCode 的只读 JSONL fallback 不能承担写阶段，触发时
+`default`；Pi 切换到四个读取 wrapper，退出时重建 fresh process/session 并恢复
+七个 wrapper，写工具仍逐次 `allow_once`。Kimi/OpenCode 的只读 JSONL fallback 不能承担写阶段，触发时
 workflow 必须 blocked。
 
 运行中 steering 只在下一阶段边界注入尚未开始的 assignment，不并发写当前
-ACP session、不修改已提交 prompt，也不能换人、加轮或扩大权限。完整设计见
+native session、不修改已提交 prompt，也不能换人、加轮或扩大权限。完整设计见
 [ADR-0009](adr/0009-bounded-milestone-workflow-steering.md)。生产 `/workflow`、
 execution mode 与 TUI/control/MCP steering 均已实现并纳入 Harness。
 
@@ -327,6 +393,10 @@ transport adapter 执行；Orchestrator/workflow 不直接启动子进程。外�
 - [x] **Phase 4.5**：OpenCode hybrid transport：`opencode acp` 成为生产
   主路径，风险/未知工具统一 ask；prepare-only fallback 使用 `--pure`、
   隔离配置和 deny-all 只读 agent。见 ADR-0007。
+- [x] **Phase 4.11**：Pi 原生 RPC-only：`pi --mode rpc` 由独立 client/adapter
+  持有；唯一显式 permission bridge、唯一命名 wrapper 工具闭集、启动
+  attestation、三 profile fresh session、逐次 `allow_once` 与 no-replay 纳入
+  fake contract 和静态 R4 gate。见 ADR-0014。
 - [x] **Phase 5.1**：`/discuss` 指定 2–3 个 worker、1–3 轮有界讨论，
   同轮 fan-out、跨轮增量上下文、失败者退出与终局 moderator。见 ADR-0008。
 - [x] **Phase 5**：里程碑 review → 单 writer 修改 → 独立复核、最多一次
@@ -369,5 +439,9 @@ A2A 不在当前阶段；Streamable HTTP、远程认证同样不在 M3（M3 是�
   由编排器的 `_run_one` 兜底成 error 事件。
 - **图片能力漂移**：Kimi 不再声明 `promptCapabilities.image` 时退化为文本附件
   引用，不伪造协议能力；fake ACP contract 固定 text + image block 形状。
+- **Pi 权限边界**：Pi 0.84.3 没有内置 permission prompt/sandbox；生产必须关闭
+  自动发现且不激活原生命名 built-in tools，只信任已 attested 的项目 bridge/wrapper。任何
+  attestation 漂移、raw RPC passthrough 或 JSON/JSONL fallback 都是阻断项。
+  bridge 仍不是 OS sandbox；用户批准 bash 后的系统权限风险由人工决定。
 - **增量补发的重复**：失败重试会把失败轮的增量再发一遍，agent 会在
   session 里看到重复的用户消息——可接受（丢上下文不可接受）。

@@ -2,7 +2,7 @@
 
 <!-- harness:controls-read-policy=on-demand -->
 
-> 作者：Bryant Yang　最近更新：2026-08-13
+> 作者：Bryant Yang　最近更新：2026-08-25
 >
 > 本文是所有编码 agent 的项目级入场入口，也是唯一的协作规则源。详细工程契约见
 > [`HARNESS.md`](HARNESS.md)，按任务选读规则见
@@ -12,7 +12,8 @@
 
 `myagents` 是一个 Python + Textual 的本地多 agent 终端编排器。它以
 hub-and-spoke 方式维护统一时间线，以 ACP 作为有状态 coding agent 的优先接入
-协议，同时保留 JSONL adapter 作为兼容回退。
+协议；厂商只有其他可靠官方长连接时使用独立 adapter（Pi RPC、Codex
+app-server），同时仅为已获证路径保留 JSONL 兼容回退。
 
 使命：让不同 coding agent 在同一 TUI 中被安全、可恢复、可验证地驱动；协议差异
 下沉到 adapter/runtime，路由、权限与生命周期由编排器统一管理。
@@ -33,12 +34,12 @@ hub-and-spoke 方式维护统一时间线，以 ACP 作为有状态 coding agent
 
 - **R1 权限默认 fail-closed**：生产代码不得显式构造
   `permission="auto"`；自动放行只能由明确授权的外部调用临时 opt-in。
-- **R2 通用层不得按 agent 名分支**：`orchestrator.py` 与通用 ACP runtime
+- **R2 通用层不得按 agent 名分支**：`orchestrator.py` 与通用 transport runtime
   不得出现 `if agent_name == "kimi"` 一类协议分支；差异必须进入
   `AgentSpec` 或具体 adapter。
 - **R3 进程只能由 transport 层启动**：`main.py`、`orchestrator.py`、
   `host.py` 不得直接创建 shell/子进程。
-- **R4 ACP worker 的生产路径保持受约束**：Kimi/OpenCode 生产注册必须分别由
+- **R4 agent 的生产 transport 保持受约束**：Kimi/OpenCode 生产注册必须分别由
   `AcpKimiAdapter` / `AcpOpenCodeAdapter` 构造；JSONL 只能作 ACP
   prepare 失败前的只读 fallback，并使用各自项目内置工具白名单。
   禁止直接注册旧 JSONL adapter、放宽写入/命令工具或在 prompt
@@ -54,6 +55,17 @@ hub-and-spoke 方式维护统一时间线，以 ACP 作为有状态 coding agent
   复用，只有明确的 `Authentication required` 才按需认证；认证只能使用 server
   公布的 ACP method，登录 URL 必须是官方 HTTPS 地址且等待有界，在独立
   fallback 安全契约获证前不得自动降级。
+  Pi 必须以 `AgentSpec("pi", "rpc", PiRpcAdapter, ...)` 走官方
+  `pi --mode rpc`，不得冒充 ACP 或回退一次性 JSON/JSONL。Pi 子进程必须关闭
+  自动发现并强制 offline，不激活任何原生命名 built-in tool，只显式加载项目固定的 permission
+  bridge，并只暴露
+  `myagents_*` wrapper 工具闭集；第一条 prompt 前必须完成 nonce/profile/workspace/
+  bridge/tool-set attestation。`DEFAULT`、`READ_ONLY`、`WORKSPACE_WRITE` 切换必须
+  重建进程和新 session；写入与 shell 只允许逐次 `allow_once`，无 handler、畸形
+  选择、profile 越界工具或 attestation 失败一律拒绝。permission handler 只能在
+  no-replay cursor 已持久化后运行；只有明确成功闭集内的 assistant terminal 才能
+  完成本轮，缺失/未知 terminal、error/abort 与权限终止工具必须记为失败。生产 client 不得暴露任意 RPC passthrough 或
+  发送 raw RPC `type: "bash"`；Pi 没有跨协议 fallback，提交后严格 no-replay。
 - **R5 多智能体协作必须有界**：自然语言讨论与 `/discuss` 只允许 2–3 个
   已注册 worker、1–3 轮和一个终局 moderator，并复用同一确定性状态机。
   自然语言有序协作只允许 2–4 个串行步骤、至少
@@ -85,6 +97,10 @@ hub-and-spoke 方式维护统一时间线，以 ACP 作为有状态 coding agent
   [`ADR-0006`](docs/adr/0006-kimi-hybrid-transport-policy.md) 和
   [`ADR-0007`](docs/adr/0007-opencode-hybrid-transport-policy.md)；
   JSONL checkpoint 不是可恢复 ACP session，下一轮必须新建会话。
+- Pi 原生 RPC 接入遵守
+  [`ADR-0014`](docs/adr/0014-pi-rpc-permission-bridge.md)：唯一显式权限 bridge、
+  wrapper tool 闭集、启动 attestation、三 profile 隔离和 raw RPC bash 禁令必须
+  同时成立；应用层权限桥不宣称提供 OS sandbox。
 - 有界讨论遵守
   [`ADR-0008`](docs/adr/0008-bounded-multi-agent-discussion.md)：同轮并发、
   跨轮串行，一条 command 只有一条 user 记录；参与者失败不自动重试，最终

@@ -48,7 +48,7 @@ def make_orch() -> Orchestrator:
     orch = Orchestrator(workdir=".", persistent=False)
     orch.adapters = {
         n: FakeAdapter(n)
-        for n in ("kimi", "opencode", "qwen", "workbuddy", "codex")
+        for n in ("kimi", "opencode", "qwen", "workbuddy", "pi", "codex")
     }
     orch.host = FakeHost()
     orch.adapters["host"] = orch.host
@@ -486,6 +486,15 @@ def test_qwen_has_distinct_tui_color() -> None:
     print("ok  Qwen TUI speaker 颜色")
 
 
+def test_pi_has_distinct_tui_color() -> None:
+    """Pi replies use a stable product color instead of default white."""
+    from main import ChatApp
+
+    rendered = ChatApp._line("pi", "收到")
+    assert rendered.spans[0].style == "bold deep_sky_blue1"
+    print("ok  Pi TUI speaker 颜色")
+
+
 def test_tui_coalesces_stream_chunks() -> None:
     """一条流式回复的 token/chunk 不应各占一行。"""
     from textual.widgets import Input, RichLog
@@ -818,6 +827,7 @@ if __name__ == "__main__":
     test_bounded_stderr()
     test_tui()
     test_qwen_has_distinct_tui_color()
+    test_pi_has_distinct_tui_color()
     test_tui_coalesces_stream_chunks()
     test_tui_renders_agent_markdown_without_visible_delimiters()
     test_tui_reuses_rendered_markdown_during_stream_redraw()

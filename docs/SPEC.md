@@ -2,7 +2,7 @@
 
 <!-- harness:behaviour-evidence=canonical-source -->
 
-> 作者：Bryant Yang　最近更新：2026-08-13
+> 作者：Bryant Yang　最近更新：2026-08-25
 >
 > 本文是关键用户行为与独立证据的唯一事实源。工程边界见
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -27,6 +27,7 @@
 | M4.8 | 完成 | 聊天主线降噪、每任务活动摘要卡与逐卡键盘展开 |
 | M4.9 | 完成 | WorkBuddy ACP-only 接入、按需有界认证与读写 profile 隔离 |
 | M4.10 | 完成 | Agent 被动就绪探测、原子派发门与 `/agents` 设置体验 |
+| M4.11 | 完成 | Pi 原生 RPC、启动 attestation、逐次权限 bridge 与三 profile 隔离 |
 | M5.1 | 完成 | 自然语言或 `/discuss` 进入 1–3 轮有界讨论与终局 moderator |
 | M5 | 完成 | review → 单 writer 修改 → 独立复核、一次修复上限与阶段边界 steering |
 | M6 | 完成 | 自然语言指定会话级角色、跨任务持续、房间隔离与状态可见 |
@@ -35,7 +36,8 @@
 ## 1. 角色
 
 - **用户**：在统一 TUI 点名 agent、批准/拒绝权限并验收结果。
-- **worker agent**：通过 ACP 或 JSONL adapter 接收任务并流式返回事件。
+- **worker agent**：通过 ACP、原生 RPC、app-server 或 JSONL adapter 接收任务并
+  流式返回事件。
 - **host**：无显式 @ 时用一次调用直接回答或进行 worker 路由；也可被
   `@host` 点名做总结/仲裁。
 - **Orchestrator**：唯一消息中心，维护共享 history、投递顺序与生命周期。
@@ -259,7 +261,8 @@
 
 ### UC-ACP-001 有状态增量上下文
 
-- **角色 / 触发**：用户连续多次 `@` 同一个 ACP agent。
+- **角色 / 触发**：用户连续多次 `@` 同一个 stateful agent（ACP、Pi RPC 或
+  app-server；用例编号为历史兼容保留 `ACP`）。
 - **前置条件**：adapter 声明 `stateful_session=True`。
 - **主流程**：首次仅 bootstrap 最近 `history_limit` 条；后续只发 cursor 后的新
   消息并过滤 agent 自己回复；成功后推进 cursor。
@@ -344,6 +347,83 @@
   region profile 尚无独立安全证据，当前产品只启用已验收的中国区 `internal`。
 - **里程碑**：M4.9。
 
+### UC-RPC-001 Pi 原生 RPC 权限桥接入
+
+- **角色 / 触发**：用户在聊天室输入 `@pi`，或把 Pi 选为普通会话、discussion、
+  自然语言有序协作或 workflow 中满足既有边界的 worker。
+- **主流程**：`AGENT_SPECS` 以 `AgentSpec("pi", "rpc", PiRpcAdapter)` 注册。
+  adapter 只启动 `pi --mode rpc`，持有一个 LF-delimited JSON request/event 进程与
+  session；Pi 声明 stateful session，因此继续复用通用增量 cursor、delivery lock、
+  room checkpoint、图片信任根、活动事件与统一回收。`agent_end` 后继续接收事件，
+  只在 `agent_settled` 后结束本轮。
+- **隔离与 attestation**：进程关闭自动发现的 extension、skill、prompt template、
+  theme，并固定 `--offline` / `PI_OFFLINE=1` 阻止隐式工具下载与更新；不激活原生命名 built-in tools，只以绝对路径加载
+  `pi_rpc/extensions/myagents_permission_bridge.ts`。第一条 prompt 前，client 必须
+  精确核对一次性 nonce、`myagents.pi.policy/v1`、profile、规范化 workspace、
+  policy/bridge hash、active tools 及每个 wrapper 的 source info；任一缺失、超时、
+  重复或不匹配都在 timeline/workspace 副作用前 fail-closed 并回收进程。
+  Pi 0.84.3 会在 RPC stdin reader 安装前 await 初始 `session_start` handler；bridge
+  必须在 handler 内只启动 fire-and-forget attestation task 并立即返回，且用单调
+  session generation 拒绝旧 session 的迟到 ACK/task 改写当前 ready 状态。
+- **execution profile**：`DEFAULT` 和 `WORKSPACE_WRITE` 只暴露
+  `myagents_read/grep/find/ls/edit/write/bash`；`READ_ONLY` 只暴露前四个读取
+  active wrapper，并在 hook 内再次 hard-deny 风险工具。profile 切换关闭旧进程
+  并建立新进程、新 session，不恢复跨 profile session。路径型 wrapper 先
+  canonicalize；workspace 外读取（含 symlink 逃逸）逐次询权，写入则拒绝 workspace
+  外、`.git`、hard-link 和非法新建目标；`edit/write/bash` 每次通过 extension UI 映射到共享 TUI，
+  只接受与本次 call nonce 绑定的 `allow_once` / `reject_once`，不提供永久授权。
+  adapter 还必须把 permission tool 精确绑定本进程已 attested 的 profile 工具闭集；
+  permission handler/弹窗只能在 Orchestrator 已持久化本轮 no-replay cursor 后运行。
+  权限 bridge 只把最多 4096 UTF-8 bytes 的有界 input 摘要交给共享
+  PermissionScreen，由后者统一脱敏；截断时带 `_myagentsPreview`。超限 bash 不
+  隐藏尾部并请求批准，而是直接阻断。完整 canonical args 由 `argsHash`、
+  toolCallId、tool name、路径快照、60 秒 TTL 与 one-time permit 绑定，展示上限不得
+  误拒绝合法的大文件输入；未知字段、畸形嵌套 schema 与无法安全截断的摘要均拒绝。
+- **故障与重放边界**：无 permission handler、handler 异常、取消/超时、畸形或
+  未绑定选择、未知工具和未知 interactive UI 均拒绝；未知非交互 lifecycle event
+  只作为有界 `activity` 显示，不能扩权或完成本轮。prompt 成功响应前的事件只缓冲；成功
+  后先发布 `delivery_committed` 再发布事件，新 session info 也只能在该边界后显示。
+  本轮必须存在最终 assistant `message_end`，且 `stopReason` 只能属于
+  `stop/length/toolUse/deferred` 显式成功闭集；缺失/未知 terminal、`error/aborted`，以及终局
+  `tool_execution_end.isError + result.terminate=true` 必须记为提交后失败；中间错误
+  后自动重试/后续 assistant 成功则正常完成。prompt 写入后无响应、提交后断线或
+  abort 不确定结果按 no-replay 失败并作废当前连接。公开 client API 不接受任意 RPC dict，也不得
+  发送 raw RPC `{ "type": "bash" }`。单帧、active prompt 事件累计字节/条数与
+  extension UI 并发数都有硬上限；活跃重复 request id 或任一溢出关闭连接。Pi 没有
+  ACP 或 headless JSON/JSONL fallback。
+- **验收**：`tests/test_pi_rpc_client.py` + `tests/fake_pi_rpc_server.py` 固定 framing、
+  stream、早到事件、permission checkpoint gate、最终失败、settled、abort、精确恢复和进程回收；
+  `tests/test_pi_adapter.py` 固定注册、三 profile argv/tool 闭集、attestation、
+  prepare 后重复 attestation 回收、profile 重建/关闭竞态、新 session 延迟落盘、
+  单事件背压、取消 no-replay、长工具 watchdog、
+  每轮 16 张且合计 20 MiB 的图片读取前预算与事件映射；
+  `tests/test_pi_permission_bridge.py` 使用隔离 fixture 固定 wrapper 路径边界、逐次
+  选择绑定、`session_start` 非阻塞与迟到 generation 失败反例。静态 R4 gate 阻断
+  built-in/raw bash/fallback 回流。默认 Harness 不调用真实 Pi，不安装、卸载或
+  修改用户 Pi 配置。
+- **真实协议证据**：2026-08-25 本机安装版与本地源码均为 Pi 0.84.3；已核实
+  `--mode rpc`、LF JSON stream/session/steer/follow_up/abort/image、extension
+  pre-tool block 与 RPC extension UI 的协议形状；只读加载探针还证明当前 0.84.3
+  导出可构造七个底层 tool definition。真实启动探针进一步确认：初始
+  `session_start` 发生在 RPC stdin reader 安装前，在该 handler 内 await select 会
+  形成约 15 秒 bootstrap deadlock。改为非阻塞 task 与 generation guard 后，真实
+  0.84.3 约 0.4 秒完成 ACK、ready、`get_commands` 与 `get_state`。adapter 将
+  受管目录内、与 native session id 绑定的未落盘路径视为新会话 reservation，
+  以 0600、fsync 的 reserved/materialized sidecar 精确绑定 token/path/id/workspace/
+  profile；跨进程只有精确 reserved 且文件未产生时才 fresh，materialized 后缺失
+  fail-closed，并在 `agent_settled` 前强制核验实际文件/header/cwd。真实短对话返回
+  `LIVE_PI_PONG` 并落盘 session；真实 implement 探针只经一次 `allow_once`
+  创建临时 `result.txt=PI_WRITE_OK`，关闭后均无 Pi 进程残留。
+- **人工验收边界**：获得明确授权后，在全新临时目录验证 attestation、越界读取
+  拒绝、写入拒绝、一次写入允许后再次询权、abort 和关闭无残留。permission
+  bridge 是应用层 capability boundary，不是 OS sandbox；批准 shell 后仍继承
+  myagents 进程权限，故不支持不受信输入/敏感环境的无人值守执行。真实图片、长期
+  session、跨进程恢复和取消时延仍待人工验收。路径快照不承诺抵抗同一用户下敌对
+  并发进程在最终校验与底层 I/O 之间制造的竞态；该威胁需要外部 sandbox/容器。
+- **事实源**：ADR-0014、`pi_rpc/client.py`、`pi_rpc/adapter.py`、
+  `pi_rpc/extensions/myagents_permission_bridge.ts`。
+- **里程碑**：M4.11。
+
 ### UC-AGENT-001 本机 Agent 就绪状态与设置入口
 
 - **角色 / 触发**：用户启动 TUI、输入 `/agents` 或 `/agents rescan`，或提交
@@ -363,6 +443,7 @@
   CLI canonical path 与 App bundle 拒绝规则约束。
 - **异常分支**：probe 异常、不可执行文件、无效显式路径或 adapter 构造失败记为
   `invalid` 并 fail-closed；状态错误不删除角色、cursor、session id 或历史事实。
+  Pi 只被动解析 `pi` 可执行文件；probe 不以启动 RPC/attestation 代替 readiness。
 - **验收**：`tests/test_agent_readiness.py` 使用 fake resolver、临时文件与符号链接
   覆盖零/部分/新增 CLI、原子门和 host 候选；`tests/test_tui_completion.py` 覆盖
   ready 排序、状态文案、rescan 及草稿保留。完整 Harness 不调用真实 agent。
@@ -373,11 +454,13 @@
 ### UC-PERM-001 权限请求与选择
 
 - **角色 / 触发**：ACP agent 在受控工具调用前发
-  `session/request_permission`。
+  `session/request_permission`，或 Pi 的已 attested permission bridge 发出绑定工具
+  call nonce 的 `extension_ui_request`。
 - **前置条件**：TUI 已注入 agent-aware 异步权限处理器。
 - **主流程**：弹窗显示来源 agent、工具标题和 options；用户选择；client 只接受
   本次 options 内非空 optionId。
-- **异常分支**：无处理器、取消、异常、None、空或未知 optionId 全部 cancelled。
+- **异常分支**：无处理器、取消、异常、None、空或未知 optionId 全部 cancelled；
+  Pi 的未知/复用 call nonce、非 `allow_once/reject_once` 选择同样拒绝。
 - **验收**：等待用户时 read loop 不阻塞；合法 allow/reject 能回传；畸形结果
   fail-closed；权限请求到结果发回期间暂停 agent inactivity timeout，用户等待
   超过该 timeout 也不会误判 agent 卡死。
@@ -387,7 +470,9 @@
   `allow_once / allow_always / reject_once` options，选择 `allow_once` 后探针
   文件内容正确；严格 optionId 成员校验落地后再次真实复验通过。
   2026-08-08 OpenCode 1.18.14 临时目录 probe 证明 runtime ask policy
-  将无害 Bash 请求转为相同三类 options，默认 deny 后 `end_turn`。
+  将无害 Bash 请求转为相同三类 options，默认 deny 后 `end_turn`；Pi 权限形状由
+  `tests/test_pi_adapter.py` 与 `tests/test_pi_permission_bridge.py` 的 fake bridge
+  contract 固定，默认 gate 不调用真实 Pi。
 - **人工验收边界**：任何真实工具写入与 `auto` 模式必须由用户逐次授权；自动化
   测试不能代替风险接受。
 - **里程碑**：M2。
@@ -396,18 +481,19 @@
 
 - **角色 / 触发**：用户取消流、退出 TUI，或 agent 超时/断线。
 - **前置条件**：子进程使用独立进程组，adapter 拥有 session。
-- **主流程**：发送 cancel；等待原 prompt 结束；TUI 先收尾权限 Future，再
+- **主流程**：发送协议对应的 cancel/abort；等待原 prompt 结束；TUI 先收尾权限 Future，再
   `aclose`；SIGTERM 超时后 SIGKILL。
-- **异常分支**：不在等待人工权限时，prompt 连续 120 秒无任何 ACP 事件才自动
+- **异常分支**：不在等待人工权限时，prompt 连续 120 秒无任何 transport 事件才自动
   cancel；该轮已提交，先建立 no-replay 边界再公开失败。cancel 不确认则连接
   作废并在下轮重建；断线使 pending request 立即失败。
 - **验收**：人工权限等待不会触发 inactivity timeout；下一轮不与旧 prompt
-  重叠；fake 子孙进程和 ACP server 均无残留。
-- **独立证据来源**：接入 Harness 前已有的 basic/ACP/Phase 2 生命周期测试；
+  重叠；fake 子孙进程和 ACP/Pi RPC server 均无残留。
+- **独立证据来源**：接入 Harness 前已有的 basic/ACP/Phase 2 生命周期测试，
+  以及 `tests/test_pi_rpc_client.py` 的 abort/close/子孙进程 fixture；
   2026-07-26 两次真实 Kimi TUI E2E 退出后 `pgrep -fl '^kimi acp$'` 为空。
 - **人工验收边界**：真实 Kimi cancel 响应时延和长任务中的不可逆工具副作用尚未
   验证。
-- **里程碑**：M1–M2。
+- **里程碑**：M1–M4.11。
 
 ### UC-ROOM-001 持久房间与重启恢复
 
@@ -417,7 +503,7 @@
   `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id>`，不污染
   workdir。
 - **主流程**：timeline 以单调 `seq` append-only 落盘；`state.json` 保存
-  每个 stateful agent 的 seq cursor 与 ACP `session_id`（原子写）；TUI
+  每个 stateful agent 的 seq cursor 与 opaque native `session_id`（原子写）；TUI
   启动按 seq 恢复显示历史；persistent Orchestrator 构造末尾获取
   owner.lock（flock 非阻塞）单写者 lease，`aclose()` 释放。
 - **异常分支**：timeline/state 损坏、schema 不支持、workdir 不匹配、

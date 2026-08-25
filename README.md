@@ -1,15 +1,15 @@
 # myagents
 
 原生长连接优先的本地多 agent 终端编排器：在一个 Textual TUI 中点名 Kimi、
-Codex、OpenCode、Qwen Code、WorkBuddy 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
+Codex、OpenCode、Qwen Code、WorkBuddy、Pi 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M5.1、M5、M6 与 M7 已完成。
+> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M4.11、M5.1、M5、M6 与 M7 已完成。
 > 共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
 > stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
 > Kimi/OpenCode 使用 ACP-first + prepare-only 只读 JSONL fallback，Qwen Code /
-> WorkBuddy 使用 ACP-only，Codex 使用官方 app-server；JSONL 不会在已提交任务后跨协议重放。真实 Kimi + MCP
+> WorkBuddy 使用 ACP-only，Pi 使用官方 RPC + 权限 bridge，Codex 使用官方 app-server；JSONL 不会在已提交任务后跨协议重放。真实 Kimi + MCP
 > 端到端验收是发布前手工证据，见“当前限制”。
 
 ## 为什么做这个项目
@@ -40,6 +40,13 @@ Codex、OpenCode、Qwen Code、WorkBuddy 等 coding agent，共享时间线、�
   收口为 `Read,Glob,Grep`，profile 切换时重建进程/session。已有登录态会直接
   复用；只有 CLI 明确返回需要认证时才在系统浏览器打开官方登录页，认证等待
   有限超时；不提供 JSONL fallback。
+- `@pi`：通过 `pi --mode rpc` 使用持久 session。myagents 启动的 Pi 进程关闭
+  自动联网下载/更新与自动发现，不激活原生命名 built-in tools，只加载固定 permission bridge 与唯一命名 wrapper
+  工具；启动 attestation 通过后才允许 prompt。普通/写 profile 的 edit、write、
+  bash 每次只接受 TUI 的 `allow_once`，只读 profile 不激活风险工具且 hook 再次
+  hard-deny；授权弹窗只会在本轮 no-replay checkpoint 已持久化后出现。图片每轮
+  最多 16 张、合计 20 MiB；不提供
+  ACP 或 JSON/JSONL fallback。
 - `@host`：由只读 Codex adapter 扮演主持人，负责总结和仲裁。
 - Agent 就绪中心：启动时只读取当前进程的 PATH、环境变量和可执行文件属性，
   不启动或安装 agent。`/agents` 显示注册项的可用状态和设置提示，
@@ -114,16 +121,17 @@ Codex、OpenCode、Qwen Code、WorkBuddy 等 coding agent，共享时间线、�
 ┌──────────────────────▼─────────────────────┐
 │ orchestrator.py                            │
 │ routing / AgentSpec / history / fan-out    │
-└─────────────┬─────────────────┬────────────┘
-              │                 │
-┌─────────────▼──────────┐  ┌───▼────────────────────┐
-│ acp/                   │  │ codex_app_server/      │
-│ Kimi/OpenCode/Qwen/    │  │ Codex native runtime   │
-│ WorkBuddy ACP          │  │                        │
-└────────────────────────┘  └────────────────────────┘
-              │                 │
-              └────────┬────────┘
-                       │ adapters/ JSONL fallback
+└─────────┬──────────────┬────────────────┬──────────┘
+          │              │                │
+┌─────────▼───────┐ ┌────▼──────────┐ ┌───▼────────────────┐
+│ acp/            │ │ pi_rpc/       │ │ codex_app_server/  │
+│ Kimi/OpenCode/  │ │ Pi RPC +      │ │ Codex native       │
+│ Qwen/WorkBuddy  │ │ permission    │ │ runtime            │
+└─────────────────┘ │ bridge        │ └────────────────────┘
+                    └───────────────┘
+          │              │                │
+          └──────────────┴────────┬───────┘
+                                  │ adapters/ JSONL fallback
 ┌────────────────────────┐  ┌────────────────────────┐
 │ storage/               │  │ control/               │
 │ RoomStore：timeline +  │  │ CommandBus（FIFO）+    │
@@ -137,7 +145,7 @@ Codex、OpenCode、Qwen Code、WorkBuddy 等 coding agent，共享时间线、�
 ```
 
 核心原则是 **Hub-and-Spoke**：所有消息先进入 Orchestrator，worker agent
-之间不直接通信。ACP/app-server 只负责“如何驱动 agent”，不参与“任务应该
+之间不直接通信。ACP/Pi RPC/app-server 只负责“如何驱动 agent”，不参与“任务应该
 派给谁”的决策。
 
 ## 环境要求
@@ -152,6 +160,8 @@ Codex、OpenCode、Qwen Code、WorkBuddy 等 coding agent，共享时间线、�
   - [OpenAI Codex CLI](https://developers.openai.com/codex/cli)
   - [OpenCode](https://opencode.ai/)
   - [Qwen Code](https://github.com/QwenLM/qwen-code)
+  - Pi Coding Agent：`pi` 命令必须能从当前进程 PATH 解析，并支持
+    `pi --mode rpc`。myagents 只给子进程传入隔离参数，不修改用户已有 Pi 配置。
   - [WorkBuddy Code CLI](https://www.codebuddy.cn/docs/cli/installation)：安装可独立
     运行的官方 CLI，例如 `npm install -g @tencent-ai/codebuddy-code`。项目不会
     调用 WorkBuddy.app 包内私有二进制；若 CLI 不在 PATH，用
@@ -302,15 +312,18 @@ implementer 可写。未指定 `--verifier` 时由 reviewer 复核。`/steer` �
 | Codex | app-server (`codex app-server`) | 持久 thread + 增量 history + thread 恢复 | 已接入；JSONL fallback |
 | OpenCode | ACP + 隔离只读 JSONL (`opencode acp` → `opencode run`) | 持久 session + 增量 history；风险工具 ask；只有 prepare 失败才降级 | ACP/permission 已验证；hybrid contract 已验收 |
 | Qwen Code | ACP (`qwen --acp`) | 持久 session + 增量 history；普通轮 default、只读轮 plan | ACP-only 已验证 |
+| WorkBuddy | ACP (`codebuddy --acp --acp-transport stdio`) | 持久 session + 增量 history；default/受限只读 fresh profile | ACP-only 已验证 |
+| Pi | RPC (`pi --mode rpc`) | 持久 session + 增量 history；唯一 permission bridge、三 profile fresh session | RPC-only；fake contract 已验收 |
 | Claude | 未接入 | 预留 AgentSpec/adapter 扩展点 | 规划中 |
 
 有状态 agent 首次接入只收到最近 `history_limit` 条共享记录；后续只收到 cursor
 之后的新消息，并过滤它自己的回复。提交前明确失败时 cursor 不推进、下轮补发；
 提交后静默超时等结果不确定失败会先建立 no-replay cursor，防止工具任务被重复
 执行。
-cursor 是持久化 timeline 的单调 seq：重启后优先 `session/load` 续接旧
-session 并保留 cursor；load 失败或 agent 不支持时回退新 session，cursor
-归零并按 `history_limit` 有界 bootstrap。
+cursor 是持久化 timeline 的单调 seq：重启后优先使用各 transport 的精确原生
+恢复能力续接旧 session 并保留 cursor；恢复失败或 agent 不支持时只按对应
+adapter 已冻结的安全契约处理。新 session 的 cursor 归零并按 `history_limit`
+有界 bootstrap，不能把失败恢复伪装成命中。
 
 Kimi 的 JSONL 降级是明确的受限模式：内置 agent profile 只允许
 `Read` / `Grep` / `Glob`，禁止写入、命令、Skill、子 agent 和 MCP。
@@ -322,6 +335,14 @@ OpenCode 正常 ACP 路径额外把默认偏宽的权限收口为 unknown/risky=
 自动升级，并通过 inline agent 与 runtime permission 双重限制为
 `read` / `glob` / `grep` / `list`。细节见
 [ADR-0007](docs/adr/0007-opencode-hybrid-transport-policy.md)。
+
+Pi 不暴露原生命名 built-in tools 或 raw RPC bash。启动时关闭自动发现，只加载
+`pi_rpc/extensions/myagents_permission_bridge.ts`，并核验 nonce/profile/workspace/
+policy/tool source attestation；普通/写 profile 的风险工具逐次询权，只读 profile
+只有四个读取 wrapper。profile 切换重建进程和新 session，提交后失败 no-replay，
+没有 JSON/JSONL fallback。细节见
+[ADR-0014](docs/adr/0014-pi-rpc-permission-bridge.md)。该 bridge 不是 OS sandbox；
+批准 shell 后仍继承本机进程权限，不适合无人值守处理不受信输入。
 
 ## MCP 外部入口（M3）
 
@@ -453,6 +474,7 @@ Harness markers/links
 → py_compile
 → basic tests
 → ACP contract tests
+→ Pi RPC/client/adapter/permission bridge contract tests
 → Phase 2 TUI/integration tests
 → storage tests
 → M2.5 persistence/restore tests
@@ -467,6 +489,9 @@ Harness markers/links
 ```bash
 .venv/bin/python tests/test_basic.py
 .venv/bin/python tests/test_acp.py
+.venv/bin/python tests/test_pi_rpc_client.py
+.venv/bin/python tests/test_pi_adapter.py
+.venv/bin/python tests/test_pi_permission_bridge.py
 .venv/bin/python tests/test_phase2.py
 .venv/bin/python tests/test_storage.py
 .venv/bin/python tests/test_m25.py
@@ -476,7 +501,7 @@ Harness markers/links
 .venv/bin/python tests/test_codex_app_server.py
 ```
 
-普通测试全部使用 fake adapter/fake ACP server，不会调用真实外部 agent。
+普通测试全部使用 fake adapter/fake ACP/Pi RPC server，不会调用真实外部 agent。
 真实 Kimi + MCP 端到端验收（见“当前限制”）是发布前手工证据，不在
 默认 gate 内。
 
@@ -489,6 +514,7 @@ myagents/
 ├── orchestrator.py            # 路由、history、并发投递、lease 生命周期
 ├── host.py                    # supervisor / host
 ├── acp/                       # 通用 ACP client 与 adapter
+├── pi_rpc/                    # Pi 原生 RPC client/adapter + 固定权限 bridge
 ├── adapters/                  # JSONL adapter 与进程工具
 ├── control/                   # CommandBus + 私有 Unix 控制 socket server/client
 ├── storage/                   # RoomStore：timeline/events/state/owner lease
@@ -519,6 +545,7 @@ myagents/
 - [docs/adr/0010-multi-session-tui-management.md](docs/adr/0010-multi-session-tui-management.md)：会话目录、后台任务、资源上限与图片短引用。
 - [docs/adr/0011-session-scoped-natural-language-roles.md](docs/adr/0011-session-scoped-natural-language-roles.md)：自然语言指定、会话生命周期与安全边界。
 - [docs/adr/0013-natural-language-sequential-collaboration.md](docs/adr/0013-natural-language-sequential-collaboration.md)：自然语言固定计划、串行接力与失败收口。
+- [docs/adr/0014-pi-rpc-permission-bridge.md](docs/adr/0014-pi-rpc-permission-bridge.md)：Pi 原生 RPC、启动 attestation、逐次权限 bridge 与三 profile。
 - [docs/concepts.md](docs/concepts.md)：相关协议与编排模式。
 - [docs/knowledge-map.html](docs/knowledge-map.html)：可交互知识地图。
 
@@ -537,6 +564,7 @@ myagents/
 - [x] M4.5：OpenCode ACP-first + ask-by-default 权限 + 隔离只读 JSONL fallback。
 - [x] M4.6：Qwen Code ACP-only、default/plan profile 与 TUI 点名接入。
 - [x] M4.7：多项目会话目录、后台执行、资源 gate、未读通知与图片短引用。
+- [x] M4.11：Pi RPC-only、唯一权限 bridge、wrapper 工具闭集、三 profile 与 no-replay。
 - [x] M5.1：自然语言或 `/discuss` 进入 1–3 轮有界讨论与终局 moderator。
 - [x] M5：干净 Git fixed point、review → 单 writer 修改 → 独立复核、最多
   一次 repair/reverify、阶段边界 steering 与 TUI 阶段状态。
@@ -557,6 +585,11 @@ myagents/
   seam 属于 CLI 版本边界。1.18.14 的 ACP 回复、`session/load`、Bash deny、
   真实只读 fallback 和无残留进程已于 2026-08-08 通过；升级后必须重跑
   capability/permission/profile 探针。
+- Pi 0.84.3 已在临时目录完成真实 attestation、固定短回复/session 落盘、一次
+  `allow_once` 写入和无残留回收；默认 Harness 仍只跑 fake server/bridge contract。
+  真实路径逃逸反例、profile 重建、abort 时延、长期 session 和图片仍待人工验收。permission bridge 不是 OS
+  sandbox；批准 shell 后仍继承 myagents 的本机权限，不承诺无人值守处理不受信
+  输入或敏感环境。
 - M4.3 图片链路已于 2026-08-09 在房间 `e279f938f34e3475` 用真实 macOS
   剪贴板 PNG 验收：附件目录/文件权限为 0700/0600，command
   `5415080a-1c55-4eba-b063-dd5b7203d877` 的 timeline `seq=5..7` 完整，

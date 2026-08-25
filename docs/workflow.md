@@ -1,6 +1,6 @@
 # myagents 工作流
 
-> 作者：Bryant Yang　最近更新：2026-08-13
+> 作者：Bryant Yang　最近更新：2026-08-25
 >
 > 每次任务先在本表定位场景，再按需加载文档。顶层契约是
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -10,8 +10,8 @@
 | # | 场景 | 先读哪份 | 必守红线 | 产出落点 | DoD |
 | --- | --- | --- | --- | --- | --- |
 | 1 | 改路由、history、fan-out 或有界讨论 | [`SPEC.md`](SPEC.md) 路由/讨论/增量用例；[`adr/0008-bounded-multi-agent-discussion.md`](adr/0008-bounded-multi-agent-discussion.md)；`../HARNESS.md` §4.1 | R2、R3、R5 | `discussion.py`、`orchestrator.py`、`host.py`、对应测试 | 快照与并发顺序测试通过；讨论有界、不递归；无 name-specific 协议分支 |
-| 2 | 改 ACP、权限、取消、session 或 hybrid fallback | [`acp-migration.md`](acp-migration.md)、[`adr/0006-kimi-hybrid-transport-policy.md`](adr/0006-kimi-hybrid-transport-policy.md)、[`adr/0007-opencode-hybrid-transport-policy.md`](adr/0007-opencode-hybrid-transport-policy.md)；`../HARNESS.md` §4.2–4.3 | R1–R4 | `acp/`、具体 adapter/profile、fake server、ACP/hybrid/Phase 2 测试、协议文档 | fail-closed、串行化、prepare-only、no-replay、回收测试通过；高风险变化有真实/人工验收计划 |
-| 3 | 新增或迁移 agent | `../HARNESS.md` §1–§3；`acp-migration.md` | R2–R4 | 具体 adapter + `AGENT_SPECS` + tests + README | adapter 接口统一；transport 状态可见；JSONL fallback 受能力与提交时机约束 |
+| 2 | 改 ACP/RPC、权限、取消、session 或 hybrid fallback | [`acp-migration.md`](acp-migration.md)、[`adr/0006-kimi-hybrid-transport-policy.md`](adr/0006-kimi-hybrid-transport-policy.md)、[`adr/0007-opencode-hybrid-transport-policy.md`](adr/0007-opencode-hybrid-transport-policy.md)、[`adr/0014-pi-rpc-permission-bridge.md`](adr/0014-pi-rpc-permission-bridge.md)；`../HARNESS.md` §4.2–4.3 | R1–R4 | `acp/` / `pi_rpc/`、具体 adapter/profile/bridge、fake server、protocol tests 与文档 | fail-closed、attestation、串行化、no-replay、回收测试通过；高风险变化有真实/人工验收计划 |
+| 3 | 新增或迁移 agent | `../HARNESS.md` §1–§3；`acp-migration.md`；有独立权限模型时读取对应 ADR | R2–R4 | 具体 adapter + `AGENT_SPECS` + tests + README | adapter 接口统一；transport 状态可见；fallback 只按获证契约开放 |
 | 4 | 改 TUI 或权限交互 | [`SPEC.md`](SPEC.md) 权限用例；`../HARNESS.md` §4.2–4.3 | R1、R3 | `main.py` + Textual pilot tests | UI 不阻塞；退出无 Future/进程残留；来源 agent 可见 |
 | 5 | 只做 review / 文档 / Harness | 本文件；相关契约；必要时 [`harness-controls.md`](harness-controls.md) | 所有受影响红线 | 对应文档、Sensor 或 review 结论 | 引用无悬空；红线 gate 与相关测试通过 |
 | 6 | 改持久化、恢复、会话身份/切换、lease、command bus、可观测性或 MCP 入口 | [`adr/0001-persistent-room-command-bus-mcp.md`](adr/0001-persistent-room-command-bus-mcp.md)、[`adr/0002-durable-execution-observability.md`](adr/0002-durable-execution-observability.md)、[`adr/0005-project-conversation-sessions.md`](adr/0005-project-conversation-sessions.md)、[`adr/0010-multi-session-tui-management.md`](adr/0010-multi-session-tui-management.md)；[`SPEC.md`](SPEC.md) 房间/恢复/会话/控制/可观测用例 | R1–R4、单写者、执行事件不进 history | `storage/`、`control/`、`session_catalog.py`、`session_manager.py`、ACP adapter、MCP bridge、TUI、对应测试 | storage/M2.5/M3 与 session catalog/manager/TUI 测试通过；会话隔离且 default 兼容；后台事件/权限按 room_id 归属；取消不杀其他会话；MCP 不创建第二 Orchestrator、不获取 lease、不绕过 TUI 权限 |
@@ -30,7 +30,7 @@
 | R1 | 权限默认 deny，生产不得显式 auto |
 | R2 | 通用层不按 agent 名分支 |
 | R3 | 子进程只在 transport 层启动 |
-| R4 | Kimi/OpenCode 保持受限 hybrid；Qwen Code/WorkBuddy 保持 ACP-only + 固定 runtime profile |
+| R4 | Kimi/OpenCode 保持受限 hybrid；Qwen Code/WorkBuddy 保持 ACP-only；Pi 保持 RPC-only + 固定 bridge/wrapper/attestation；所有 runtime profile 受约束 |
 | R5 | 自然语言讨论与 `/discuss` 固定 2–3 人、1–3 轮，不由 agent 自主续轮 |
 | R6 | `/workflow` 固定角色/阶段、单 writer、一次 repair 上限和有界 steering |
 
@@ -39,7 +39,7 @@
 | 目的 | 必读 | 按需 |
 | --- | --- | --- |
 | 理解产品与路线 | `README.md`、`docs/SPEC.md` | `docs/concepts.md` |
-| 改 ACP 协议或 hybrid fallback | `docs/acp-migration.md`、对应 ADR-0006/0007、HARNESS §4 | `docs/harness-controls.md` 对应 Control |
+| 改 ACP/Pi RPC 协议或 hybrid fallback | `docs/acp-migration.md`、对应 ADR-0006/0007/0014、HARNESS §4 | `docs/harness-controls.md` 对应 Control |
 | 改编排器 | HARNESS §3–§4、SPEC 对应用例 | `host.py` 与 adapter 调用方 |
 | 新增 agent | `AGENTS.md`、HARNESS §1–§3 | 对应 CLI 官方协议文档 |
 | 改会话级自然语言角色 | ADR-0011、HARNESS §4.1 | RoomStore 与 host/Orchestrator/TUI 调用方 |

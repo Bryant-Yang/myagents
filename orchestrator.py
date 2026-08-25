@@ -7,7 +7,7 @@
 - **多种传输，两种上下文策略**（AgentSpec.transport）：
   - JSONL adapter：无头调用每次是全新会话，agent 看不到聊天记录，
     把最近 N 条对话记录塞进 prompt 一起发（transcript 快照）。
-  - 有状态 adapter（`stateful_session`，ACP 或 app-server）：原生会话
+  - 有状态 adapter（`stateful_session`，ACP、原生 RPC 或 app-server）：原生会话
     在 agent 侧保持，编排器
     只发**增量**——每个 agent 一个 history cursor，记录已交付到哪儿；
     每轮只发 cursor 之后的新消息（跳过 agent 自己的回复，那些本来就在
@@ -55,6 +55,7 @@ from adapters.base import (
     ExecutionMode,
 )
 from codex_app_server.adapter import CodexAppServerAdapter
+from pi_rpc.adapter import PiRpcAdapter
 from collaboration import (
     CollaborationPlan,
     CollaborationValidationError,
@@ -110,6 +111,7 @@ class AgentSpec:
       - "acp"        ACP 有状态会话，编排器发增量上下文
       - "acp+jsonl" ACP 为主，仅 prepare 失败时受限 JSONL 降级
       - "app-server" Codex 原生有状态 thread，编排器发增量上下文
+      - "rpc"        厂商原生有状态 RPC，编排器发增量上下文
       - "jsonl"      无头一次性调用，编排器发完整 transcript 快照
 
     新增 agent = 在这里加一行（写一个 adapter 类）。协议判断只看
@@ -117,7 +119,7 @@ class AgentSpec:
     """
 
     name: str
-    transport: str  # "acp" | "acp+jsonl" | "app-server" | "jsonl"
+    transport: str  # "acp" | "acp+jsonl" | "app-server" | "rpc" | "jsonl"
     factory: Callable[[], AgentAdapter]
     probe: ReadinessProbe | None = None
 
@@ -164,6 +166,10 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
     AgentSpec(
         "workbuddy", "acp", AcpWorkBuddyAdapter,
         workbuddy_readiness_probe,
+    ),
+    AgentSpec(
+        "pi", "rpc", PiRpcAdapter,
+        executable_probe("pi", ("pi",), "安装 Pi coding agent CLI"),
     ),
     AgentSpec(
         "codex", "app-server", CodexAppServerAdapter,

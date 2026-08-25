@@ -48,6 +48,10 @@ class ClipboardImageError(RuntimeError):
     """剪贴板没有可用图片，或图片无法安全落盘。"""
 
 
+class PromptImageBudgetError(ClipboardImageError):
+    """一条 prompt 的可信图片数量或聚合字节数超过 transport 预算。"""
+
+
 RunCommand = Callable[..., subprocess.CompletedProcess]
 
 
@@ -173,7 +177,12 @@ def _private_attachment_root(root: Path) -> tuple[Path, int]:
     return root.resolve(), fd
 
 
-def _read_attachment_png(root: Path, relative_path: Path) -> bytes:
+def _read_attachment_png(
+    root: Path,
+    relative_path: Path,
+    *,
+    max_bytes: int = MAX_CLIPBOARD_IMAGE_BYTES,
+) -> bytes:
     """经受限目录句柄读取 PNG，避免校验后的路径替换。"""
     if (relative_path.is_absolute() or not relative_path.parts
             or any(part in {"", ".", ".."} for part in relative_path.parts)):
@@ -194,14 +203,20 @@ def _read_attachment_png(root: Path, relative_path: Path) -> bytes:
         file_fd = os.open(relative_path.parts[-1], file_flags, dir_fd=current_fd)
         try:
             info = os.fstat(file_fd)
+            if info.st_size > MAX_CLIPBOARD_IMAGE_BYTES:
+                raise ClipboardImageError(
+                    "剪贴板图片超过 20 MiB 上限")
+            if info.st_size > max_bytes:
+                raise PromptImageBudgetError(
+                    "协议图片总量超过当前 transport 上限")
             with os.fdopen(file_fd, "rb", closefd=True) as image_file:
-                data = image_file.read(MAX_CLIPBOARD_IMAGE_BYTES + 1)
+                data = image_file.read(max_bytes + 1)
         except BaseException:
             # fdopen() only owns the descriptor after it returns successfully.
             with contextlib.suppress(OSError):
                 os.close(file_fd)
             raise
-        _validate_png_data(data, info, MAX_CLIPBOARD_IMAGE_BYTES)
+        _validate_png_data(data, info, max_bytes)
         return data
     finally:
         if current_fd != directory_fd:
@@ -212,6 +227,9 @@ def _read_attachment_png(root: Path, relative_path: Path) -> bytes:
 def prompt_images(
     prompt: str,
     attachment_root: Path | None,
+    *,
+    max_total_bytes: int | None = None,
+    max_images: int | None = None,
 ) -> tuple[TrustedImage, ...]:
     """提取当前房间内可信图片，并立即读为不可变快照。
 
@@ -221,6 +239,16 @@ def prompt_images(
     """
     if attachment_root is None:
         return ()
+    if (max_total_bytes is not None
+            and (not isinstance(max_total_bytes, int)
+                 or isinstance(max_total_bytes, bool)
+                 or max_total_bytes < 1)):
+        raise ValueError("max_total_bytes 必须是正整数")
+    if (max_images is not None
+            and (not isinstance(max_images, int)
+                 or isinstance(max_images, bool)
+                 or max_images < 1)):
+        raise ValueError("max_images 必须是正整数")
     try:
         root, directory_fd = _private_attachment_root(attachment_root)
     except (ClipboardImageError, OSError):
@@ -229,6 +257,7 @@ def prompt_images(
         os.close(directory_fd)
     found: list[TrustedImage] = []
     seen: set[Path] = set()
+    total_bytes = 0
     for match in _ATTACHMENT_REFERENCE_RE.finditer(prompt):
         try:
             short_number, legacy_path = match.groups()
@@ -246,10 +275,28 @@ def prompt_images(
                 relative = resolved.relative_to(root)
             if relative in seen:
                 continue
-            data = _read_attachment_png(root, relative)
+            if max_images is not None and len(found) >= max_images:
+                raise PromptImageBudgetError(
+                    f"协议图片数量超过 {max_images} 张上限")
+            remaining = (
+                MAX_CLIPBOARD_IMAGE_BYTES
+                if max_total_bytes is None
+                else max_total_bytes - total_bytes
+            )
+            if remaining < 1:
+                raise PromptImageBudgetError(
+                    "协议图片总量超过当前 transport 上限")
+            data = _read_attachment_png(
+                root,
+                relative,
+                max_bytes=min(MAX_CLIPBOARD_IMAGE_BYTES, remaining),
+            )
+        except PromptImageBudgetError:
+            raise
         except (ClipboardImageError, OSError, RuntimeError, ValueError):
             continue
         seen.add(relative)
+        total_bytes += len(data)
         found.append(TrustedImage(
             path=root / relative,
             attachment_root=root,

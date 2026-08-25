@@ -1,6 +1,6 @@
 # myagents 工程契约（HARNESS）
 
-> 作者：Bryant Yang　最近更新：2026-08-13
+> 作者：Bryant Yang　最近更新：2026-08-25
 > Harness Framework：2.1.0（来源 commit：
 > `b3b8fd47ebc49b57abdc365f327688b33970d54c`）
 
@@ -12,7 +12,7 @@
 ## 0. 项目使命
 
 为不同 coding agent 提供一个统一、可验证的本地 TUI 编排面：路由和共享时间线
-只有一个中心；ACP 负责有状态 agent 会话；adapter 隔离各 CLI 差异；权限默认
+只有一个中心；ACP、原生 RPC 与 app-server 负责有状态 agent 会话；adapter 隔离各 CLI 差异；权限默认
 拒绝；取消或退出后不留下仍能修改工作区的子进程。
 
 ## 1. 北极星原则
@@ -20,7 +20,7 @@
 | 原则 | 项目解释 |
 | --- | --- |
 | 一个编排中心 | agent 不直接互调，消息与 history 统一经过 Orchestrator。 |
-| 原生长连接优先，JSONL fallback | 有官方可靠长连接时优先使用；Kimi/OpenCode/Qwen Code/WorkBuddy 走 ACP，Codex 走 app-server；Qwen/WorkBuddy 在只读降级契约获证前保持 ACP-only。 |
+| 原生长连接优先，JSONL fallback | 有官方可靠长连接时优先使用；Kimi/OpenCode/Qwen Code/WorkBuddy 走 ACP，Codex 走 app-server，Pi 走原生 RPC；Qwen/WorkBuddy/Pi 不自动降级。 |
 | 协议通用、差异下沉 | 通用 runtime 不按 agent 名分支，具体差异进入 adapter/spec。 |
 | 注册不等于就绪 | 生产 TUI 被动探测当前进程可见的 CLI；缺失目标在副作用前原子拒绝，不自动安装或修改用户环境。 |
 | 权限 fail-closed | 无处理器、异常或畸形选择一律拒绝；auto 必须显式授权。 |
@@ -35,10 +35,11 @@
 | TUI | Textual `>=1.0` |
 | ACP transport | NDJSON JSON-RPC 2.0 over stdio，protocolVersion 1 |
 | Codex transport | app-server JSONL over stdio（JSON-RPC-like，无 `jsonrpc` header） |
-| JSONL transport | 各 agent CLI 无头模式；Kimi/OpenCode 自动降级只允许各自内置只读 profile；Qwen/WorkBuddy 不自动降级 |
+| Pi transport | `pi --mode rpc`，LF-delimited JSON request/event stream；独立 `pi_rpc/` runtime，不是 ACP |
+| JSONL transport | 各 agent CLI 无头模式；Kimi/OpenCode 自动降级只允许各自内置只读 profile；Qwen/WorkBuddy/Pi 不自动降级 |
 | 持久化 | RoomStore：timeline.jsonl（对话）+ events.jsonl（执行）+ state.json（seq/cursor/session）+ owner.lock |
 | 外部入口 | control/：CommandBus FIFO + 私有 Unix 控制 socket；myagents_mcp.py stdio MCP bridge（`mcp>=1.27,<2`） |
-| 测试 | 直接运行的 Python test scripts + Textual pilot + fake ACP server + 官方 MCP SDK stdio client |
+| 测试 | 直接运行的 Python test scripts + Textual pilot + fake ACP/Pi RPC server + 官方 MCP SDK stdio client |
 | 本地总门禁 | `bash scripts/check-harness.sh` |
 | Git / CI | Git 已初始化；远程 CI 尚未配置，不得假称已有合并门禁 |
 
@@ -47,9 +48,9 @@ main.py (Textual TUI)
     ↓
 orchestrator.py (routing / history / delivery locks / lease)
     ↓
-acp/             codex_app_server/  adapters/       storage/
-ACP runtime      Codex runtime      JSONL fallback  RoomStore
-    ↓                  ↓
+acp/             pi_rpc/          codex_app_server/  adapters/       storage/
+ACP runtime      Pi RPC runtime   Codex runtime      JSONL fallback  RoomStore
+    ↓                  ↓                 ↓
 coding agent subprocesses
 
 control/ (CommandBus FIFO + 私有 Unix 控制 socket)
@@ -57,7 +58,8 @@ control/ (CommandBus FIFO + 私有 Unix 控制 socket)
 myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 ```
 
-`tests/fake_acp_server.py` 是协议 fixture，不是生产 transport。
+`tests/fake_acp_server.py` 与 `tests/fake_pi_rpc_server.py` 是协议 fixture，不是生产
+transport。
 
 ## 3. 分层与依赖
 
@@ -68,6 +70,13 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 - `acp/client.py` 负责通用 ACP framing、request/response、反向权限请求和进程回收。
 - `acp/adapter.py` 把 ACP session 转成 `AgentEvent`，并将可选的
   prepare-only JSONL 降级收在同一 adapter seam 内。
+- `pi_rpc/client.py` 独占 `pi --mode rpc` 进程，负责 LF framing、request/event、
+  permission bridge UI、attestation、abort、session 与进程组回收；公开 API 不
+  接受任意 raw RPC dict。
+- `pi_rpc/adapter.py` 把 Pi session/stream 映射成 stateful `AgentEvent`；不得把
+  Pi RPC 冒充 ACP，也不得提供 JSON/JSONL fallback。
+- `pi_rpc/extensions/myagents_permission_bridge.ts` 是 Pi 唯一显式加载的权限组件，
+  注册唯一命名 wrapper 工具闭集；协议/权限策略不得散入 Orchestrator。
 - `codex_app_server/client.py` 独占 Codex app-server 进程，负责 initialize、
   request/response、反向 approval、通知和进程回收。
 - `codex_app_server/adapter.py` 把 Codex thread/turn 映射成 stateful
@@ -149,6 +158,22 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
   `internal` 环境，不回退 WorkBuddy.app 包内私有二进制。已有登录态直接复用；
   只有 session prepare 明确返回认证错误才接受 initialize 公布的 method 并按需
   认证。登录 URL 仅允许官方 HTTPS 域名，认证等待有界，失败原子回收。
+- `PiRpcAdapter` 的 `permission_handler` 默认为 `None`（deny）；`PiRpcClient` 对
+  handler 的畸形/异常结果回复 cancelled，对缺 id/method 的畸形 wire request
+  关闭连接。Pi 进程关闭自动发现并固定 `--offline` / `PI_OFFLINE=1`，
+  且不激活原生命名 built-in tools；只显式加载固定
+  `myagents_permission_bridge.ts`，并在第一条 prompt 前精确核验 nonce、policy
+  version、profile、workspace、bridge source 与 active wrapper tools。
+  `DEFAULT` / `WORKSPACE_WRITE` 只暴露七个 `myagents_*` wrapper，
+  `edit/write/bash` 每次只接受共享 UI 返回的 `allow_once`；`READ_ONLY` 只激活
+  `read/grep/find/ls` 四个 wrapper，并在 hook 内再次 hard-deny 风险工具。
+  permission handler 必须等 no-replay cursor 持久化后才能运行；profile 切换必须
+  重建进程和新 session。
+  attestation、权限 handler、请求绑定或 option 校验任一失败都拒绝，不允许
+  `allow_always`。permission preview 的最终 stable JSON 必须不超过 4096 UTF-8
+  bytes；未知 schema 或无法安全截断的内容拒绝。active prompt 事件同时受条数与
+  64 MiB 累计字节预算约束，adapter 不得用无界中间队列绕过预算；extension UI
+  受 32 个并发和活跃 id 唯一约束。
 - TUI 异步决定权限并显示来源 agent。
 - `session/request_permission` 到权限结果发回前属于人工等待，不计入 ACP
   inactivity timeout；read loop、取消和关闭仍保持可响应。
@@ -157,13 +182,15 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 
 ### 4.3 生命周期
 
-- 每个 ACP adapter 是其 session 的唯一 writer。
-- 同一 ACP agent 的 prompt 串行；不同 agent 可以并发 fan-out。
+- 每个 stateful adapter 是其原生 session 的唯一 writer。
+- 同一 stateful agent 的 prompt 串行；不同 agent 可以并发 fan-out。
 - 不在等待人工权限且没有活跃工具时，prompt 连续 120 秒无任何 ACP 通知或
   终止响应才自动取消；活跃工具使用独立 15 分钟 watchdog。两类超时都是提交后
   结果不确定，按 no-replay 失败处理。
 - cancel 后必须等待原 prompt 停止；超时则关闭并重建连接。
-- 子进程使用独立进程组；退出时 SIGTERM，超时再 SIGKILL。
+- agent 主进程使用独立进程组；退出时 SIGTERM，超时再 SIGKILL。Pi Bash 另用
+  detached group，正常关闭依赖 Pi 的 signal handler 回收；外部直接 SIGKILL 时不
+  宣称 detached 子孙必然回收。
 - TUI unmount 先取消权限 Future，再调用 `Orchestrator.aclose()`。
 - worker JSONL fallback 只允许在新 ACP 连接的 start/initialize/
   session prepare 失败时启动；活跃 session 冲突、checkpoint 失败、
@@ -172,6 +199,14 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
   fallback 只允许 `read` / `glob` / `grep` / `list`，并禁用项目配置、
   Claude 兼容层、plugin 和自动升级。两者均禁止写入、命令、网络、Skill、
   子 agent 和 MCP；权限必须由各 CLI runtime 执行，不能退化为 prompt-only。
+- Pi 不存在 fallback。prompt 成功响应后发生的断线、超时或 abort 不确定结果必须
+  建立 no-replay 边界；早到事件先缓冲，提交确认后先发布 `delivery_committed`。
+  `agent_end` 不作为终局，必须等 `agent_settled`；最终 assistant terminal 必须存在
+  且 stop reason 属于显式成功闭集，缺失/未知 terminal、error/abort 或权限终止工具
+  不得记为成功，自动重试后的最终成功可正常收口。reserved session path 另以私有、
+  fsync 的 reserved/materialized marker 绑定 checkpoint；只有精确 reserved 且文件尚未
+  产生时可 fresh，materialized 后缺失必须 fail-closed。取消超时则回收进程组。生产
+  client 不得发送 RPC `type: "bash"`，命令只能走逐次权限 wrapper。
 
 ### 4.4 持久化与恢复（M2.5）
 
@@ -311,6 +346,7 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 | OpenCode hybrid transport | `tests/test_opencode_hybrid.py` + `tests/fake_acp_server.py` |
 | Qwen Code ACP-only 注册 | `tests/test_phase2.py` + `tests/fake_acp_server.py` |
 | WorkBuddy ACP-only 注册/认证/profile | `tests/test_workbuddy_acp.py` + `tests/fake_acp_server.py` |
+| Pi RPC/attestation/权限 bridge/profile | `tests/test_pi_rpc_client.py` + `tests/test_pi_adapter.py` + `tests/test_pi_permission_bridge.py` + `tests/fake_pi_rpc_server.py`（只调用 fixture，不调用真实 Pi） |
 | Agent 被动就绪探测/原子资格门/TUI | `tests/test_agent_readiness.py` + `tests/test_tui_completion.py`（仅 fake resolver/临时文件） |
 | 会话级自然语言角色 | `tests/test_session_roles.py` + `tests/test_discussion.py` + `tests/test_tui_completion.py` + TUI 纯状态模型 |
 | 自然语言有界讨论 | `tests/test_discussion.py`（显式 mention、host 路由、边界与同一状态机） |
@@ -324,9 +360,9 @@ myagents_mcp.py (stdio MCP bridge，mcp>=1.27,<2)
 | M3 MCP stdio | `tests/test_m3_mcp.py`（官方 SDK client） |
 | M4 Codex app-server | `tests/test_codex_app_server.py` + `tests/fake_codex_app_server.py` |
 | M4.3 剪贴板图片 | `tests/test_clipboard_image.py` + macOS 人工截图验收 |
-| 真实协议边界 | `docs/SPEC.md` 登记的 Kimi/OpenCode/WorkBuddy ACP + Textual/受限临时目录 E2E；Qwen 上游源码与本机启动证据 |
+| 真实协议边界 | `docs/SPEC.md` 登记的 Kimi/OpenCode/WorkBuddy ACP + Textual/受限临时目录 E2E；Qwen 上游源码与本机启动证据；Pi 0.84.3 临时目录握手/短回复/逐次授权写入 E2E |
 
-普通测试禁止调用真实 Kimi/Codex/OpenCode/Qwen/WorkBuddy。真实 agent 验收必须由用户明确授权，
+普通测试禁止调用真实 Kimi/Codex/OpenCode/Qwen/WorkBuddy/Pi。真实 agent 验收必须由用户明确授权，
 在临时目录运行，并在结束后检查没有残留进程。
 
 ## 6. 质量门禁
@@ -338,6 +374,7 @@ harness 文档引用 → redlines → py_compile → readiness → basic → 会
 → Kimi hybrid
 → OpenCode hybrid
 → WorkBuddy ACP
+→ Pi RPC + permission bridge
 → storage → M2.5 → M3 bus → M3 control → M3 MCP stdio → M4 app-server
 → M4.3 clipboard image
 ```
@@ -383,6 +420,12 @@ branch protection / required checks 需要单独配置后才能宣称生效。
   进程残留。WorkBuddy.app 包内 CodeBuddy CLI 2.115.0 虽能握手，但正文路径会
   挂起，故明确不作为独立 CLI fallback；真实跨进程恢复、取消时延、图片与长期
   session 稳定性仍待人工验收；
+- Pi 0.84.3 的本机 CLI 与源码已核实官方 `--mode rpc`、LF JSON request/event、
+  session/stream/abort/image 与 extension 前置工具阻断能力；临时目录真实探针已
+  完成 attestation、固定短回复/session 落盘、一次 `allow_once` 写入及无残留回收。
+  默认 gate 仍只使用 fake RPC/extension fixture；真实路径逃逸、profile 重建、
+  图片、abort 时延和长期 session 尚待人工验收。permission bridge 不是 OS
+  sandbox，不支持不受信输入的无人值守执行；
 - `/discuss` 已于 2026-08-08 在同一持久房间恢复原 Kimi/OpenCode session，
   经 MCP 完成两轮交叉讨论和 Codex host 仲裁；单 user、连续 timeline、跨轮
   引用、无工具事件及退出回收均已核对。真实模型不进默认 gate；
@@ -395,9 +438,9 @@ branch protection / required checks 需要单独配置后才能宣称生效。
 | # | 红线 | 守门 |
 | --- | --- | --- |
 | R1 | 生产构造不得显式使用 `permission="auto"`，权限默认必须为 `deny` | `bash scripts/check-redlines.sh` 的 AST permission gate |
-| R2 | 通用 orchestration/ACP 层不得按具体 agent 名做条件分支 | `bash scripts/check-redlines.sh` 的 AST name-branch gate |
+| R2 | 通用 orchestration/transport 层不得按具体 agent 名做条件分支 | `bash scripts/check-redlines.sh` 的 AST name-branch gate |
 | R3 | UI、orchestrator、host 不得直接启动 shell/子进程 | `bash scripts/check-redlines.sh` 的 AST process-boundary gate |
-| R4 | Kimi/OpenCode 必须受限 ACP-first；Qwen/WorkBuddy 必须 ACP-only 且固定 runtime profile；OpenCode 普通轮风险工具 ask、只读轮 runtime deny；WorkBuddy 只用独立 CLI、固定已验收 region、按需有界认证且登录 URL fail-closed；JSONL 仅获证的 prepare-only 只读降级 | `bash scripts/check-redlines.sh` 的 registry/policy/profile gate |
+| R4 | Kimi/OpenCode 必须受限 ACP-first；Qwen/WorkBuddy 必须 ACP-only 且固定 runtime profile；Pi 必须是原生 RPC-only + 固定 bridge/wrapper/tool/profile attestation，禁止 raw RPC bash 和 fallback；OpenCode 普通轮风险工具 ask、只读轮 runtime deny；WorkBuddy 只用独立 CLI、固定已验收 region、按需有界认证且登录 URL fail-closed；JSONL 仅获证的 prepare-only 只读降级 | `bash scripts/check-redlines.sh` 的 registry/policy/profile/bridge gate |
 | R5 | 自然语言讨论与 `/discuss` 必须共用 2–3 人、1–3 轮、终局主持状态机；自然语言协作必须保持 2–4 步、至少两个 worker、严格串行且失败/取消即停；两者均不得递归 dispatch/动态扩员；会话角色不得改变参与者、步骤/轮数、权限或 runtime | `bash scripts/check-redlines.sh` 的 discussion/collaboration bounds 与 AST gate + `tests/test_discussion.py` + `tests/test_session_roles.py` + `tests/test_collaboration.py` |
 | R6 | `/workflow` 必须保持固定角色/阶段、单 writer、最多一次 repair/reverify、read-only 复核和有界 steering | `bash scripts/check-redlines.sh` 的 workflow bounds/mode/AST gate |
 
@@ -417,6 +460,8 @@ branch protection / required checks 需要单独配置后才能宣称生效。
   [`docs/adr/0006-kimi-hybrid-transport-policy.md`](docs/adr/0006-kimi-hybrid-transport-policy.md)。
 - M4.5 OpenCode hybrid transport 事实源：
   [`docs/adr/0007-opencode-hybrid-transport-policy.md`](docs/adr/0007-opencode-hybrid-transport-policy.md)。
+- M4.11 Pi RPC 与权限 bridge 事实源：
+  [`docs/adr/0014-pi-rpc-permission-bridge.md`](docs/adr/0014-pi-rpc-permission-bridge.md)。
 - M5.1 有界多智能体讨论事实源：
   [`docs/adr/0008-bounded-multi-agent-discussion.md`](docs/adr/0008-bounded-multi-agent-discussion.md)。
 - M5 有界里程碑工作流事实源：

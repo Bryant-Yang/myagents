@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import json
 import pathlib
+import re
 import sys
 
 ROOT = pathlib.Path.cwd()
@@ -82,7 +83,7 @@ for path, classes in required_deny_defaults.items():
 # R2: generic orchestration/runtime may register names, but may not branch on
 # specific worker literals.
 worker_names = {
-    "kimi", "codex", "opencode", "qwen", "workbuddy", "claude"}
+    "kimi", "codex", "opencode", "qwen", "workbuddy", "pi", "claude"}
 for path in [ROOT / "orchestrator.py", ROOT / "acp/client.py"]:
     tree = parse(path)
     for node in ast.walk(tree):
@@ -122,7 +123,8 @@ for path in [
                      f"上层直接调用 {attr}；改由 ACP/JSONL adapter 执行")
 
 # R4: production Kimi/OpenCode remain constrained ACP-first; Qwen/WorkBuddy
-# remain ACP-only. JSONL is allowed only behind each verified prepare-only seam.
+# remain ACP-only; Pi remains attested RPC-only. JSONL is allowed only behind
+# each verified prepare-only seam.
 orchestrator = ROOT / "orchestrator.py"
 source = orchestrator.read_text(encoding="utf-8")
 tree = parse(orchestrator)
@@ -154,6 +156,7 @@ expected_specs = {
     ("opencode", "acp+jsonl", "AcpOpenCodeAdapter"),
     ("qwen", "acp", "AcpQwenAdapter"),
     ("workbuddy", "acp", "AcpWorkBuddyAdapter"),
+    ("pi", "rpc", "PiRpcAdapter"),
 }
 for name, transport, factory in sorted(expected_specs - registered_specs):
     errors.append(
@@ -399,6 +402,274 @@ if ("resolve(strict=True)" not in workbuddy_validator_source
     errors.append(
         "[R4] acp/adapter.py: WorkBuddy CLI 校验必须 canonicalize、要求可执行，"
         "并拒绝 App bundle 内目标（含符号链接）")
+
+# Pi is a separate native RPC transport.  Its process is safe to expose only
+# when the fixed extension, exact wrapper-tool closure, startup attestation,
+# and three execution profiles stay inseparable.  There is no Pi JSONL/ACP
+# fallback and the deliberately small client may never expose raw RPC bash.
+pi_adapter = ROOT / "pi_rpc/adapter.py"
+pi_client = ROOT / "pi_rpc/client.py"
+pi_bridge = ROOT / "pi_rpc/extensions/myagents_permission_bridge.ts"
+for required_path in (pi_adapter, pi_client, pi_bridge):
+    if not required_path.is_file():
+        errors.append(
+            f"[R4] {required_path.relative_to(ROOT)}: Pi RPC 受控路径缺失")
+
+expected_pi_read_tools = (
+    "myagents_read",
+    "myagents_grep",
+    "myagents_find",
+    "myagents_ls",
+)
+expected_pi_mutating_tools = (
+    "myagents_edit",
+    "myagents_write",
+    "myagents_bash",
+)
+expected_pi_tools = expected_pi_read_tools + expected_pi_mutating_tools
+
+if pi_adapter.is_file():
+    pi_adapter_source = pi_adapter.read_text(encoding="utf-8")
+    pi_adapter_tree = parse(pi_adapter)
+    pi_constants: dict[str, object] = {}
+    for node in pi_adapter_tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if (isinstance(target, ast.Name)
+                    and target.id in {
+                        "PI_READ_ONLY_TOOLS", "PI_MUTATING_TOOLS",
+                        "PI_POLICY_VERSION", "PI_ATTEST_PREFIX",
+                        "PI_PERMISSION_PREFIX", "PI_READY_STATUS_KEY",
+                        "PI_POLICY_COMMAND", "_POLICY_NONCE_ENV",
+                        "_POLICY_HASH_ENV", "_POLICY_PATH_ENV",
+                        "_PROFILE_ENV", "_WORKSPACE_ENV",
+                    }):
+                try:
+                    pi_constants[target.id] = ast.literal_eval(node.value)
+                except (ValueError, TypeError):
+                    pi_constants[target.id] = None
+    expected_pi_constants = {
+        "PI_READ_ONLY_TOOLS": expected_pi_read_tools,
+        "PI_MUTATING_TOOLS": expected_pi_mutating_tools,
+        "PI_POLICY_VERSION": "myagents.pi.policy/v1",
+        "PI_ATTEST_PREFIX": "MYAGENTS_PI_ATTEST_V1:",
+        "PI_PERMISSION_PREFIX": "MYAGENTS_PI_PERMISSION_V1:",
+        "PI_READY_STATUS_KEY": "myagents.pi.policy",
+        "PI_POLICY_COMMAND": "myagents-policy-v1",
+        "_POLICY_NONCE_ENV": "MYAGENTS_PI_POLICY_NONCE",
+        "_POLICY_HASH_ENV": "MYAGENTS_PI_POLICY_HASH",
+        "_POLICY_PATH_ENV": "MYAGENTS_PI_POLICY_PATH",
+        "_PROFILE_ENV": "MYAGENTS_PI_PROFILE",
+        "_WORKSPACE_ENV": "MYAGENTS_PI_WORKSPACE",
+    }
+    if pi_constants != expected_pi_constants:
+        errors.append(
+            "[R4] pi_rpc/adapter.py: Pi policy/version/prefix 与 wrapper "
+            "工具闭集必须保持固定")
+
+    pi_adapter_class = next((
+        node for node in pi_adapter_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "PiRpcAdapter"
+    ), None)
+    pi_adapter_class_source = (
+        ast.get_source_segment(pi_adapter_source, pi_adapter_class)
+        if pi_adapter_class is not None else ""
+    )
+    pi_init = next((
+        node for node in (pi_adapter_class.body if pi_adapter_class else [])
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "__init__"
+    ), None)
+    permission_default = object()
+    if pi_init is not None:
+        for arg, default in zip(
+                pi_init.args.kwonlyargs, pi_init.args.kw_defaults):
+            if arg.arg == "permission_handler":
+                permission_default = default
+                break
+    if not (isinstance(permission_default, ast.Constant)
+            and permission_default.value is None):
+        errors.append(
+            "[R1] pi_rpc/adapter.py: PiRpcAdapter permission_handler "
+            "默认值必须为 None（deny）")
+
+    command_method = next((
+        node for node in (pi_adapter_class.body if pi_adapter_class else [])
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_command"
+    ), None)
+    command_source = (
+        ast.get_source_segment(pi_adapter_source, command_method)
+        if command_method is not None else ""
+    )
+    command_literals = {
+        node.value for node in ast.walk(command_method)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    } if command_method is not None else set()
+    required_pi_argv = {
+        "--mode", "rpc", "--offline", "--no-approve", "--no-extensions",
+        "--extension", "--no-skills", "--no-prompt-templates",
+        "--no-themes", "--no-builtin-tools", "--tools", "--session-dir",
+    }
+    if (not required_pi_argv <= command_literals
+            or "_tools_for" not in command_source
+            or "_bridge_path" not in command_source
+            or "json" in command_literals
+            or "acp" in command_literals):
+        errors.append(
+            "[R4] pi_rpc/adapter.py: Pi argv 必须固定 rpc、关闭自动发现、"
+            "只显式加载 bridge 并传入 profile wrapper 闭集")
+    extension_flags = [
+        node for node in ast.walk(command_method)
+        if isinstance(node, ast.Constant)
+        and node.value == "--extension"
+    ] if command_method is not None else []
+    if len(extension_flags) != 1:
+        errors.append(
+            "[R4] pi_rpc/adapter.py: Pi 只能显式加载一个 permission bridge")
+
+    required_pi_adapter_seams = {
+        "extensions", "myagents_permission_bridge.ts",
+        "_POLICY_NONCE_ENV", "_POLICY_HASH_ENV", "_POLICY_PATH_ENV",
+        "_PROFILE_ENV", "_WORKSPACE_ENV", "_handle_attestation",
+        "_handle_ready_status", "_validate_policy_command",
+        "sourceInfo", "hashlib.sha256", "ExecutionMode.READ_ONLY",
+        "resume_session_id = None", "delivery_committed",
+        "delivery_maybe_sent", "await self._reset_locked()",
+        "_prompt_permission_gate", "permission_gate.wait()",
+        "permission_gate.set()", "tool_name not in self._expected_tools",
+        "last_assistant_end", "terminal_tool_failure",
+        "_SESSION_MARKER_VERSION", "_read_session_marker",
+        "_write_session_marker", 'state="materialized"',
+        'expected_previous="reserved"', '"PI_OFFLINE": "1"',
+        "last_assistant_end is None",
+        "max_total_bytes=MAX_CLIPBOARD_IMAGE_BYTES",
+        "max_images=_MAX_PROMPT_IMAGES",
+        "_policy_generation", "_reclaim_policy_generation",
+        "maxsize=_PERMISSION_EVENT_QUEUE_LIMIT",
+        "raw_task = asyncio.create_task(anext(raw_stream))",
+    }
+    if not all(value in pi_adapter_class_source
+               for value in required_pi_adapter_seams):
+        errors.append(
+            "[R4] pi_rpc/adapter.py: Pi 必须在首个 prompt 前完成 bridge/"
+            "nonce/profile/workspace/tool-source attestation，并在 profile "
+            "切换时重建进程和 fresh session")
+    forbidden_pi_adapter_calls = {
+        node.func.attr for node in ast.walk(pi_adapter_class)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and "fallback" in node.func.attr.lower()
+    } if pi_adapter_class is not None else {"missing"}
+    if forbidden_pi_adapter_calls:
+        errors.append(
+            "[R4] pi_rpc/adapter.py: Pi RPC-only 不得调用任何 fallback seam")
+
+if pi_client.is_file():
+    pi_client_source = pi_client.read_text(encoding="utf-8")
+    pi_client_tree = parse(pi_client)
+    pi_client_class = next((
+        node for node in pi_client_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "PiRpcClient"
+    ), None)
+    public_methods = {
+        node.name for node in (pi_client_class.body if pi_client_class else [])
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.name.startswith("_")
+    }
+    expected_pi_client_public = {
+        "pid", "running", "start", "get_state", "get_commands", "prompt",
+        "abort", "extension_ui_response", "close",
+    }
+    if public_methods != expected_pi_client_public:
+        errors.append(
+            "[R4] pi_rpc/client.py: Pi client 公共面必须保持固定且不得公开 "
+            "raw request/send/bash API")
+    required_pi_client_seams = {
+        "_EVENT_QUEUE_BYTE_LIMIT", "_active_prompt_event_bytes",
+        "_queue_prompt_event", "_next_prompt_event",
+        "_EXTENSION_UI_TASK_LIMIT", "duplicate extension UI request id",
+    }
+    if not all(value in pi_client_source
+               for value in required_pi_client_seams):
+        errors.append(
+            "[R4] pi_rpc/client.py: Pi 事件流必须有累计字节预算，"
+            "extension UI 必须限制并发并拒绝活跃重复 id")
+    for node in ast.walk(pi_client_tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        pairs = {
+            key.value: value.value
+            for key, value in zip(node.keys, node.values)
+            if isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+            and isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+        }
+        if pairs.get("type") == "bash":
+            fail("R4", pi_client, node,
+                 "生产 client 禁止发送 raw Pi RPC type=bash；必须走权限 wrapper")
+    extension_response_method = next((
+        node for node in (pi_client_class.body if pi_client_class else [])
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "extension_ui_response"
+    ), None)
+    extension_response_source = (
+        ast.get_source_segment(pi_client_source, extension_response_method)
+        if extension_response_method is not None else ""
+    )
+    if "_validated_extension_response" not in extension_response_source:
+        errors.append(
+            "[R4] pi_rpc/client.py: extension UI response 必须先做严格 shape/id 校验")
+
+if pi_bridge.is_file():
+    bridge_source = pi_bridge.read_text(encoding="utf-8")
+    wrapper_match = re.search(
+        r"export\s+const\s+WRAPPER_TOOL_NAMES\s*=\s*\[(.*?)\]\s*as\s+const",
+        bridge_source,
+        re.DOTALL,
+    )
+    wrapper_names = (
+        tuple(re.findall(r'"([^"]+)"', wrapper_match.group(1)))
+        if wrapper_match is not None else ()
+    )
+    if wrapper_names != expected_pi_tools:
+        errors.append(
+            "[R4] pi_rpc/extensions/myagents_permission_bridge.ts: wrapper "
+            "工具必须精确为固定七项且顺序稳定")
+    required_bridge_tokens = {
+        '"myagents.pi.policy/v1"', '"MYAGENTS_PI_ATTEST_V1:"',
+        '"MYAGENTS_PI_PERMISSION_V1:"', '"myagents.pi.policy"',
+        '"myagents-policy-v1"', '"default"', '"read_only"',
+        '"workspace_write"', "MYAGENTS_PI_POLICY_NONCE",
+        "MYAGENTS_PI_POLICY_HASH", "MYAGENTS_PI_POLICY_PATH",
+        "MYAGENTS_PI_PROFILE", "MYAGENTS_PI_WORKSPACE",
+        'pi.on("session_start"', 'pi.on("tool_call"',
+        "pi.getActiveTools()", "pi.getAllTools()", "sourceInfoMatches",
+        "sameOrderedStrings", "allow_once:", "reject_once:",
+        "permits.delete(event.toolCallId)", "canonicalizeInput",
+        "rejectUnsafeMutation", "hasGitSegment", "nlink > 1",
+        "PERMISSION_PREVIEW_MAX_BYTES = 4 * 1024",
+        "PERMIT_TTL_MS = 60_000",
+        "permissionDisplayInput", "_myagentsPreview", "TOOL_INPUT_KEYS",
+        "assertDisplaySchema", "enforcePermissionDisplayBudget",
+        "stableJsonByteLength",
+        "argsHash: canonical.digest",
+        "bash command is too large to display safely",
+        'pi.on("session_start", (_event, ctx) => {',
+        "const currentGeneration = ++generation",
+        "void (async () => {",
+        "if (currentGeneration !== generation) return",
+        "generation: callGeneration",
+        "permit.generation !== generation",
+        "callGeneration !== generation",
+    }
+    if not all(token in bridge_source for token in required_bridge_tokens):
+        errors.append(
+            "[R4] pi_rpc/extensions/myagents_permission_bridge.ts: "
+            "attestation、非阻塞 generation guard、active-tool/source 核验、"
+            "逐次 permit、权限预览或路径边界被放宽")
 
 profile = ROOT / "adapters/kimi_readonly_fallback.md"
 if not profile.is_file():
@@ -713,7 +984,7 @@ if errors:
 print("✓ R1 权限默认 fail-closed")
 print("✓ R2 通用层无 agent-name 协议分支")
 print("✓ R3 子进程仅由 transport 层启动")
-print("✓ R4 Kimi/OpenCode 受限 ACP-first + Qwen/WorkBuddy ACP-only 固定 profile")
+print("✓ R4 Kimi/OpenCode 受限 ACP-first + Qwen/WorkBuddy ACP-only + Pi attested RPC-only")
 print("✓ R5 自然语言讨论、/discuss 与有序协作均有界且不递归 dispatch")
 print("✓ R6 /workflow 固定阶段/单 writer/一次 repair/steering 有界")
 PY

@@ -218,7 +218,7 @@ def make_plan_orchestrator(plan: CollaborationPlan):
     orch = Orchestrator(workdir=".", persistent=False)
     adapters = {
         name: RecordingAdapter(name, calls)
-        for name in ("kimi", "opencode", "qwen", "workbuddy", "codex")
+        for name in ("kimi", "opencode", "qwen", "workbuddy", "pi", "codex")
     }
     host = PlanHost(calls, plan)
     adapters["host"] = host

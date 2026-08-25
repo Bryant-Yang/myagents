@@ -15,7 +15,7 @@
 | 调节目标 | 当前覆盖 | 证据索引 | 明确不保证 |
 | --- | --- | --- | --- |
 | Maintainability | 部分：项目入口、场景索引、文档引用、Python 语法和测试 gate | `AGENTS.md`、`workflow.md`、`scripts/check-harness.sh` | 没有 formatter、lint、静态类型检查和复杂度阈值 |
-| Architecture Fitness | 较强：transport 边界、ACP-first、权限默认值、会话角色边界、有界讨论和单写者 workflow 有确定性检查 | HARNESS R1–R6、`test_session_roles.py`、`test_phase2.py`、`test_discussion.py`、`test_workflow.py` | 不证明新抽象必要，也不覆盖生产性能 |
+| Architecture Fitness | 较强：transport 边界、ACP-first/Pi RPC-only、权限默认值、Pi bridge attestation、会话角色边界、有界讨论和单写者 workflow 有确定性检查 | HARNESS R1–R6、`test_session_roles.py`、`test_phase2.py`、Pi RPC tests、`test_discussion.py`、`test_workflow.py` | 不证明新抽象必要，也不覆盖生产性能或 OS sandbox |
 | Behaviour | 关键 Phase 2 + M2.5（持久化/恢复/lease）+ M3（command bus/控制 socket/MCP stdio）路径有 fake contract tests 与真实 Kimi E2E 双证据 | [`SPEC.md#关键行为用例`](SPEC.md#关键行为用例) | 不保证所有 CLI 版本、长会话 compaction 或真实 cancel 时延 |
 
 ## 2. Control Map
@@ -23,9 +23,9 @@
 | ID | 目标 | Guide（行动前） | Sensor / 人工确认（行动后） | 失败处置 | Owner |
 | --- | --- | --- | --- | --- | --- |
 | C1 | 通用 agent 接入边界 | HARNESS §3；`acp-migration.md` 架构 | R2–R4；`test_phase2.py` AgentSpec/并发用例 | 阻断并把差异下沉至 adapter/spec | Bryant Yang |
-| C2 | 权限 fail-closed 且人工等待不误超时 | HARNESS §4.2；`acp-migration.md` 权限策略 | R1；ACP/Phase 2 权限测试；`test_acp.py` permission-wait/inactivity 用例；SPEC UC-PERM-001 | 阻断；恢复 deny/合法 option 校验与人工等待暂停计时后复验 | Bryant Yang |
+| C2 | 权限 fail-closed 且人工等待不误超时 | HARNESS §4.2；`acp-migration.md` 权限策略；ADR-0014 | R1；ACP/Phase 2 权限测试；`test_acp.py` permission-wait/inactivity；Pi adapter/bridge 权限请求绑定；SPEC UC-PERM-001 | 阻断；恢复 deny/合法 option 或 Pi call nonce 校验与人工等待暂停计时后复验 | Bryant Yang |
 | C3 | 增量上下文不重发、不乱序（seq cursor） | HARNESS §4.1、§4.4；`acp-migration.md` 增量契约与持久化契约 | `test_phase2.py` cursor/bootstrap/delivery-lock 用例；`test_m25.py` seq 增量与 timeout no-replay 用例 | 区分明确未提交的可重试失败与提交后不确定的 no-replay；修复后重跑并发回归 | Bryant Yang |
-| C4 | 取消与退出不留进程 | HARNESS §4.3；`acp-migration.md` 取消/生命周期 | basic/ACP/Phase 2 回收测试；SPEC UC-LIFE-001 人工边界 | 阻断交付；清理进程并定位锁/进程组问题 | Bryant Yang |
+| C4 | 取消与退出不留进程 | HARNESS §4.3；`acp-migration.md` 取消/生命周期 | basic/ACP/Phase 2 与 Pi RPC abort/close 回收测试；SPEC UC-LIFE-001 人工边界 | 阻断交付；清理进程并定位锁/进程组问题 | Bryant Yang |
 | C5 | Harness 入口与引用不漂移 | `AGENTS.md`；`workflow.md` | `scripts/check-harness.sh` 文档/marker/link Sensor | 修正文档或引用；不得复制多份规则 | Bryant Yang |
 | C6 | 关键行为证据可信 | `SPEC.md` | fake fixture + 既有 tests + 授权的真实 E2E/人工验收 | 报告证据缺口，不以新生成测试代替验收 | Bryant Yang |
 | C7 | 持久化、多会话 runtime、session restore 与单写者 lease | HARNESS §4.4；`acp-migration.md`；ADR-0001、ADR-0005、ADR-0010 | storage/M2.5 与 `test_session_catalog.py`、`test_session_manager.py`、`test_session_tui.py`；SPEC UC-ROOM-001/UC-SESSION-001/UC-ACP-002 | fail loudly 不假提交；本地命令不入 timeline；事件/权限按 room_id 归属；只回收合格的后台空闲 runtime | Bryant Yang |
@@ -36,6 +36,7 @@
 | C12 | 指定成员讨论有界、跨轮上下文正确且失败不假绿 | ADR-0008；HARNESS §4.1；SPEC UC-DISCUSS-001 | R5 bounds/AST gate；`test_discussion.py` parser/并发/失败 contract；授权真实 MCP 回放 | 阻断；恢复 2–3 人、1–3 轮、非递归状态机和失败汇总后复验 | Bryant Yang |
 | C13 | 里程碑 workflow 保持 Git fixed point、单 writer、固定复核与阶段边界 steering | ADR-0009；SPEC UC-WORKFLOW-001 | R6 bounds/mode/AST gate；`test_workflow.py`；hybrid/app-server/control/MCP/TUI contract；授权真实验收 | 阻断；恢复 fixed point、read-only 复核、一次 repair 和 steering 上限后复验 | Bryant Yang |
 | C14 | 自然语言角色保持会话隔离且不改变编排安全边界 | ADR-0011；HARNESS §4.1；SPEC UC-ROLE-001 | `test_session_roles.py`；`test_discussion.py`；`test_tui_completion.py`；TUI activity/status tests | 阻断；恢复固定 target 闭集、room 级原子状态与 assignment-only 注入；查看/清空不得进入 timeline 或跨运行中 command 边界，确认不改权限/runtime/讨论边界/workflow | Bryant Yang |
+| C15 | Pi RPC 只通过已 attested 的唯一权限 bridge 与 wrapper 闭集执行 | ADR-0014；HARNESS §3、§4.2–4.3；SPEC UC-RPC-001 | R4 registry/bridge/profile/raw-bash gate；`test_pi_rpc_client.py`、`test_pi_adapter.py`、`test_pi_permission_bridge.py` + fake server；授权临时目录反例 | 阻断；恢复 RPC-only、隔离 flags、bridge/hash/nonce/tool source 精确核验、三 profile fresh session 与逐次 allow_once；不得用 fallback、prompt-only 或 raw RPC command 绕过 | Bryant Yang |
 
 ## 3. 约束等级
 
@@ -43,7 +44,7 @@
 | --- | --- | --- | --- |
 | R1–R6 | Deterministic Gate | AST/注册表/有界常量检查低误报且能定位文件 | 违反必拦，修复后复验 |
 | S1 | Inferential Review Criterion | 新抽象、跨层职责、重复逻辑需要语义判断 | review 提供证据与替代方案，不假装机械事实 |
-| S2 | Inferential Review Criterion | fake server 是否仍代表真实 ACP 边界 | 比较真实 wire/options；必要时更新 fixture |
+| S2 | Inferential Review Criterion | fake server 是否仍代表真实 ACP/Pi RPC 边界 | 比较真实 wire/options/extension UI；必要时更新 fixture |
 | A1 | Human Acceptance Decision | 真实工具调用、auto 权限和外部系统写入风险 | 只有用户明确授权才执行 |
 | A2 | Human Acceptance Decision | A2A/Streamable HTTP/远程认证路线及兼容成本（M3 已定为私有 socket + stdio MCP，见 ADR-0001） | Owner 决定后再冻结协议 |
 
@@ -58,6 +59,7 @@
 | Kimi hybrid 受限降级 | [`SPEC.md#uc-hybrid-001-kimi-acp-first-受限降级`](SPEC.md#uc-hybrid-001-kimi-acp-first-受限降级) | C1、C2、C3、C11 |
 | OpenCode hybrid 权限与受限降级 | [`SPEC.md#uc-hybrid-002-opencode-acp-first-权限收口与受限降级`](SPEC.md#uc-hybrid-002-opencode-acp-first-权限收口与受限降级) | C1、C2、C3、C11 |
 | Qwen Code ACP-only 接入 | [`SPEC.md#uc-acp-003-qwen-code-acp-only-接入`](SPEC.md#uc-acp-003-qwen-code-acp-only-接入) | C1、C2、C3、C11 |
+| Pi 原生 RPC 权限桥接入 | [`SPEC.md#uc-rpc-001-pi-原生-rpc-权限桥接入`](SPEC.md#uc-rpc-001-pi-原生-rpc-权限桥接入) | C1、C2、C3、C4、C6、C15 |
 | 权限决策 | [`SPEC.md#uc-perm-001-权限请求与选择`](SPEC.md#uc-perm-001-权限请求与选择) | C2、C6 |
 | 生命周期 | [`SPEC.md#uc-life-001-取消与退出回收`](SPEC.md#uc-life-001-取消与退出回收) | C4、C6 |
 | 持久房间与重启恢复 | [`SPEC.md#uc-room-001-持久房间与重启恢复`](SPEC.md#uc-room-001-持久房间与重启恢复) | C7、C6 |
@@ -74,7 +76,7 @@
 | Agent 本地循环 | `check-redlines.sh` + 相关 test script | 当前 agent 自修并复验 |
 | 完整交付 | `check-harness.sh`（含 storage/M2.5/M3 回归） | 阻断“完成”声明 |
 | 人工 Review | SPEC 证据边界、真实权限/协议风险；长会话 compaction 与真实 cancel 时延仍是证据缺口 | 修改或由 Owner 明确接受 |
-| 真实 agent 验收 | `scripts/e2e-m3-real.py`、ADR-0006/0007 临时目录探针与 ADR-0008 真实讨论回放；真实模型不进默认快速 gate；结束后检查进程 | 立即停止外部写入并报告 |
+| 真实 agent 验收 | `scripts/e2e-m3-real.py`、ADR-0006/0007 临时目录探针、ADR-0008 真实讨论回放与 ADR-0014 Pi 临时目录权限反例；真实模型不进默认快速 gate；结束后检查进程 | 立即停止外部写入并报告 |
 
 ## 6. Steering
 

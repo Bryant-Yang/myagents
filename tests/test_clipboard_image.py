@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 from acp.client import AcpClient
 from clipboard_image import (
     ClipboardImageError,
+    PromptImageBudgetError,
     TrustedImage,
     attachment_reference,
     capture_clipboard_png,
@@ -200,6 +201,44 @@ def test_prompt_images_are_confined_to_current_room() -> None:
     print("ok  协议图片严格限制在当前房间")
 
 
+def test_prompt_images_enforce_aggregate_and_count_before_extra_reads() -> None:
+    with TemporaryDirectory() as tmp:
+        attachments = Path(tmp) / "attachments"
+        attachments.mkdir()
+        os.chmod(attachments, 0o700)
+        for number in (1, 2):
+            image = attachments / f"img-{number:04d}.png"
+            image.write_bytes(_PNG)
+            os.chmod(image, 0o600)
+        prompt = "比较 [图片 1] 和 [图片 2]"
+
+        try:
+            prompt_images(
+                prompt,
+                attachments,
+                max_total_bytes=len(_PNG),
+                max_images=16,
+            )
+        except PromptImageBudgetError as exc:
+            assert "总量" in str(exc)
+        else:
+            raise AssertionError("第二张图片不得越过聚合内存预算")
+
+        try:
+            prompt_images(
+                prompt,
+                attachments,
+                max_total_bytes=len(_PNG) * 2,
+                max_images=1,
+            )
+        except PromptImageBudgetError as exc:
+            assert "数量" in str(exc)
+        else:
+            raise AssertionError("图片数量预算必须 fail-closed")
+
+    print("ok  协议图片读取前执行聚合与数量预算")
+
+
 def test_native_protocol_payloads_include_image() -> None:
     async def run() -> None:
         with TemporaryDirectory() as tmp:
@@ -325,6 +364,7 @@ if __name__ == "__main__":
     test_capture_clipboard_png_enforces_size_limit()
     test_capture_rejects_corrupt_png_and_symlink_root()
     test_prompt_images_are_confined_to_current_room()
+    test_prompt_images_enforce_aggregate_and_count_before_extra_reads()
     test_native_protocol_payloads_include_image()
     test_tui_paste_image_inserts_reference_without_submitting()
     print("\nClipboard image 全部通过")
