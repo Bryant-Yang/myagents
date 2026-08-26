@@ -9,7 +9,8 @@
 - JSONL agent 重启后 prompt 含恢复的 history 快照
 - ACP restore：load 成功保留 cursor；load 失败/无 capability 回退 new 时
   cursor 归 0 走 bootstrap；checkpoint 写失败零 prompt 且状态不假提交；
-  prompt 失败 cursor 不推进
+  明确未发送时 cursor 不推进；write 已开始或 remote error 时推进
+  no-replay cursor；post-submit cursor 落盘失败必须 fatal 且禁止继续派发
 
 全部使用 tempfile，不触碰真实状态目录。
 
@@ -27,14 +28,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from acp.adapter import AcpAdapter
-from adapters.base import AgentEvent
+from acp.adapter import AcpAdapter, SessionPreparation
+from adapters.base import (
+    AgentDeliveryCancelledError,
+    AgentDeliveryUncertainError,
+    AgentEvent,
+)
 from orchestrator import Orchestrator, OrchestratorClosedError
 from storage.store import (CorruptedStorageError, RoomBusyError, RoomStore,
                            WorkdirMismatchError)
 
 SERVER = str(Path(__file__).parent / "fake_acp_server.py")
 _FAKE_ENV_KEYS = ("FAKE_ACP_STATE", "FAKE_ACP_FAIL_LOAD",
+                  "FAKE_ACP_FAIL_LOAD_CODE",
                   "FAKE_ACP_NO_LOAD_CAP", "FAKE_ACP_FAIL_PROMPT")
 
 
@@ -64,6 +70,141 @@ class StatefulFake:
         self.prompts.append(prompt)
         yield AgentEvent("text", f"{self.name} 回复{len(self.prompts)}")
         yield AgentEvent("done")
+
+
+class _PairBarrier:
+    def __init__(self) -> None:
+        self.arrivals = 0
+        self.ready = asyncio.Event()
+
+    async def arrive(self) -> None:
+        self.arrivals += 1
+        if self.arrivals == 2:
+            self.ready.set()
+        await asyncio.wait_for(self.ready.wait(), timeout=1)
+
+
+class _ParallelPreparedFake:
+    """Stateful fake that submits once, then waits for structured cancel."""
+
+    stateful_session = True
+
+    def __init__(self, name: str, barrier: _PairBarrier) -> None:
+        self.name = name
+        self.session_id = f"{name}-session"
+        self.prompts: list[str] = []
+        self.cancelled = asyncio.Event()
+        self.closed = asyncio.Event()
+
+        self._barrier = barrier
+
+    async def stream_prepared(
+        self,
+        prompt_factory,
+        workdir: str,
+        resume_session_id: str | None = None,
+        **_kwargs,
+    ):
+        del workdir, resume_session_id
+        prep = SessionPreparation(
+            session_id=self.session_id,
+            restored=False,
+            load_failed=False,
+            fresh=True,
+        )
+        self.prompts.append(prompt_factory(prep))
+        await self._barrier.arrive()
+        try:
+            yield AgentEvent("delivery_committed")
+            await asyncio.Event().wait()
+            yield AgentEvent("text", f"{self.name}-late-reply")
+            yield AgentEvent("done")
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        finally:
+            self.closed.set()
+
+
+class _TerminalBeforeEventPreparedFake:
+    """Accept a prepared prompt, then terminate before a public event."""
+
+    stateful_session = True
+
+    def __init__(self, terminal: str) -> None:
+        self.terminal = terminal
+        self.calls = 0
+
+    async def stream_prepared(
+        self,
+        prompt_factory,
+        workdir: str,
+        resume_session_id: str | None = None,
+        **_kwargs,
+    ):
+        del workdir, resume_session_id
+        self.calls += 1
+        prompt_factory(SessionPreparation(
+            session_id="terminal-before-event-session",
+            restored=False,
+            load_failed=False,
+            fresh=True,
+        ))
+        if self.terminal == "uncertain":
+            raise AgentDeliveryUncertainError("accepted before first event")
+        if self.terminal == "cancelled":
+            raise AgentDeliveryCancelledError("cancelled after acceptance")
+        raise AssertionError(self.terminal)
+        yield  # pragma: no cover - keep this an async generator
+
+
+class _ClosablePreparedFake:
+    """Expose whether a callback-side abort explicitly closes the producer."""
+
+    stateful_session = True
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.closed = 0
+
+    async def stream_prepared(
+        self,
+        prompt_factory,
+        workdir: str,
+        resume_session_id: str | None = None,
+        **_kwargs,
+    ):
+        del workdir, resume_session_id
+        self.calls += 1
+        prompt_factory(SessionPreparation(
+            session_id="closable-prepared-session",
+            restored=self.calls > 1,
+            load_failed=False,
+            fresh=self.calls == 1,
+        ))
+        try:
+            yield AgentEvent("delivery_committed")
+            yield AgentEvent("text", f"prepared reply {self.calls}")
+            yield AgentEvent("done")
+        finally:
+            self.closed += 1
+
+
+class _ClosableJsonlFake:
+    """Stateless counterpart for callback-side stream cleanup."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.closed = 0
+
+    async def stream(self, prompt: str, workdir: str):
+        del prompt, workdir
+        self.calls += 1
+        try:
+            yield AgentEvent("text", f"jsonl reply {self.calls}")
+            yield AgentEvent("done")
+        finally:
+            self.closed += 1
 
 
 class _Room:
@@ -302,7 +443,11 @@ def test_acp_load_failure_resets_cursor() -> None:
     for i in range(30):
         store.append("user", f"老消息{i}")          # seq 1..30
     store.set_agent_state("kimi", cursor=25, session_id="fake-session-1")
-    _set_fake_env(room, FAKE_ACP_FAIL_LOAD="1")
+    _set_fake_env(
+        room,
+        FAKE_ACP_FAIL_LOAD="1",
+        FAKE_ACP_FAIL_LOAD_CODE="-32002",
+    )
 
     async def run() -> None:
         orch, adapter = _make_acp_orch(room)
@@ -441,8 +586,306 @@ def test_acp_checkpoint_failure_no_commit() -> None:
     print("ok  ACP checkpoint 写失败（零 prompt + 状态不假提交 + 抛异常）")
 
 
-def test_acp_prompt_failure_keeps_cursor() -> None:
-    """prompt 本身失败：cursor 不推进（内存/磁盘），session id 已落盘。"""
+def test_acp_post_submit_cursor_failure_is_fatal_no_replay() -> None:
+    """After delivery_committed, a cursor write failure must halt the room.
+
+    It cannot be converted into an ordinary agent failure: that would leave a
+    stale durable cursor and permit a later dispatch to replay the accepted
+    prompt and its tool side effects.
+    """
+    room = _Room()
+    _set_fake_env(room)
+
+    async def run() -> None:
+        orch, adapter = _make_acp_orch(room)
+        inner_store = orch.store
+        assert inner_store is not None
+        orig_set = inner_store.set_agent_state
+        set_calls = 0
+
+        def fail_post_submit(*args, **kwargs):
+            nonlocal set_calls
+            set_calls += 1
+            if set_calls == 2:
+                raise OSError("post-submit cursor fsync failed")
+            return orig_set(*args, **kwargs)
+
+        inner_store.set_agent_state = fail_post_submit  # type: ignore[method-assign]
+        events = []
+        try:
+            await orch.dispatch(
+                "@kimi once-only", lambda _name, event: events.append(event))
+        except OSError as exc:
+            assert str(exc) == "post-submit cursor fsync failed"
+        else:
+            raise AssertionError("post-submit cursor 写失败必须原样传播")
+
+        assert set_calls == 2  # prepare checkpoint 成功，commit checkpoint 失败
+        assert any(
+            event.kind == "error" and "checkpoint" in event.text
+            for event in events
+        ), events
+        assert [message.speaker for message in orch.history] == ["user"]
+        assert not any("调用失败" in message.text for message in orch.history)
+        wire = _fake_state_raw(room)
+        assert wire.count("once-only") == 1, wire
+
+        # Even after the test store starts accepting writes again, this
+        # orchestrator cannot safely infer the missing durable cursor.  It must
+        # reject before appending another user message or touching the agent.
+        inner_store.set_agent_state = orig_set  # type: ignore[method-assign]
+        try:
+            await orch.dispatch("@kimi second", lambda _name, _event: None)
+        except OrchestratorClosedError:
+            pass
+        else:
+            raise AssertionError("fatal no-replay 缺口后必须拒绝后续 dispatch")
+        assert [message.text for message in orch.history] == ["@kimi once-only"]
+        assert _fake_state_raw(room).count("once-only") == 1
+        assert "second" not in _fake_state_raw(room)
+        await orch.aclose()
+        assert adapter._started is False
+
+    try:
+        asyncio.run(run())
+    finally:
+        _clear_fake_env()
+        room.cleanup()
+    print("ok  ACP post-submit cursor 写失败 → fatal + 不重放")
+
+
+def _assert_terminal_checkpoint_failure_is_fatal(terminal: str) -> None:
+    room = _Room()
+
+    async def run() -> None:
+        adapter = _TerminalBeforeEventPreparedFake(terminal)
+        orch = room.make_orch(kimi=adapter)
+        store = orch.store
+        assert store is not None
+        original = store.set_agent_state
+        writes = 0
+
+        def fail_no_replay_commit(*args, **kwargs):
+            nonlocal writes
+            writes += 1
+            if writes == 2:
+                raise OSError(f"{terminal} no-replay checkpoint failed")
+            return original(*args, **kwargs)
+
+        store.set_agent_state = fail_no_replay_commit  # type: ignore[method-assign]
+        try:
+            await orch.dispatch(
+                f"@kimi once-only {terminal}", lambda _name, _event: None)
+        except OSError as exc:
+            assert str(exc) == f"{terminal} no-replay checkpoint failed"
+        else:
+            raise AssertionError(
+                f"{terminal} 后 checkpoint 写失败必须原样传播")
+
+        assert writes == 2
+        assert adapter.calls == 1
+        assert orch._closed is True
+        assert [message.speaker for message in orch.history] == ["user"]
+
+        # 恢复存储也不能推测缺失的 durable cursor；后续派发必须在触碰
+        # adapter 前拒绝，确保已接受 turn 不会被重放。
+        store.set_agent_state = original  # type: ignore[method-assign]
+        try:
+            await orch.dispatch("@kimi replay", lambda _name, _event: None)
+        except OrchestratorClosedError:
+            pass
+        else:
+            raise AssertionError("no-replay checkpoint 缺口后必须 poison room")
+        assert adapter.calls == 1
+        assert [message.text for message in orch.history] == [
+            f"@kimi once-only {terminal}"]
+        await orch.aclose()
+
+    try:
+        asyncio.run(run())
+    finally:
+        room.cleanup()
+
+
+def test_uncertain_checkpoint_failure_is_fatal_no_replay() -> None:
+    _assert_terminal_checkpoint_failure_is_fatal("uncertain")
+    print("ok  uncertain 后 checkpoint 写失败 → fatal + 不重放")
+
+
+def test_cancelled_checkpoint_failure_is_fatal_no_replay() -> None:
+    _assert_terminal_checkpoint_failure_is_fatal("cancelled")
+    print("ok  cancelled 后 checkpoint 写失败 → fatal + 不重放")
+
+
+def test_event_callback_failure_closes_agent_streams() -> None:
+    """A consumer failure must not strand either producer behind its lock."""
+
+    async def run_case(adapter) -> None:
+        room = _Room()
+        try:
+            orch = room.make_orch(kimi=adapter)
+
+            def broken_sink(_name: str, event: AgentEvent) -> None:
+                if event.kind == "text":
+                    raise RuntimeError("event sink failed")
+
+            try:
+                await orch.dispatch("@kimi first", broken_sink)
+            except RuntimeError as exc:
+                assert str(exc) == "event sink failed"
+            else:
+                raise AssertionError("event sink 异常必须穿透 dispatch")
+
+            assert adapter.calls == 1
+            assert adapter.closed == 1
+            # A second delivery proves the prior iterator is no longer live.
+            await asyncio.wait_for(
+                orch.dispatch("@kimi second", lambda _name, _event: None),
+                timeout=1,
+            )
+            assert adapter.calls == 2
+            assert adapter.closed == 2
+            await orch.aclose()
+        finally:
+            room.cleanup()
+
+    async def run() -> None:
+        await run_case(_ClosablePreparedFake())
+        await run_case(_ClosableJsonlFake())
+
+    asyncio.run(run())
+    print("ok  event sink 失败显式关闭 prepared/普通 agent stream")
+
+
+def test_acp_event_callback_failure_releases_writer_lock() -> None:
+    """Real AcpAdapter regression for a sink abort between streamed events."""
+    room = _Room()
+    _set_fake_env(room)
+
+    async def run() -> None:
+        orch, adapter = _make_acp_orch(room)
+
+        def broken_sink(_name: str, event: AgentEvent) -> None:
+            if event.kind == "text":
+                raise RuntimeError("ACP event sink failed")
+
+        try:
+            await orch.dispatch("@kimi first", broken_sink)
+        except RuntimeError as exc:
+            assert str(exc) == "ACP event sink failed"
+        else:
+            raise AssertionError("ACP sink 异常必须穿透 dispatch")
+
+        assert adapter._lock.locked() is False
+        await asyncio.wait_for(
+            orch.dispatch("@kimi second", lambda _name, _event: None),
+            timeout=2,
+        )
+        assert _fake_state_raw(room).count("prompt:") == 2
+        await orch.aclose()
+
+    try:
+        asyncio.run(run())
+    finally:
+        _clear_fake_env()
+        room.cleanup()
+    print("ok  ACP event sink 失败回收 stream 并释放 writer lock")
+
+
+def _install_parallel_checkpoint_failure(orch: Orchestrator):
+    store = orch.store
+    assert store is not None
+    original = store.set_agent_state
+
+    def fail_kimi_delivery(name: str, *args, **kwargs):
+        # make_prompt includes session_id; delivery_committed only advances
+        # cursor.  Fail exactly the latter for one participant.
+        if name == "kimi" and kwargs.get("session_id") is None:
+            raise OSError("parallel post-submit checkpoint failed")
+        return original(name, *args, **kwargs)
+
+    store.set_agent_state = fail_kimi_delivery  # type: ignore[method-assign]
+    return store, original
+
+
+def test_fanout_checkpoint_fatal_cancels_and_awaits_sibling() -> None:
+    """Fatal state in one fan-out branch leaves no background history writer."""
+    room = _Room()
+
+    async def run() -> None:
+        barrier = _PairBarrier()
+        kimi = _ParallelPreparedFake("kimi", barrier)
+        opencode = _ParallelPreparedFake("opencode", barrier)
+        orch = room.make_orch(kimi=kimi, opencode=opencode)
+        store, original = _install_parallel_checkpoint_failure(orch)
+        try:
+            await orch.dispatch(
+                "@kimi @opencode once-only fanout",
+                lambda _name, _event: None,
+            )
+        except OSError as exc:
+            assert str(exc) == "parallel post-submit checkpoint failed"
+        else:
+            raise AssertionError("fan-out post-submit checkpoint 失败必须传播")
+
+        # dispatch may return only after every sibling reached terminal
+        # cancellation.  No task may append a late reply in the poisoned room.
+        assert opencode.cancelled.is_set()
+        assert opencode.closed.is_set()
+        await asyncio.sleep(0)
+        assert [message.speaker for message in orch.history] == ["user"]
+        assert len(kimi.prompts) == len(opencode.prompts) == 1
+        store.set_agent_state = original  # type: ignore[method-assign]
+        await orch.aclose()
+
+    try:
+        asyncio.run(run())
+    finally:
+        room.cleanup()
+    print("ok  fan-out fatal checkpoint 结构化取消并等待 sibling")
+
+
+def test_discussion_checkpoint_fatal_cancels_and_awaits_round_sibling() -> None:
+    """A poisoned discussion round cannot leak a participant or moderator."""
+    room = _Room()
+
+    async def run() -> None:
+        barrier = _PairBarrier()
+        kimi = _ParallelPreparedFake("kimi", barrier)
+        opencode = _ParallelPreparedFake("opencode", barrier)
+        moderator = FakeJsonl("host")
+        orch = room.make_orch(kimi=kimi, opencode=opencode)
+        orch.host = moderator
+        orch.adapters["host"] = moderator
+        store, original = _install_parallel_checkpoint_failure(orch)
+        try:
+            await orch.dispatch(
+                "/discuss @kimi @opencode --rounds 2 -- fatal round",
+                lambda _name, _event: None,
+            )
+        except OSError as exc:
+            assert str(exc) == "parallel post-submit checkpoint failed"
+        else:
+            raise AssertionError("discussion post-submit checkpoint 失败必须传播")
+
+        assert opencode.cancelled.is_set()
+        assert opencode.closed.is_set()
+        await asyncio.sleep(0)
+        assert [message.speaker for message in orch.history] == ["user"]
+        assert len(kimi.prompts) == len(opencode.prompts) == 1
+        assert moderator.last_prompt is None
+        store.set_agent_state = original  # type: ignore[method-assign]
+        await orch.aclose()
+
+    try:
+        asyncio.run(run())
+    finally:
+        room.cleanup()
+    print("ok  discussion round fatal checkpoint 取消 sibling 且不进 moderator")
+
+
+def test_acp_prompt_remote_error_commits_no_replay_cursor() -> None:
+    """A drained prompt remote error fails visibly but is never replayed."""
     room = _Room()
     _set_fake_env(room, FAKE_ACP_FAIL_PROMPT="1")
 
@@ -454,18 +897,29 @@ def test_acp_prompt_failure_keeps_cursor() -> None:
                             lambda n, e: events.append(e))
         assert any(e.kind == "error" for e in events)
         assert "调用失败" in orch.history[-1].text
-        assert orch._cursors["kimi"] == 0  # 不推进
+        assert orch._cursors["kimi"] == 1
         state = room.open_store().get_agent_state("kimi")
-        assert state["cursor"] == 0
+        assert state["cursor"] == 1
         assert state["session_id"] == "fake-session-1"  # checkpoint 已提交
         await orch.aclose()
+
+        # A fresh runtime may continue with later input, but must not resend
+        # the prompt whose stdio drain already completed before remote error.
+        os.environ.pop("FAKE_ACP_FAIL_PROMPT", None)
+        orch2, _adapter2 = _make_acp_orch(room)
+        await orch2.dispatch("@kimi second round", lambda _n, _e: None)
+        prompt_log = _fake_state_raw(room)
+        assert prompt_log.count("fast round") == 1, prompt_log
+        assert prompt_log.count("second round") == 1, prompt_log
+        assert orch2._cursors["kimi"] > 1
+        await orch2.aclose()
 
     try:
         asyncio.run(run())
     finally:
         _clear_fake_env()
         room.cleanup()
-    print("ok  ACP prompt 失败（cursor 不推进 + session id 已落盘）")
+    print("ok  ACP prompt remote error（cursor no-replay + 只发送一次）")
 
 
 def test_acp_inactivity_timeout_commits_no_replay_cursor() -> None:
@@ -876,7 +1330,14 @@ if __name__ == "__main__":
     test_acp_no_load_capability_resets_cursor()
     test_acp_reconnect_load_keeps_cursor()
     test_acp_checkpoint_failure_no_commit()
-    test_acp_prompt_failure_keeps_cursor()
+    test_acp_post_submit_cursor_failure_is_fatal_no_replay()
+    test_uncertain_checkpoint_failure_is_fatal_no_replay()
+    test_cancelled_checkpoint_failure_is_fatal_no_replay()
+    test_event_callback_failure_closes_agent_streams()
+    test_acp_event_callback_failure_releases_writer_lock()
+    test_fanout_checkpoint_fatal_cancels_and_awaits_sibling()
+    test_discussion_checkpoint_fatal_cancels_and_awaits_round_sibling()
+    test_acp_prompt_remote_error_commits_no_replay_cursor()
     test_acp_inactivity_timeout_commits_no_replay_cursor()
     test_tui_restore_display()
     test_tui_ctrl_n_requests_fresh_named_session()

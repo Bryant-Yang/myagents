@@ -55,6 +55,7 @@ from adapters.base import (
     ExecutionMode,
 )
 from codex_app_server.adapter import CodexAppServerAdapter
+from dsh_acp import AcpDshAdapter, dsh_readiness_probe
 from pi_rpc.adapter import PiRpcAdapter
 from collaboration import (
     CollaborationPlan,
@@ -168,6 +169,10 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         workbuddy_readiness_probe,
     ),
     AgentSpec(
+        "dsh", "acp", AcpDshAdapter,
+        dsh_readiness_probe,
+    ),
+    AgentSpec(
         "pi", "rpc", PiRpcAdapter,
         executable_probe("pi", ("pi",), "安装 Pi coding agent CLI"),
     ),
@@ -254,6 +259,22 @@ class _CheckpointError(Exception):
     """
 
 
+class _PostSubmitCheckpointError(_CheckpointError):
+    """A durable no-replay checkpoint failed after prompt acceptance.
+
+    Unlike a pre-submit checkpoint failure, retrying this room is unsafe: the
+    agent may already have performed side effects while the durable cursor
+    still points before the accepted turn.  ``cause`` is re-raised unchanged
+    after the active stream is closed and the orchestrator is poisoned.
+    """
+
+    def __init__(self, name: str, cause: Exception) -> None:
+        self.cause = cause
+        super().__init__(
+            f"agent {name!r} post-submit checkpoint 写失败：{cause}；"
+            "Orchestrator 已停用以防止重放")
+
+
 class _EventCallbackError(Exception):
     """区分 event sink 与 agent 异常；sink 失败不得被当成 agent 失败吞掉。"""
 
@@ -264,6 +285,45 @@ class _EventCallbackError(Exception):
 
 class OrchestratorClosedError(Exception):
     """Orchestrator 已关闭：拒绝新的 dispatch 和排队中的 delivery。"""
+
+
+async def _gather_structured(*awaitables):
+    """Gather peers without abandoning siblings after one branch fails.
+
+    ``asyncio.gather`` propagates the first exception while other awaitables
+    keep running.  Room writers need a stronger scope: after a fatal
+    no-replay checkpoint error poisons the Orchestrator, no sibling may append
+    history in the background.  Outer cancellation follows the same cleanup
+    contract.
+    """
+    tasks = [asyncio.create_task(awaitable) for awaitable in awaitables]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+async def _close_async_stream(stream) -> None:
+    """Best-effort producer cleanup after the consumer aborts iteration.
+
+    Python's ``async for`` does not close an arbitrary async iterator when its
+    body raises.  Stateful adapters commonly hold their single-writer lock for
+    the iterator lifetime, so every consumer-side failure must explicitly
+    finish it before propagating the primary error.
+    """
+    closer = getattr(stream, "aclose", None)
+    if closer is None:
+        return
+    try:
+        await closer()
+    except (asyncio.CancelledError, Exception):
+        # Cleanup is secondary to the callback/checkpoint error that caused
+        # iteration to stop.  Adapters retain their own bounded reset path.
+        pass
 
 
 class Orchestrator:
@@ -1011,7 +1071,7 @@ class Orchestrator:
                     **self._session_role_meta(name),
                 },
             ))
-        results = await asyncio.gather(
+        results = await _gather_structured(
             *(self._run_one(
                 name, on_event, snapshot, command_id,
                 assignments.get(name))
@@ -1375,7 +1435,7 @@ class Orchestrator:
                     return
                 on_event(name, event)
 
-            results = await asyncio.gather(
+            results = await _gather_structured(
                 *(self._run_one(
                     name,
                     round_event,
@@ -1518,44 +1578,72 @@ class Orchestrator:
         parts: list[str] = []
         failed: str | None = None
         done_meta: dict = {}
+        stream = None
+
+        def commit_post_submit_cursor() -> None:
+            """Persist one no-replay boundary or poison this room."""
+            try:
+                self._commit_cursor(name, delivered["upto"])
+            except Exception as exc:
+                # The accepted prompt cannot be safely retried when its
+                # no-replay boundary could not reach durable storage.  Poison
+                # before any callback/timeline write can fail independently.
+                self._closed = True
+                raise _PostSubmitCheckpointError(name, exc) from exc
+
         try:
-            if execution_mode is ExecutionMode.DEFAULT:
-                stream = adapter.stream_prepared(
-                    make_prompt, self.workdir, resume_session_id)
-            else:
-                stream = adapter.stream_prepared(
-                    make_prompt, self.workdir, resume_session_id,
-                    execution_mode=execution_mode)
-            async for ev in stream:
-                if ev.kind == "delivery_committed":
-                    # adapter 已确认用户 turn 被接受。必须先持久化，再公开
-                    # 任何可能触发 events/UI 写入的后续事件。
-                    self._commit_cursor(name, delivered["upto"])
-                    continue
-                if ev.kind == "done":
-                    # done 不立即转发：等回复落盘成功后才发（见方法尾）
-                    done_meta = ev.meta
-                    continue
-                self._emit_adapter_event(on_event, name, ev)
-                if ev.kind == "text":
-                    parts.append(ev.text)
+            try:
+                if execution_mode is ExecutionMode.DEFAULT:
+                    stream = adapter.stream_prepared(
+                        make_prompt, self.workdir, resume_session_id)
+                else:
+                    stream = adapter.stream_prepared(
+                        make_prompt, self.workdir, resume_session_id,
+                        execution_mode=execution_mode)
+                async for ev in stream:
+                    if ev.kind == "delivery_committed":
+                        # adapter 已确认用户 turn 被接受。必须先持久化，再公开
+                        # 任何可能触发 events/UI 写入的后续事件。
+                        commit_post_submit_cursor()
+                        continue
+                    if ev.kind == "done":
+                        # done 不立即转发：等回复落盘成功后才发（见方法尾）
+                        done_meta = ev.meta
+                        continue
+                    self._emit_adapter_event(on_event, name, ev)
+                    if ev.kind == "text":
+                        parts.append(ev.text)
+            except AgentDeliveryUncertainError as exc:
+                # turn/start 的应答丢失时服务端可能已开始执行。诚实记录失败，
+                # 先持久 no-replay 边界，再做任何 callback/timeline 写入。
+                commit_post_submit_cursor()
+                failed = str(exc)
+                self._emit_adapter_event(
+                    on_event, name, AgentEvent("error", failed))
+            except AgentDeliveryCancelledError:
+                # 保持取消语义交给 CommandBus，但先固化已提交 turn 的
+                # no-replay 边界。
+                commit_post_submit_cursor()
+                raise
         except _EventCallbackError as exc:
+            await _close_async_stream(stream)
+            raise exc.cause from exc
+        except _PostSubmitCheckpointError as exc:
+            # async-for does not guarantee that a producer is closed when its
+            # consumer body raises.  Explicitly finish the adapter generator
+            # so an accepted prompt cannot remain active behind the poisoned
+            # room.  Teardown errors are secondary to the storage root cause.
+            await _close_async_stream(stream)
+            try:
+                on_event(name, AgentEvent("error", str(exc)))
+            except Exception:
+                # Preserve the fatal checkpoint failure as the primary error;
+                # the room is already poisoned and cannot continue dispatch.
+                pass
             raise exc.cause from exc
         except _CheckpointError as exc:
             # checkpoint 失败：发 error event 后原样抛出，不进 history
             on_event(name, AgentEvent("error", str(exc)))
-            raise
-        except AgentDeliveryUncertainError as exc:
-            # turn/start 的应答丢失时服务端可能已开始执行。诚实记录失败，
-            # 先持久 no-replay 边界，再做任何 callback/timeline 写入；否则
-            # 后两者失败会留下旧 cursor，重启后可能重复工具副作用。
-            self._commit_cursor(name, delivered["upto"])
-            failed = str(exc)
-            on_event(name, AgentEvent("error", failed))
-        except AgentDeliveryCancelledError:
-            # 保持 CancelledError 语义交给 CommandBus 标记 cancelled，但先
-            # 固化 turn 已提交后的 no-replay 边界。
-            self._commit_cursor(name, delivered["upto"])
             raise
         except Exception as exc:  # agent 崩溃不拖垮整个聊天室
             failed = str(exc)
@@ -1589,6 +1677,7 @@ class Orchestrator:
         parts: list[str] = []
         failed: str | None = None
         done_meta: dict = {}
+        stream = None
         try:
             if execution_mode is ExecutionMode.DEFAULT:
                 stream = adapter.stream(prompt, self.workdir)
@@ -1604,6 +1693,7 @@ class Orchestrator:
                 if ev.kind == "text":
                     parts.append(ev.text)
         except _EventCallbackError as exc:
+            await _close_async_stream(stream)
             raise exc.cause from exc
         except Exception as exc:  # agent 崩溃不拖垮整个聊天室
             failed = str(exc)

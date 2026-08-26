@@ -90,12 +90,14 @@ runtime hard deny 会把工具失败反馈给模型，使其继续使用安全�
 
 ### 2.4 降级和 no-replay 时机
 
-沿用 ADR-0006 的通用 seam：只有新 ACP 连接在 start / initialize /
-session prepare 阶段失败，且尚未发送 `session/prompt` 时，才自动切换 JSONL。
+沿用 ADR-0006 的通用 seam：只有新 ACP 连接因本地 executable 无法启动，
+或 initialize / `session/new` 明确返回标准 method-not-found（`-32601`），
+且尚未建立 session、未发送 `session/prompt` 时，才自动切换 JSONL。
 
 以下情况禁止 fallback：
 
 - 活跃 session id 冲突；
+- `session/load`、认证/权限/配额/backend 拒绝、timeout 或 transport 错误；
 - checkpoint / make_prompt 失败；
 - prompt 明确拒绝；
 - prompt 写入后的断线、静默超时、取消或结果不确定。

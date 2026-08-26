@@ -139,7 +139,9 @@ M3 只支持显式 `--workdir` 选择一个本地房间。TUI 未运行、endpoi
 
 1. 同一 workdir 重启 TUI 后时间线、单调 seq 和 agent cursor 恢复。
 2. 记录的 ACP session 可 `session/load`，成功恢复后不重复发送旧 transcript。
-3. load 失败会新建 session 并有界 bootstrap，不静默丢失上下文。
+3. load 仅在标准 resource/method-not-found 或具体 adapter 已获证的
+   精确 session-not-found 映射时新建 session 并有界 bootstrap；其他
+   remote/transport 错误 fail-closed，不用 fresh session 绕过。
 4. timeline/state 损坏、schema 不支持、持久化写失败均 fail loudly，不能悄悄
    启动空房间覆盖旧数据。
 5. 状态文件不污染 workdir，目录/文件权限符合本 ADR。

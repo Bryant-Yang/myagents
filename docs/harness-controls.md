@@ -15,7 +15,7 @@
 | 调节目标 | 当前覆盖 | 证据索引 | 明确不保证 |
 | --- | --- | --- | --- |
 | Maintainability | 部分：项目入口、场景索引、文档引用、Python 语法和测试 gate | `AGENTS.md`、`workflow.md`、`scripts/check-harness.sh` | 没有 formatter、lint、静态类型检查和复杂度阈值 |
-| Architecture Fitness | 较强：transport 边界、ACP-first/Pi RPC-only、权限默认值、Pi bridge attestation、会话角色边界、有界讨论和单写者 workflow 有确定性检查 | HARNESS R1–R6、`test_session_roles.py`、`test_phase2.py`、Pi RPC tests、`test_discussion.py`、`test_workflow.py` | 不证明新抽象必要，也不覆盖生产性能或 OS sandbox |
+| Architecture Fitness | 较强：transport 边界、ACP-first/Pi RPC-only、DSH ACP-only 生命周期 gate、权限默认值、Pi bridge attestation、会话角色边界、有界讨论和单写者 workflow 有确定性检查 | HARNESS R1–R6、`test_session_roles.py`、`test_phase2.py`、`test_dsh_acp.py`、Pi RPC tests、`test_discussion.py`、`test_workflow.py` | 不证明新抽象必要，也不覆盖生产性能或 OS sandbox |
 | Behaviour | 关键 Phase 2 + M2.5（持久化/恢复/lease）+ M3（command bus/控制 socket/MCP stdio）路径有 fake contract tests 与真实 Kimi E2E 双证据 | [`SPEC.md#关键行为用例`](SPEC.md#关键行为用例) | 不保证所有 CLI 版本、长会话 compaction 或真实 cancel 时延 |
 
 ## 2. Control Map
@@ -37,6 +37,7 @@
 | C13 | 里程碑 workflow 保持 Git fixed point、单 writer、固定复核与阶段边界 steering | ADR-0009；SPEC UC-WORKFLOW-001 | R6 bounds/mode/AST gate；`test_workflow.py`；hybrid/app-server/control/MCP/TUI contract；授权真实验收 | 阻断；恢复 fixed point、read-only 复核、一次 repair 和 steering 上限后复验 | Bryant Yang |
 | C14 | 自然语言角色保持会话隔离且不改变编排安全边界 | ADR-0011；HARNESS §4.1；SPEC UC-ROLE-001 | `test_session_roles.py`；`test_discussion.py`；`test_tui_completion.py`；TUI activity/status tests | 阻断；恢复固定 target 闭集、room 级原子状态与 assignment-only 注入；查看/清空不得进入 timeline 或跨运行中 command 边界，确认不改权限/runtime/讨论边界/workflow | Bryant Yang |
 | C15 | Pi RPC 只通过已 attested 的唯一权限 bridge 与 wrapper 闭集执行 | ADR-0014；HARNESS §3、§4.2–4.3；SPEC UC-RPC-001 | R4 registry/bridge/profile/raw-bash gate；`test_pi_rpc_client.py`、`test_pi_adapter.py`、`test_pi_permission_bridge.py` + fake server；授权临时目录反例 | 阻断；恢复 RPC-only、隔离 flags、bridge/hash/nonce/tool source 精确核验、三 profile fresh session 与逐次 allow_once；不得用 fallback、prompt-only 或 raw RPC command 绕过 | Bryant Yang |
+| C16 | DSH 只通过 stock `dsh --profile myagents` 加载 myagents 标准 bundle，以完整 stateful 生命周期和两 execution safety profile 执行；stock DSH 保持不可变 | ADR-0015；HARNESS §3、§4.2–4.3；SPEC UC-ACP-005 | R4 registry/official-launcher/profile/exact-bundle/name-version/entry+patch SHA/capability/state/no-fallback gate；临时 `DSH_HOME` 的 `test_dsh_acp.py` + fake server；`scripts/check-dsh-plugin.sh` 校验 pinned source/runtime contract 且证明 DSH HEAD/Git/完整文件树 invariant；2026-08-26 核心真实 session/load、reject 与 read-only 清单已执行，主动 cancel 时延、长会话/压力与真实图片仍属人工边界 | 阻断；恢复标准 bundle canonical ownership、stock DSH 零改动、被动 profile/bundle 解析、load/close hard gate、绝对状态目录、execution profile fresh session、仅 end_turn 成功与零 fallback；缺 runtime 工具守卫证据或需 DSH 补丁时不得宣称生产安全 | Bryant Yang |
 
 ## 3. 约束等级
 
@@ -59,6 +60,7 @@
 | Kimi hybrid 受限降级 | [`SPEC.md#uc-hybrid-001-kimi-acp-first-受限降级`](SPEC.md#uc-hybrid-001-kimi-acp-first-受限降级) | C1、C2、C3、C11 |
 | OpenCode hybrid 权限与受限降级 | [`SPEC.md#uc-hybrid-002-opencode-acp-first-权限收口与受限降级`](SPEC.md#uc-hybrid-002-opencode-acp-first-权限收口与受限降级) | C1、C2、C3、C11 |
 | Qwen Code ACP-only 接入 | [`SPEC.md#uc-acp-003-qwen-code-acp-only-接入`](SPEC.md#uc-acp-003-qwen-code-acp-only-接入) | C1、C2、C3、C11 |
+| DSH ACP-only 接入 | [`SPEC.md#uc-acp-005-deepseek-harness-dsh-acp-only-接入`](SPEC.md#uc-acp-005-deepseek-harness-dsh-acp-only-接入) | C1、C2、C3、C4、C6、C7、C16 |
 | Pi 原生 RPC 权限桥接入 | [`SPEC.md#uc-rpc-001-pi-原生-rpc-权限桥接入`](SPEC.md#uc-rpc-001-pi-原生-rpc-权限桥接入) | C1、C2、C3、C4、C6、C15 |
 | 权限决策 | [`SPEC.md#uc-perm-001-权限请求与选择`](SPEC.md#uc-perm-001-权限请求与选择) | C2、C6 |
 | 生命周期 | [`SPEC.md#uc-life-001-取消与退出回收`](SPEC.md#uc-life-001-取消与退出回收) | C4、C6 |
@@ -76,7 +78,7 @@
 | Agent 本地循环 | `check-redlines.sh` + 相关 test script | 当前 agent 自修并复验 |
 | 完整交付 | `check-harness.sh`（含 storage/M2.5/M3 回归） | 阻断“完成”声明 |
 | 人工 Review | SPEC 证据边界、真实权限/协议风险；长会话 compaction 与真实 cancel 时延仍是证据缺口 | 修改或由 Owner 明确接受 |
-| 真实 agent 验收 | `scripts/e2e-m3-real.py`、ADR-0006/0007 临时目录探针、ADR-0008 真实讨论回放与 ADR-0014 Pi 临时目录权限反例；真实模型不进默认快速 gate；结束后检查进程 | 立即停止外部写入并报告 |
+| 真实 agent 验收 | `scripts/e2e-m3-real.py`、ADR-0006/0007 临时目录探针、ADR-0008 真实讨论回放、ADR-0014 Pi 权限反例与 ADR-0015 临时 `DSH_HOME` 官方 CLI/profile/bundle/lifecycle 清单；真实模型不进默认快速 gate；结束后检查进程 | 立即停止外部写入并报告 |
 
 ## 6. Steering
 

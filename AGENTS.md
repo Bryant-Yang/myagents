@@ -2,7 +2,7 @@
 
 <!-- harness:controls-read-policy=on-demand -->
 
-> 作者：Bryant Yang　最近更新：2026-08-25
+> 作者：Bryant Yang　最近更新：2026-08-26
 >
 > 本文是所有编码 agent 的项目级入场入口，也是唯一的协作规则源。详细工程契约见
 > [`HARNESS.md`](HARNESS.md)，按任务选读规则见
@@ -55,6 +55,27 @@ app-server），同时仅为已获证路径保留 JSONL 兼容回退。
   复用，只有明确的 `Authentication required` 才按需认证；认证只能使用 server
   公布的 ACP method，登录 URL 必须是官方 HTTPS 地址且等待有界，在独立
   fallback 安全契约获证前不得自动降级。
+  DeepSeek Harness（DSH）必须以
+  `AgentSpec("dsh", "acp", AcpDshAdapter, ...)` 注册为 ACP-only：安装模式只接受
+  `MYAGENTS_DSH_CLI` 指向或 PATH 解析出的官方 `dsh`，源码模式只用
+  `MYAGENTS_DSH_SOURCE_ROOT` 定位已构建的官方 `apps/cli/lib/bin.js`；两者都固定启动
+  stock `dsh --profile myagents`。产品专属 `@myagents/dsh-acp-host` 必须作为标准
+  bundle 存在于 `dsh_acp/plugin`，声明 `dsh.bundle.patch=./cordis.patch.yml`；profile
+  必须被动证明 exact bundle 顺序为 `@deepseek-ai/dsh-base` →
+  `@myagents/dsh-acp-host`，且依赖解析后的插件 name/version/entry/patch 精确匹配。
+  DSH checkout 是不可变依赖：不得复制产品源码到其中，也不得修改其 core、官方 ACP
+  包、示例或测试；只能调用 DSH 已公开的 agent/AgentSetup/ToolRuntime/持久化 seam。
+  readiness 只能被动读取官方 CLI、profile manifest、bundle manifest、解析后的插件
+  版本与文件属性，禁止调用 pnpm/build/CLI/真实 agent；`MYAGENTS_DSH_SOURCE_ROOT`
+  不能再承担产品 host 或环境注入职责。profile home、固定 product state、workspace、
+  source、plugin 与配置输入不得重叠。普通与 workspace-write 轮通过
+  `DSH_ACP_PROFILE=workspace-write` 固定执行安全 profile，只读轮固定
+  `DSH_ACP_PROFILE=read-only`；跨 execution safety profile 必须重建
+  进程/session；首轮前必须确认 load/close capability。DSH 默认 deny、无
+  headless/SDK RPC/JSONL fallback，状态目录必须为绝对路径且遵循
+  `XDG_STATE_HOME`。host/runtime/compatibility identity 必须精确匹配 checked-in contract；durable
+  replay 必须有事件数与字节上限。只有 `end_turn` 是成功
+  terminal，其他、缺失或未知 stop reason 均不得产生 done。
   Pi 必须以 `AgentSpec("pi", "rpc", PiRpcAdapter, ...)` 走官方
   `pi --mode rpc`，不得冒充 ACP 或回退一次性 JSON/JSONL。Pi 子进程必须关闭
   自动发现并强制 offline，不激活任何原生命名 built-in tool，只显式加载项目固定的 permission
@@ -101,6 +122,11 @@ app-server），同时仅为已获证路径保留 JSONL 兼容回退。
   [`ADR-0014`](docs/adr/0014-pi-rpc-permission-bridge.md)：唯一显式权限 bridge、
   wrapper tool 闭集、启动 attestation、三 profile 隔离和 raw RPC bash 禁令必须
   同时成立；应用层权限桥不宣称提供 OS sandbox。
+- DSH ACP-only 接入遵守
+  [`ADR-0015`](docs/adr/0015-dsh-acp-only-transport.md)：官方 profile 入口、标准
+  myagents bundle、被动 readiness、两 execution safety profile、load/close hard gate、
+  no-replay、状态目录与零 fallback 必须同时成立；
+  fake contract 通过不能替代 DSH runtime 工具守卫与真实回收验收。
 - 有界讨论遵守
   [`ADR-0008`](docs/adr/0008-bounded-multi-agent-discussion.md)：同轮并发、
   跨轮串行，一条 command 只有一条 user 记录；参与者失败不自动重试，最终

@@ -35,13 +35,16 @@ JSONL 进程都收在 adapter implementation 内；Orchestrator 不出现
 
 ### 2.2 唯一自动降级点
 
-只有“尚无活跃 ACP session，且 start / initialize / session prepare
-失败”可以自动进入 JSONL。此时尚未发送 `session/prompt`，不存在
-重复工具副作用。
+只有尚无活跃 ACP session，且本地 executable 无法启动，或
+initialize / `session/new` 明确返回标准 method-not-found（`-32601`）时，
+可以自动进入 JSONL。此时尚未建立 session、也未发送 `session/prompt`，
+不存在重复工具副作用。`session/load` 的任何失败都不跨协议：只有标准或
+具体 adapter 获证的 session-not-found 可在 ACP 内部回退 `session/new`。
 
 以下情况一律禁止降级：
 
 - 活跃 session 与持久化 session id 冲突；
+- `session/load`、认证/权限/配额/backend 拒绝、timeout 或 transport 错误；
 - Orchestrator `make_prompt` / checkpoint 失败；
 - `session/prompt` 明确拒绝；
 - prompt 发送后的断线、静默超时、取消、非成功终态或结果不确定。
@@ -49,9 +52,10 @@ JSONL 进程都收在 adapter implementation 内；Orchestrator 不出现
 后一类继续遵守 no-replay：先持久化已投递 cursor，再公开失败，
 不把同一任务交给 JSONL 重做。
 
-ACP client 区分两种失败：stdio `drain` 完成前的请求视为未发送；agent 在
-尚无 session 活动时返回显式 JSON-RPC error 视为明确拒绝。除此之外，
-prompt 写入后的断线或协议失败都按结果不确定处理。首个
+ACP client 只有在 `writer.write()` 前明确失败时才标记请求未发送；一旦 write
+开始，`drain` 失败、断线与 prompt 的显式 remote error 都跨过 no-replay
+边界，不能据此重投。session prepare 的显式 remote error 可确定失败，但是否
+允许 fallback 仍只按上述精确 classifier。首个
 `session/update` / 权限活动进入外部 sink 前，adapter 先发内部
 `delivery_committed` 事件，让 Orchestrator 固化 no-replay cursor。
 
@@ -94,8 +98,9 @@ Kimi JSONL 会污染本地 session 列表，不作为“快速”的交换代价
 
 1. contract test 证明 JSONL 命令携带内置 agent file，且白名单
    没有写入、命令、Skill、子 agent 工具。
-2. fake ACP initialize 失败时，只调用一次 JSONL，用户可见
-   `prepare-only` fallback 事件。
+2. fake ACP initialize 明确返回 method-not-found 时，只调用一次 JSONL，
+   用户可见 `prepare-only` fallback 事件；load/auth/policy/quota/backend/
+   timeout/transport 反例均为零 fallback。
 3. fallback checkpoint 的下一轮直接 session/new，不 load 伪 id。
 4. prompt 明确拒绝、post-submit inactivity 与 prompt 写入后断线都不调用
    fallback；首个可见 ACP 输出前已产生 `delivery_committed`。

@@ -2,7 +2,7 @@
 
 <!-- harness:behaviour-evidence=canonical-source -->
 
-> 作者：Bryant Yang　最近更新：2026-08-25
+> 作者：Bryant Yang　最近更新：2026-08-26
 >
 > 本文是关键用户行为与独立证据的唯一事实源。工程边界见
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -28,6 +28,7 @@
 | M4.9 | 完成 | WorkBuddy ACP-only 接入、按需有界认证与读写 profile 隔离 |
 | M4.10 | 完成 | Agent 被动就绪探测、原子派发门与 `/agents` 设置体验 |
 | M4.11 | 完成 | Pi 原生 RPC、启动 attestation、逐次权限 bridge 与三 profile 隔离 |
+| M4.12 | 完成 | DSH ACP-only adapter、标准 bundle + stock `myagents` profile、权限隔离与真实恢复验收 |
 | M5.1 | 完成 | 自然语言或 `/discuss` 进入 1–3 轮有界讨论与终局 moderator |
 | M5 | 完成 | review → 单 writer 修改 → 独立复核、一次修复上限与阶段边界 steering |
 | M6 | 完成 | 自然语言指定会话级角色、跨任务持续、房间隔离与状态可见 |
@@ -347,6 +348,121 @@
   region profile 尚无独立安全证据，当前产品只启用已验收的中国区 `internal`。
 - **里程碑**：M4.9。
 
+### UC-ACP-005 DeepSeek Harness DSH ACP-only 接入
+
+- **角色 / 触发**：用户输入 `@dsh`，或把 ready 的 DSH 选为普通任务、discussion、
+  有序协作或 workflow worker。
+- **主流程**：`AGENT_SPECS` 仅注册
+  `AgentSpec("dsh", "acp", AcpDshAdapter, dsh_readiness_probe)`。安装入口由
+  `MYAGENTS_DSH_CLI` 指向或 PATH 解析出的官方 `dsh` 提供；源码入口只由
+  `MYAGENTS_DSH_SOURCE_ROOT` 定位已构建的官方 `apps/cli/lib/bin.js`。两种入口都固定
+  启动 stock `dsh --profile myagents`，该 profile 的 exact bundle 顺序必须是
+  `@deepseek-ai/dsh-base` → `@myagents/dsh-acp-host`。产品 bundle 的 canonical
+  `package.json`、entry、`cordis.patch.yml`、ACP framing、session lifecycle、identity
+  与权限桥全部由 `dsh_acp/plugin` 拥有；stock DSH checkout 不得有 myagents 产生的
+  core、官方 ACP、示例或测试改动，也不得依赖未导出的 `src/*`。
+  `DEFAULT` / `WORKSPACE_WRITE` 使用同一 stock profile 并覆盖
+  `DSH_ACP_PROFILE=workspace-write`；`READ_ONLY` 覆盖
+  `DSH_ACP_PROFILE=read-only`。跨组切换关闭旧 session/进程、禁止 load 旧 session，
+  再以同一 stock profile 建立新进程与 session。
+- **readiness 与状态**：probe 只读取环境、PATH、官方 CLI、
+  `$DSH_HOME/profiles/myagents/package.json`、解析后的 bundle package manifest 与文件
+  属性，不执行 CLI、pnpm/build 或真实模型，也不创建或修复 profile/state。它要求
+  profile dependencies 包含 `@myagents/dsh-acp-host`、bundle 列表精确等于
+  `["@deepseek-ai/dsh-base", "@myagents/dsh-acp-host"]`，解析后的 package 精确为
+  `@myagents/dsh-acp-host@0.1.0`，并声明
+  `dsh.bundle.patch=./cordis.patch.yml`；entry 与 patch 必须是 canonical、普通、可读，
+  通过 no-follow 稳定读取，且 SHA-256 与 checked-in runtime contract 精确一致。
+  `MYAGENTS_DSH_SOURCE_ROOT` 只定位官方已构建
+  launcher；产品 host 组合由 profile 中的标准 bundle 提供，readiness 不审计整个
+  源码树。`DSH_HOME/profiles` 与 `profiles/myagents` 必须是 profile home 内真实、
+  非 symlink 的 canonical 目录；profile manifest 通过 no-follow、单链接、有界且
+  读前后身份稳定的句柄读取。由于 stock DSH 在 bundle 后继续应用 home/profile
+  `cordis.patch.yml`，这两层只能缺失，或是至多 64 KiB 且忽略空行/注释后唯一语义行
+  精确为 `[]` 的 canonical 单链接普通文件；空文件、仅注释文件与任何有效 patch
+  均拒绝。任一缺失、版本漂移、越界 symlink、后置 patch 或 runtime identity 漂移均为
+  `invalid`。上述 profile 契约在 spawn 前及复用活跃进程的下一轮前重验。子进程显式收到绝对
+  `DSH_ACP_PERSISTENCE_DIR`：尊重用户值，否则为
+  `${XDG_STATE_HOME:-~/.local/state}/myagents/dsh-acp`，并固定派生 `sessions/`、
+  `runtime-home/`、`attachment-home/` 与 `runtime-home/agents/`。state 与 stock checkout
+  或 profile home/workspace/plugin/CLI 任一方向包含都 fail-closed；派生目录 symlink
+  逃逸同样阻断。`DSH_HOME` 保留为 stock profile home；`DSH_AGENTS_HOME` 绑定
+  `runtime-home/agents/`。profile home 的 settings/credentials 通过 no-follow 有界读取后
+  复制到 `config-inputs/` 的 mode-0600 产品文件，host 只以显式 canonical path、
+  `watch=false` 挂载副本，不接触原文件。入口定位不依赖 ambient cwd，但 transport 在
+  initialize 前把子进程 cwd 规范绑定目标 workspace；活跃进程不得跨 cwd 复用。
+- **stateful/lifecycle gate**：initialize 必须在任何 new/load/prompt 前同时广告
+  `agentCapabilities.loadSession=true` 与对象形状的
+  `sessionCapabilities.close`；`agentInfo` 还必须精确声明 name
+  `dsh-myagents-acp`、精确 host version `0.1.0`，以及符合
+  [ADR-0015 §2.2](adr/0015-dsh-acp-only-transport.md)
+  的五个 literal `_meta` key：
+  `deepseek.ai/dsh-myagents-profile` 字符串必须与当前进程一致，
+  `deepseek.ai/dsh-myagents-policy-revision` 必须是 integer `1`，
+  `deepseek.ai/dsh-myagents-read-only-tools` 必须是顺序精确的
+  `["read", "glob", "grep"]`，`deepseek.ai/dsh-runtime-version` 必须为
+  `0.1.1-rc.2`，`deepseek.ai/dsh-compatibility-revision` 必须是 integer `1`，否则
+  进程回收并 block。恢复只用标准
+  `session/load`；无 auth 的 load 历史通知直接丢弃，有 auth 时队列上限 64，
+  不外泄到当前回复。cancel 有界等待原 prompt，reset/aclose 先有界 close session，
+  最后按进程组回收。
+  持久化固定 uncompressed/unpacked JSONL；load 在完整历史 materialize 前通过 public
+  `list`/`locate` 做 no-follow 文件扫描，硬限制 4096 events / 16 MiB，并在 materialize
+  与 resume 前复核 stat identity；无法证明时不广告或拒绝恢复。
+- **权限与终局**：默认 deny、handler 结果必须属于当次 options；每次权限请求必须
+  恰有不同 id 的 `allow_once` / `reject_once` 两项，`allow_always`、重复/缺失/新增项
+  在进入 TUI 前 cancelled；read-only 即使注入 allow 也由 client cancelled。真正的安全边界还要求专用 DSH host 在 runtime
+  证明 read/glob/grep 工具闭集、shadow/scoped/run-code hard deny，以及
+  workspace-write 风险工具逐次 `allow_once/reject_once`。prompt 首个活动或响应先
+  提交 no-replay cursor；外层取消、`stream.aclose()` 与 inactivity 等任何
+  实际发出 `session/cancel` 的路径均保持 committed/no-replay，且只有精确
+  `stopReason=cancelled` 才确认中断，否则连接重建。只有 `stopReason=end_turn` 产生 done，max-token、turn-limit、
+  refusal、cancelled、缺失与未知终局都在 commit 后确定性失败。
+- **无 fallback / 图片**：没有 headless、SDK JSON-RPC 或 JSONL fallback，prepare
+  失败和提交后失败都不换协议。只有 initialize 同时广告 image 且真实
+  provider/model 支持时发送可信房间 PNG；缺证据时图片能力不得宣称可用。
+- **自动化证据**：`tests/test_dsh_acp.py` + `tests/fake_acp_server.py` 使用临时
+  `DSH_HOME` 覆盖未安装、官方 CLI/source built launcher 缺失、profile 缺失、bundle
+  顺序/依赖/name/version/entry/patch 漂移、canonical ownership、profile
+  parent/profile/manifest/patch symlink、有效或空/仅注释的后置 patch、readiness 后
+  patch 置换、probe 无副作用、
+  绝对 argv/env 与子进程 cwd 绑定、
+  注册/no fallback、双向
+  profile 重建、identity/policy metadata、one-shot 权限闭集、load/no-replay、历史
+  flood、materialize 前持久回放 4096 事件 / 16 MiB 上限、state/plugin/config symlink
+  与自修改反例、严格 cancel/close/回收、
+  lifecycle capability 缺失、动态 image gate 和非成功 terminal；R1/R2/R4 固定静态契约。默认 gate
+  不启动真实 DSH。`dsh_acp/plugin/tests/` 是需显式
+  `MYAGENTS_DSH_SOURCE_ROOT` 的 release contract 由
+  `scripts/check-dsh-plugin.sh` 执行：必须在执行 checkout 内任何 build tool 前，以
+  source-only preflight 把实际 DSH commit、official built CLI、ACP SDK、public package
+  source/runtime exports 与当前平台 esbuild identity 对照 checked-in runtime contract；
+  构建后再校验 built bundle entry/patch SHA-256，然后仅通过 stock DSH public exports 完成
+  Oxlint、严格 TypeScript `noEmit` 和无缓存 Vitest；checkout 起始必须完全干净，
+  且测试前后 HEAD、Git 状态和包含 ignored 文件内容 SHA-256 的完整 `lstat` 文件树
+  不变。它不把 DSH 安装变成默认测试前提。
+- **真实验收证据**：2026-08-26 在临时 `DSH_HOME` 与临时 workspace 中，先由官方
+  `plugin --profile myagents add` 安装打包后的 `@myagents/dsh-acp-host@0.1.0`，再分别
+  走 source launcher 解析和显式 `MYAGENTS_DSH_CLI` 解析。source 路径以两个独立进程
+  完成 `new → prompt → close → load → prompt → close`，同一 session
+  `7afca581-e99c-4a2f-8631-4efaec794fd8` 依次精确返回
+  `DSH_FINAL_PROFILE_OK` 与 `DSH_FINAL_PROFILE_RESUME_OK`，第二轮
+  `restored=true`。显式 CLI 路径的真实 workspace-write 轮产生一次绑定
+  `allow_once/reject_once` 的 permission request；选择 reject 后零文件副作用，切换
+  read-only 后建立 fresh session、风险工具不进入权限 UI 且仍为零副作用。release gate
+  同时通过 12 个测试文件、151 项 host contract、Oxlint、严格 typecheck、两次可复现
+  构建、无源码 tarball、官方 dump-config 与连续 vision 握手；前后 stock DSH HEAD、
+  Git 状态及含 ignored 文件内容的完整文件树不变。用户 settings/credentials 的 inode、
+  mode、size、mtime 与 SHA-256 前后相同，默认 `~/.dsh/profiles/myagents` 未创建，退出后
+  无 DSH profile 进程残留。
+- **人工验收边界**：旧 custom `tsx` host 证据仍为 **superseded**。当前未修改或安装
+  用户级 DSH，因此独立发布包形态的全局 `dsh` 可执行文件仍需在实际安装时复跑同一
+  release gate；真实主动 cancel 时延、长 session/compaction、max-token/refusal 压力
+  与真实图片模型仍未覆盖。对应能力不得超出已获证范围，任何必须修改 DSH 本体才能
+  通过的能力直接判为 no-go。
+- **事实源**：ADR-0015、`dsh_acp/adapter.py`、`dsh_acp/plugin`、`acp/client.py`。
+- **里程碑**：M4.12。
+
 ### UC-RPC-001 Pi 原生 RPC 权限桥接入
 
 - **角色 / 触发**：用户在聊天室输入 `@pi`，或把 Pi 选为普通会话、discussion、
@@ -440,7 +556,10 @@
 - **安全边界**：probe 不得启动 CLI、联网、打开浏览器、读取登录态、执行包管理器
   或修改 shell/PATH；产品不自动安装、卸载、移动或替换 agent。`not_found` 只表述
   “当前进程 PATH 未检测到”，不得推断用户没有安装。WorkBuddy 候选继续受独立
-  CLI canonical path 与 App bundle 拒绝规则约束。
+  CLI canonical path 与 App bundle 拒绝规则约束。DSH 只接受官方 installed `dsh`，
+  或 `MYAGENTS_DSH_SOURCE_ROOT` 中已构建的官方 CLI，并要求 stock `myagents` profile
+  及 exact myagents bundle ready；CLI/profile/dependency/bundle/name/version/entry/patch
+  任一缺失为 invalid，probe 不 build、不启动且不创建 persistence/profile 目录。
 - **异常分支**：probe 异常、不可执行文件、无效显式路径或 adapter 构造失败记为
   `invalid` 并 fail-closed；状态错误不删除角色、cursor、session id 或历史事实。
   Pi 只被动解析 `pi` 可执行文件；probe 不以启动 RPC/attestation 代替 readiness。
@@ -472,7 +591,8 @@
   2026-08-08 OpenCode 1.18.14 临时目录 probe 证明 runtime ask policy
   将无害 Bash 请求转为相同三类 options，默认 deny 后 `end_turn`；Pi 权限形状由
   `tests/test_pi_adapter.py` 与 `tests/test_pi_permission_bridge.py` 的 fake bridge
-  contract 固定，默认 gate 不调用真实 Pi。
+  contract 固定；`tests/test_dsh_acp.py` 固定 DSH 两 profile 的 option 绑定与默认
+  deny，默认 gate 不调用真实 Pi/DSH。
 - **人工验收边界**：任何真实工具写入与 `auto` 模式必须由用户逐次授权；自动化
   测试不能代替风险接受。
 - **里程碑**：M2。
@@ -487,13 +607,14 @@
   cancel；该轮已提交，先建立 no-replay 边界再公开失败。cancel 不确认则连接
   作废并在下轮重建；断线使 pending request 立即失败。
 - **验收**：人工权限等待不会触发 inactivity timeout；下一轮不与旧 prompt
-  重叠；fake 子孙进程和 ACP/Pi RPC server 均无残留。
+  重叠；fake 子孙进程和 ACP/Pi RPC/DSH server 均无残留。
 - **独立证据来源**：接入 Harness 前已有的 basic/ACP/Phase 2 生命周期测试，
-  以及 `tests/test_pi_rpc_client.py` 的 abort/close/子孙进程 fixture；
+  `tests/test_dsh_acp.py` 的 cancel/close/profile reset/terminal fixture，以及
+  `tests/test_pi_rpc_client.py` 的 abort/close/子孙进程 fixture；
   2026-07-26 两次真实 Kimi TUI E2E 退出后 `pgrep -fl '^kimi acp$'` 为空。
 - **人工验收边界**：真实 Kimi cancel 响应时延和长任务中的不可逆工具副作用尚未
   验证。
-- **里程碑**：M1–M4.11。
+- **里程碑**：M1–M4.12。
 
 ### UC-ROOM-001 持久房间与重启恢复
 
@@ -580,11 +701,16 @@
   session 时保留 cursor，继续纯增量；cursor/session_id 的 checkpoint 在
   prompt 前一次性原子落盘，成功后才更新内存 cursor；prompt 成功后先持久
   推进 `delivered_upto` 再更新内存。
-- **异常分支**：load 失败或 agent 不声明 loadSession 时回退新 session，
-  cursor 归零并按 `history_limit` 有界 bootstrap（不沿用旧 cursor 静默
-  跳过 history），实际新 session id 落盘；checkpoint 写失败穿透
+- **异常分支**：仅 load 返回标准 `-32002` / `-32601`，或具体 adapter
+  已获证的精确 session-not-found 映射时回退新 session；agent 不声明
+  loadSession 时可直接新建。其他 generic server/policy/quota/transport 错误
+  fail-closed。实际 fresh session 将 cursor 归零并按 `history_limit`
+  有界 bootstrap（不沿用旧 cursor 静默跳过 history），新 session id 落盘；
+  checkpoint 写失败穿透
   dispatch（零 prompt、adapter reset、内存/磁盘不假提交），不伪装成
-  agent 调用失败；prompt 提交前或明确拒绝的失败 cursor 不推进、下轮补发；
+  agent 调用失败；post-submit no-replay checkpoint 落盘失败则停用
+  Orchestrator，拒绝后续 dispatch；prompt 提交前的明确未发送失败
+  cursor 不推进、下轮补发；
   prompt 已提交后的 inactivity timeout 属于结果不确定，先持久化 no-replay
   cursor，再返回失败。
 - **验收**：load 成功后 prompt 不含旧内容；回退路径 bootstrap 有界；
@@ -601,8 +727,9 @@
 
 ### UC-HYBRID-001 Kimi ACP-first 受限降级
 
-- **角色 / 触发**：用户向 Kimi worker 派发任务，但新 ACP 连接在
-  start、initialize 或 session prepare 阶段失败。
+- **角色 / 触发**：用户向 Kimi worker 派发任务，但新 ACP 连接的本地
+  executable 无法启动，或 initialize / `session/new` 明确返回标准
+  method-not-found（`-32601`）。
 - **主流程**：`AcpKimiAdapter` 在同一 writer lock 内保持统一
   `AgentAdapter` interface；prepare 失败时先以
   `fallback:jsonl:kimi` 调用 checkpoint hook，再使用
@@ -611,16 +738,18 @@
 - **权限边界**：降级 profile 只暴露 `Read` / `Grep` / `Glob`，
   `subagents: []`；禁止写入、命令、网络、Skill、子 agent 和 MCP。
   JSONL 可返回分析或明确阻塞，不得伪装已完成变更。
-- **禁止分支**：活跃 session 冲突、checkpoint 失败、prompt 明确拒绝
-  以及 prompt 提交后的取消/超时/断线/不确定结果均不调用
-  fallback。后一类先建立 no-replay cursor 再公开失败。
+- **禁止分支**：`session/load`、认证/权限/配额/backend 拒绝、timeout、
+  transport 错误、活跃 session 冲突、checkpoint 失败、prompt 明确拒绝以及
+  prompt 提交后的取消/超时/断线/不确定结果均不调用 fallback。后一类先建立
+  no-replay cursor 再公开失败。
 - **恢复**：下一轮不对 `fallback:jsonl:*` 伪 id 执行
   `session/load`，直接新建 ACP session；以 fresh/unrestored 语义
   归零 cursor 并有界 bootstrap。两种 transport 不并发写同一 session。
 - **验收**：生产注册仍由 `AcpKimiAdapter` 构造，可见 transport
-  为 `acp+jsonl`；prepare 失败正好调用一次受限 JSONL；
-  prompt 拒绝、post-submit 静默与写入后断线均零 fallback 调用；首个可见
-  ACP 输出前已提交内部 `delivery_committed`。
+  为 `acp+jsonl`；获准的 pre-session failure 正好调用一次受限 JSONL；
+  load/auth/policy/quota/backend/timeout/transport、prompt 拒绝、post-submit
+  静默与写入后断线均零 fallback 调用；首个可见 ACP 输出前已提交内部
+  `delivery_committed`。
 - **独立证据来源**：Kimi CLI 0.34.0 本机 `--help` 和官方 reference
   确认 `-p` / `stream-json` / `--agent-file`；`tests/fake_acp_server.py`
   作为独立 protocol fixture，`tests/test_kimi_hybrid.py` 验证工具白名单、
@@ -632,7 +761,8 @@
 ### UC-HYBRID-002 OpenCode ACP-first 权限收口与受限降级
 
 - **角色 / 触发**：用户向 OpenCode worker 派发任务；正常走 ACP，或新 ACP
-  连接在 start、initialize、session prepare 阶段失败。
+  连接的本地 executable 无法启动，或 initialize / `session/new` 明确返回
+  标准 method-not-found（`-32601`）。
 - **ACP 主流程**：生产由 `AcpOpenCodeAdapter` 构造，运行
   `opencode acp`，保持持久 session、增量 cursor、权限 UI、取消与恢复。
   OpenCode runtime 权限将未知工具、写入、命令、网络、Skill、子 agent、
@@ -645,7 +775,8 @@
   myagents-readonly-fallback`。环境禁用项目配置、Claude 兼容层、自动升级，
   inline profile 与 runtime permission 双重限制为
   `read` / `glob` / `grep` / `list`。
-- **禁止分支**：活跃 session 冲突、checkpoint 失败、prompt 明确拒绝以及
+- **禁止分支**：`session/load`、认证/权限/配额/backend 拒绝、timeout、
+  transport 错误、活跃 session 冲突、checkpoint 失败、prompt 明确拒绝以及
   prompt 提交后的取消、超时、断线或结果不确定均零 fallback；后一类先形成
   no-replay cursor。下一轮不 load fallback 伪 id，直接新建 ACP session。
 - **验收**：生产 transport 为 `acp+jsonl`；真实 ACP v1 capability 包含

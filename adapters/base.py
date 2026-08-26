@@ -34,6 +34,14 @@ class ReadOnlyFallbackError(RuntimeError):
     """写阶段只能进入只读 fallback；调用方必须 fail-closed。"""
 
 
+class LineFrameTooLargeError(RuntimeError):
+    """A newline-delimited transport frame exceeded its configured limit."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        super().__init__(f"line frame exceeds {limit} bytes")
+
+
 class ExecutionMode(str, Enum):
     """一轮 agent 调用允许的工作区能力。"""
 
@@ -164,18 +172,32 @@ class BoundedLog:
         return self.head + self.tail
 
 
-async def read_lines(stream: asyncio.StreamReader) -> AsyncIterator[str]:
+async def read_lines(
+    stream: asyncio.StreamReader,
+    *,
+    max_frame_bytes: int | None = None,
+) -> AsyncIterator[str]:
     """从 StreamReader 逐行产出文本：读定长块、按 \n 手动切。
 
     不用 `async for line in stream`（底层 readline 有 64KB 单行上限，
     超长 JSON 行会直接抛 LimitOverrunError）——与 pi 的 rpc-process
     同一做法。stream_jsonl 和 acp/client 共用。
     """
+    if max_frame_bytes is not None and max_frame_bytes <= 0:
+        raise ValueError("max_frame_bytes 必须大于 0")
     buf = b""
     while chunk := await stream.read(65536):
         buf += chunk
-        while b"\n" in buf:
-            raw, buf = buf.split(b"\n", 1)
+        while True:
+            newline = buf.find(b"\n")
+            if newline < 0:
+                if (max_frame_bytes is not None
+                        and len(buf) > max_frame_bytes):
+                    raise LineFrameTooLargeError(max_frame_bytes)
+                break
+            raw, buf = buf[:newline], buf[newline + 1:]
+            if max_frame_bytes is not None and len(raw) > max_frame_bytes:
+                raise LineFrameTooLargeError(max_frame_bytes)
             line = raw.decode("utf-8", errors="replace").strip()
             if line:
                 yield line

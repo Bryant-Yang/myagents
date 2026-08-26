@@ -48,7 +48,9 @@ def make_orch() -> Orchestrator:
     orch = Orchestrator(workdir=".", persistent=False)
     orch.adapters = {
         n: FakeAdapter(n)
-        for n in ("kimi", "opencode", "qwen", "workbuddy", "pi", "codex")
+        for n in (
+            "kimi", "opencode", "qwen", "workbuddy", "dsh", "pi", "codex"
+        )
     }
     orch.host = FakeHost()
     orch.adapters["host"] = orch.host
@@ -62,6 +64,7 @@ def test_parse_mentions() -> None:
     assert orch.parse_mentions("@kimi @kimi 重复只算一次") == ["kimi"]
     assert orch.parse_mentions("@qwen 看看这个") == ["qwen"]
     assert orch.parse_mentions("@workbuddy 看看这个") == ["workbuddy"]
+    assert orch.parse_mentions("@dsh 看看这个") == ["dsh"]
     assert orch.parse_mentions("@nobody 不存在") == []
     assert orch.parse_mentions("没有提到任何人") == []
     print("ok  parse_mentions")

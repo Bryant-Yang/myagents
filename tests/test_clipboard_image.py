@@ -253,13 +253,17 @@ def test_native_protocol_payloads_include_image() -> None:
             acp = AcpClient(["unused"])
             acp_params = {}
 
-            async def acp_request(method, params):
+            async def acp_request(method, params, *, timeout=None):
+                del timeout
+                if method == "session/new":
+                    return {"sessionId": "session-1"}
                 assert method == "session/prompt"
                 acp_params.update(params)
                 return {"stopReason": "end_turn"}
 
             acp.request = acp_request
-            await acp.prompt("session-1", "看图", (trusted,))
+            session_id = await acp.session_new(str(Path(tmp)))
+            await acp.prompt(session_id, "看图", (trusted,))
             assert acp_params["prompt"][1] == {
                 "type": "image",
                 "mimeType": "image/png",

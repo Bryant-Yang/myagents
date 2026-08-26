@@ -27,7 +27,10 @@ required=(
   docs/adr/0012-agent-readiness-and-setup-ux.md
   docs/adr/0013-natural-language-sequential-collaboration.md
   docs/adr/0014-pi-rpc-permission-bridge.md
+  docs/adr/0015-dsh-acp-only-transport.md
   scripts/check-redlines.sh
+  scripts/check-dsh-runtime-contract.py
+  scripts/package-dsh-plugin.sh
 )
 
 for path in "${required[@]}"; do
@@ -73,6 +76,7 @@ docs = [
     root / "docs/adr/0012-agent-readiness-and-setup-ux.md",
     root / "docs/adr/0013-natural-language-sequential-collaboration.md",
     root / "docs/adr/0014-pi-rpc-permission-bridge.md",
+    root / "docs/adr/0015-dsh-acp-only-transport.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -122,6 +126,7 @@ fi
 .venv/bin/python tests/test_session_tui.py
 .venv/bin/python tests/test_acp.py
 .venv/bin/python tests/test_workbuddy_acp.py
+.venv/bin/python tests/test_dsh_acp.py
 .venv/bin/python tests/test_pi_rpc_client.py
 .venv/bin/python tests/test_pi_adapter.py
 .venv/bin/python tests/test_pi_permission_bridge.py

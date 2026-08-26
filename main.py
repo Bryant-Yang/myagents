@@ -4,7 +4,7 @@
     .venv/bin/python main.py            # 在当前目录启动
     .venv/bin/python main.py /path/to/project   # 指定 agent 的工作目录
 
-聊天室里 @kimi / @opencode / @qwen / @workbuddy / @pi / @codex 把消息派发给对应 agent，支持一条消息
+聊天室里 @kimi / @opencode / @qwen / @workbuddy / @dsh / @pi / @codex 把消息派发给对应 agent，支持一条消息
 @多个（并发执行）。@host 叫主持人（由 codex 扮演）出来总结/仲裁；不带 @
 的消息由 host 用一次调用直接回答或决定派给谁。
 `/discuss` 可在一个 CommandBus command 内安排 2–3 个 worker 做 1–3 轮
@@ -92,6 +92,7 @@ from tui_activity import ActivityFeed
 # 每个发言者的显示颜色
 _COLORS = {"user": "yellow", "kimi": "cyan", "opencode": "green",
            "qwen": "bright_blue", "workbuddy": "bright_magenta",
+           "dsh": "spring_green2",
            "pi": "deep_sky_blue1", "codex": "orange1", "host": "magenta",
            "activity": "bright_black"}
 

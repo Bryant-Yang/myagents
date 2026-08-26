@@ -29,6 +29,7 @@ AGENTS = (
     ("opencode", "ACP+JSONL"),
     ("qwen", "ACP"),
     ("workbuddy", "ACP"),
+    ("dsh", "ACP"),
     ("pi", "RPC"),
     ("codex", "APP-SERVER"),
     ("host", "MODERATOR"),
@@ -44,7 +45,8 @@ def test_completion_parser_and_command_boundary() -> None:
     assert multi is not None
     assert "@kimi" not in [item.value for item in multi.items]
     assert [item.value for item in multi.items] == [
-        "@opencode", "@qwen", "@workbuddy", "@pi", "@codex", "@host"]
+        "@opencode", "@qwen", "@workbuddy", "@dsh", "@pi", "@codex",
+        "@host"]
 
     slash = completion_context("/ca", 3, AGENTS)
     assert slash is not None
@@ -92,13 +94,13 @@ def test_agent_completion_keyboard_and_focus() -> None:
             await pilot.pause()
             assert app._completion is not None
             assert [item.value for item in app._completion.items] == [
-                "@kimi", "@opencode", "@qwen", "@workbuddy", "@pi", "@codex",
-                "@host"]
+                "@kimi", "@opencode", "@qwen", "@workbuddy", "@dsh", "@pi",
+                "@codex", "@host"]
 
             # ↑ 从首项循环到末项；↓ 回首项后再选第二项。
             await pilot.press("up")
             await pilot.pause()
-            assert app._completion_index == 6
+            assert app._completion_index == 7
             await pilot.press("down")
             await pilot.pause()
             assert app._completion_index == 0

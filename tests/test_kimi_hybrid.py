@@ -42,6 +42,10 @@ def fake_acp_env(**values: str | None):
         "FAKE_ACP_FAIL_INIT",
         "FAKE_ACP_FAIL_NEW",
         "FAKE_ACP_FAIL_LOAD",
+        "FAKE_ACP_FAIL_LOAD_CODE",
+        "FAKE_ACP_FAIL_LOAD_MESSAGE",
+        "FAKE_ACP_HANG_LOAD",
+        "FAKE_ACP_DISCONNECT_LOAD",
         "FAKE_ACP_FAIL_PROMPT",
         "FAKE_ACP_NO_LOAD_CAP",
         "FAKE_ACP_CANCEL_DELAY",
@@ -153,6 +157,56 @@ def test_prepare_failure_uses_visible_jsonl_fallback() -> None:
     print("ok  ACP prepare 失败显式进入只读 JSONL fallback")
 
 
+def test_fatal_session_prepare_errors_never_use_jsonl_fallback() -> None:
+    """Load/auth/policy/quota/transport errors stay on the ACP failure path."""
+    cases = (
+        {"FAKE_ACP_FAIL_LOAD": "1",
+         "FAKE_ACP_FAIL_LOAD_CODE": "-32000",
+         "FAKE_ACP_FAIL_LOAD_MESSAGE": "Authentication required"},
+        {"FAKE_ACP_FAIL_LOAD": "1",
+         "FAKE_ACP_FAIL_LOAD_CODE": "-32000",
+         "FAKE_ACP_FAIL_LOAD_MESSAGE": "Policy rejected load"},
+        {"FAKE_ACP_FAIL_LOAD": "1",
+         "FAKE_ACP_FAIL_LOAD_CODE": "-32000",
+         "FAKE_ACP_FAIL_LOAD_MESSAGE": "Quota exceeded"},
+        {"FAKE_ACP_FAIL_LOAD": "1",
+         "FAKE_ACP_FAIL_LOAD_CODE": "-32000",
+         "FAKE_ACP_FAIL_LOAD_MESSAGE": "Backend database unavailable"},
+        {"FAKE_ACP_HANG_LOAD": "1"},
+        {"FAKE_ACP_DISCONNECT_LOAD": "1"},
+    )
+
+    async def body() -> None:
+        fallback = RecordingFallback()
+        adapter = AcpAdapter(
+            "fake",
+            CMD,
+            fallback_adapter=fallback,
+            session_prepare_timeout=0.05,
+        )
+        try:
+            await collect(adapter.stream_prepared(
+                lambda _prep: "must-not-cross-protocol",
+                "/tmp",
+                "persisted-session",
+            ))
+        except Exception:
+            pass
+        else:
+            raise AssertionError("fatal ACP prepare 错误必须 fail-closed")
+        assert fallback.calls == []
+        await adapter.aclose()
+
+    with tempfile.TemporaryDirectory() as td:
+        for index, flags in enumerate(cases):
+            with fake_acp_env(
+                FAKE_ACP_STATE=str(Path(td) / f"state-{index}"),
+                **flags,
+            ):
+                asyncio.run(body())
+    print("ok  Kimi load/auth/policy/quota/transport/timeout 零 fallback")
+
+
 def test_execution_mode_denies_readonly_and_blocks_write_fallback() -> None:
     async def readonly_body(state: str) -> None:
         adapter = AcpAdapter("fake", CMD, fallback_adapter=RecordingFallback())
@@ -221,7 +275,7 @@ def test_fallback_checkpoint_is_not_loaded_as_acp_session() -> None:
         assert second_preps[0].restored is False
         assert any(event.kind == "done" for event in events)
         lines = Path(state).read_text(encoding="utf-8").splitlines()
-        assert "new:/tmp" in lines
+        assert f"new:{Path('/tmp').resolve()}" in lines
         assert not any(line.startswith("load:fallback:") for line in lines)
 
     with tempfile.TemporaryDirectory() as td:
@@ -349,6 +403,7 @@ def test_production_registration_is_acp_first_hybrid() -> None:
 if __name__ == "__main__":
     test_kimi_jsonl_uses_enforced_readonly_profile()
     test_prepare_failure_uses_visible_jsonl_fallback()
+    test_fatal_session_prepare_errors_never_use_jsonl_fallback()
     test_execution_mode_denies_readonly_and_blocks_write_fallback()
     test_fallback_checkpoint_is_not_loaded_as_acp_session()
     test_prompt_rejection_never_uses_fallback()

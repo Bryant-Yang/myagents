@@ -20,3 +20,4 @@
 | [0012](0012-agent-readiness-and-setup-ux.md) | Accepted | M4.10 Agent 就绪探测、派发资格门与缺失安装体验 |
 | [0013](0013-natural-language-sequential-collaboration.md) | Accepted | M7 自然语言有序协作计划、串行接力与失败收口 |
 | [0014](0014-pi-rpc-permission-bridge.md) | Accepted | M4.11 Pi 原生 RPC、唯一权限 bridge、wrapper 工具闭集与三 profile 隔离 |
+| [0015](0015-dsh-acp-only-transport.md) | Accepted | M4.12 标准 myagents bundle + stock `dsh --profile myagents`、不可变 DSH、两 execution safety profile、stateful lifecycle gate 与零 fallback |

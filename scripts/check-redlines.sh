@@ -53,6 +53,7 @@ required_deny_defaults = {
     ROOT / "acp/adapter.py": {
         "AcpAdapter", "AcpKimiAdapter", "AcpOpenCodeAdapter",
         "AcpQwenAdapter", "AcpWorkBuddyAdapter"},
+    ROOT / "dsh_acp/adapter.py": {"AcpDshAdapter"},
 }
 for path, classes in required_deny_defaults.items():
     tree = parse(path)
@@ -83,7 +84,8 @@ for path, classes in required_deny_defaults.items():
 # R2: generic orchestration/runtime may register names, but may not branch on
 # specific worker literals.
 worker_names = {
-    "kimi", "codex", "opencode", "qwen", "workbuddy", "pi", "claude"}
+    "kimi", "codex", "opencode", "qwen", "workbuddy", "dsh", "pi",
+    "claude"}
 for path in [ROOT / "orchestrator.py", ROOT / "acp/client.py"]:
     tree = parse(path)
     for node in ast.walk(tree):
@@ -122,9 +124,9 @@ for path in [
                 fail("R3", path, node,
                      f"上层直接调用 {attr}；改由 ACP/JSONL adapter 执行")
 
-# R4: production Kimi/OpenCode remain constrained ACP-first; Qwen/WorkBuddy
-# remain ACP-only; Pi remains attested RPC-only. JSONL is allowed only behind
-# each verified prepare-only seam.
+# R4: production Kimi/OpenCode remain constrained ACP-first;
+# Qwen/WorkBuddy/DSH remain ACP-only; Pi remains attested RPC-only. JSONL is
+# allowed only behind each verified prepare-only seam.
 orchestrator = ROOT / "orchestrator.py"
 source = orchestrator.read_text(encoding="utf-8")
 tree = parse(orchestrator)
@@ -156,6 +158,7 @@ expected_specs = {
     ("opencode", "acp+jsonl", "AcpOpenCodeAdapter"),
     ("qwen", "acp", "AcpQwenAdapter"),
     ("workbuddy", "acp", "AcpWorkBuddyAdapter"),
+    ("dsh", "acp", "AcpDshAdapter"),
     ("pi", "rpc", "PiRpcAdapter"),
 }
 for name, transport, factory in sorted(expected_specs - registered_specs):
@@ -402,6 +405,617 @@ if ("resolve(strict=True)" not in workbuddy_validator_source
     errors.append(
         "[R4] acp/adapter.py: WorkBuddy CLI 校验必须 canonicalize、要求可执行，"
         "并拒绝 App bundle 内目标（含符号链接）")
+
+# DSH is ACP-only. Both installed and source-backed launches use the official
+# CLI with the stock ``myagents`` profile; the product ACP surface is a normal
+# @myagents bundle loaded by that profile. Readiness is passive and source mode
+# only locates an already-built official CLI.
+dsh_adapter = ROOT / "dsh_acp/adapter.py"
+dsh_source = dsh_adapter.read_text(encoding="utf-8")
+dsh_tree = parse(dsh_adapter)
+dsh_adapter_class = next(
+    (node for node in dsh_tree.body
+     if isinstance(node, ast.ClassDef) and node.name == "AcpDshAdapter"),
+    None,
+)
+dsh_adapter_source = (
+    ast.get_source_segment(dsh_source, dsh_adapter_class)
+    if dsh_adapter_class is not None else ""
+)
+
+
+def dsh_function_source(name: str) -> str:
+    node = next(
+        (item for item in dsh_tree.body
+         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+         and item.name == name),
+        None,
+    )
+    return ast.get_source_segment(dsh_source, node) if node is not None else ""
+
+
+dsh_assignment_values: dict[str, object] = {}
+for node in dsh_tree.body:
+    if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+        continue
+    target = node.targets[0]
+    if not isinstance(target, ast.Name):
+        continue
+    try:
+        dsh_assignment_values[target.id] = ast.literal_eval(node.value)
+    except (TypeError, ValueError):
+        pass
+
+expected_dsh_literals = {
+    "_DSH_CLI_ENV": "MYAGENTS_DSH_CLI",
+    "_DSH_SOURCE_ROOT_ENV": "MYAGENTS_DSH_SOURCE_ROOT",
+    "_DSH_HOME_ENV": "DSH_HOME",
+    "_DSH_PERSISTENCE_ENV": "DSH_ACP_PERSISTENCE_DIR",
+    "_DSH_RUNTIME_HOME_ENV": "DSH_ACP_RUNTIME_HOME",
+    "_DSH_ATTACHMENT_HOME_ENV": "DSH_ACP_ATTACHMENT_HOME",
+    "_DSH_SETTINGS_FILE_ENV": "DSH_ACP_SETTINGS_FILE",
+    "_DSH_CREDENTIALS_FILE_ENV": "DSH_ACP_CREDENTIALS_FILE",
+    "_DSH_AGENTS_HOME_ENV": "DSH_AGENTS_HOME",
+    "_DSH_RUNTIME_PROFILE_ENV": "DSH_ACP_PROFILE",
+    "_DSH_PROFILE_NAME": "myagents",
+    "_DSH_PROFILE_BUNDLES": (
+        "@deepseek-ai/dsh-base", "@myagents/dsh-acp-host"),
+    "_DSH_PLUGIN_NAME": "@myagents/dsh-acp-host",
+    "_DSH_PLUGIN_VERSION": "0.1.0",
+    "_DSH_RUNTIME_PACKAGE": "@deepseek-ai/dsh",
+    "_DSH_RUNTIME_ROOT_PACKAGE": "@deepseek-ai/dsh-root",
+    "_DSH_RUNTIME_VERSION": "0.1.1-rc.2",
+    "DSH_ACP_WORKSPACE_PROFILE": "workspace-write",
+    "DSH_ACP_READ_ONLY_PROFILE": "read-only",
+    "_DSH_AGENT_NAME": "dsh-myagents-acp",
+    "_DSH_PROFILE_META_KEY": "deepseek.ai/dsh-myagents-profile",
+    "_DSH_POLICY_REVISION_META_KEY": (
+        "deepseek.ai/dsh-myagents-policy-revision"),
+    "_DSH_READ_ONLY_TOOLS_META_KEY": (
+        "deepseek.ai/dsh-myagents-read-only-tools"),
+    "_DSH_RUNTIME_VERSION_META_KEY": "deepseek.ai/dsh-runtime-version",
+    "_DSH_COMPATIBILITY_REVISION_META_KEY": (
+        "deepseek.ai/dsh-compatibility-revision"),
+    "_DSH_POLICY_REVISION": 1,
+    "_DSH_COMPATIBILITY_REVISION": 1,
+    "_DSH_READ_ONLY_TOOLS": ["read", "glob", "grep"],
+    "_DSH_PERMISSION_KINDS": {"allow_once", "reject_once"},
+    "_DSH_PLUGIN_ENTRY_SHA256": (
+        "a8515ac654705e07ea04c2f7c2f3df452500c9ad902652cb0d434af49aba3290"),
+    "_DSH_PLUGIN_PATCH_SHA256": (
+        "744d7ce4370c0bac08db1b53e0da407005a2e053077648b85adbd69c996afbb2"),
+}
+observed_dsh_literals = {
+    name: dsh_assignment_values.get(name) for name in expected_dsh_literals
+}
+if (observed_dsh_literals != expected_dsh_literals
+        or type(observed_dsh_literals.get("_DSH_POLICY_REVISION")) is not int
+        or type(observed_dsh_literals.get(
+            "_DSH_COMPATIBILITY_REVISION")) is not int):
+    errors.append(
+        "[R4] dsh_acp/adapter.py: DSH official CLI/profile/bundle、两种 "
+        "execution safety profile 与 identity wire literals 必须保持精确")
+
+required_dsh_adapter_tokens = {
+    'Path("apps/cli/package.json")', 'Path("apps/cli/lib/bin.js")',
+    "_validated_profile", "_validated_source_launch", "_resolve_dsh_launch",
+    "_canonical_profile_directory", "_read_canonical_bounded_file",
+    "_validated_empty_user_patch", "_MAX_USER_PATCH_BYTES",
+    "_dsh_state_layout", "_validate_state_layout",
+    "_validate_static_separation", "_validate_workspace_separation",
+    "_read_config_snapshot", "_materialize_product_state",
+    "_revalidate_launch", "dsh_readiness_probe", "resolve(strict=True)",
+    "O_NOFOLLOW", "_atomic_private_write", "os.fchmod", "0o600",
+    '"NODE_OPTIONS"', '"NODE_PATH"', "_DSH_CHILD_ENV_REMOVALS",
+}
+if (not all(token in dsh_source for token in required_dsh_adapter_tokens)
+        or "_DSH_HOST_VERSION = _DSH_PLUGIN_VERSION" not in dsh_source):
+    errors.append(
+        "[R4] dsh_acp/adapter.py: DSH 必须被动解析官方 launcher/stock profile，"
+        "固定标准 bundle identity，并隔离 state/workspace/config")
+
+dsh_profile_source = dsh_function_source("_validated_profile")
+required_dsh_profile_tokens = {
+    "_DSH_PROFILE_BUNDLES", 'manifest.get("dependencies")',
+    "_DSH_PLUGIN_NAME", "_DSH_PLUGIN_VERSION",
+    'patch_value != "./cordis.patch.yml"',
+    'main_value != "lib/index.js"', "_validated_bundle_artifact",
+    "_DSH_PLUGIN_ENTRY_SHA256", "_DSH_PLUGIN_PATCH_SHA256",
+    "_MAX_PLUGIN_ENTRY_BYTES", "_MAX_PLUGIN_PATCH_BYTES",
+    "_canonical_profile_directory",
+    "_read_canonical_bounded_file", "_MAX_MANIFEST_BYTES",
+    'profile_home / "cordis.patch.yml"',
+    'profile_dir / "cordis.patch.yml"',
+}
+if (not all(token in dsh_profile_source for token in required_dsh_profile_tokens)
+        or dsh_profile_source.count("_validated_empty_user_patch(") != 2):
+    errors.append(
+        "[R4] dsh_acp/adapter.py: stock myagents profile 必须被动证明 exact "
+        "base→host bundles、resolved plugin name/version、main=lib/index.js、"
+        "dsh.bundle.patch=./cordis.patch.yml 与两层 later-wins 空 patch")
+
+dsh_profile_dir_source = dsh_function_source("_canonical_profile_directory")
+required_dsh_profile_dir_tokens = {
+    "path.lstat()", "path.resolve(strict=True)", "stat.S_ISLNK",
+    "stat.S_ISDIR", "resolved != lexical", "is_relative_to(profile_home)",
+}
+if not all(token in dsh_profile_dir_source
+           for token in required_dsh_profile_dir_tokens):
+    errors.append(
+        "[R4] dsh_acp/adapter.py: DSH profiles/profile 必须拒绝 symlink/非目录/"
+        "canonical 越界")
+
+dsh_bounded_file_source = dsh_function_source("_read_canonical_bounded_file")
+required_dsh_bounded_file_tokens = {
+    'getattr(os, "O_NOFOLLOW"', "before.st_nlink != 1",
+    "before.st_size > byte_limit", "path.lstat()", "resolve(strict=True)",
+    "resolved != path.absolute()", "is_relative_to(parent)",
+    "before.st_mtime_ns", "before.st_ctime_ns", "before_id != after_id",
+}
+if not all(token in dsh_bounded_file_source
+           for token in required_dsh_bounded_file_tokens):
+    errors.append(
+        "[R4] dsh_acp/adapter.py: profile manifest/user patch 必须 no-follow、"
+        "单链接、有界且通过读前后 identity 复核")
+
+dsh_user_patch_source = dsh_function_source("_validated_empty_user_patch")
+required_dsh_user_patch_tokens = {
+    "os.path.lexists", "_MAX_USER_PATCH_BYTES", 'payload.decode("utf-8")',
+    'semantic_lines != ["[]"]',
+}
+if not all(token in dsh_user_patch_source
+           for token in required_dsh_user_patch_tokens):
+    errors.append(
+        "[R4] dsh_acp/adapter.py: bundle 后生效的 DSH home/profile patch 只能"
+        "缺失或语义精确为 YAML 空数组 []")
+
+dsh_revalidate_source = dsh_function_source("_revalidate_launch")
+if ('_validated_profile(launch.profile_home)' not in dsh_revalidate_source
+        or "launch.profile_dir" not in dsh_revalidate_source
+        or "launch.plugin_root" not in dsh_revalidate_source):
+    errors.append(
+        "[R4] dsh_acp/adapter.py: spawn/复用前必须重验 profile、later-wins "
+        "patch 与解析后的 bundle identity")
+
+dsh_source_launch_source = dsh_function_source("_validated_source_launch")
+required_dsh_source_launch_tokens = {
+    "_DSH_RUNTIME_ROOT_PACKAGE", "_DSH_RUNTIME_PACKAGE",
+    "_DSH_RUNTIME_VERSION", "_DSH_SOURCE_CLI_PACKAGE",
+    "_DSH_SOURCE_CLI_BIN", "_declared_dsh_bin", 'find("node")',
+    "_validated_executable",
+}
+forbidden_dsh_source_launch_tokens = {
+    "src/bin.ts", "config/cordis.yml", "node_modules/tsx", "pnpm",
+    "subprocess", "TSX_TSCONFIG_PATH", "DSH_ACP_SOURCE_ROOT",
+    "DSH_ACP_ENV_DIR", "fingerprint", "git ",
+}
+if (not all(token in dsh_source_launch_source
+            for token in required_dsh_source_launch_tokens)
+        or any(token in dsh_source_launch_source
+               for token in forbidden_dsh_source_launch_tokens)):
+    errors.append(
+        "[R4] dsh_acp/adapter.py: MYAGENTS_DSH_SOURCE_ROOT 只能被动定位 "
+        "apps/cli/lib/bin.js 与 node，不得恢复 tsx/custom host/build/full-tree gate")
+
+dsh_resolver_source = dsh_function_source("_resolve_dsh_launch")
+required_dsh_resolver_tokens = {
+    "_absolute_dsh_home", "_validated_profile", "_DSH_CLI_ENV",
+    "_DSH_SOURCE_ROOT_ENV", "_validated_cli_package",
+    "_validated_source_launch", 'find("dsh")', '"--profile"',
+    "_DSH_PROFILE_NAME",
+}
+if (not all(token in dsh_resolver_source
+            for token in required_dsh_resolver_tokens)
+        or "subprocess" in dsh_resolver_source
+        or "pnpm" in dsh_resolver_source
+        or "shlex" in dsh_resolver_source):
+    errors.append(
+        "[R4] dsh_acp/adapter.py: installed/source 两条路径必须只启动官方 "
+        "CLI --profile myagents，resolver 不得 build、执行 readiness probe 或解析 shell words")
+
+dsh_validator_source = dsh_function_source("_validated_executable")
+if ("resolve(strict=True)" not in dsh_validator_source
+        or "os.access" not in dsh_validator_source
+        or "os.X_OK" not in dsh_validator_source):
+    errors.append(
+        "[R4] dsh_acp/adapter.py: DSH 官方 CLI/node 必须 canonicalize 且可执行")
+
+dsh_home_source = dsh_function_source("_absolute_dsh_home")
+if ("_DSH_HOME_ENV" not in dsh_home_source
+        or 'Path(home).expanduser() if home else Path.home()' not in dsh_home_source
+        or ' / ".dsh"' not in dsh_home_source
+        or "resolve(strict=True)" not in dsh_home_source):
+    errors.append(
+        "[R4] dsh_acp/adapter.py: DSH_HOME 必须保留为可证明存在的 stock profile home")
+
+dsh_persistence_source = dsh_function_source("_dsh_persistence_dir")
+if ("is_absolute" not in dsh_persistence_source
+        or "raise AcpError" not in dsh_persistence_source
+        or 'env.get("XDG_STATE_HOME"' not in dsh_persistence_source
+        or 'env.get("HOME"' not in dsh_persistence_source):
+    errors.append(
+        "[R4] dsh_acp/adapter.py: DSH 显式 persistence override 必须是绝对路径，"
+        "默认路径必须来自 myagents state root")
+
+if ("execution_env_overrides" not in dsh_adapter_source
+        or "ExecutionMode.READ_ONLY" not in dsh_adapter_source
+        or "ExecutionMode.WORKSPACE_WRITE" not in dsh_adapter_source
+        or "DSH_ACP_WORKSPACE_PROFILE" not in dsh_adapter_source
+        or "DSH_ACP_READ_ONLY_PROFILE" not in dsh_adapter_source
+        or "_validate_initialized_client" not in dsh_adapter_source
+        or 'capabilities.get("loadSession") is not True'
+        not in dsh_adapter_source
+        or 'session_capabilities.get("close")' not in dsh_adapter_source
+        or "_images_for_prompt" not in dsh_adapter_source
+        or '"promptCapabilities"' not in dsh_adapter_source
+        or "_dsh_state_layout" not in dsh_adapter_source
+        or "_validate_workspace_separation" not in dsh_adapter_source
+        or "_revalidate_launch" not in dsh_adapter_source
+        or "_materialize_product_state" not in dsh_adapter_source
+        or "self._client.cwd = workspace" not in dsh_adapter_source
+        or "_DSH_AGENT_NAME" not in dsh_adapter_source
+        or "_DSH_PROFILE_META_KEY" not in dsh_adapter_source
+        or "_DSH_POLICY_REVISION_META_KEY" not in dsh_adapter_source
+        or "_DSH_READ_ONLY_TOOLS_META_KEY" not in dsh_adapter_source
+        or "_DSH_RUNTIME_VERSION_META_KEY" not in dsh_adapter_source
+        or "_DSH_COMPATIBILITY_REVISION_META_KEY" not in dsh_adapter_source
+        or "env_removals=" not in dsh_adapter_source
+        or "_DSH_PERMISSION_KINDS" not in dsh_adapter_source
+        or "len(option_ids) != len(options)" not in dsh_adapter_source
+        or "fallback_adapter" in dsh_adapter_source
+        or "jsonl" in dsh_adapter_source.lower()
+        or "headless" in dsh_adapter_source.lower()):
+    errors.append(
+        "[R4] dsh_acp/adapter.py: AcpDshAdapter 必须 ACP-only，以进程级 env "
+        "隔离 read_only/workspace_write；首个 session 前 hard-gate load/close，"
+        "并绑定 workspace/state/identity/one-shot permission/image")
+if "/Users/" in dsh_adapter_source or "/Users/" in dsh_resolver_source:
+    errors.append(
+        "[R4] dsh_acp/adapter.py: DSH adapter/resolver 禁止硬编码用户目录")
+plugin_root = ROOT / "dsh_acp/plugin"
+plugin_package = plugin_root / "package.json"
+plugin_patch = plugin_root / "cordis.patch.yml"
+plugin_index = plugin_root / "src/index.ts"
+plugin_acp = plugin_root / "src/acp.ts"
+plugin_acp_codec = plugin_root / "src/acp-codec.ts"
+plugin_acp_content = plugin_root / "src/acp-content.ts"
+plugin_runtime_contract = plugin_root / "runtime-contract.json"
+plugin_build = plugin_root / "scripts/build.mjs"
+plugin_typecheck = plugin_root / "scripts/typecheck.mjs"
+plugin_profile_test = plugin_root / "tests/profile.spec.ts"
+plugin_bin_test = plugin_root / "tests/bin.spec.ts"
+plugin_bundle_test = plugin_root / "tests/bundle.spec.ts"
+plugin_bridge_test = plugin_root / "tests/bridge.spec.ts"
+plugin_approval_test = plugin_root / "tests/approval.spec.ts"
+plugin_load_test = plugin_root / "tests/load.spec.ts"
+plugin_vitest_config = plugin_root / "vitest.config.mjs"
+dsh_release_check = ROOT / "scripts/check-dsh-plugin.sh"
+dsh_package_script = ROOT / "scripts/package-dsh-plugin.sh"
+dsh_runtime_contract_check = ROOT / "scripts/check-dsh-runtime-contract.py"
+if not all(path.is_file() for path in (
+        plugin_package, plugin_patch, plugin_index, plugin_acp,
+        plugin_acp_codec, plugin_acp_content, plugin_profile_test,
+        plugin_bin_test, plugin_bundle_test, plugin_bridge_test,
+        plugin_approval_test, plugin_load_test, plugin_vitest_config,
+        plugin_runtime_contract, plugin_build, plugin_typecheck,
+        dsh_release_check, dsh_package_script, dsh_runtime_contract_check)):
+    errors.append(
+        "[R4] dsh_acp/plugin: myagents 必须拥有标准 bundle、built main、"
+        "cordis.patch.yml 与完整 ACP contract source/tests")
+else:
+    package = json.loads(plugin_package.read_text(encoding="utf-8"))
+    patch_text = plugin_patch.read_text(encoding="utf-8")
+    plugin_text = plugin_index.read_text(encoding="utf-8")
+    plugin_acp_text = plugin_acp.read_text(encoding="utf-8")
+    plugin_codec_text = plugin_acp_codec.read_text(encoding="utf-8")
+    plugin_content_text = plugin_acp_content.read_text(encoding="utf-8")
+    plugin_build_text = plugin_build.read_text(encoding="utf-8")
+    runtime_contract = json.loads(
+        plugin_runtime_contract.read_text(encoding="utf-8"))
+    package_exports = package.get("exports")
+    package_files = package.get("files")
+    package_dsh = package.get("dsh")
+    if (package.get("name") != "@myagents/dsh-acp-host"
+            or package.get("version") != "0.1.0"
+            or package.get("main") != "lib/index.js"
+            or not isinstance(package_exports, dict)
+            or package_exports.get(".") != {"default": "./lib/index.js"}
+            or package_exports.get("./cordis.patch.yml")
+            != "./cordis.patch.yml"
+            or not isinstance(package_files, list)
+            or not {"lib/index.js", "cordis.patch.yml"} <= set(package_files)
+            or any(str(item).startswith("src/") or str(item).endswith(".ts")
+                   for item in package_files)
+            or package_dsh != {
+                "bundle": {"patch": "./cordis.patch.yml"}}
+            or "bin" in package):
+        errors.append(
+            "[R4] dsh_acp/plugin/package.json: 标准 bundle 必须固定 myagents "
+            "name/version、main/exports=lib/index.js、dsh.bundle.patch，且不得发布"
+            "source executable")
+
+    expected_peer_names = {
+        "@deepseek-ai/cordis", "@deepseek-ai/schemastery",
+        "@deepseek-ai/dsh-agent", "@deepseek-ai/dsh-attachment",
+        "@deepseek-ai/dsh-llm", "@deepseek-ai/dsh-sandbox-policy",
+        "@deepseek-ai/dsh-session", "@deepseek-ai/dsh-tools",
+        "@deepseek-ai/dsh-user-approval",
+    }
+    public_packages = runtime_contract.get("publicPackages")
+    expected_plugin_peers = {
+        name: details.get("version")
+        for name in expected_peer_names
+        if isinstance(public_packages, dict)
+        and isinstance((details := public_packages.get(name)), dict)
+    }
+    public_package_contracts_valid = (
+        isinstance(public_packages, dict)
+        and bool(public_packages)
+        and all(
+            isinstance(details, dict)
+            and isinstance(details.get("entrySha256"), str)
+            and isinstance(details.get("runtimeEntry"), str)
+            and isinstance(details.get("runtimeEntrySha256"), str)
+            and len(details["entrySha256"]) == 64
+            and len(details["runtimeEntrySha256"]) == 64
+            for details in public_packages.values()
+        )
+    )
+    dsh_root_contract = runtime_contract.get("dshRoot")
+    if (runtime_contract.get("schemaVersion") != 5
+            or runtime_contract.get("hostVersion") != "0.1.0"
+            or runtime_contract.get("compatibilityRevision") != 1
+            or not isinstance(dsh_root_contract, dict)
+            or dsh_root_contract.get("name")
+            != "@deepseek-ai/dsh-root"
+            or dsh_root_contract.get("version")
+            != "0.1.1-rc.2"
+            or dsh_root_contract.get("sourceCommit")
+            != "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"
+            or dsh_root_contract.get("cliEntry") != "apps/cli/lib/bin.js"
+            or dsh_root_contract.get("cliEntrySha256")
+            != "c0226687bb20f45c603ec6fe50f3de16d1c3510c3a803304ec575ef9bc366c62"
+            or dsh_root_contract.get("cliRuntimeFiles") != {
+                "bin.js": (
+                    "c0226687bb20f45c603ec6fe50f3de16d1c3510c3a803304ec575ef9bc366c62"),
+                "dump-config-D-jtgwY3.js": (
+                    "f75ee5e1f3a7392103029f1b254188975c57c41ef6f959c887c2163bc7aaf47d"),
+                "plugin-9h8shc4d.js": (
+                    "6f4459da44f0e5bdb3c72471f4be0ee1929913be352baf8b0da7b700afc1804c"),
+                "profile-boot-BnJoK_kl.js": (
+                    "778c5b338674d986a49972be920c965d28b2c8cac85364ae77f8587070397663"),
+                "profile-boot-DG5t9aNs.js": (
+                    "f83ffea6a4d30cfbe02b41dabcc05104c4ad27bf79c74f601f0ddb6ccdf88969"),
+            }
+            or "runtimeFileCount" in dsh_root_contract
+            or "runtimeTreeSha256" in dsh_root_contract
+            or runtime_contract.get("acpSdk") != {
+                "name": "@agentclientprotocol/sdk",
+                "version": "0.25.1",
+                "entrySha256": (
+                    "a99ccb28840ca0338595e1f636cf41527f482bf4d45dded78fd15fdd61cd23d6"),
+            }
+            or runtime_contract.get("buildTool") != {
+                "name": "esbuild",
+                "version": "0.28.1",
+                "entry": "lib/main.js",
+                "entrySha256": (
+                    "8331fe1d8b3a07381f33cc425fcfaa94776e263113653f80ec3ba433e9657e73"),
+                "binary": "bin/esbuild",
+                "binarySha256ByPlatform": {
+                    "darwin-arm64": (
+                        "e2dc9a52440a2a34f09434a2f4843cb1e30f84e40dcf238976ec61ef8cd7f36a"),
+                },
+            }
+            or runtime_contract.get("profileBundle") != {
+                "name": "@myagents/dsh-acp-host",
+                "main": "lib/index.js",
+                "patch": "cordis.patch.yml",
+                "acpSdkBundled": True,
+                "entrySha256": (
+                    "a8515ac654705e07ea04c2f7c2f3df452500c9ad902652cb0d434af49aba3290"),
+                "patchSha256": (
+                    "744d7ce4370c0bac08db1b53e0da407005a2e053077648b85adbd69c996afbb2"),
+            }
+            or not public_package_contracts_valid
+            or set(expected_plugin_peers) != expected_peer_names
+            or package.get("peerDependencies") != expected_plugin_peers):
+        errors.append(
+            "[R4] dsh_acp/plugin: package peers、host/DSH/ACP SDK 版本与 "
+            "checked-in standard bundle compatibility contract 必须精确一致")
+
+    required_patch_tokens = {
+        "id: session-persistence-jsonl", "compression: none",
+        "packChunks: false", "id: sandbox-policy",
+        "id: approval", "id: permission", "read-only:",
+        "workspace-write:", "process.env.DSH_ACP_PROFILE",
+        "id: myagents-dsh-acp-host",
+        "name: '@myagents/dsh-acp-host'", "id: subagent",
+        "id: tool-subagent", "id: web", "disabled: true",
+    }
+    if (not all(token in patch_text for token in required_patch_tokens)
+            or any(token in patch_text for token in (
+                "../src/", "src/bin", "config/cordis.yml"))):
+        errors.append(
+            "[R4] dsh_acp/plugin/cordis.patch.yml: stock base overlay 必须固定 "
+            "uncompressed/unpacked JSONL、两 profile、递归工具禁用与唯一 built host")
+
+    runtime_plugin_text = "\n".join((
+        plugin_text, plugin_acp_text, plugin_codec_text, plugin_content_text,
+    ))
+    if ("@deepseek-ai/dsh-acp-demo" in runtime_plugin_text
+            or "@deepseek-ai/dsh-acp/" in runtime_plugin_text
+            or "AcpDemo" in runtime_plugin_text
+            or re.search(
+                r"@deepseek-ai/[^'\"\s]+/src(?:/|['\"])",
+                runtime_plugin_text,
+            )):
+        errors.append(
+            "[R4] dsh_acp/plugin: 产品 ACP server 不得委托 stock ACP demo、"
+            "依赖 DSH 补丁或深层导入其未公开源码")
+
+    required_plugin_index_tokens = {
+        "ProductAcp", "installModelSelection", "profileSetup",
+        "READ_ONLY_TOOLS", "agentCtx.tools.restrict",
+        "agentCtx.tools.guard", "tools/pre-execute",
+        "effectiveSandboxMode", "effectiveApprovalPolicy",
+        "ctx.inject", "runtimeCtx.plugin(ProductAcp", "agentInfo:",
+        "dsh-myagents-acp", "DSH_ACP_PERSISTENCE_DIR",
+        "DSH_ACP_RUNTIME_HOME", "DSH_ACP_ATTACHMENT_HOME",
+        "DSH_ACP_SETTINGS_FILE", "DSH_ACP_CREDENTIALS_FILE",
+        "DSH_HOME", "DSH_AGENTS_HOME", "derivedStateDirectory",
+        "rejectRuntimeInjection", "assertDisjoint", "process.cwd()",
+        "fileURLToPath(import.meta.url)", "process.execPath",
+        "deepseek.ai/dsh-runtime-version",
+        "deepseek.ai/dsh-compatibility-revision",
+    }
+    if not all(token in plugin_text for token in required_plugin_index_tokens):
+        errors.append(
+            "[R4] dsh_acp/plugin/src/index.ts: 标准 Loader plugin 必须从 stock "
+            "profile 注入 public services，并固定 state topology、工具闭集、"
+            "execution policy attestation 与 wire identity")
+
+    required_product_acp_tokens = {
+        "AgentSideConnection", "loadSession", "closeSession",
+        "requestPermission", "allow-once", "reject-once",
+        "outcome.optionId === 'allow-once'",
+        "outcome.optionId === 'reject-once'",
+        "SessionPersistenceGuard", "persistence.list()",
+        "persistence.locate(header)", "preflightDurableArtifact",
+        "assertArtifactIdentity", "sameStatIdentity",
+        "scanArtifactLines", "headerLineMatches",
+        "MAX_DURABLE_REPLAY_BYTES", "MAX_DURABLE_REPLAY_EVENTS",
+        "O_NOFOLLOW", "sessionCapabilities: { close: {} }",
+        "loadSession: true",
+    }
+    if not all(token in plugin_acp_text
+               for token in required_product_acp_tokens):
+        errors.append(
+            "[R4] dsh_acp/plugin/src/acp.ts: myagents-owned ACP server 必须拥有 "
+            "load/close/permission、materialize 前 bounded JSONL preflight 与"
+            "未知 option fail-closed 契约")
+    if ("turnEndToStopReason" not in plugin_codec_text
+            or "admitAcpPrompt" not in plugin_content_text):
+        errors.append(
+            "[R4] dsh_acp/plugin: terminal/content codec 必须归 myagents canonical source")
+
+    required_build_tokens = {
+        "MYAGENTS_DSH_SOURCE_ROOT", "MYAGENTS_DSH_ESBUILD_BIN",
+        "verified esbuild binary must remain inside the stock DSH checkout",
+        "--bundle", "--platform=node", "--format=esm", "--target=node24",
+        "--external:@deepseek-ai/*", "@agentclientprotocol/sdk/dist/acp.js",
+        "--alias:@agentclientprotocol/sdk=", "index.js",
+    }
+    if not all(token in plugin_build_text for token in required_build_tokens):
+        errors.append(
+            "[R4] dsh_acp/plugin/scripts/build.mjs: release build 必须生成唯一 "
+            "lib/index.js，外置 DSH public peers 并固定打包 ACP SDK public entry")
+
+    release_check_text = dsh_release_check.read_text(encoding="utf-8")
+    required_release_invariant_tokens = {
+        "MYAGENTS_DSH_SOURCE_ROOT", "apps/cli/lib/bin.js",
+        'profile_home="$snapshot_dir/dsh-home"', 'DSH_HOME="$profile_home"',
+        "plugin --profile myagents", 'add "$tarball" --offline',
+        "MYAGENTS_DSH_TEST_HOME", "cordis.patch.yml", "lib/index.js",
+        "pack --pack-destination", "tar -tzf", "--dump-config",
+        "@deepseek-ai/dsh-base,@myagents/dsh-acp-host",
+        "build-one", "build-two", "cmp -s", "--no-cache", "oxlint",
+        "--deny-warnings", "--disable-nested-config", "head.before",
+        "status.before", "tree.before", "head.after", "status.after",
+        "tree.after", "git_root", "untracked-files=all",
+        "os.lstat", "st_mtime_ns", "hashlib.sha256", "content_hash",
+        '[[ -s "$snapshot_dir/status.before" ]]', "typecheck.mjs",
+        "--no-optional-locks",
+        "check-dsh-runtime-contract.py", "--source-root",
+        "--bundle-entry", "--bundle-patch", "--contract",
+    }
+    if not all(token in release_check_text
+               for token in required_release_invariant_tokens):
+        errors.append(
+            "[R4] scripts/check-dsh-plugin.sh: release contract 必须锁定所选 "
+            "stock checkout，在临时 DSH_HOME 通过官方 plugin/profile/bundle "
+            "路径，并证明测试前后 HEAD、Git 状态和完整文件树不变")
+    release_preflight = release_check_text.find("--print-esbuild-bin")
+    release_build = release_check_text.find("dsh_acp/plugin/scripts/build.mjs")
+    release_postflight = release_check_text.find("--bundle-entry")
+    if not 0 <= release_preflight < release_build < release_postflight:
+        errors.append(
+            "[R4] scripts/check-dsh-plugin.sh: source-only runtime contract "
+            "preflight 必须早于任何 checkout build tool，bundle postflight 必须在构建后")
+    if "/Users/" in release_check_text or "default_profile" in release_check_text:
+        errors.append(
+            "[R4] scripts/check-dsh-plugin.sh: release gate 只能使用临时 DSH_HOME，"
+            "不得硬编码或探测用户默认 profile")
+    package_script_text = dsh_package_script.read_text(encoding="utf-8")
+    required_package_tokens = {
+        "MYAGENTS_DSH_SOURCE_ROOT", "mktemp -d /tmp/myagents-dsh-package.",
+        "dsh_acp/plugin/scripts/build.mjs", "pack --pack-destination",
+        "myagents-dsh-acp-host-0.1.0.tgz", "拒绝覆盖已有 tarball",
+        "lib/index.js", "runtime-contract.json", "THIRD_PARTY_NOTICES.md",
+        "check-dsh-runtime-contract.py", "--source-root",
+        "--bundle-entry", "--bundle-patch", "--contract",
+    }
+    if (not all(token in package_script_text for token in required_package_tokens)
+            or "DSH_HOME" in package_script_text
+            or "plugin --profile" in package_script_text
+            or "/Users/" in package_script_text
+            or "$HOME" in package_script_text):
+        errors.append(
+            "[R4] scripts/package-dsh-plugin.sh: 用户 setup 只能从 canonical "
+            "source 生成不覆盖的标准 tarball，不得读取或修改 DSH profile")
+    package_preflight = package_script_text.find("--print-esbuild-bin")
+    package_build = package_script_text.find("dsh_acp/plugin/scripts/build.mjs")
+    package_postflight = package_script_text.find("--bundle-entry")
+    if not 0 <= package_preflight < package_build < package_postflight:
+        errors.append(
+            "[R4] scripts/package-dsh-plugin.sh: source-only runtime contract "
+            "preflight 必须早于任何 checkout build tool，bundle postflight 必须在构建后")
+    runtime_contract_check_text = dsh_runtime_contract_check.read_text(
+        encoding="utf-8")
+    required_runtime_contract_tokens = {
+        '"rev-parse", "--show-toplevel"', '"rev-parse", "HEAD"',
+        'dsh_root.get("sourceCommit")', 'source_root / "package.json"',
+        'source_root / "node_modules" / "@agentclientprotocol" / "sdk"',
+        'sdk_root / "dist/acp.js"', 'contract.get("publicPackages")',
+        'package_root / "src/index.ts"', 'contract.get("profileBundle")',
+        'dsh_root.get("cliEntrySha256")', 'expected.get("runtimeEntry")',
+        'dsh_root.get("cliRuntimeFiles")', "_verify_cli_runtime_closure",
+        "_RELATIVE_ESM_IMPORT_PATTERNS", "set(observed) != set(expected)",
+        'expected.get("runtimeEntrySha256")', 'contract.get("buildTool")',
+        'build_tool.get("binarySha256ByPlatform")',
+        'arguments.print_esbuild_bin',
+        'profile_bundle.get("entrySha256")',
+        'profile_bundle.get("patchSha256")', "hashlib.sha256",
+    }
+    if not all(token in runtime_contract_check_text
+               for token in required_runtime_contract_tokens):
+        errors.append(
+            "[R4] scripts/check-dsh-runtime-contract.py: release/package gate "
+            "必须把实际 DSH commit、ACP/public entry 与 built bundle SHA-256 "
+            "绑定到 checked-in runtime contract")
+if ("session_close" not in (ROOT / "acp/client.py").read_text(encoding="utf-8")
+        or "_close_active_session" not in acp_source):
+    errors.append(
+        "[R4] acp: 广告 sessionCapabilities.close 的 DSH session 必须在 "
+        "profile 重建/关闭时有界收尾")
+required_acp_terminal_and_prepare_tokens = {
+    '_AUTH_NOTIFICATION_QUEUE_LIMIT = 64',
+    'asyncio.Queue(maxsize=_AUTH_NOTIFICATION_QUEUE_LIMIT)',
+    'except asyncio.QueueFull',
+    'client.on_notification = None',
+    'if stop_reason != "end_turn"',
+    'raise AcpError(',
+    'AgentDeliveryCancelledError',
+    'cancel_sent = False',
+    'cancel_sent = True',
+    'cancel_sent or caller_cancelled is not None',
+    'if stop_reason != "cancelled"',
+}
+if not all(token in acp_source
+           for token in required_acp_terminal_and_prepare_tokens):
+    errors.append(
+        "[R4] acp/adapter.py: ACP prepare auth 通知必须有界、无 auth 的 load "
+        "通知必须丢弃；只有 end_turn 可产生 done")
 
 # Pi is a separate native RPC transport.  Its process is safe to expose only
 # when the fixed extension, exact wrapper-tool closure, startup attestation,
@@ -984,7 +1598,7 @@ if errors:
 print("✓ R1 权限默认 fail-closed")
 print("✓ R2 通用层无 agent-name 协议分支")
 print("✓ R3 子进程仅由 transport 层启动")
-print("✓ R4 Kimi/OpenCode 受限 ACP-first + Qwen/WorkBuddy ACP-only + Pi attested RPC-only")
+print("✓ R4 Kimi/OpenCode 受限 ACP-first + Qwen/WorkBuddy/DSH ACP-only + Pi attested RPC-only")
 print("✓ R5 自然语言讨论、/discuss 与有序协作均有界且不递归 dispatch")
 print("✓ R6 /workflow 固定阶段/单 writer/一次 repair/steering 有界")
 PY

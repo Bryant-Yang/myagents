@@ -51,6 +51,8 @@ def fake_acp_env(**values: str | None):
         "FAKE_ACP_FAIL_INIT",
         "FAKE_ACP_FAIL_NEW",
         "FAKE_ACP_FAIL_LOAD",
+        "FAKE_ACP_FAIL_LOAD_CODE",
+        "FAKE_ACP_FAIL_LOAD_MESSAGE",
         "FAKE_ACP_FAIL_PROMPT",
         "FAKE_ACP_NO_LOAD_CAP",
         "FAKE_ACP_CANCEL_DELAY",
@@ -198,7 +200,7 @@ def test_read_only_tool_denial_still_produces_workflow_result() -> None:
             adapter._active_env_overrides["OPENCODE_PERMISSION"]
         ) == OPENCODE_ACP_PERMISSION_POLICY
         state = state_path.read_text()
-        assert state.count("new:/tmp") == 2
+        assert state.count(f"new:{Path('/tmp').resolve()}") == 2
         assert state.count("opencode-bash-policy:deny") == 1
         assert state.count("opencode-bash-policy:ask") == 1
         assert (
@@ -242,6 +244,34 @@ def test_prepare_failure_uses_visible_jsonl_fallback() -> None:
     print("ok  OpenCode ACP prepare 失败显式进入只读 JSONL fallback")
 
 
+def test_fatal_load_policy_never_uses_opencode_jsonl_fallback() -> None:
+    async def body() -> None:
+        fallback = RecordingFallback()
+        adapter = AcpAdapter("opencode", CMD, fallback_adapter=fallback)
+        try:
+            await collect(adapter.stream_prepared(
+                lambda _prep: "must-not-cross-protocol",
+                "/tmp",
+                "persisted-session",
+            ))
+        except Exception:
+            pass
+        else:
+            raise AssertionError("OpenCode fatal load policy 必须 fail-closed")
+        assert fallback.calls == []
+        await adapter.aclose()
+
+    with tempfile.TemporaryDirectory() as td:
+        with fake_acp_env(
+            FAKE_ACP_STATE=str(Path(td) / "state"),
+            FAKE_ACP_FAIL_LOAD="1",
+            FAKE_ACP_FAIL_LOAD_CODE="-32000",
+            FAKE_ACP_FAIL_LOAD_MESSAGE="Policy rejected load",
+        ):
+            asyncio.run(body())
+    print("ok  OpenCode fatal load policy 零 JSONL fallback")
+
+
 def test_post_submit_disconnect_never_uses_fallback() -> None:
     async def body() -> None:
         fallback = RecordingFallback()
@@ -280,6 +310,7 @@ if __name__ == "__main__":
     test_acp_policy_is_ask_by_default()
     test_read_only_tool_denial_still_produces_workflow_result()
     test_prepare_failure_uses_visible_jsonl_fallback()
+    test_fatal_load_policy_never_uses_opencode_jsonl_fallback()
     test_post_submit_disconnect_never_uses_fallback()
     test_production_registration_is_acp_first_hybrid()
     print("\nOpenCode hybrid transport 契约测试全部通过")

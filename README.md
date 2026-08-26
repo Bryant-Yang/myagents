@@ -1,15 +1,15 @@
 # myagents
 
 原生长连接优先的本地多 agent 终端编排器：在一个 Textual TUI 中点名 Kimi、
-Codex、OpenCode、Qwen Code、WorkBuddy、Pi 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
+Codex、OpenCode、Qwen Code、WorkBuddy、DeepSeek Harness（DSH）、Pi 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M4.11、M5.1、M5、M6 与 M7 已完成。
+> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M4.11、M4.12、M5.1、M5、M6 与 M7 已完成。
 > 共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
 > stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
 > Kimi/OpenCode 使用 ACP-first + prepare-only 只读 JSONL fallback，Qwen Code /
-> WorkBuddy 使用 ACP-only，Pi 使用官方 RPC + 权限 bridge，Codex 使用官方 app-server；JSONL 不会在已提交任务后跨协议重放。真实 Kimi + MCP
+> WorkBuddy/DSH 使用 ACP-only，Pi 使用官方 RPC + 权限 bridge，Codex 使用官方 app-server；JSONL 不会在已提交任务后跨协议重放。真实 Kimi + MCP
 > 端到端验收是发布前手工证据，见“当前限制”。
 
 ## 为什么做这个项目
@@ -40,6 +40,12 @@ Codex、OpenCode、Qwen Code、WorkBuddy、Pi 等 coding agent，共享时间线
   收口为 `Read,Glob,Grep`，profile 切换时重建进程/session。已有登录态会直接
   复用；只有 CLI 明确返回需要认证时才在系统浏览器打开官方登录页，认证等待
   有限超时；不提供 JSONL fallback。
+- `@dsh`：通过 stock `dsh --profile myagents` 加载 myagents 标准 bundle，使用持久
+  ACP session。普通/写轮固定 `DSH_ACP_PROFILE=workspace-write`，workflow 只读轮固定
+  `DSH_ACP_PROFILE=read-only`；切换时重建进程/session。
+  首轮前强制要求 load/close capability，只有 `end_turn` 记为成功；默认 deny，
+  不提供 headless、SDK RPC 或 JSONL fallback。当前自动化只证明 myagents fake
+  contract，真实 DSH profile/权限/回收验收见 ADR-0015。
 - `@pi`：通过 `pi --mode rpc` 使用持久 session。myagents 启动的 Pi 进程关闭
   自动联网下载/更新与自动发现，不激活原生命名 built-in tools，只加载固定 permission bridge 与唯一命名 wrapper
   工具；启动 attestation 通过后才允许 prompt。普通/写 profile 的 edit、write、
@@ -73,7 +79,8 @@ Codex、OpenCode、Qwen Code、WorkBuddy、Pi 等 coding agent，共享时间线
 - 会话工作台：`Ctrl+O` 或 `/sessions` 搜索当前/全部项目会话，任务运行时也能
   切换；每个会话保留独立草稿、状态与未读标记，并支持重命名和确认后永久删除。
 - ACP session 恢复：重启后优先 `session/load` 续接旧 session，保留已持久化
-  cursor；load 失败或不支持时回退新 session 并有界 bootstrap。
+  cursor；仅标准 resource/method-not-found 或具体 adapter 已获证的精确映射
+  可回退新 session，不支持 load 时直接新建；其他错误 fail-closed。
 - 原子 checkpoint：cursor/session_id 在 prompt 前一次性落盘，失败不伪装
   成功；用户消息持久确认后才在 TUI 显示。
 - 房间单写者 lease：owner.lock（flock）保证同一房间同一时刻只有一个
@@ -126,9 +133,9 @@ Codex、OpenCode、Qwen Code、WorkBuddy、Pi 等 coding agent，共享时间线
 ┌─────────▼───────┐ ┌────▼──────────┐ ┌───▼────────────────┐
 │ acp/            │ │ pi_rpc/       │ │ codex_app_server/  │
 │ Kimi/OpenCode/  │ │ Pi RPC +      │ │ Codex native       │
-│ Qwen/WorkBuddy  │ │ permission    │ │ runtime            │
-└─────────────────┘ │ bridge        │ └────────────────────┘
-                    └───────────────┘
+│ Qwen/WorkBuddy/ │ │ permission    │ │ runtime            │
+│ DSH             │ │ bridge        │ │                    │
+└─────────────────┘ └───────────────┘ └────────────────────┘
           │              │                │
           └──────────────┴────────┬───────┘
                                   │ adapters/ JSONL fallback
@@ -166,6 +173,85 @@ Codex、OpenCode、Qwen Code、WorkBuddy、Pi 等 coding agent，共享时间线
     运行的官方 CLI，例如 `npm install -g @tencent-ai/codebuddy-code`。项目不会
     调用 WorkBuddy.app 包内私有二进制；若 CLI 不在 PATH，用
     `MYAGENTS_WORKBUDDY_CLI=/absolute/path/to/codebuddy` 指定。
+  - DeepSeek Harness：安装官方 `dsh` CLI，或准备一个已安装依赖且已构建官方 CLI
+    的 stock DSH 源码树。myagents 自己拥有 `dsh_acp/plugin` 中的标准
+    `@myagents/dsh-acp-host` bundle、ACP server 与产品 host；不会复制或修改 DSH 的
+    core、官方 ACP 包、示例和测试。readiness 也不运行 pnpm/build/CLI 或真实 agent。
+
+先把 canonical source 打成标准 tarball，再用官方 plugin 命令把 bundle 安装进固定
+profile。打包只写指定输出目录，不修改 DSH checkout 或用户 profile：
+
+```bash
+mkdir -p /tmp/myagents-dsh-package
+MYAGENTS_DSH_SOURCE_ROOT=/absolute/path/to/deepseek-harness \
+  bash scripts/package-dsh-plugin.sh /tmp/myagents-dsh-package
+```
+
+安装后的
+`$DSH_HOME/profiles/myagents/package.json` 必须按顺序只列出
+`@deepseek-ai/dsh-base` 与 `@myagents/dsh-acp-host` 两个 bundle：
+
+```bash
+DSH_HOME=/absolute/profile-home \
+  /absolute/path/to/dsh plugin --profile myagents add \
+  /tmp/myagents-dsh-package/myagents-dsh-acp-host-0.1.0.tgz --offline
+```
+
+源码运行时把 `/absolute/path/to/dsh` 换成
+`node /absolute/path/to/deepseek-harness/apps/cli/lib/bin.js`。不要直接安装
+`dsh_acp/plugin` 源码目录；发布入口固定为 tarball 内的 `lib/index.js`。
+
+随后二选一配置启动入口：
+
+```bash
+export MYAGENTS_DSH_CLI=/absolute/path/to/dsh
+# 或：stock 源码树必须已有依赖和已构建的 apps/cli/lib/bin.js
+export MYAGENTS_DSH_SOURCE_ROOT=/absolute/path/to/deepseek-harness
+```
+
+DSH 状态默认保存到
+`${XDG_STATE_HOME:-~/.local/state}/myagents/dsh-acp`，不污染工作区；可用绝对
+`DSH_ACP_PERSISTENCE_DIR` 覆盖。其下固定为 `sessions/`、`runtime-home/` 和
+`attachment-home/`。子进程的 `DSH_HOME` 保留为上述 stock profile home；只有
+`DSH_AGENTS_HOME` 绑定产品派生状态。状态目录不能与 DSH checkout、canonical
+plugin/CLI、profile home 或目标 workspace 任一方向重叠；目标 workspace 也不能包含
+执行入口或原始 settings/credentials。adapter 从 profile home 对
+`settings.yaml` / `.credentials.yaml` 做 no-follow 有界读取，再原子复制到
+`config-inputs/` 的 mode-0600 产品文件；host 只挂载副本，不修改用户原文件。
+
+源码模式把 DSH checkout 当作不可变依赖。若某项能力只能通过修改 DSH 本体或从
+未导出的包内 `src/*` 深层导入才能实现，该能力会被阻断，而不会在 DSH 仓库打补丁。
+readiness 纯读取官方 CLI、`profiles/myagents/package.json`、exact bundle 顺序、
+依赖解析后的 `@myagents/dsh-acp-host@0.1.0` manifest、
+`dsh.bundle.patch=./cordis.patch.yml`、entry 与 patch 文件，并以 no-follow 稳定读取和
+checked-in SHA-256 contract 拒绝同名同版本的产物漂移；不会执行它们。
+`$DSH_HOME/profiles` 与 `profiles/myagents` 必须是 profile home 内真实、非 symlink
+的 canonical 目录，manifest 通过 no-follow、有界、单链接稳定快照读取。stock DSH
+会在 bundle 后继续应用 `$DSH_HOME/cordis.patch.yml` 与
+`$DSH_HOME/profiles/myagents/cordis.patch.yml`；两者只能缺失，或忽略空行/注释后
+唯一语义行精确为 `[]`（文件至多 64 KiB）。空文件、仅注释文件、任何有效 patch
+或 symlink/hardlink 都会使 DSH fail-closed；spawn 前和复用进程的下一轮前会重验。
+`MYAGENTS_DSH_SOURCE_ROOT` 只定位已构建官方 `apps/cli/lib/bin.js`；产品 host 组合由
+profile 中的标准 bundle 加载，readiness 不审计整个源码树。启动后的 DSH 子进程 cwd 固定为
+本轮目标 workspace，不能用同一活跃 session 跨目录工作。
+
+DSH 持久化固定为 uncompressed、unpacked JSONL。`session/load` 在 DSH materialize
+历史前通过公开 `list`/`locate` seam 做 no-follow 文件预检，硬限制 4096 事件 / 16 MiB，
+并在 materialize 与 resume 前复核同一文件身份；无法证明边界时不广告恢复能力。
+
+标准 bundle/host 的 release contract 可对已安装依赖的 DSH checkout 与临时
+`DSH_HOME` profile 运行；默认 Harness 不要求本机存在 DSH：
+
+```bash
+MYAGENTS_DSH_SOURCE_ROOT=/absolute/path/to/deepseek-harness \
+  bash scripts/check-dsh-plugin.sh
+```
+
+该 release gate 要求 DSH checkout 起始即完全干净，以临时 profile 验证 exact
+base → host bundle、entry/patch、permission 与 lifecycle contract；前后比较 HEAD、
+Git 状态以及包含 ignored 文件内容 SHA-256 的完整文件树。它只读 DSH，不会向该仓库
+安装、生成或写入文件。完整文件树比较只用于证明验收未修改不可变 checkout，不是
+readiness 的兼容性 fingerprint；运行时不会扫描或哈希整个 DSH 源码树。
 
 WorkBuddy 当前固定使用官方文档中的中国区环境 `internal`。连接优先复用 CLI
 已有登录态；仅当 `session/new` 明确返回 `Authentication required` 时，才使用
@@ -313,6 +399,7 @@ implementer 可写。未指定 `--verifier` 时由 reviewer 复核。`/steer` �
 | OpenCode | ACP + 隔离只读 JSONL (`opencode acp` → `opencode run`) | 持久 session + 增量 history；风险工具 ask；只有 prepare 失败才降级 | ACP/permission 已验证；hybrid contract 已验收 |
 | Qwen Code | ACP (`qwen --acp`) | 持久 session + 增量 history；普通轮 default、只读轮 plan | ACP-only 已验证 |
 | WorkBuddy | ACP (`codebuddy --acp --acp-transport stdio`) | 持久 session + 增量 history；default/受限只读 fresh profile | ACP-only 已验证 |
+| DSH | ACP（stock `dsh --profile myagents` + `@myagents/dsh-acp-host` bundle） | 持久 session + 增量 history；workspace-write/read-only fresh execution profile；load/close hard gate | ACP-only fake/release contract 与临时 profile 核心真实验收已通过 |
 | Pi | RPC (`pi --mode rpc`) | 持久 session + 增量 history；唯一 permission bridge、三 profile fresh session | RPC-only；fake contract 已验收 |
 | Claude | 未接入 | 预留 AgentSpec/adapter 扩展点 | 规划中 |
 
@@ -335,6 +422,13 @@ OpenCode 正常 ACP 路径额外把默认偏宽的权限收口为 unknown/risky=
 自动升级，并通过 inline agent 与 runtime permission 双重限制为
 `read` / `glob` / `grep` / `list`。细节见
 [ADR-0007](docs/adr/0007-opencode-hybrid-transport-policy.md)。
+
+DSH 只接受官方安装版 `dsh`，或源码树中已构建的官方 CLI；两者都固定启动
+`--profile myagents` 并从该 profile 加载 myagents 标准 bundle，readiness 纯被动。
+两种 execution safety profile、
+load/close、no-replay、cancel/close、仅 `end_turn` 成功与零 fallback 的完整边界见
+[ADR-0015](docs/adr/0015-dsh-acp-only-transport.md)。DSH 专用 host 的工具守卫和
+真实模型能力没有进入默认 fake gate，缺证据的能力保持 blocked。
 
 Pi 不暴露原生命名 built-in tools 或 raw RPC bash。启动时关闭自动发现，只加载
 `pi_rpc/extensions/myagents_permission_bridge.ts`，并核验 nonce/profile/workspace/
@@ -437,7 +531,8 @@ fallback 都由 runtime 白名单限制为只读；正常 ACP 写入仍需在 TU
 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id>`
 （目录 0700、文件 0600、`state.json`/`endpoint.json` 原子写），绝不写进
 目标工作区。TUI 重启后恢复时间线显示、agent seq cursor 和 ACP session
-映射（优先 `session/load`，失败回退新 session + 有界 bootstrap）。
+映射（优先 `session/load`；仅确定的 session-not-found 回退新
+session + 有界 bootstrap，其他错误 fail-closed）。
 
 常见排障：
 
@@ -474,6 +569,7 @@ Harness markers/links
 → py_compile
 → basic tests
 → ACP contract tests
+→ DSH ACP-only contract tests
 → Pi RPC/client/adapter/permission bridge contract tests
 → Phase 2 TUI/integration tests
 → storage tests
@@ -489,6 +585,7 @@ Harness markers/links
 ```bash
 .venv/bin/python tests/test_basic.py
 .venv/bin/python tests/test_acp.py
+.venv/bin/python tests/test_dsh_acp.py
 .venv/bin/python tests/test_pi_rpc_client.py
 .venv/bin/python tests/test_pi_adapter.py
 .venv/bin/python tests/test_pi_permission_bridge.py
@@ -501,7 +598,8 @@ Harness markers/links
 .venv/bin/python tests/test_codex_app_server.py
 ```
 
-普通测试全部使用 fake adapter/fake ACP/Pi RPC server，不会调用真实外部 agent。
+普通测试全部使用 fake adapter/fake ACP/Pi RPC server，不会调用真实外部 agent，
+也不会 build 或启动真实 DSH。
 真实 Kimi + MCP 端到端验收（见“当前限制”）是发布前手工证据，不在
 默认 gate 内。
 
@@ -546,6 +644,7 @@ myagents/
 - [docs/adr/0011-session-scoped-natural-language-roles.md](docs/adr/0011-session-scoped-natural-language-roles.md)：自然语言指定、会话生命周期与安全边界。
 - [docs/adr/0013-natural-language-sequential-collaboration.md](docs/adr/0013-natural-language-sequential-collaboration.md)：自然语言固定计划、串行接力与失败收口。
 - [docs/adr/0014-pi-rpc-permission-bridge.md](docs/adr/0014-pi-rpc-permission-bridge.md)：Pi 原生 RPC、启动 attestation、逐次权限 bridge 与三 profile。
+- [docs/adr/0015-dsh-acp-only-transport.md](docs/adr/0015-dsh-acp-only-transport.md)：DSH 专用 ACP 入口、两 profile、stateful lifecycle gate 与零 fallback。
 - [docs/concepts.md](docs/concepts.md)：相关协议与编排模式。
 - [docs/knowledge-map.html](docs/knowledge-map.html)：可交互知识地图。
 
@@ -565,6 +664,8 @@ myagents/
 - [x] M4.6：Qwen Code ACP-only、default/plan profile 与 TUI 点名接入。
 - [x] M4.7：多项目会话目录、后台执行、资源 gate、未读通知与图片短引用。
 - [x] M4.11：Pi RPC-only、唯一权限 bridge、wrapper 工具闭集、三 profile 与 no-replay。
+- [x] M4.12：DSH ACP-only adapter、标准 bundle、stock
+  `--profile myagents` 被动探测、两 execution profile 与核心真实恢复/权限验收。
 - [x] M5.1：自然语言或 `/discuss` 进入 1–3 轮有界讨论与终局 moderator。
 - [x] M5：干净 Git fixed point、review → 单 writer 修改 → 独立复核、最多
   一次 repair/reverify、阶段边界 steering 与 TUI 阶段状态。
@@ -590,6 +691,13 @@ myagents/
   真实路径逃逸反例、profile 重建、abort 时延、长期 session 和图片仍待人工验收。permission bridge 不是 OS
   sandbox；批准 shell 后仍继承 myagents 的本机权限，不承诺无人值守处理不受信
   输入或敏感环境。
+- 2026-08-26 已以标准 bundle + stock `dsh --profile myagents`、临时
+  `DSH_HOME` 与临时 workspace 复跑最终双进程恢复：session
+  `7afca581-e99c-4a2f-8631-4efaec794fd8` 第二轮 `restored=true`，精确返回
+  `DSH_FINAL_PROFILE_OK` / `DSH_FINAL_PROFILE_RESUME_OK`；逐次 reject、read-only
+  fresh session、配置/默认 profile/checkout 不变及退出无残留也通过。旧 custom
+  `tsx` 证据继续 **superseded**；独立发布包形态的 installed CLI、真实主动 cancel
+  时延、长 session/compaction、压力终局与真实图片模型仍是人工边界。
 - M4.3 图片链路已于 2026-08-09 在房间 `e279f938f34e3475` 用真实 macOS
   剪贴板 PNG 验收：附件目录/文件权限为 0700/0600，command
   `5415080a-1c55-4eba-b063-dd5b7203d877` 的 timeline `seq=5..7` 完整，
