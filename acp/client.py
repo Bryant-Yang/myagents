@@ -27,10 +27,16 @@ import inspect
 import json
 import math
 import os
+import re
 import signal
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Union
 
-from adapters.base import BoundedLog, LineFrameTooLargeError, read_lines
+from adapters.base import (
+    BoundedLog,
+    LineFrameTooLargeError,
+    read_lines,
+    redact_sensitive_text,
+)
 from clipboard_image import TrustedImage
 
 # 通知回调：(method, params) -> None
@@ -50,6 +56,112 @@ _MAX_PENDING_PERMISSIONS = 16
 _PENDING_PERMISSION_BYTE_LIMIT = 32 * 1024 * 1024
 _PERMISSION_REAP_TIMEOUT = 1.0
 _MAX_REVERSE_REQUEST_ID_BYTES = 256
+_REMOTE_ERROR_DETAIL_BYTE_LIMIT = 900
+_REMOTE_ERROR_SCAN_CHAR_LIMIT = 3600
+_REMOTE_ERROR_CANDIDATE_LIMIT = 12
+_REMOTE_ERROR_DETAIL_KEYS = (
+    "error", "details", "message", "reason", "hint", "description",
+)
+_REMOTE_ERROR_SENSITIVE_FIELD = re.compile(
+    r"(?i)\b([a-z0-9_-]*(?:authorization|api[_-]?key|token|secret|"
+    r"password|passwd|credential|private[_-]?key)[a-z0-9_-]*)"
+    r"([\"']?\s*(?::|=)\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\n,;}\]]+)",
+)
+_CONTEXT_TOKEN_COUNTS = re.compile(
+    r"request\s*\(\s*([\d,]+)\s+tokens?\s*\).*?"
+    r"(?:context(?:\s+(?:size|length))?|context_size).*?"
+    r"\(\s*([\d,]+)\s+tokens?\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _bounded_remote_error_text(value: str) -> str:
+    """Redact and UTF-8-bound one untrusted provider error detail."""
+    # ACP frame 本身可达数十 MiB；先按字符数截断再 split/regex，避免为了
+    # 最终 900-byte 提示对整段恶意 detail 制造多份临时字符串。
+    scanned = value[:_REMOTE_ERROR_SCAN_CHAR_LIMIT]
+    redacted = redact_sensitive_text(
+        " ".join(scanned.split()),
+        limit=_REMOTE_ERROR_DETAIL_BYTE_LIMIT,
+    )
+    redacted = _REMOTE_ERROR_SENSITIVE_FIELD.sub(
+        r"\1\2[已隐藏]", redacted)
+    return redacted.encode(
+        "utf-8", errors="replace"
+    )[:_REMOTE_ERROR_DETAIL_BYTE_LIMIT].decode(
+        "utf-8", errors="ignore")
+
+
+def _remote_error_details(value: object) -> tuple[str, ...]:
+    """Extract bounded human-facing candidates from JSON-RPC ``error.data``.
+
+    Provider data is untrusted and may contain arbitrary nested diagnostics.
+    Restrict traversal to a small key vocabulary and depth, then redact/bound
+    each scalar before it can reach events or the durable timeline.
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def visit(item: object, depth: int) -> None:
+        if depth > 3 or len(candidates) >= _REMOTE_ERROR_CANDIDATE_LIMIT:
+            return
+        if isinstance(item, str):
+            text = _bounded_remote_error_text(item)
+            if text and text not in seen:
+                seen.add(text)
+                candidates.append(text)
+            return
+        if not isinstance(item, dict):
+            return
+        for key in _REMOTE_ERROR_DETAIL_KEYS:
+            if key in item:
+                visit(item[key], depth + 1)
+
+    visit(value, 0)
+    return tuple(candidates)
+
+
+def _actionable_remote_error(
+    message: str,
+    details: tuple[str, ...],
+) -> str:
+    """Prefer a safe provider cause and translate common actionable failures."""
+    safe_message = _bounded_remote_error_text(message)
+    candidates = details + ((safe_message,) if safe_message else ())
+    for visible in candidates:
+        context_match = _CONTEXT_TOKEN_COUNTS.search(visible)
+        if context_match is not None:
+            requested = int(context_match.group(1).replace(",", ""))
+            available = int(context_match.group(2).replace(",", ""))
+            return (
+                "上下文窗口不足：请求 "
+                f"{requested:,} tokens，模型上限 {available:,}；"
+                "请提高 Context Length 或切换长上下文模型，然后新建会话"
+            )
+
+        folded = visible.casefold()
+        account_terms = ("balance", "credit", "quota", "funds")
+        shortage_terms = (
+            "insufficient", "exhausted", "depleted", "not enough",
+            "not sufficient", "used up", "out of",
+        )
+        balance_shortage = (
+            "余额不足" in visible
+            or "额度不足" in visible
+            or "payment required" in folded
+            or "billing hard limit" in folded
+            or (
+                any(term in folded for term in account_terms)
+                and any(term in folded for term in shortage_terms)
+            )
+        )
+        if balance_shortage:
+            return (
+                "账户余额或额度不足；请充值或切换 agent。"
+                f"上游：{visible}"
+            )
+    return details[0] if details else safe_message
 
 
 class AcpError(Exception):
@@ -67,10 +179,19 @@ class AcpRequestWriteUncertainError(AcpError):
 class AcpRemoteError(AcpError):
     """agent 返回显式 JSON-RPC error；请求已被明确拒绝。"""
 
-    def __init__(self, code: object, message: object) -> None:
+    def __init__(
+        self,
+        code: object,
+        message: object,
+        data: object = None,
+    ) -> None:
         self.code = code
         self.remote_message = str(message)
-        super().__init__(f"{code}: {message}")
+        # 不保留 provider 的任意原始 data，避免后续调试/序列化意外泄露凭据。
+        details = _remote_error_details(data)
+        self.remote_detail = details[0] if details else None
+        super().__init__(
+            f"{code}: {_actionable_remote_error(self.remote_message, details)}")
 
 
 def _validate_reverse_request_id(value: object) -> JsonRpcRequestId:
@@ -674,7 +795,10 @@ class AcpClient:
                         if "error" in msg:
                             err = msg["error"]
                             fut.set_exception(AcpRemoteError(
-                                err.get("code"), err.get("message")))
+                                err.get("code"),
+                                err.get("message"),
+                                err.get("data"),
+                            ))
                         else:
                             fut.set_result(msg.get("result", {}))
         except LineFrameTooLargeError as exc:

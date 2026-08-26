@@ -258,7 +258,7 @@ RoomStore（`storage/store.py`）把房间状态落盘到
 client 声明 `fs/terminal` 能力为 false（不代理文件/终端）。
 `session/request_permission` 的决策链：
 
-1. **TUI 已挂载**（默认路径）：`main.py` 把异步决策回调注入所有 ACP
+1. **TUI 已挂载**（默认询问路径）：`main.py` 把异步决策回调注入所有 ACP
    adapter（`Orchestrator.set_permission_handler`），回调签名
    `async (agent_name, params) -> outcome`——通用多 agent runtime 里
    弹窗必须显示来源 agent（名字在 adapter 注入时绑定，client 层保持
@@ -273,6 +273,20 @@ client 声明 `fs/terminal` 能力为 false（不代理文件/终端）。
    抛异常，一律按 cancelled 回应（`_validate_outcome`），绝不向 agent
    发无效 outcome。
 
+生产 TUI 另提供显式 `/yolo` 会话级开关。它不修改 client/adapter 的 deny
+默认值，而是只让当前 room 的 TUI 决策器选择本次 options 中的非空
+`allow_once`；没有该选项仍 cancelled。再次输入关闭，状态只保存在当前进程，
+不写 room state；切换会话时各 room 独立，退出后全部失效，
+并且不改变 workflow `read_only`、runtime hard-deny 或只读 JSONL fallback。见
+[ADR-0016](adr/0016-explicit-auto-approve-mode.md)。
+
+JSON-RPC error object 的 `data` 是 provider 具体原因的重要载体。通用
+`AcpClient` 保留 `code` / `message` 作为协议事实，同时只从 `data` 的固定
+`error/details/message/reason/hint/description` 字段、最多三层中提取正文，
+统一做凭据脱敏与 900 UTF-8 bytes 上限。上下文超限显示请求量、模型上限和
+调整 Context Length 的建议；余额/额度不足提示充值或切换 agent。未知结构仍
+回退到有界 `message`，不得把整个 data、traceback 或 secret 写进 timeline。
+
 等待用户决策期间不阻塞 read loop（独立 task 应答），并暂停 adapter 的
 agent inactivity timeout；权限结果发回后重新开始普通静默计时。OpenCode ACP
 还通过 runtime permission policy 把默认偏宽的 unknown、edit、bash、task、
@@ -284,6 +298,10 @@ ask。这样既隔离 `allow_always`，也避免 OpenCode 在 ask 被 cancelled 
 TUI 的 auto/yolo；只读轮用上游 plan mode 在 runtime 层阻断写入/有副作用命令，
 profile 前后同样重建进程与 fresh session。WorkBuddy 先尝试 `session/new` 复用
 CLI 既有登录态；只在明确的认证错误后发送标准 ACP `authenticate(methodId)`。
+Qwen Code 的系统提示和工具 schema 会让本地大模型首轮 prefill 很长；其具体
+adapter 只在 fresh session 首个活动前把无通知看门狗有界放宽到 300 秒，避免
+120 秒误杀；收到任意活动或进入后续轮即恢复 120 秒，其他 ACP 默认值不变，
+取消/close 仍可立即打断。
 默认 method 是 `internal`，可由环境变量覆盖，但必须属于 server 当次公布的集合。私有
 `_codebuddy.ai/authUrl` 通知只允许打开官方 HTTPS 域名，认证等待最多 300 秒，
 失败时整条连接原子回收。
@@ -357,8 +375,9 @@ Pi 必须看到最终 assistant `message_end`，且 stop reason 属于
 自动重试后的最后一条 assistant 成功可覆盖中间 error。
 
 不在等待人工权限且没有活跃工具时，prompt 连续 120 秒无 ACP 通知或终止响应
-会触发 inactivity cancel；工具已创建且尚未进入终态时改用独立 15 分钟
-watchdog，避免工程子代理和长命令被普通分析阈值误杀。由于 prompt 已经提交，
+会触发 inactivity cancel；Qwen fresh session 只在首个活动前放宽到 300 秒；
+工具已创建且尚未进入终态时改用独立 15 分钟 watchdog，避免工程子代理和长命令
+被普通分析阈值误杀。由于 prompt 已经提交，
 这不是安全重试点：
 Orchestrator 必须先持久化 no-replay cursor，再记录调用失败。
 

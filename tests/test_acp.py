@@ -1174,6 +1174,83 @@ def test_inactivity_timeout_unblocks_next_round() -> None:
     print("ok  ACP 无活动超时 → 自动取消并放行下一轮")
 
 
+def test_initial_inactivity_timeout_only_covers_fresh_prefill() -> None:
+    """延长值只覆盖 fresh 首个活动前；活动后和后续轮恢复普通阈值。"""
+    async def expect_timeout(adapter: AcpAdapter, prompt: str) -> None:
+        try:
+            async for _ in adapter.stream(prompt, "/tmp"):
+                pass
+        except AgentDeliveryUncertainError as exc:
+            assert "0.05 秒无活动" in str(exc), exc
+        else:
+            raise AssertionError(f"{prompt!r} 应使用普通 inactivity timeout")
+
+    async def run() -> None:
+        with patch.dict(os.environ, {
+            "FAKE_ACP_CANCEL_DELAY": "0.01",
+        }, clear=False):
+            reset_state()
+            prefill = AcpAdapter(
+                "fake",
+                [sys.executable, SERVER],
+                inactivity_timeout=0.05,
+                initial_inactivity_timeout=0.5,
+                cancel_timeout=0.1,
+            )
+            pending = asyncio.create_task(
+                _consume(prefill.stream(
+                    "silent-slow initial-prefill", "/tmp")))
+            for _ in range(200):
+                if "prompt:silent-slow initial-prefill" in state_events():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("fake server 未收到 fresh prefill prompt")
+            await asyncio.sleep(0.12)
+            assert not pending.done(), (
+                "fresh 首个活动前不应误用普通 0.05 秒阈值")
+            pending.cancel()
+            try:
+                await pending
+            except AgentDeliveryCancelledError:
+                pass
+            await prefill.aclose()
+
+            after_activity = AcpAdapter(
+                "fake",
+                [sys.executable, SERVER],
+                inactivity_timeout=0.05,
+                initial_inactivity_timeout=0.5,
+                cancel_timeout=0.1,
+            )
+            # 首轮先收到 chunk，再静默；不能继续占用 0.5 秒首活动预算。
+            await asyncio.wait_for(
+                expect_timeout(after_activity, "slow task"), timeout=0.25)
+            await after_activity.aclose()
+
+            later_round = AcpAdapter(
+                "fake",
+                [sys.executable, SERVER],
+                inactivity_timeout=0.05,
+                initial_inactivity_timeout=0.5,
+                cancel_timeout=0.1,
+            )
+            async for _ in later_round.stream("fast round", "/tmp"):
+                pass
+            await asyncio.wait_for(
+                expect_timeout(later_round, "silent-slow task"),
+                timeout=0.25,
+            )
+            await later_round.aclose()
+
+    async def _consume(stream) -> None:
+        async for _ in stream:
+            pass
+
+    asyncio.run(run())
+    print("ok  fresh 首活动前延长；活动后/后续轮恢复普通静默阈值")
+
+
 def test_close_during_prompt() -> None:
     """P2 生命周期：prompt 进行中 close()，pending 失败且进程无残留。"""
     async def run() -> None:
@@ -2004,6 +2081,130 @@ def test_prompt_error_propagates() -> None:
     print("ok  prompt remote error 确定失败 + no-replay")
 
 
+def test_prompt_context_error_data_is_actionable() -> None:
+    """ACP error.data 中的 provider 原因不能退化为 Internal error。"""
+    async def run() -> None:
+        os.environ.update({
+            "FAKE_ACP_FAIL_PROMPT": "1",
+            "FAKE_ACP_FAIL_PROMPT_CODE": "-32603",
+            "FAKE_ACP_FAIL_PROMPT_MESSAGE": "Internal error",
+            "FAKE_ACP_FAIL_PROMPT_DATA": json.dumps({
+                "details": (
+                    "Engine protocol predict request returned 400: "
+                    "request (11361 tokens) exceeds the available context "
+                    "size (8192 tokens), try increasing it"
+                ),
+            }),
+        })
+        try:
+            adapter = AcpAdapter("fake", [sys.executable, SERVER])
+            try:
+                async for _ in adapter.stream("hi", "/tmp"):
+                    pass
+                raise AssertionError("上下文超限应该抛 AcpError")
+            except AcpError as exc:
+                rendered = str(exc)
+                assert "上下文窗口不足" in rendered, rendered
+                assert "11,361" in rendered and "8,192" in rendered
+                assert "Context Length" in rendered
+                assert "Internal error" not in rendered
+            await adapter.aclose()
+        finally:
+            for key in (
+                "FAKE_ACP_FAIL_PROMPT",
+                "FAKE_ACP_FAIL_PROMPT_CODE",
+                "FAKE_ACP_FAIL_PROMPT_MESSAGE",
+                "FAKE_ACP_FAIL_PROMPT_DATA",
+            ):
+                os.environ.pop(key, None)
+    asyncio.run(run())
+    print("ok  ACP provider context error.data → 可操作上下文提示")
+
+
+def test_prompt_balance_error_data_is_actionable_and_redacted() -> None:
+    """余额不足可见，但 provider data 中的凭据仍必须脱敏。"""
+    async def run() -> None:
+        os.environ.update({
+            "FAKE_ACP_FAIL_PROMPT": "1",
+            "FAKE_ACP_FAIL_PROMPT_CODE": "-32603",
+            "FAKE_ACP_FAIL_PROMPT_MESSAGE": "Internal error",
+            "FAKE_ACP_FAIL_PROMPT_DATA": json.dumps({
+                "error": "Internal error",
+                "details": (
+                    "insufficient balance, please recharge, "
+                    "\"api_key\": \"json-super-secret\", "
+                    "client_secret: compound-super-secret, "
+                    "session_token: token-super-secret, "
+                    "password: colon-super-secret; "
+                    "API_KEY=sk-super-secret-provider-key"
+                ),
+            }),
+        })
+        try:
+            adapter = AcpAdapter("fake", [sys.executable, SERVER])
+            try:
+                async for _ in adapter.stream("hi", "/tmp"):
+                    pass
+                raise AssertionError("余额不足应该抛 AcpError")
+            except AcpError as exc:
+                rendered = str(exc)
+                assert "账户余额或额度不足" in rendered, rendered
+                assert "充值或切换 agent" in rendered
+                assert "super-secret" not in rendered
+                assert "json-super-secret" not in rendered
+                assert "compound-super-secret" not in rendered
+                assert "token-super-secret" not in rendered
+                assert "colon-super-secret" not in rendered
+                assert "[已隐藏]" in rendered
+                assert len(rendered.encode("utf-8")) <= 1200
+            await adapter.aclose()
+        finally:
+            for key in (
+                "FAKE_ACP_FAIL_PROMPT",
+                "FAKE_ACP_FAIL_PROMPT_CODE",
+                "FAKE_ACP_FAIL_PROMPT_MESSAGE",
+                "FAKE_ACP_FAIL_PROMPT_DATA",
+            ):
+                os.environ.pop(key, None)
+    asyncio.run(run())
+    print("ok  ACP provider balance error.data → 可操作余额提示 + 脱敏")
+
+
+def test_prompt_error_data_surrogate_remains_deterministic() -> None:
+    """非法 Unicode scalar 只能被替换，不能把明确 remote error 变成断线。"""
+    async def run() -> None:
+        os.environ.update({
+            "FAKE_ACP_FAIL_PROMPT": "1",
+            "FAKE_ACP_FAIL_PROMPT_CODE": "-32603",
+            "FAKE_ACP_FAIL_PROMPT_MESSAGE": "Internal error",
+            "FAKE_ACP_FAIL_PROMPT_DATA": json.dumps({
+                "details": "provider \ud800 rejected request",
+            }),
+        })
+        adapter = AcpAdapter("fake", [sys.executable, SERVER])
+        try:
+            try:
+                async for _ in adapter.stream("hi", "/tmp"):
+                    pass
+                raise AssertionError("remote error 应抛 AcpError")
+            except AcpError as exc:
+                assert "provider ? rejected request" in str(exc), exc
+            assert adapter._started is True
+            assert adapter.session_id is not None
+        finally:
+            await adapter.aclose()
+            for key in (
+                "FAKE_ACP_FAIL_PROMPT",
+                "FAKE_ACP_FAIL_PROMPT_CODE",
+                "FAKE_ACP_FAIL_PROMPT_MESSAGE",
+                "FAKE_ACP_FAIL_PROMPT_DATA",
+            ):
+                os.environ.pop(key, None)
+
+    asyncio.run(run())
+    print("ok  ACP provider surrogate error → 有界替换且保持确定失败")
+
+
 def test_factory_runs_before_first_event() -> None:
     """M2.5 原子性：第一个 info 事件返回前，prompt factory 已执行完毕。"""
     async def run() -> None:
@@ -2226,6 +2427,7 @@ if __name__ == "__main__":
     test_stream_aclose_requires_exact_cancelled_terminal()
     test_inactivity_cancel_requires_exact_cancelled_terminal()
     test_inactivity_timeout_unblocks_next_round()
+    test_initial_inactivity_timeout_only_covers_fresh_prefill()
     test_close_during_prompt()
     test_initialize_failure()
     test_session_new_failure_atomic()
@@ -2256,6 +2458,9 @@ if __name__ == "__main__":
     test_resume_no_steal_active_session()
     test_restore_new_error_propagates()
     test_prompt_error_propagates()
+    test_prompt_context_error_data_is_actionable()
+    test_prompt_balance_error_data_is_actionable_and_redacted()
+    test_prompt_error_data_surrogate_remains_deterministic()
     test_factory_runs_before_first_event()
     test_fresh_factory_error_resets()
     test_nonfresh_factory_error_keeps_session()

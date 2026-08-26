@@ -98,6 +98,24 @@ _COLORS = {"user": "yellow", "kimi": "cyan", "opencode": "green",
 
 # 权限弹窗的固定应答：用户取消 / 退出 TUI 兜底
 _CANCELLED = {"outcome": "cancelled"}
+
+
+def _auto_approve_once(params: dict) -> dict:
+    """只自动选择当次请求明确提供的 allow_once。
+
+    不伪造 optionId，也不选 allow_always；这样模式退出后不会把
+    远端 session 留在长期授权状态。
+    """
+    options = params.get("options")
+    if not isinstance(options, list):
+        return dict(_CANCELLED)
+    for option in options:
+        if not isinstance(option, dict) or option.get("kind") != "allow_once":
+            continue
+        option_id = option.get("optionId")
+        if isinstance(option_id, str) and option_id:
+            return {"outcome": "selected", "optionId": option_id}
+    return dict(_CANCELLED)
 _STREAM_RENDER_INTERVAL = 0.05
 _SENSITIVE_DETAIL_KEYS = {
     "token", "secret", "password", "authorization", "api_key", "apikey",
@@ -624,6 +642,10 @@ class ChatApp(App):
         border: round $secondary;
         color: $text-muted;
     }
+    #task-status.auto-approve {
+        border: round $error;
+        color: $warning;
+    }
     #completion-list {
         display: none;
         height: auto;
@@ -776,6 +798,9 @@ class ChatApp(App):
         self._activity_feeds = {activity_room_id: ActivityFeed()}
         self._activity_feed = self._activity_feeds[activity_room_id]
         self._activity_room_id = activity_room_id
+        # /yolo 是当前进程内、按 room 隔离的显式授权。不得写入 room state，
+        # 因此重启后一定恢复默认逐次询问。
+        self._auto_approve_rooms: set[str] = set()
         self._expanded_activity_ids = {activity_room_id: set()}
         self._expanded_activity = self._expanded_activity_ids[activity_room_id]
         self._activity_line_index: dict[str, int] = {}
@@ -804,7 +829,6 @@ class ChatApp(App):
         yield Footer()
 
     async def on_mount(self) -> None:
-        self.title = "myagents"
         if self.session_manager is not None:
             await self.session_manager.start()
             self._bind_active_runtime()
@@ -838,6 +862,7 @@ class ChatApp(App):
         rows.append(
             f"会话：{self.session_name}；工作目录：{self.orch.workdir}")
         self._system("\n".join(rows))
+        self._update_permission_mode_ui()
         self.query_one("#composer", ComposerInput).focus()
 
     async def on_unmount(self) -> None:
@@ -848,16 +873,20 @@ class ChatApp(App):
             handle.cancel()
         self._stream_flush_handles.clear()
         self._cancel_pending_permissions()
-        if self.session_manager is not None:
-            await self.session_manager.aclose()
-        else:
-            try:
-                if self.control_server is not None:
-                    await self.control_server.aclose()
-                await self.bus.aclose()
-            finally:
-                # 控制层或事件日志收尾失败，也不能跳过 adapter/进程组回收。
-                await self.orch.aclose()
+        try:
+            if self.session_manager is not None:
+                await self.session_manager.aclose()
+            else:
+                try:
+                    if self.control_server is not None:
+                        await self.control_server.aclose()
+                    await self.bus.aclose()
+                finally:
+                    # 控制层或事件日志收尾失败，也不能跳过 adapter/进程组回收。
+                    await self.orch.aclose()
+        finally:
+            # 退出即撤销全部高风险临时授权，即使其他收尾步骤失败也不保留。
+            self._auto_approve_rooms.clear()
 
     def _bind_active_runtime(self) -> None:
         if self.session_manager is None:
@@ -879,7 +908,7 @@ class ChatApp(App):
         for command_id, _snapshot in self._activity_feed.take_evicted():
             self._expanded_activity.discard(command_id)
         self._discard_stale_activity_selection()
-        self.title = f"myagents · {runtime.summary.title}"
+        self._update_permission_mode_ui()
 
     def _on_session_event(
         self,
@@ -1051,6 +1080,8 @@ class ChatApp(App):
 
     async def _reap_idle_sessions(self) -> None:
         if self.session_manager is not None:
+            # runtime 空闲回收不等于 room 被删除；这里只释放 UI runtime
+            # 资源，保留当前 App 进程内的 /yolo room 状态供重新激活。
             for room_id in await self.session_manager.reap_idle():
                 self._activity_feeds.pop(room_id, None)
                 self._expanded_activity_ids.pop(room_id, None)
@@ -1101,6 +1132,17 @@ class ChatApp(App):
         mirrors_events = (
             params.get("_myagents_mirrors_permission_events") is True
         )
+        if self._auto_approve_for(room_id):
+            outcome = _auto_approve_once(params)
+            selected = outcome.get("outcome") == "selected"
+            detail = (
+                f"自动批准权限：{outcome.get('optionId', '')}"
+                if selected else "自动批准失败：请求未提供 allow_once，已拒绝"
+            )
+            if record_events and not mirrors_events:
+                self._record_permission_event(
+                    command_id, agent_name, f"{detail} · {title}")
+            return outcome
         if record_events and not mirrors_events:
             self._record_permission_event(
                 command_id, agent_name, f"等待权限：{title}")
@@ -1599,6 +1641,42 @@ class ChatApp(App):
         rendered = "、".join(f"@{name}" for name in cleared)
         self._system(f"已清空当前会话角色：{rendered}")
 
+    @property
+    def auto_approve(self) -> bool:
+        """当前活动会话是否由 /yolo 临时自动批准。"""
+        return self._activity_room_id in self._auto_approve_rooms
+
+    def _auto_approve_for(self, room_id: str | None) -> bool:
+        key = self._activity_room_id if room_id is None else room_id
+        return key in self._auto_approve_rooms
+
+    def _update_permission_mode_ui(self) -> None:
+        """让当前会话的危险状态同时出现在标题与固定任务区。"""
+        if self.session_manager is None:
+            title = "myagents"
+        else:
+            title = f"myagents · {self.session_manager.active_runtime.summary.title}"
+        self.title = f"{title} · YOLO" if self.auto_approve else title
+        if not self.is_mounted:
+            return
+        panel = self.query_one("#task-status", Static)
+        panel.set_class(self.auto_approve, "auto-approve")
+        self._render_task_status()
+
+    def action_toggle_yolo(self) -> None:
+        """切换当前会话的进程内自动批准；不持久化、不越过只读 profile。"""
+        room_id = self._activity_room_id
+        if room_id in self._auto_approve_rooms:
+            self._auto_approve_rooms.remove(room_id)
+            self._system("YOLO 已关闭：当前会话恢复逐次权限确认")
+        else:
+            self._auto_approve_rooms.add(room_id)
+            self._system(
+                "YOLO 已开启：当前会话将自动批准普通/写入轮次的 "
+                "allow_once；只读阶段仍硬拒绝，退出后自动失效"
+            )
+        self._update_permission_mode_ui()
+
     def action_show_help(self) -> None:
         commands = "\n".join(
             f"{command.token:<10} {command.description}"
@@ -1859,16 +1937,22 @@ class ChatApp(App):
         if not self.is_mounted:
             return
         panel = self.query_one("#task-status", Static)
+        warning = (
+            "YOLO：当前会话自动完全授权已开启（只读阶段仍硬拒绝）\n"
+            if self.auto_approve else ""
+        )
         progress = self._selected_task()
         if progress is None:
-            panel.update("空闲 · 输入 @ 选择 agent，输入 / 查看命令")
+            panel.update(
+                warning + "空闲 · 输入 @ 选择 agent，输入 / 查看命令")
             return
         with contextlib.suppress(Exception):
             snapshot = self.bus.get(progress.command_id)
             progress.set_command(snapshot.status.value, snapshot.error)
         started = self._task_started_at.get(
             progress.command_id, time.monotonic())
-        panel.update(progress.render(time.monotonic() - started))
+        panel.update(
+            warning + progress.render(time.monotonic() - started))
 
     def action_cancel_active(self) -> None:
         if self.session_manager is not None:
@@ -2057,6 +2141,7 @@ class ChatApp(App):
                 return
             self._activity_feeds.pop(room_id, None)
             self._expanded_activity_ids.pop(room_id, None)
+            self._auto_approve_rooms.discard(room_id)
             self._system("会话已永久删除")
 
         self.run_worker(runner())
@@ -2403,8 +2488,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def run_chat_loop(
-        workdir: str, session_name: str, *,
-        app_factory=ChatApp) -> None:
+        workdir: str, session_name: str, *, app_factory=ChatApp) -> None:
     """启动一个 App；其内部 SessionManager 管理全部会话 runtime。"""
     app_factory(
         workdir,
@@ -2418,7 +2502,10 @@ def run_cli(
     """解析 CLI 并把可恢复的启动冲突转换为无 traceback 的操作提示。"""
     args = parse_args(argv)
     try:
-        runner(args.workdir, args.session)
+        runner(
+            args.workdir,
+            args.session,
+        )
     except RoomBusyError as exc:
         session = normalize_session_name(args.session)
         workdir = shlex.quote(str(args.workdir))

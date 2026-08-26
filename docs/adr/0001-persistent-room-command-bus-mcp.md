@@ -88,7 +88,9 @@ adapter/session，也不能直接写 timeline。
   但不取消其他 target。失败 worker 的 partial 必须在 timeline 明确标注失败。
 - command 状态与时间线写入使用同一事件循环；TUI 更新通过线程安全/事件循环安全
   callback 进入 RichLog。
-- 权限请求仍由当前 TUI 决策；MCP 与 socket 都没有 `auto` 放行入口。
+- 权限请求仍由当前 TUI 决策；MCP 与 socket 都没有模式开关或绕过
+  入口。默认 TUI 弹窗；若 TUI 本身按 ADR-0016 显式启动危险模式，
+  外部任务遵守同一进程级决策。
 - TUI 退出先停止接收新命令，再让队列收尾或标记 cancelled，随后关闭 adapters
   并删除 endpoint/socket。
 
@@ -152,7 +154,8 @@ M3 只支持显式 `--workdir` 选择一个本地房间。TUI 未运行、endpoi
    已运行 TUI 的共享时间线，并由同一个 Orchestrator/ACP session 处理。
 2. `get/wait/read` 可看到 queued → running → terminal 状态和 agent 最终回复；
    timeline pagination 不越界、不丢 seq。
-3. 外部消息触发工具权限时，仍在 TUI 弹窗；bridge 无绕过路径。
+3. 外部消息触发工具权限时，仍由 TUI 决策（默认弹窗）；bridge
+   无模式开关或绕过路径。
 4. 同房间并发 submit 按队列顺序执行；相同 `request_id` 不重复执行。
 5. socket/endpoint 权限正确；第二个 TUI 不抢占；stale 文件可恢复；正常退出无
    socket、endpoint、MCP 或 agent 残留进程。

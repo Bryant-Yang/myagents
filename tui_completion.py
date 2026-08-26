@@ -41,6 +41,7 @@ LOCAL_COMMANDS: tuple[LocalCommand, ...] = (
         "agents rescan", "重新检测本机 agent", "action_rescan_agents"),
     LocalCommand("roles", "查看当前会话角色", "action_show_roles"),
     LocalCommand("roles clear", "清空当前会话角色", "action_clear_roles"),
+    LocalCommand("yolo", "切换当前会话自动完全授权", "action_toggle_yolo"),
     LocalCommand("help", "查看本地命令与快捷键", "action_show_help"),
 )
 

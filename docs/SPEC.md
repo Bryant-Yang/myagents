@@ -260,6 +260,24 @@
 - **事实源**：ADR-0009、`workflow.py`、`workspace/git_adapter.py`。
 - **里程碑**：M5。
 
+### UC-PERM-002 显式自动批准模式
+
+- **角色 / 触发**：用户信任当前 workspace 与输入，在活动会话输入 `/yolo`。
+- **主流程**：只有当前 room 启用自动决策器；当 ACP、Pi RPC
+  bridge 或 Codex app-server 产生权限请求时，从当次 options 中选择
+  非空 `kind=allow_once`，不显示权限弹窗。再次输入 `/yolo` 关闭；切换会话
+  时其他 room 保持各自的进程内状态。
+- **可见性**：窗口标题与固定任务区持续显示 `YOLO` 危险模式；自动
+  权限结果仍按 transport 镜像规则进入 events/活动卡。
+- **安全边界**：默认仍逐次询问；模式不写 room state、退出后失效、不选 `allow_always`、
+  不伪造 optionId。没有 `allow_once` 时拒绝。workflow `read_only`、各 adapter
+  runtime/profile 硬拒绝和只读 JSONL fallback 不受影响。该模式不是 OS
+  sandbox，不用于无人值守处理不受信输入。
+- **验收**：Textual + fake ACP 验证 `/yolo` 不进 timeline、按会话隔离、
+  无弹窗、allow-once、无 Future 残留和持续提示；现有 adapter 反例证明
+  read-only 不能被上层 allow 结果突破。
+- **里程碑**：M4.13。
+
 ### UC-ACP-001 有状态增量上下文
 
 - **角色 / 触发**：用户连续多次 `@` 同一个 stateful agent（ACP、Pi RPC 或
@@ -269,8 +287,12 @@
   消息并过滤 agent 自己回复；成功后推进 cursor。
 - **异常分支**：prompt 提交前或服务端明确拒绝的失败不推进 cursor；提交后
   静默超时等结果不确定失败先持久化 no-replay cursor，再公开失败。同 agent
-  并发 dispatch 在 delivery lock 内串行；不同 agent 仍可并行。
-- **验收**：不重复旧消息、不丢跨 agent 消息、不乱序、首次发送有界。
+  并发 dispatch 在 delivery lock 内串行；不同 agent 仍可并行。JSON-RPC
+  `error.data` 只按固定字段/深度/字节预算提取并脱敏；上下文超限、余额或额度
+  不足转为可操作提示，未知结构回退到有界 message。
+- **验收**：不重复旧消息、不丢跨 agent 消息、不乱序、首次发送有界；fake
+  provider error 证明 Qwen 类上下文超限和 Kimi 类余额不足不再显示为裸
+  `-32603: Internal error`，且敏感字段不进入可见错误。
 - **独立证据来源**：`tests/test_phase2.py` fake stateful adapter；Codex 在实现后
   独立构造过并发复现，确认修复前第二轮重复 first、修复后回归通过。
 - **人工验收边界**：长会话 token/内存增长和 compaction 策略尚未验收。
@@ -284,7 +306,9 @@
   注册；普通轮启动 `qwen --acp --approval-mode default`，workflow `read_only`
   启动 `qwen --acp --approval-mode plan`，profile 切换时重建进程、丢弃 resume id
   并 `session/new`。两者复用通用 ACP 增量 cursor、权限 UI、取消和进程组回收
-  契约。TUI 的 `@` 补全、`/agents` 与启动状态动态展示 `@qwen(ACP)`，编排器
+  契约。Qwen 首轮长 prompt prefill 允许最长 300 秒无通知，仍由 adapter
+  有界看门狗与取消回收约束；其他 ACP 保持通用 120 秒。TUI 的 `@` 补全、
+  `/agents` 与启动状态动态展示 `@qwen(ACP)`，编排器
   不增加任何按 qwen 名称分支。
 - **安全边界**：默认 `permission="deny"`，无处理器或非法 option 一律
   cancelled。普通轮显式覆盖用户 native TUI 可能保存的 auto/yolo mode；只读轮
@@ -593,7 +617,8 @@
   `tests/test_pi_adapter.py` 与 `tests/test_pi_permission_bridge.py` 的 fake bridge
   contract 固定；`tests/test_dsh_acp.py` 固定 DSH 两 profile 的 option 绑定与默认
   deny，默认 gate 不调用真实 Pi/DSH。
-- **人工验收边界**：任何真实工具写入与 `auto` 模式必须由用户逐次授权；自动化
+- **人工验收边界**：默认模式下任何真实工具写入必须由用户逐次授权；`/yolo`
+  自动模式只能由用户在 TUI 显式开启，真实外部/工具测试仍需单独授权，自动化
   测试不能代替风险接受。
 - **里程碑**：M2。
 
@@ -604,7 +629,8 @@
 - **主流程**：发送协议对应的 cancel/abort；等待原 prompt 结束；TUI 先收尾权限 Future，再
   `aclose`；SIGTERM 超时后 SIGKILL。
 - **异常分支**：不在等待人工权限时，prompt 连续 120 秒无任何 transport 事件才自动
-  cancel；该轮已提交，先建立 no-replay 边界再公开失败。cancel 不确认则连接
+  cancel；Qwen fresh session 仅在首个 transport 活动前使用 300 秒，收到活动或
+  进入后续轮后恢复 120 秒。该轮已提交，先建立 no-replay 边界再公开失败。cancel 不确认则连接
   作废并在下轮重建；断线使 pending request 立即失败。
 - **验收**：人工权限等待不会触发 inactivity timeout；下一轮不与旧 prompt
   重叠；fake 子孙进程和 ACP/Pi RPC/DSH server 均无残留。
@@ -825,8 +851,9 @@
   匹配，全部 fail closed 并返回含启动命令的可操作 tool error；未知
   method、非法字段、超上限请求返回稳定错误码（`INVALID_REQUEST` /
   `INVALID_PARAMS` / `METHOD_NOT_FOUND` / `NOT_FOUND` / `CAPACITY` /
-  `BUS_CLOSED`），不泄漏 traceback；外部消息触发工具权限时仍在 TUI
-  弹窗由用户决策，bridge 无 `auto` 放行入口；control/validation 错误
+  `BUS_CLOSED`），不泄漏 traceback；外部消息触发工具权限时仍由当前 TUI
+  决策（默认弹窗），bridge 无模式开关或绕过入口；若 TUI 以 ADR-0016
+  危险模式启动，外部任务同样遵守该进程级决策；control/validation 错误
   不会使 MCP server 崩溃。
 - **验收**：八方法语义正确；同房间并发 submit 按 FIFO 顺序执行且相同
   `request_id` 不重复执行；官方 Python MCP SDK（`mcp>=1.27,<2`）经
@@ -875,8 +902,8 @@
   更新继续进入该 room 的活动模型。每卡只保留最近 50 个工具明细、每 room
   只保留最近 100 张可展开终态卡，更早内容在当前视图冻结成折叠归档；完整事实仍从
   `events.jsonl` 读取；后台 runtime 经过 10 分钟 idle reap 后同步释放该 room
-  的 UI 活动模型。活跃工具使用 15 分钟独立 watchdog，普通分析仍使用 120 秒
-  阈值。
+  的 UI 活动模型。活跃工具使用 15 分钟独立 watchdog，普通分析使用 120 秒
+  阈值；Qwen fresh session 只在首个活动前使用 300 秒。
 - **重启分支**：最后事件非 terminal 的 command 显示为上次中断及最后状态。
 - **完成语义**：`completed` 只表示本轮调用正常结束，不等同于用户任务验收；
   TUI 显示“本轮响应结束”，不显示“agent 完成”。fan-out 任一 worker

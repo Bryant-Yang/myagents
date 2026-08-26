@@ -223,6 +223,67 @@ def test_ctrl_n_creates_untitled_session_without_name_dialog() -> None:
     asyncio.run(run())
 
 
+def test_yolo_mode_is_isolated_by_room_and_not_persisted() -> None:
+    async def run() -> None:
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "project"
+            workdir.mkdir()
+            state_root = root / "state"
+            first = RoomStore(workdir, state_root=state_root)
+            second = RoomStore(
+                workdir,
+                state_root=state_root,
+                session_name="second",
+            )
+            app = ChatApp(
+                workdir=str(workdir),
+                orchestrator=Orchestrator(str(workdir), store=first),
+            )
+
+            async with app.run_test() as pilot:
+                first_id = app.session_manager.active_session_id
+                app.action_toggle_yolo()
+                await pilot.pause()
+                assert app.auto_approve is True
+                assert "YOLO" in app.title
+
+                await app.session_manager.activate(second.room_id)
+                app._bind_active_runtime()
+                app._render_active_session()
+                assert app.auto_approve is False
+                assert "YOLO" not in app.title
+
+                # 后台 runtime 的空闲回收不能误清当前进程内的 room 状态。
+                app.session_manager._idle_timeout = 0
+                await app._reap_idle_sessions()
+                assert first_id not in app.session_manager._runtimes
+                assert first_id in app._auto_approve_rooms
+
+                await app.session_manager.activate(first_id)
+                app._bind_active_runtime()
+                app._render_active_session()
+                assert app.auto_approve is True
+                assert "YOLO" in app.title
+
+            assert not app._auto_approve_rooms
+
+            # 新 ChatApp 不从 room state 恢复 /yolo。
+            reopened = ChatApp(
+                workdir=str(workdir),
+                orchestrator=Orchestrator(
+                    str(workdir),
+                    store=RoomStore(workdir, state_root=state_root),
+                ),
+            )
+            async with reopened.run_test() as pilot:
+                await pilot.pause()
+                assert reopened.auto_approve is False
+                assert "YOLO" not in reopened.title
+
+    asyncio.run(run())
+
+
 def test_picker_renames_and_exact_title_deletes_inactive_session() -> None:
     async def run() -> None:
         with TemporaryDirectory(dir="/tmp") as tmp:
@@ -477,6 +538,7 @@ if __name__ == "__main__":
     test_picker_keeps_two_line_rows_and_scrolls_in_narrow_terminals()
     test_picker_switches_history_and_restores_per_session_drafts()
     test_ctrl_n_creates_untitled_session_without_name_dialog()
+    test_yolo_mode_is_isolated_by_room_and_not_persisted()
     test_picker_renames_and_exact_title_deletes_inactive_session()
     test_picker_can_search_all_projects_grouped_by_workdir()
     test_ui_switch_does_not_make_runner_wait_on_the_new_session_bus()

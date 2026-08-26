@@ -33,7 +33,9 @@ app-server），同时仅为已获证路径保留 JSONL 兼容回退。
 严格对齐：
 
 - **R1 权限默认 fail-closed**：生产代码不得显式构造
-  `permission="auto"`；自动放行只能由明确授权的外部调用临时 opt-in。
+  `permission="auto"`；自动放行只能由明确授权的外部调用，或用户在当前
+  TUI 会话显式输入 `/yolo` 后临时 opt-in。`/yolo` 不得持久化或突破
+  read-only runtime/profile。
 - **R2 通用层不得按 agent 名分支**：`orchestrator.py` 与通用 transport runtime
   不得出现 `if agent_name == "kimi"` 一类协议分支；差异必须进入
   `AgentSpec` 或具体 adapter。

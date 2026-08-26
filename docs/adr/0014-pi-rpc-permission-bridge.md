@@ -62,7 +62,7 @@ Pi 与其他 agent 使用同一组 `ExecutionMode` 语义，但安全性由 runt
 
 | profile | 可见 wrapper 闭集 | 权限行为 |
 | --- | --- | --- |
-| `DEFAULT` | 七个 wrapper 全部 | workspace 内读取直接执行；外部读取与 `edit`、`write`、`bash` 每次进入共享 TUI 权限弹窗 |
+| `DEFAULT` | 七个 wrapper 全部 | workspace 内读取直接执行；外部读取与 `edit`、`write`、`bash` 每次进入共享 TUI 权限决策器（默认弹窗） |
 | `READ_ONLY` | `read`、`grep`、`find`、`ls` 四个 active wrapper | 写入与命令不在 active tool 闭集中且 hook 再次 hard-deny；外部读取仍逐次询权 |
 | `WORKSPACE_WRITE` | 七个 wrapper 全部 | 与普通轮使用同一逐次 `allow_once`；不产生永久授权 |
 

@@ -205,14 +205,25 @@ transport。
   inactivity timeout；read loop、取消和关闭仍保持可响应。
 - `selected.optionId` 必须非空且属于本次 `params.options`；否则 cancelled。
 - `auto` 只允许明确授权的测试、运维或一次性外部调用使用。
+- 生产 TUI 只允许用户在当前会话显式输入 `/yolo` 开启自动批准；
+  默认关闭、按 room 隔离、退出后不记忆。该决策器只能选择当次 options 中的非空
+  `allow_once`，不得选 `allow_always`或伪造 optionId；标题与固定任务区
+  必须持续显示危险模式。`read_only` runtime/profile 与只读 JSONL
+  fallback 不得被放宽。完整决策见
+  [`ADR-0016`](docs/adr/0016-explicit-auto-approve-mode.md)。
+- ACP JSON-RPC `error.data` 必须在通用 client 层按固定字段、深度与 UTF-8
+  字节预算提取并脱敏；上下文超限、余额/额度不足等已知 provider 原因要转为
+  可操作提示。不得在 Orchestrator 按 agent 名解析错误，也不得把未知结构、
+  traceback 或凭据原样写入 timeline。
 
 ### 4.3 生命周期
 
 - 每个 stateful adapter 是其原生 session 的唯一 writer。
 - 同一 stateful agent 的 prompt 串行；不同 agent 可以并发 fan-out。
 - 不在等待人工权限且没有活跃工具时，prompt 连续 120 秒无任何 ACP 通知或
-  终止响应才自动取消；活跃工具使用独立 15 分钟 watchdog。两类超时都是提交后
-  结果不确定，按 no-replay 失败处理。
+  终止响应才自动取消；Qwen fresh session 仅在首个活动前允许 300 秒，收到
+  任意活动或进入后续轮立即恢复 120 秒。活跃工具使用独立 15 分钟 watchdog。
+  这些超时都是提交后结果不确定，按 no-replay 失败处理。
 - cancel 后必须等待原 prompt 停止；超时则关闭并重建连接。
 - ACP 只有 `stopReason=end_turn` 能产生成功 done；max-token、turn-limit、refusal、
   cancelled、缺失和未知 terminal 都在 no-replay cursor 提交后确定性失败。

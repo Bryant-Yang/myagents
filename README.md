@@ -4,7 +4,7 @@
 Codex、OpenCode、Qwen Code、WorkBuddy、DeepSeek Harness（DSH）、Pi 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M4.11、M4.12、M5.1、M5、M6 与 M7 已完成。
+> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M4.11、M4.12、M4.13、M5.1、M5、M6 与 M7 已完成。
 > 共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
 > stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
@@ -108,12 +108,14 @@ Codex、OpenCode、Qwen Code、WorkBuddy、DeepSeek Harness（DSH）、Pi 等 co
   输入、系统状态和活动卡保持原文，流式回复仍原位合并。
 - 明确委托：host 路由同时给每个 worker 生成完整 task，消解“你/让 Kimi”
   等角色关系，并直接注入本轮 prompt，不再只显示路由理由。
-- 权限弹窗：显示来源 agent、工具标题、命令上下文和 agent 提供的 options。
+- 默认权限弹窗：显示来源 agent、工具标题、命令上下文和 agent 提供的 options。
 - 精确取消：TUI `Ctrl+X` 或 MCP 只取消当前 command，房间继续工作。
 - 权限 fail-closed：无处理器、异常或非法 option 一律拒绝。
 - 流式回复合并：ACP token/chunk 持续更新同一条 TUI 记录，不再一词一行。
 - ACP 卡死回收：普通分析连续 120 秒无协议事件才取消；已进入工具生命周期后
   使用独立 15 分钟无活动上限，避免工程子代理或长命令被普通静默阈值误杀。
+  Qwen fresh session 只在首个协议活动前放宽到 300 秒，活动后与后续轮恢复
+  120 秒。
   必要时重建连接，并将已提交轮次标为 no-replay，避免重复执行。
 - 完整进程回收：取消、超时和 TUI 退出都会清理 agent 进程组。
 
@@ -287,6 +289,18 @@ python3 -m venv .venv
 ```bash
 .venv/bin/python main.py --session game-review /path/to/project
 ```
+
+对明确信任的 workspace，可在聊天室输入下面的命令，为当前会话自动批准每个
+`allow_once` 权限请求：
+
+```text
+/yolo
+```
+
+再次输入 `/yolo` 即关闭。该模式按会话隔离，退出后不记忆，不选择
+`allow_always`，也不放宽 workflow
+的 review/verify/final 只读边界。它不是 OS sandbox，不应用于无人
+值守处理不受信输入。
 
 每个 `(工作目录, 会话名)` 对应一个持久房间：对话 timeline、执行 events、
 图片 attachments、agent cursor/session 映射和
@@ -501,8 +515,8 @@ myagents_read_timeline(after_seq=0, limit=50)
   为 MCP；MCP 只存在于 bridge 的 stdio 一侧；
 - 外部消息走与 TUI 输入完全相同的 CommandBus FIFO 和
   `Orchestrator.dispatch`，单写者约束不变；
-- 外部消息触发工具权限时仍在 TUI 弹窗由用户决策，bridge 没有 `auto`
-  放行入口；
+- 外部消息触发工具权限时仍由所属会话的当前 TUI 决策；bridge 没有开关或绕过
+  入口。默认弹窗，只有该会话已由用户显式输入 `/yolo` 才自动批准；
 - TUI 未运行、endpoint stale 或房间不匹配时，工具返回可操作错误
   （含启动命令），不创建任何状态。
 
@@ -513,6 +527,8 @@ OpenCode adapter 还会把上游默认偏宽的未知及风险工具收口为 `a
 
 - `auto` 只能由明确授权的 client invocation 显式开启，并在该 client
   生命周期内持续生效；
+- 生产 TUI 的 `/yolo` 默认关闭；开启后只自动选择当前会话当次 options
+  中的 `allow_once`，窗口标题和固定任务区持续显示危险状态；
 - `selected.optionId` 必须属于本次 ACP 请求提供的 options；
 - 关闭 TUI 时，等待中的权限请求按 cancelled 收尾；
 - 一个 ACP session 同一时刻只能有一个 writer；
@@ -520,7 +536,7 @@ OpenCode adapter 还会把上游默认偏宽的未知及风险工具收口为 `a
   TUI 实例启动即失败，不会抢占或静默共用状态。
 
 Codex worker 使用 `workspace-write + on-request`：超出沙箱的 Git 元数据、
-本地 socket 等操作必须进入同一 TUI 权限弹窗；只读 host 使用
+本地 socket 等操作必须进入同一 TUI 权限决策器（默认弹窗）；只读 host 使用
 `read-only + never`，不会为路由申请写权限。Kimi/OpenCode 自动 JSONL
 fallback 都由 runtime 白名单限制为只读；正常 ACP 写入仍需在 TUI 明确批准，
 并建议在 Git 仓库或隔离 worktree 中工作、交付前检查 diff。
@@ -645,6 +661,7 @@ myagents/
 - [docs/adr/0013-natural-language-sequential-collaboration.md](docs/adr/0013-natural-language-sequential-collaboration.md)：自然语言固定计划、串行接力与失败收口。
 - [docs/adr/0014-pi-rpc-permission-bridge.md](docs/adr/0014-pi-rpc-permission-bridge.md)：Pi 原生 RPC、启动 attestation、逐次权限 bridge 与三 profile。
 - [docs/adr/0015-dsh-acp-only-transport.md](docs/adr/0015-dsh-acp-only-transport.md)：DSH 专用 ACP 入口、两 profile、stateful lifecycle gate 与零 fallback。
+- [docs/adr/0016-explicit-auto-approve-mode.md](docs/adr/0016-explicit-auto-approve-mode.md)：`/yolo` 会话级自动批准、持续危险提示与只读硬边界。
 - [docs/concepts.md](docs/concepts.md)：相关协议与编排模式。
 - [docs/knowledge-map.html](docs/knowledge-map.html)：可交互知识地图。
 
@@ -666,6 +683,8 @@ myagents/
 - [x] M4.11：Pi RPC-only、唯一权限 bridge、wrapper 工具闭集、三 profile 与 no-replay。
 - [x] M4.12：DSH ACP-only adapter、标准 bundle、stock
   `--profile myagents` 被动探测、两 execution profile 与核心真实恢复/权限验收。
+- [x] M4.13：显式 `/yolo` 会话级自动批准、只选 allow-once、持续危险提示与
+  workflow read-only 硬边界。
 - [x] M5.1：自然语言或 `/discuss` 进入 1–3 轮有界讨论与终局 moderator。
 - [x] M5：干净 Git fixed point、review → 单 writer 修改 → 独立复核、最多
   一次 repair/reverify、阶段边界 steering 与 TUI 阶段状态。

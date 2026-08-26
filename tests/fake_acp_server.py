@@ -52,6 +52,18 @@ FAIL_LOAD_MESSAGE = os.environ.get(
 LOAD_NOTIFICATION_COUNT = int(
     os.environ.get("FAKE_ACP_LOAD_NOTIFICATION_COUNT", "0"))
 FAIL_PROMPT = os.environ.get("FAKE_ACP_FAIL_PROMPT") == "1"
+try:
+    FAIL_PROMPT_CODE = int(os.environ.get(
+        "FAKE_ACP_FAIL_PROMPT_CODE", "-32000"))
+except ValueError:
+    FAIL_PROMPT_CODE = -32603
+FAIL_PROMPT_MESSAGE = os.environ.get(
+    "FAKE_ACP_FAIL_PROMPT_MESSAGE", "prompt boom")
+try:
+    FAIL_PROMPT_DATA = json.loads(os.environ.get(
+        "FAKE_ACP_FAIL_PROMPT_DATA", "null"))
+except json.JSONDecodeError:
+    FAIL_PROMPT_DATA = None
 STOP_REASON = os.environ.get("FAKE_ACP_STOP_REASON", "end_turn")
 PROMPT_UPDATE_FLOOD = int(
     os.environ.get("FAKE_ACP_PROMPT_UPDATE_FLOOD", "0"))
@@ -365,8 +377,13 @@ def main() -> None:
                 log("disconnect:" + text)
                 return
             if FAIL_PROMPT:
-                send({"jsonrpc": "2.0", "id": rid,
-                      "error": {"code": -32000, "message": "prompt boom"}})
+                error = {
+                    "code": FAIL_PROMPT_CODE,
+                    "message": FAIL_PROMPT_MESSAGE,
+                }
+                if FAIL_PROMPT_DATA is not None:
+                    error["data"] = FAIL_PROMPT_DATA
+                send({"jsonrpc": "2.0", "id": rid, "error": error})
                 continue
             if "giant-frame" in text:
                 chunk(sid, "X" * FRAME_PAYLOAD_BYTES)

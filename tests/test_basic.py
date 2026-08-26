@@ -770,7 +770,12 @@ def test_main_loop_reopens_requested_session() -> None:
     calls = []
 
     class FakeApp:
-        def __init__(self, workdir: str, *, session_name: str) -> None:
+        def __init__(
+            self,
+            workdir: str,
+            *,
+            session_name: str,
+        ) -> None:
             calls.append((workdir, session_name))
 
         def run(self):
@@ -778,7 +783,11 @@ def test_main_loop_reopens_requested_session() -> None:
 
     args = parse_args(["--session", "review", "/tmp"])
     assert (args.workdir, args.session) == ("/tmp", "review")
-    run_chat_loop("/tmp", "default", app_factory=FakeApp)
+    run_chat_loop(
+        "/tmp",
+        "default",
+        app_factory=FakeApp,
+    )
     assert calls == [
         ("/tmp", "default"),
     ]

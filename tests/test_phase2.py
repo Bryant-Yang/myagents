@@ -11,6 +11,7 @@
 """
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -147,6 +148,8 @@ def test_agent_specs() -> None:
     assert qwen._execution_cmd_overrides[ExecutionMode.READ_ONLY] == list(
         QWEN_ACP_READ_ONLY_CMD)
     assert qwen._fallback is None
+    assert qwen._inactivity_timeout == 120
+    assert qwen._initial_inactivity_timeout == 300
     workbuddy = orch.adapters["workbuddy"]
     assert isinstance(workbuddy, AcpWorkBuddyAdapter)
     assert workbuddy._fallback is None
@@ -210,6 +213,85 @@ def test_incremental_not_lost_on_failure() -> None:
     assert "任务二" in p and "任务三" in p   # 失败轮的增量补发
     assert "任务一" not in p                 # 但不退化成全量重发
     print("ok  失败后增量不丢（cursor 不推进，下轮补发）")
+
+
+def test_provider_failures_are_actionable_in_events_and_timeline() -> None:
+    """Qwen/Kimi 类 provider 原因穿过 ACP 后仍对用户可见。"""
+    async def scenario(
+        agent: str,
+        data: dict,
+        expected: str,
+        forbidden: tuple[str, ...] = (),
+    ) -> None:
+        reset_state()
+        os.environ.update({
+            "FAKE_ACP_FAIL_PROMPT": "1",
+            "FAKE_ACP_FAIL_PROMPT_CODE": "-32603",
+            "FAKE_ACP_FAIL_PROMPT_MESSAGE": "Internal error",
+            "FAKE_ACP_FAIL_PROMPT_DATA": json.dumps(data),
+        })
+        adapter = AcpAdapter(agent, [sys.executable, SERVER])
+        orch = make_orch(**{agent: adapter})
+        events: list[AgentEvent] = []
+        try:
+            outcome = await orch.dispatch(
+                f"@{agent} 测试 provider 错误",
+                lambda _name, event: events.append(event),
+            )
+            assert outcome.failures
+            assert expected in orch.history[-1].text
+            assert "Internal error" not in orch.history[-1].text
+            assert any(
+                event.kind == "error" and expected in event.text
+                for event in events
+            )
+            visible = "\n".join(
+                [orch.history[-1].text]
+                + [event.text for event in events]
+            )
+            assert not any(secret in visible for secret in forbidden), visible
+        finally:
+            await orch.aclose()
+            for key in (
+                "FAKE_ACP_FAIL_PROMPT",
+                "FAKE_ACP_FAIL_PROMPT_CODE",
+                "FAKE_ACP_FAIL_PROMPT_MESSAGE",
+                "FAKE_ACP_FAIL_PROMPT_DATA",
+            ):
+                os.environ.pop(key, None)
+
+    async def run() -> None:
+        await scenario(
+            "qwen",
+            {"details": (
+                "request (11361 tokens) exceeds the available context "
+                "size (8192 tokens)"
+            )},
+            "上下文窗口不足",
+        )
+        await scenario(
+            "kimi",
+            {
+                "error": "Internal error",
+                "details": (
+                    "insufficient balance, please recharge; "
+                    "\"access_token\": \"timeline-json-secret\", "
+                    "client_secret: timeline-client-secret, "
+                    "TOKEN: timeline-token-secret, "
+                    "authorization: Basic timeline-colon-secret"
+                ),
+            },
+            "账户余额或额度不足",
+            (
+                "timeline-json-secret",
+                "timeline-client-secret",
+                "timeline-token-secret",
+                "timeline-colon-secret",
+            ),
+        )
+
+    asyncio.run(run())
+    print("ok  provider 错误 → event + timeline 可操作提示")
 
 
 def test_session_id_info_once() -> None:
@@ -380,6 +462,46 @@ def test_tui_permission_select() -> None:
         assert perms and '"outcome": "selected"' in perms[0] and "allow" in perms[0]
     asyncio.run(run())
     print("ok  TUI 权限弹窗（标题/options 可见，选择 → selected）")
+
+
+def test_tui_yolo_auto_approve_mode() -> None:
+    """显式 /yolo 不弹窗，只选择 agent 本次提供的 allow_once。"""
+    async def run() -> None:
+        from main import ChatApp, PermissionScreen
+        from textual.widgets import Input, Static
+
+        reset_state()
+        app = ChatApp(
+            workdir="/tmp",
+            orchestrator=make_orch(
+                kimi=AcpAdapter("kimi", [sys.executable, SERVER])),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_toggle_yolo()
+            await pilot.pause()
+            status = str(app.query_one("#task-status", Static).render())
+            assert "当前会话自动完全授权已开启" in status
+            assert "只读阶段仍硬拒绝" in status
+
+            box = app.query_one(Input)
+            box.value = "@kimi 需要 perm 一下"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not isinstance(app.screen, PermissionScreen)
+            assert not app._permission_futures
+
+        permissions = [
+            event for event in state_events()
+            if event.startswith("permission:")
+        ]
+        assert len(permissions) == 1
+        assert '"outcome": "selected"' in permissions[0]
+        assert '"optionId": "allow"' in permissions[0]
+
+    asyncio.run(run())
+    print("ok  /yolo 自动批准（无弹窗 + allow_once + 持续风险提示）")
 
 
 def test_tui_permission_cancel_on_exit() -> None:
@@ -673,6 +795,7 @@ if __name__ == "__main__":
     test_agent_specs()
     test_incremental_context()
     test_incremental_not_lost_on_failure()
+    test_provider_failures_are_actionable_in_events_and_timeline()
     test_session_id_info_once()
     test_concurrent_same_agent_serialized()
     test_concurrent_different_agents_parallel()
@@ -685,6 +808,7 @@ if __name__ == "__main__":
     test_permission_outcome_failclosed()
     test_permission_task_exception_consumed()
     test_tui_permission_select()
+    test_tui_yolo_auto_approve_mode()
     test_tui_permission_cancel_on_exit()
     test_tui_permission_cancel_with_ctrl_x()
     test_tui_status_and_shutdown()

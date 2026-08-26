@@ -67,6 +67,7 @@ def test_completion_parser_and_command_boundary() -> None:
     assert local_command_for("/discuss") is not None
     assert local_command_for("/workflow") is not None
     assert local_command_for("/steer") is not None
+    assert local_command_for("/yolo").description == "切换当前会话自动完全授权"
     assert local_command_for("/roles").description == "查看当前会话角色"
     assert local_command_for("/roles clear").description == "清空当前会话角色"
     assert local_command_for("/agents rescan").description == "重新检测本机 agent"
@@ -353,6 +354,41 @@ def test_slash_commands_unknown_agent_and_submit_behaviour() -> None:
     print("ok  /command 补全/本地执行/未知 agent/命令误判")
 
 
+def test_yolo_is_session_scoped_visible_and_not_dispatched() -> None:
+    """/yolo 只切换当前会话内存状态，不进入 timeline 或调用 host。"""
+    async def run() -> None:
+        from textual.widgets import Static
+
+        orch = make_orch()
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test() as pilot:
+            box = app.query_one("#composer", ComposerInput)
+
+            box.value = "/yolo"
+            box.cursor_position = len(box.value)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert orch.history == []
+            assert orch.host.decide_calls == 0
+            assert app.auto_approve is True
+            assert "YOLO" in app.title
+            assert "自动完全授权已开启" in str(
+                app.query_one("#task-status", Static).render())
+
+            box.value = "/yolo"
+            box.cursor_position = len(box.value)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.auto_approve is False
+            assert "YOLO" not in app.title
+            assert "自动完全授权已开启" not in str(
+                app.query_one("#task-status", Static).render())
+            assert orch.history == []
+
+    asyncio.run(run())
+    print("ok  /yolo 当前会话切换 + 持续可见 + 不进入 timeline")
+
+
 def test_agent_readiness_status_rescan_and_draft_preservation() -> None:
     from textual.widgets import RichLog
 
@@ -607,6 +643,7 @@ if __name__ == "__main__":
     test_agent_completion_scrolls_selected_item_into_view()
     test_unready_dsh_remains_visible_after_ready_candidates()
     test_slash_commands_unknown_agent_and_submit_behaviour()
+    test_yolo_is_session_scoped_visible_and_not_dispatched()
     test_agent_readiness_status_rescan_and_draft_preservation()
     test_tui_starts_with_zero_or_all_fake_clis()
     test_roles_commands_view_and_clear_without_dispatch()
