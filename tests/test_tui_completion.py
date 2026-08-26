@@ -17,6 +17,8 @@ from host import HostDecision
 from orchestrator import AgentSpec, Orchestrator
 from session_roles import SessionRole, SessionRoleChanges
 from test_basic import make_orch
+from textual.geometry import Region
+from textual.widgets import OptionList
 from tui_completion import (
     completion_context,
     local_command_for,
@@ -34,6 +36,11 @@ AGENTS = (
     ("codex", "APP-SERVER"),
     ("host", "MODERATOR"),
 )
+
+
+def visible_widget_text(widget: OptionList) -> str:
+    viewport = Region(0, 0, widget.outer_size.width, widget.outer_size.height)
+    return "\n".join(strip.text for strip in widget.render_lines(viewport))
 
 
 def test_completion_parser_and_command_boundary() -> None:
@@ -96,6 +103,8 @@ def test_agent_completion_keyboard_and_focus() -> None:
             assert [item.value for item in app._completion.items] == [
                 "@kimi", "@opencode", "@qwen", "@workbuddy", "@dsh", "@pi",
                 "@codex", "@host"]
+            popup = app.query_one("#completion-list", OptionList)
+            assert "@dsh" in visible_widget_text(popup)
 
             # ↑ 从首项循环到末项；↓ 回首项后再选第二项。
             await pilot.press("up")
@@ -139,8 +148,159 @@ def test_agent_completion_keyboard_and_focus() -> None:
             assert app._completion is None
             assert orch.history == []
 
+            # 点击候选必须使用鼠标所在项补全，不能沿用键盘旧索引。
+            box.value = "@"
+            box.cursor_position = len(box.value)
+            await pilot.pause()
+            popup = app.query_one("#completion-list", OptionList)
+            values = {
+                popup.get_option_at_index(index).id
+                for index in range(popup.option_count)
+            }
+            await pilot.click("#completion-list", offset=(8, 4))
+            await pilot.pause()
+            assert app._completion is None
+            assert box.value.removesuffix(" ") in values
+            assert box.value != "@kimi "
+            assert box.has_focus
+
     asyncio.run(run())
     print("ok  @agent 键盘导航/补全/多目标/Esc/焦点")
+
+
+def test_agent_completion_scrolls_selected_item_into_view() -> None:
+    class Adapter:
+        session_id = None
+
+        async def stream(self, _prompt, _workdir):
+            yield AgentEvent("done")
+
+        async def aclose(self) -> None:
+            return None
+
+    def ready(name: str):
+        return lambda: AgentReadiness(
+            name,
+            ReadinessState.READY,
+            "fake ready",
+            "setup fake",
+            f"/tmp/{name}",
+        )
+
+    specs = tuple(
+        AgentSpec(
+            f"agent{index}",
+            "acp-with-long-transport-description",
+            Adapter,
+            ready(f"agent{index}"),
+        )
+        for index in range(10)
+    )
+    orch = Orchestrator(
+        ".",
+        specs=specs,
+        persistent=False,
+        discover_agents=True,
+        host_probe=ready("host"),
+    )
+
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=orch)
+        try:
+            async with app.run_test(size=(44, 24)) as pilot:
+                box = app.query_one("#composer", ComposerInput)
+                await pilot.press("@")
+                await pilot.pause()
+                assert app._completion is not None
+                assert len(app._completion.items) == 11
+                popup = app.query_one("#completion-list", OptionList)
+                assert popup.max_scroll_y > 0
+                assert "@agent9" not in visible_widget_text(popup)
+
+                await pilot.press("up", "up")
+                await pilot.pause()
+                assert app._completion_index == 9
+                assert popup.highlighted == 9
+                assert popup.scroll_y > 0
+                assert "@agent9" in visible_widget_text(popup)
+
+                await pilot.press("enter")
+                await pilot.pause()
+                assert box.value == "@agent9 "
+                assert box.has_focus
+        finally:
+            await orch.aclose()
+
+    asyncio.run(run())
+    print("ok  超出弹层高度的 @agent 候选可滚动且选中项始终可见")
+
+
+def test_unready_dsh_remains_visible_after_ready_candidates() -> None:
+    class Adapter:
+        session_id = None
+
+        async def stream(self, _prompt, _workdir):
+            yield AgentEvent("done")
+
+        async def aclose(self) -> None:
+            return None
+
+    def probe(name: str, state: ReadinessState):
+        return lambda: AgentReadiness(
+            name,
+            state,
+            "fake readiness",
+            "setup fake",
+            f"/tmp/{name}" if state is ReadinessState.READY else None,
+        )
+
+    transports = (
+        ("kimi", "acp+jsonl"),
+        ("opencode", "acp+jsonl"),
+        ("qwen", "acp"),
+        ("workbuddy", "acp"),
+        ("dsh", "acp"),
+        ("pi", "rpc"),
+        ("codex", "app-server"),
+    )
+    specs = tuple(
+        AgentSpec(
+            name,
+            transport,
+            Adapter,
+            probe(
+                name,
+                ReadinessState.NOT_FOUND
+                if name == "dsh" else ReadinessState.READY,
+            ),
+        )
+        for name, transport in transports
+    )
+    orch = Orchestrator(
+        ".",
+        specs=specs,
+        persistent=False,
+        discover_agents=True,
+        host_probe=probe("host", ReadinessState.READY),
+    )
+
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=orch)
+        try:
+            async with app.run_test(size=(120, 32)) as pilot:
+                await pilot.press("@")
+                await pilot.pause()
+                assert app._completion is not None
+                assert app._completion.items[-1].value == "@dsh"
+                popup = app.query_one("#completion-list", OptionList)
+                visible = visible_widget_text(popup)
+                assert "@dsh" in visible
+                assert "未检测到 CLI" in visible
+        finally:
+            await orch.aclose()
+
+    asyncio.run(run())
+    print("ok  DSH 未就绪且排在最后时仍可见")
 
 
 def test_slash_commands_unknown_agent_and_submit_behaviour() -> None:
@@ -444,6 +604,8 @@ def test_roles_clear_waits_for_current_command_boundary() -> None:
 if __name__ == "__main__":
     test_completion_parser_and_command_boundary()
     test_agent_completion_keyboard_and_focus()
+    test_agent_completion_scrolls_selected_item_into_view()
+    test_unready_dsh_remains_visible_after_ready_candidates()
     test_slash_commands_unknown_agent_and_submit_behaviour()
     test_agent_readiness_status_rescan_and_draft_preservation()
     test_tui_starts_with_zero_or_all_fake_clis()

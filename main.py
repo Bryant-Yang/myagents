@@ -627,7 +627,10 @@ class ChatApp(App):
     #completion-list {
         display: none;
         height: auto;
-        max-height: 8;
+        max-height: 10;
+        overflow-x: hidden;
+        overflow-y: auto;
+        text-wrap: nowrap;
         padding: 0 1;
         border: round $accent;
         background: $surface;
@@ -790,7 +793,7 @@ class ChatApp(App):
     def compose(self) -> ComposeResult:
         yield ActivityLog(wrap=True)
         yield Static(id="task-status")
-        yield Static(id="completion-list")
+        yield OptionList(id="completion-list", compact=True)
         yield ComposerInput(
             placeholder=(
                 "输入 @ 选择 agent；/new 或 Ctrl+N 新会话；"
@@ -1399,22 +1402,45 @@ class ChatApp(App):
         self._render_completion()
 
     def _render_completion(self) -> None:
-        popup = self.query_one("#completion-list", Static)
+        popup = self.query_one("#completion-list", OptionList)
         context = self._completion
         if context is None:
             popup.styles.display = "none"
-            popup.update("")
+            popup.clear_options()
             return
-        lines = Text()
-        for index, item in enumerate(context.items):
-            prefix = "› " if index == self._completion_index else "  "
-            style = "reverse bold" if index == self._completion_index else ""
-            lines.append(
-                f"{prefix}{item.label:<14} {item.description}\n",
-                style=style,
-            )
-        popup.update(lines)
+        options: list[Option] = []
+        for item in context.items:
+            prompt = Text(no_wrap=True, overflow="ellipsis")
+            prompt.append("  ")
+            prompt.append(f"{item.label:<14}", "bold")
+            prompt.append(f" {item.description}", "bright_black")
+            options.append(Option(prompt, id=item.value))
+        popup.clear_options()
+        popup.add_options(options)
+        # OptionList 的 auto height 不计边框；候选刚好达到上限时会裁掉末项，
+        # 同时又不会生成可滚动区域。显式把两行边框计入实际高度。
+        popup.styles.height = min(len(options) + 2, 10)
         popup.styles.display = "block"
+        popup.highlighted = self._completion_index
+        popup.scroll_to_highlight()
+
+    def on_option_list_option_highlighted(
+            self, event: OptionList.OptionHighlighted) -> None:
+        if event.option_list.id != "completion-list":
+            return
+        context = self._completion
+        if context is not None and event.option_index < len(context.items):
+            self._completion_index = event.option_index
+
+    def on_option_list_option_selected(
+            self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id != "completion-list":
+            return
+        context = self._completion
+        if context is None or event.option_index >= len(context.items):
+            return
+        self._completion_index = event.option_index
+        self.accept_completion()
 
     def move_completion(self, delta: int) -> bool:
         context = self._completion
