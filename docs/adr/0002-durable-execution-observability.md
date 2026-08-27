@@ -13,7 +13,8 @@ M3 能提交命令并查询 queued/running/terminal，但 agent 在一轮内长�
 内存中的流式状态也会消失，形成“后台悄悄做事、最后突然申请权限”的体验。
 
 这不是自然语言路由问题，也不能靠为 `hi` 等输入建立关键词白名单解决。
-Codex host 的模型、reasoning、plugin 与 MCP 配置继续继承用户默认配置。
+当时的 Codex host 模型、reasoning、plugin 与 MCP 配置继续继承用户默认配置；
+生产 host 已于 ADR-0017 改为显式配置的原生无工具 model runtime。
 
 ## 2. 决策
 
@@ -116,7 +117,8 @@ MCP bridge 对应新增 `myagents_read_events` 与
 4. active/queued 可精确取消，bus worker 继续服务下一条命令。
 5. TUI `Ctrl+X`、control 与 MCP 使用同一取消语义。
 6. M3 旧房间可无损补建事件日志；损坏事件日志拒绝打开。
-7. Codex host 不添加模型、reasoning、plugin、MCP 或自然语言关键词覆盖。
+7. 历史 Codex host 不添加模型、reasoning、plugin、MCP 或自然语言关键词覆盖；
+   当前 host 改由 ADR-0017 约束。
 8. `done/completed` 的用户文案不声称任务已验收。
 9. 人工权限等待超过 inactivity timeout 不误取消；权限结束后恢复普通计时。
 10. fan-out 任一 worker 失败时其他 target 仍收尾，command 终态为 `failed`。

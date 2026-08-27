@@ -4,12 +4,12 @@
 Codex、OpenCode、Qwen Code、WorkBuddy、DeepSeek Harness（DSH）、Pi 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M4.11、M4.12、M4.13、M5.1、M5、M6 与 M7 已完成。
+> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M4.11、M4.12、M4.13、M4.14、M5.1、M5、M6 与 M7 已完成。
 > 共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
 > stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
 > Kimi/OpenCode 使用 ACP-first + prepare-only 只读 JSONL fallback，Qwen Code /
-> WorkBuddy/DSH 使用 ACP-only，Pi 使用官方 RPC + 权限 bridge，Codex 使用官方 app-server；JSONL 不会在已提交任务后跨协议重放。真实 Kimi + MCP
+> WorkBuddy/DSH 使用 ACP-only，Pi 使用官方 RPC + 权限 bridge，Codex worker 使用官方 app-server；host 使用 myagents 原生模型 runtime；JSONL 不会在已提交任务后跨协议重放。真实 Kimi + MCP
 > 端到端验收是发布前手工证据，见“当前限制”。
 
 ## 为什么做这个项目
@@ -53,7 +53,9 @@ Codex、OpenCode、Qwen Code、WorkBuddy、DeepSeek Harness（DSH）、Pi 等 co
   hard-deny；授权弹窗只会在本轮 no-replay checkpoint 已持久化后出现。图片每轮
   最多 16 张、合计 20 MiB；不提供
   ACP 或 JSON/JSONL fallback。
-- `@host`：由只读 Codex adapter 扮演主持人，负责总结和仲裁。
+- `@host`：由 myagents 自有的无工具 native model runtime 驱动，负责意图识别、
+  路由、直接回答、讨论主持和总结；不依赖任何第三方 Agent CLI，`/yolo` 也不能
+  赋予它文件、shell、网络或 skill。
 - Agent 就绪中心：启动时只读取当前进程的 PATH、环境变量和可执行文件属性，
   不启动或安装 agent。`/agents` 显示注册项的可用状态和设置提示，
   `/agents rescan` 在用户修复 PATH 或安装后被动重扫；缺失目标会在时间线写入前
@@ -260,8 +262,9 @@ WorkBuddy 当前固定使用官方文档中的中国区环境 `internal`。连�
 `MYAGENTS_WORKBUDDY_AUTH_METHOD`（默认 `internal`）发起认证，并且该 method 必须
 由本次 `initialize.authMethods` 公布。其他区域 profile 尚未独立验收。
 
-只使用某一个 agent 时，不要求安装其他 worker CLI；但无 mention 路由和
-`@host` 当前依赖 Codex CLI。
+只使用某一个 agent 时，不要求安装其他 worker CLI。无 mention 路由和
+`@host` 只需要配置一个模型 API；LM Studio 可直接提供首版支持的
+OpenAI-compatible 接口。
 
 myagents 不会自动安装、卸载或修改这些 CLI。聊天室启动后可输入 `/agents`
 查看“当前进程检测到的状态”；完成外部安装或 PATH 调整后输入
@@ -275,8 +278,19 @@ cd myagents
 
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+.venv/bin/python - <<'PY'
+import json, urllib.request
+print(*(item["id"] for item in json.load(
+    urllib.request.urlopen("http://127.0.0.1:1234/v1/models"))["data"]), sep="\n")
+PY
+export MYAGENTS_MODEL_ID='把这里替换为上一条命令返回的精确 id'
 .venv/bin/python main.py
 ```
+
+默认模型地址是 LM Studio 的 `http://127.0.0.1:1234/v1`。其他
+OpenAI-compatible 服务可设置 `MYAGENTS_MODEL_BASE_URL`；需要凭据时再设置
+`MYAGENTS_MODEL_API_KEY`。模型 id 必须与 `/v1/models` 的完整返回值精确一致，
+myagents 不会猜别名或自动切换模型。`/agents` 可查看 host 配置状态。
 
 也可以指定 agent 的工作目录：
 
@@ -627,6 +641,7 @@ myagents/
 ├── myagents_mcp.py            # stdio MCP bridge（只连控制 socket）
 ├── orchestrator.py            # 路由、history、并发投递、lease 生命周期
 ├── host.py                    # supervisor / host
+├── native_agent/              # 中立 model provider + 原生无工具 agent runtime
 ├── acp/                       # 通用 ACP client 与 adapter
 ├── pi_rpc/                    # Pi 原生 RPC client/adapter + 固定权限 bridge
 ├── adapters/                  # JSONL adapter 与进程工具
@@ -662,6 +677,7 @@ myagents/
 - [docs/adr/0014-pi-rpc-permission-bridge.md](docs/adr/0014-pi-rpc-permission-bridge.md)：Pi 原生 RPC、启动 attestation、逐次权限 bridge 与三 profile。
 - [docs/adr/0015-dsh-acp-only-transport.md](docs/adr/0015-dsh-acp-only-transport.md)：DSH 专用 ACP 入口、两 profile、stateful lifecycle gate 与零 fallback。
 - [docs/adr/0016-explicit-auto-approve-mode.md](docs/adr/0016-explicit-auto-approve-mode.md)：`/yolo` 会话级自动批准、持续危险提示与只读硬边界。
+- [docs/adr/0017-native-model-backed-host.md](docs/adr/0017-native-model-backed-host.md)：原生模型 provider/runtime、无工具 host 与 LM Studio 接入。
 - [docs/concepts.md](docs/concepts.md)：相关协议与编排模式。
 - [docs/knowledge-map.html](docs/knowledge-map.html)：可交互知识地图。
 
@@ -685,6 +701,8 @@ myagents/
   `--profile myagents` 被动探测、两 execution profile 与核心真实恢复/权限验收。
 - [x] M4.13：显式 `/yolo` 会话级自动批准、只选 allow-once、持续危险提示与
   workflow read-only 硬边界。
+- [x] M4.14：myagents 原生模型 provider/runtime、LM Studio
+  OpenAI-compatible 首版、无工具 host 与 no-replay 生命周期。
 - [x] M5.1：自然语言或 `/discuss` 进入 1–3 轮有界讨论与终局 moderator。
 - [x] M5：干净 Git fixed point、review → 单 writer 修改 → 独立复核、最多
   一次 repair/reverify、阶段边界 steering 与 TUI 阶段状态。
@@ -694,6 +712,11 @@ myagents/
 
 ## 当前限制
 
+- M4.14 原生 host 已于 2026-08-27 通过本机 LM Studio 真实最小探针：从
+  `/v1/models` 选择当前已加载的精确 id
+  `qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive`，生产 provider/runtime
+  流式返回 `NATIVE_HOST_OK` 和权威 done；未修改 LM Studio 或用户配置。不同
+  OpenAI-compatible 服务的兼容差异、长上下文质量与成本仍需分别验收。
 - M4 真实 Codex 两轮探针已于 2026-07-27 通过：直接 adapter 冷/热两轮约
   18.0s/4.6s，真实 Orchestrator 连续两次 `@codex` 也复用同一
   app-server PID/thread；退出后无残留。app-server 是实验接口，Codex CLI
@@ -726,8 +749,9 @@ myagents/
   [`scripts/e2e-m3-real.py`](scripts/e2e-m3-real.py)：两次独立
   TUI/ACP/MCP 生命周期复用同一 Kimi session，timeline 无重复，退出后无
   endpoint/socket/agent 残留。该脚本调用真实模型，不放进默认快速 gate。
-- M5.1 `/discuss` 已于 2026-08-08 在同一命名房间恢复原 Kimi/OpenCode
-  session，通过 MCP 完成两轮交叉讨论和一次 Codex host 仲裁；6 条新增
+- M5.1 `/discuss` 的历史实测已于 2026-08-08 在同一命名房间恢复原
+  Kimi/OpenCode session，通过 MCP 完成两轮交叉讨论和一次当时的 Codex host
+  仲裁；6 条新增
   timeline 连续、第二轮能回应对方首轮、无工具/权限事件且退出无残留。
 - M5 真实探针已于 2026-08-09 通过
   [`scripts/e2e-m5-real.py`](scripts/e2e-m5-real.py)：Kimi 只读 review/verify，

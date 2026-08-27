@@ -90,9 +90,8 @@ Orchestrator 看到 fresh/unrestored 后把 cursor 归零，按既有
 
 ### 2.5 Host 不切换到 Kimi JSONL
 
-生产 host 继续使用 ADR-0003/0004 的 Codex app-server ephemeral
-thread。Kimi print mode 没有等价 ephemeral 开关，把每次路由都换成
-Kimi JSONL 会污染本地 session 列表，不作为“快速”的交换代价。
+生产 host 现使用 ADR-0017 的 myagents 原生无工具 model runtime。Kimi print
+mode 不作为 host fallback，也不会因 native provider 失败而跨协议重放。
 
 ## 3. 验收
 

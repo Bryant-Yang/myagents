@@ -1,7 +1,7 @@
 # ADR-0003：Codex app-server 长连接传输
 
-- 状态：Accepted（host thread 持久化由
-  [ADR-0004](0004-ephemeral-codex-host-threads.md)补充）
+- 状态：Accepted（仅当前 `@codex` worker；历史 host 决策已由
+  [ADR-0017](0017-native-model-backed-host.md)取代）
 - 日期：2026-07-27
 - 里程碑：M4
 - 作者：Bryant Yang
@@ -35,8 +35,8 @@ app-server 是 Codex 专用协议，不是 ACP。M4 不把它包装成“通用 
 
 - 一个 `CodexAppServerAdapter` 独占一个 app-server 进程和一个 thread。
 - 同一 adapter 的 turn 严格串行；不同 adapter 可以并发。
-- host 与 `@codex` worker 各自持有 adapter，不共享 thread，避免角色上下文和
-  权限边界相互污染。
+- 历史实现中 host 与 `@codex` worker 各自持有 adapter；当前生产只有
+  `@codex` worker 使用本 adapter，host 使用 ADR-0017 的 native runtime。
 - 同一进程至少服务两个连续 turn；正常 turn 结束不关闭进程。
 - `aclose()` 必须终止整个进程组并使全部 pending request 失败。
 
@@ -54,8 +54,8 @@ app-server 启动命令不得添加 `--model`、`-c` 或 reasoning/plugin/MCP �
 - host 使用 `sandbox=read-only` 与 `approvalPolicy=never`，路由与直接回答
   不申请写权限。
 
-这些字段只作用于该 thread，不写入 `~/.codex/config.toml`。host 的
-`thread/start` 另按 ADR-0004 发送 `ephemeral: true`，不适用于 worker。
+这些字段只作用于该 thread，不写入 `~/.codex/config.toml`。ADR-0004 的
+ephemeral host 形状只作为历史 adapter contract 保留，不再生产注册。
 
 M4.3 允许 `turn/start.input` 在 text 后追加官方 schema 的
 `{"type":"localImage","path":"..."}`。路径只能来自当前房间私有
@@ -87,7 +87,7 @@ M4.3 允许 `turn/start.input` 在 text 后追加官方 schema 的
 
 - initialize 或 thread prepare 阶段失败可以回退到 `codex exec --json`；
   此时尚未提交用户 turn，即使空 thread 已在服务端建立也没有工具副作用。
-  host fallback 另按 ADR-0004 增加 `--ephemeral`。
+  历史 host fallback 另按 ADR-0004 增加 `--ephemeral`；生产 host 不走此路径。
 - 一旦发送 `turn/start` 就不自动回退：响应丢失时无法证明服务端是否已接受并
   开始执行。无论是否已收到流式事件或 approval，都诚实失败并作废连接，下一轮
   再重建，绝不冒险重复工具副作用。

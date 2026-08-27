@@ -34,7 +34,7 @@ AGENTS = (
     ("dsh", "ACP"),
     ("pi", "RPC"),
     ("codex", "APP-SERVER"),
-    ("host", "MODERATOR"),
+    ("host", "MODERATOR · NATIVE MODEL"),
 )
 
 
@@ -461,6 +461,7 @@ def test_agent_readiness_status_rescan_and_draft_preservation() -> None:
                 str(line.text) for line in app.query_one(RichLog).lines)
             assert "Agent 就绪状态" in rendered
             assert "@missing · 可用" in rendered
+            assert "@host · 可用 · NATIVE-MODEL" in rendered
             assert "未安装或改动任何 agent" in rendered
 
     asyncio.run(run())

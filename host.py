@@ -9,7 +9,8 @@
   **显式 @ 永远优先**——主持人的判断只在用户没点名时生效。
 - **代价**：需要 worker 的无 @ 消息仍比显式 @ 多一次 LLM 路由调用；
   主持人直接回答的消息只调用一次。路由 JSON 必须可解析、可校验、有兜底。
-- 主持人本身也是一个普通 adapter（默认 kimi），只是 prompt 角色不同。
+- 主持人本身也是一个普通 adapter（默认 myagents 原生模型 runtime），只是
+  prompt 角色不同。
   它也注册进 AGENTS，@host 可以直接叫它出来总结、仲裁、回答元问题。
 """
 
@@ -21,7 +22,6 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator, Callable
 
 from adapters.base import AgentAdapter, AgentEvent, ExecutionMode
-from adapters.kimi_adapter import KimiAdapter
 from collaboration import (
     CollaborationPlan,
     CollaborationValidationError,
@@ -32,6 +32,7 @@ from discussion import (
     DiscussionValidationError,
     parse_discussion_payload,
 )
+from native_agent import NativeSessionPreparation, create_native_host_runtime
 from session_roles import SessionRoleChanges
 
 # host 一次调用完成四选一：讨论、并行路由、有序协作，或直接回答。
@@ -144,7 +145,8 @@ MODERATOR_TEMPLATE = """\
 
 {assignment}
 请以主持人身份回应用户最新的消息。直接输出内容，不要自我介绍，不要复述记录。
-如需读写文件、运行命令，都在当前目录内进行。
+你没有工具，禁止读写文件、运行命令、访问网络或调用 skill；需要执行这些动作时，
+只能基于已有记录提出建议或明确指出应交给 worker，不得声称已经执行。
 """
 
 _JSON_RE = re.compile(r"\{.*\}", re.S)
@@ -182,18 +184,35 @@ class HostCollaboration:
 
 
 class HostAgent:
-    """supervisor：包一个普通 adapter，多一个 decide() 路由能力。"""
+    """Product-level supervisor over a tool-less native agent runtime."""
 
     name = "host"
 
     def __init__(self, adapter: AgentAdapter | None = None,
                  workers: list[str] | None = None) -> None:
-        self.adapter = adapter or KimiAdapter()
+        self.adapter = adapter or create_native_host_runtime()
         self.workers = workers or []
 
     @property
     def session_id(self) -> str | None:  # 满足 AgentAdapter 协议
         return self.adapter.session_id
+
+    @property
+    def stateful_session(self) -> bool:
+        return bool(
+            getattr(self.adapter, "stateful_session", False)
+            and callable(getattr(self.adapter, "stream_prepared", None))
+        )
+
+    @property
+    def prepared_semantic_session(self) -> bool:
+        """Whether Orchestrator must use the durable semantic-call seam."""
+        return self.stateful_session
+
+    @property
+    def replay_history_on_fresh_session(self) -> bool:
+        return bool(getattr(
+            self.adapter, "replay_history_on_fresh_session", True))
 
     async def decide(
             self, transcript: str, workdir: str,
@@ -205,13 +224,25 @@ class HostAgent:
         selected = self.workers if choices is None else choices
         prompt = self._build_route_prompt(transcript, selected)
         buf: list[str] = []
-        async for ev in self.adapter.stream(prompt, workdir):
+        async for ev in self._direct_semantic_stream(prompt, workdir):
             if ev.kind == "text":
                 buf.append(ev.text)
             elif ev.kind not in {"done", "delivery_committed"}:
                 if on_event is not None:
                     on_event(ev)
         return self._parse("".join(buf), selected)
+
+    def build_route_prompt(
+        self,
+        transcript: str,
+        choices: list[str],
+    ) -> str:
+        """Build a route prompt for Orchestrator's prepared delivery seam."""
+        return self._build_route_prompt(transcript, choices)
+
+    def parse_decision(self, raw: str, choices: list[str]) -> HostDecision:
+        """Validate one captured model response without invoking a provider."""
+        return self._parse(raw, choices)
 
     async def extract_session_roles(
         self,
@@ -221,19 +252,29 @@ class HostAgent:
         on_event: Callable[[AgentEvent], None] | None = None,
     ) -> SessionRoleChanges:
         """在固定候选闭集内提取角色变化，不参与路由。"""
-        prompt = _ROLE_EXTRACTION_TEMPLATE.format(
-            choices="、".join(choices),
-            text=text[:12000],
-        )
+        prompt = self.build_session_roles_prompt(text, choices)
         parts: list[str] = []
-        async for event in self.adapter.stream(prompt, workdir):
+        async for event in self._direct_semantic_stream(prompt, workdir):
             if event.kind == "text":
                 parts.append(event.text)
             elif event.kind not in {"done", "delivery_committed"}:
                 if on_event is not None:
                     on_event(event)
-        return SessionRoleChanges.from_model_output(
-            "".join(parts), choices)
+        return self.parse_session_roles("".join(parts), choices)
+
+    @staticmethod
+    def build_session_roles_prompt(text: str, choices: list[str]) -> str:
+        return _ROLE_EXTRACTION_TEMPLATE.format(
+            choices="、".join(choices),
+            text=text[:12000],
+        )
+
+    @staticmethod
+    def parse_session_roles(
+        raw: str,
+        choices: list[str],
+    ) -> SessionRoleChanges:
+        return SessionRoleChanges.from_model_output(raw, choices)
 
     async def extract_collaboration(
         self,
@@ -243,18 +284,29 @@ class HostAgent:
         on_event: Callable[[AgentEvent], None] | None = None,
     ) -> HostCollaboration:
         """Extract plan and roles in one call inside the mention closure."""
-        prompt = _COLLABORATION_EXTRACTION_TEMPLATE.format(
-            choices="、".join(choices),
-            text=text[:12000],
-        )
+        prompt = self.build_collaboration_prompt(text, choices)
         parts: list[str] = []
-        async for event in self.adapter.stream(prompt, workdir):
+        async for event in self._direct_semantic_stream(prompt, workdir):
             if event.kind == "text":
                 parts.append(event.text)
             elif event.kind not in {"done", "delivery_committed"}:
                 if on_event is not None:
                     on_event(event)
-        raw = "".join(parts).strip()
+        return self.parse_collaboration("".join(parts), choices)
+
+    @staticmethod
+    def build_collaboration_prompt(text: str, choices: list[str]) -> str:
+        return _COLLABORATION_EXTRACTION_TEMPLATE.format(
+            choices="、".join(choices),
+            text=text[:12000],
+        )
+
+    @staticmethod
+    def parse_collaboration(
+        raw: str,
+        choices: list[str],
+    ) -> HostCollaboration:
+        raw = raw.strip()
         match = _JSON_RE.search(raw)
         if match is None:
             raise CollaborationValidationError("host 未返回协作计划 JSON")
@@ -274,6 +326,21 @@ class HostAgent:
             choices,
         )
         return HostCollaboration(plan, role_changes)
+
+    def _direct_semantic_stream(
+        self,
+        prompt: str,
+        workdir: str,
+    ) -> AsyncIterator[AgentEvent]:
+        """Compatibility path restricted to stateless injected adapters.
+
+        Production stateful hosts must be invoked by Orchestrator through
+        ``stream_prepared`` so cursor/checkpoint and no-replay stay atomic.
+        """
+        if self.stateful_session:
+            raise RuntimeError(
+                "有状态 host 语义调用必须通过 prepared delivery seam")
+        return self.adapter.stream(prompt, workdir)
 
     async def extract_collaboration_plan(
         self,
@@ -373,7 +440,7 @@ class HostAgent:
         targets = choices[:1]
         return HostDecision(targets, "host 无输出，回退到 worker")
 
-    async def stream(
+    def stream(
         self,
         prompt: str,
         workdir: str,
@@ -382,12 +449,30 @@ class HostAgent:
     ) -> AsyncIterator[AgentEvent]:
         """让 host 也能像普通 agent 一样被 dispatch（@host 时走这条路）。"""
         if execution_mode is ExecutionMode.DEFAULT:
-            stream = self.adapter.stream(prompt, workdir)
-        else:
-            stream = self.adapter.stream(
-                prompt, workdir, execution_mode=execution_mode)
-        async for ev in stream:
-            yield ev
+            return self.adapter.stream(prompt, workdir)
+        return self.adapter.stream(
+            prompt, workdir, execution_mode=execution_mode)
+
+    def stream_prepared(
+        self,
+        make_prompt: Callable[[NativeSessionPreparation], str],
+        workdir: str,
+        resume_session_id: str | None = None,
+        *,
+        execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
+    ) -> AsyncIterator[AgentEvent]:
+        """Forward the stateful prepare/checkpoint contract to the runtime."""
+        prepared = getattr(self.adapter, "stream_prepared", None)
+        if prepared is None:
+            raise RuntimeError("host 底层 adapter 不支持 stateful prepare")
+        if execution_mode is ExecutionMode.DEFAULT:
+            return prepared(make_prompt, workdir, resume_session_id)
+        return prepared(
+            make_prompt,
+            workdir,
+            resume_session_id,
+            execution_mode=execution_mode,
+        )
 
     def set_permission_handler(self, handler) -> None:
         """把通用权限处理器转发给底层 adapter，并保留 host 身份。"""

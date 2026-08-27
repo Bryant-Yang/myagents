@@ -2,7 +2,7 @@
 
 <!-- harness:behaviour-evidence=canonical-source -->
 
-> 作者：Bryant Yang　最近更新：2026-08-26
+> 作者：Bryant Yang　最近更新：2026-08-27
 >
 > 本文是关键用户行为与独立证据的唯一事实源。工程边界见
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -29,6 +29,8 @@
 | M4.10 | 完成 | Agent 被动就绪探测、原子派发门与 `/agents` 设置体验 |
 | M4.11 | 完成 | Pi 原生 RPC、启动 attestation、逐次权限 bridge 与三 profile 隔离 |
 | M4.12 | 完成 | DSH ACP-only adapter、标准 bundle + stock `myagents` profile、权限隔离与真实恢复验收 |
+| M4.13 | 完成 | `/yolo` 会话级自动批准、allow-once 约束、持续风险提示与 read-only 硬边界 |
+| M4.14 | 完成 | myagents 原生模型 provider/runtime、无工具 Host、LM Studio 与 OpenAI-compatible 接入 |
 | M5.1 | 完成 | 自然语言或 `/discuss` 进入 1–3 轮有界讨论与终局 moderator |
 | M5 | 完成 | review → 单 writer 修改 → 独立复核、一次修复上限与阶段边界 steering |
 | M6 | 完成 | 自然语言指定会话级角色、跨任务持续、房间隔离与状态可见 |
@@ -189,7 +191,7 @@
   ADR-0008 的授权真实模型回放不进入默认 gate。
 - **真实验收证据**：2026-08-08 恢复命名房间
   `collab-smoke-20260808-7f3c`，经真实 MCP bridge 提交 Kimi/OpenCode 两轮
-  `/discuss`，再由 Codex host 仲裁。command
+  `/discuss`，再由当时的 Codex host 仲裁。command
   `ce688171-43e4-401d-81a5-ee1ff9cc5d8f` 为 completed；新增 timeline
   `seq=6..11` 恰含一条 user、两条 Kimi、两条 OpenCode 和一条 host，全部绑定
   同一 command id。两名 ACP worker 沿用原 session id，cursor 从 1 推进到 8；
@@ -277,6 +279,46 @@
   无弹窗、allow-once、无 Future 残留和持续提示；现有 adapter 反例证明
   read-only 不能被上层 allow 结果突破。
 - **里程碑**：M4.13。
+
+### UC-HOST-001 原生模型驱动的 Host
+
+- **角色 / 触发**：用户发送无 mention 消息、显式 `@host`，或有界讨论/
+  workflow 进入 host moderator/final 阶段。
+- **前置条件**：`MYAGENTS_MODEL_ID` 已配置，且与
+  `MYAGENTS_MODEL_BASE_URL/models` 返回的完整 `id` 精确一致；当前 provider 为
+  `openai-compatible`。未配置时 host 为“未就绪”，在 timeline 写入前拒绝并
+  显示 `/v1/models` 与环境变量引导。
+- **主流程**：`HostAgent` 仍是 moderator/supervisor 产品角色，底层由
+  `NativeAgentRuntime` 驱动。runtime 通过中立 `ModelProvider/ModelEvent`
+  契约流式调用模型、维护 room 内独立上下文和 session；首个 provider 使用
+  OpenAI-compatible `/models` + `/chat/completions`，但通用 Orchestrator 不感知
+  provider wire protocol。host 单次调用可以直接回答或输出经普通代码验证的
+  route/discussion/collaboration JSON，终局主持继续复用既有有界状态机。
+- **权限边界**：host 固定 `tool_policy=none`，请求不携带 `tools` 或
+  `tool_choice`，不能读写文件、运行 shell、访问网络、调用 skill 或递归派发。
+  `/yolo` 与 execution mode 不改变该 profile。需要执行动作时只能路由到已就绪
+  worker；`MODERATOR` 是 UI 角色，不是 transport。
+- **会话与失败**：每个 room 独占 runtime/context/writer lock。只有权威
+  `finish_reason + [DONE]` 才更新模型上下文。提交后的取消、静默超时、断流或
+  非权威终止形成 no-replay cursor 并重建 session；模型不存在在 POST 前拒绝。
+  不自动降级或跨协议重放到任何第三方 Agent CLI。API key 仅来自环境且在
+  repr、状态、错误和事件中脱敏。
+- **验收**：fake HTTP server 覆盖流式正文、结构化路由、直接回答、discussion
+  moderator、session 隔离、取消、超时、部分流 EOF、错误映射、未配置、模型
+  不存在、secret 不泄露和 host 无工具；显式 `@worker` 证明零 host HTTP 请求。
+  TUI 显示 `MODERATOR · NATIVE MODEL` 与 `NATIVE-MODEL` readiness。真实 LM
+  Studio 只做只读模型列表和一次有界最小回复，不修改用户配置。
+- **独立证据来源**：ADR-0017、`tests/test_native_agent.py`、
+  `tests/fake_openai_compatible_server.py`、`tests/test_phase2.py`、
+  `tests/test_tui_completion.py`。
+- **真实验收证据**：2026-08-27 只读获取本机 LM Studio 的 3 个模型 id，选择
+  当前已加载的精确 id
+  `qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive`，经生产 provider/runtime
+  收到 `delivery_committed`、4 个 text chunk 和权威 done，合并正文严格为
+  `NATIVE_HOST_OK`；未修改 LM Studio 或用户配置。
+- **人工验收边界**：不同本地模型的路由 JSON 可靠性、长上下文质量、吞吐、成本
+  与 provider 兼容范围不能由 fake contract 证明。
+- **里程碑**：M4.14。
 
 ### UC-ACP-001 有状态增量上下文
 
@@ -974,20 +1016,17 @@
   模型能力限制，不影响已验证的附件保存、fan-out 与 Kimi 视觉链路。
 - **里程碑**：M4.3。
 
-### UC-CODEX-001 Codex 原生长连接
+### UC-CODEX-001 Codex worker 原生长连接
 
-- **角色 / 触发**：用户连续点名 `@codex`，或多次发送无 mention 消息给
-  Codex host。
+- **角色 / 触发**：用户连续点名 `@codex`，或编排器将 Codex 选为 worker。
 - **前置条件**：本机 Codex CLI 支持 `codex app-server`；adapter 独占其进程。
 - **主流程**：一次 initialize 后建立 thread；worker 的连续 turn 复用同一
-  app-server PID/thread 并按 cursor 接收增量；host 复用暖进程、每次建立干净
-  的 ephemeral thread，以免 transcript 快照在原生历史中重复，同时不把内部
-  路由提示词写入 Codex 历史。
+  app-server PID/thread 并按 cursor 接收增量。历史 Codex host 的 ephemeral
+  thread 能力仍由 adapter contract tests 保留，但生产 host 已由 ADR-0017 的
+  native model runtime 取代。
 - **配置边界**：不发送 model、effort、config、collaboration mode、plugin 或
   MCP 覆盖，不修改 Codex 全局配置；仅传 cwd、既有 sandbox、approval policy，
-  以及 host 专用的 `ephemeral: true`。worker 为
-  `workspace-write + on-request`，越界操作进入统一权限 UI；host 为
-  `read-only + never`。
+  worker 为 `workspace-write + on-request`，越界操作进入统一权限 UI。
 - **事件分支**：agent message delta 流式进入正文；command/file/MCP item
   进入脱敏 tool/status；approval 进入统一权限 UI且无处理器默认拒绝；
   reasoning 正文不显示；`turn/completed` 后才产生 done。
@@ -997,10 +1036,9 @@
   用户取消都先形成持久 no-replay 边界，再公开失败/取消。服务端明确拒绝或
   确认未发送的失败保持可重试；即使旧 thread 无法恢复，新 thread 也不
   bootstrap 已投递的旧输入。明确接受的 turn 在任何正文/工具/权限 event
-  sink 回调前先持久化该边界。host 的 JSONL fallback 使用
-  `codex exec --ephemeral`，故障路径也不写入 Codex 历史。
-- **验收**：fake server 证明 worker 两轮同 PID/thread、host 两个 ephemeral
-  thread 共用同一 PID、无 `jsonrpc` header、默认配置字段未被覆盖、取消不
+  sink 回调前先持久化该边界。
+- **验收**：fake server 证明 worker 两轮同 PID/thread、无 `jsonrpc` header、
+  默认配置字段未被覆盖、取消不
   重叠、断线失败、close 无残留。
 - **独立证据来源**：`tests/fake_codex_app_server.py` +
   `tests/test_codex_app_server.py`。

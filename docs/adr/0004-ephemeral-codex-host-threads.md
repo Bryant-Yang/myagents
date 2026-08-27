@@ -1,6 +1,7 @@
 # ADR-0004：Codex host 使用 ephemeral thread
 
-- 状态：Accepted
+- 状态：Superseded（生产 host 已由
+  [ADR-0017](0017-native-model-backed-host.md) 取代；本文保留历史决策）
 - 日期：2026-07-28
 - 里程碑：M4.1
 - 作者：Bryant Yang

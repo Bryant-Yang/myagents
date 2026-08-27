@@ -73,6 +73,7 @@ from discussion import (
     participant_assignment,
 )
 from host import MODERATOR_TEMPLATE, HostAgent
+from native_agent import native_host_readiness_probe
 from session_roles import (
     SessionRole,
     SessionRoleChanges,
@@ -145,6 +146,16 @@ class DispatchOutcome:
             for failure in self.failures)
 
 
+@dataclass(frozen=True)
+class _PreparedStreamResult:
+    """Raw result of one stateful prepared stream before timeline policy."""
+
+    text: str
+    done_meta: dict
+    failed: str | None
+    delivered_upto: int
+
+
 # 工人 agent 注册表：长连接协议优先，JSONL 只作受约束降级。
 # Kimi 主路径是 ACP（命令 ["kimi", "acp"]），只允许在
 # ACP prepare 失败前使用只读 JSONL fallback；OpenCode 使用同一 ACP seam，
@@ -183,11 +194,7 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
 )
 AGENTS: dict[str, AgentSpec] = {spec.name: spec for spec in AGENT_SPECS}
 
-_HOST_READINESS_PROBE = executable_probe(
-    HOST_NAME,
-    ("codex",),
-    "安装 Codex CLI；host 依赖 codex app-server",
-)
+_HOST_READINESS_PROBE = native_host_readiness_probe
 
 
 def _ready_probe(name: str) -> ReadinessProbe:
@@ -377,13 +384,9 @@ class Orchestrator:
                 )
         # 主持人也注册进 adapters：@host 时和工人走同一条派发路径，
         # 只是 _build_prompt 会给它主持人角色的 prompt。
-        # 主持人由 codex 扮演，用 read-only 沙箱：总结/仲裁/路由只需要看，不需要写。
-        self.host = HostAgent(adapter=CodexAppServerAdapter(
-                                  sandbox="read-only",
-                                  approval_policy="never",
-                                  reuse_thread=False,
-                                  ephemeral_thread=True),
-                              workers=[spec.name for spec in specs])
+        # host 是产品级 moderator/supervisor；底层由 myagents 自有、无工具的
+        # native model runtime 驱动，不依赖任何第三方 agent CLI。
+        self.host = HostAgent(workers=[spec.name for spec in specs])
         self.adapters[HOST_NAME] = self.host
         # 持久化：persistent=True 默认按 workdir/session 打开 RoomStore；
         # 调用方也可注入自己的 store（必须属于同一房间，fail loudly）。
@@ -632,6 +635,8 @@ class Orchestrator:
         on_event: EventCallback,
         *,
         host_will_continue: bool = False,
+        command_id: str | None = None,
+        max_seq: int,
     ) -> SessionRoleChanges:
         if not targets or not has_session_role_cue(text):
             return SessionRoleChanges.empty()
@@ -641,13 +646,23 @@ class Orchestrator:
             {"agent_state": "running", "phase": "角色识别"},
         ))
         try:
-            changes = await self.host.extract_session_roles(
-                text,
-                targets,
-                self.workdir,
-                lambda event: self._emit_adapter_event(
-                    on_event, HOST_NAME, event),
-            )
+            if getattr(self.host, "prepared_semantic_session", False):
+                raw = await self._run_host_semantic(
+                    lambda _transcript: self.host.build_session_roles_prompt(
+                        text, targets),
+                    on_event,
+                    command_id,
+                    max_seq=max_seq,
+                )
+                changes = self.host.parse_session_roles(raw, targets)
+            else:
+                changes = await self.host.extract_session_roles(
+                    text,
+                    targets,
+                    self.workdir,
+                    lambda event: self._emit_adapter_event(
+                        on_event, HOST_NAME, event),
+                )
         except _EventCallbackError as exc:
             raise exc.cause from exc
         except Exception as exc:
@@ -729,19 +744,28 @@ class Orchestrator:
             return "（暂无记录）"
         return "\n".join(f"[{m.speaker}] {m.text[:2000]}" for m in messages)
 
-    def _messages_for(self, name: str) -> tuple[list[Message], int]:
+    def _messages_for(
+        self,
+        name: str,
+        *,
+        max_seq: int | None = None,
+    ) -> tuple[list[Message], int]:
         """有状态 agent 本轮的增量消息 + 交付目标 seq（快照末尾的 seq）。
 
         必须在 delivery lock 内调用：cursor 读取、增量选择、推进是一个
         原子单元，锁外读到的 cursor 可能已被并发轮次推进。
 
-        cursor 是持久化的 timeline seq，不是 list 下标：
+        cursor 是持久化的 timeline seq，不是 list 下标；``max_seq`` 为 host
+        语义调用冻结本次 dispatch 的消息上界，避免等待单写锁时串入后续消息：
         - cursor>0：选 seq 严格大于 cursor 的新消息，跳过 agent 自己的
           回复（那些已经在它的 ACP session 里，重发就是重复上下文）。
         - cursor=0（bootstrap）：不发全部历史，只发最近 history_limit
           条，避免长聊天后第一次 @ 就无界发送。
         """
-        snapshot = list(self.history)
+        snapshot = [
+            message for message in self.history
+            if max_seq is None or message.seq <= max_seq
+        ]
         snapshot_end_seq = snapshot[-1].seq if snapshot else 0
         cursor = self._cursors.get(name, 0)
         if cursor > 0:
@@ -874,8 +898,9 @@ class Orchestrator:
         # 快照（在第一个 await 之前）：等待 host 处理或 agent 启动期间，
         # 用户可能又提交了新消息进 history。JSONL agent 和 host 路由的
         # prompt 必须用快照拼接，否则并发消息会串话（agent 执行错任务）。
-        # ACP agent 不走这个快照——它的增量起点（cursor）在 delivery lock
-        # 内、拿到锁之后才读取，见 _run_one。
+        # worker 的有状态 adapter 不走这个快照——它的增量起点（cursor）在
+        # delivery lock 内读取。原生 host 仍以 committed.seq 为上界，防止
+        # 等待 host 单写锁时混入稍后提交的并发消息。
         snapshot = list(self.history)
         snapshot_text = self._format(snapshot[-self.history_limit:])
         assignments: dict[str, str] = {}
@@ -894,13 +919,23 @@ class Orchestrator:
             ))
             try:
                 ready_workers = self.ready_worker_names()
-                decision = await self.host.decide(
-                    snapshot_text,
-                    self.workdir,
-                    lambda event: self._emit_adapter_event(
-                        on_event, HOST_NAME, event),
-                    choices=ready_workers,
-                )
+                if getattr(self.host, "prepared_semantic_session", False):
+                    raw = await self._run_host_semantic(
+                        lambda transcript: self.host.build_route_prompt(
+                            transcript, ready_workers),
+                        on_event,
+                        command_id,
+                        max_seq=committed.seq,
+                    )
+                    decision = self.host.parse_decision(raw, ready_workers)
+                else:
+                    decision = await self.host.decide(
+                        snapshot_text,
+                        self.workdir,
+                        lambda event: self._emit_adapter_event(
+                            on_event, HOST_NAME, event),
+                        choices=ready_workers,
+                    )
             except _EventCallbackError as exc:
                 # host 进度事件与 worker 事件使用同一持久化失败契约：
                 # sink 失败必须穿透，不能伪装成路由失败后继续派发。
@@ -966,6 +1001,7 @@ class Orchestrator:
                         command_id,
                         recognized_naturally=True,
                         user_already_committed=True,
+                        user_seq=committed.seq,
                     )
                 collaboration = decision.collaboration
                 targets, reason = decision.targets, decision.reason
@@ -1015,13 +1051,25 @@ class Orchestrator:
                     },
                 ))
                 try:
-                    extraction = await self.host.extract_collaboration(
-                        user_text,
-                        targets,
-                        self.workdir,
-                        lambda event: self._emit_adapter_event(
-                            on_event, HOST_NAME, event),
-                    )
+                    if getattr(self.host, "prepared_semantic_session", False):
+                        raw = await self._run_host_semantic(
+                            lambda _transcript:
+                                self.host.build_collaboration_prompt(
+                                    user_text, targets),
+                            on_event,
+                            command_id,
+                            max_seq=committed.seq,
+                        )
+                        extraction = self.host.parse_collaboration(
+                            raw, targets)
+                    else:
+                        extraction = await self.host.extract_collaboration(
+                            user_text,
+                            targets,
+                            self.workdir,
+                            lambda event: self._emit_adapter_event(
+                                on_event, HOST_NAME, event),
+                        )
                 except _EventCallbackError as exc:
                     raise exc.cause from exc
                 except CollaborationValidationError as exc:
@@ -1053,6 +1101,8 @@ class Orchestrator:
                     targets,
                     on_event,
                     host_will_continue=HOST_NAME in targets,
+                    command_id=command_id,
+                    max_seq=committed.seq,
                 )
         self._apply_session_role_changes(role_changes)
         if collaboration is not None:
@@ -1348,6 +1398,7 @@ class Orchestrator:
             *,
             recognized_naturally: bool = False,
             user_already_committed: bool = False,
+            user_seq: int | None = None,
     ) -> DispatchOutcome:
         """Execute one bounded discussion without recursively dispatching.
 
@@ -1358,10 +1409,13 @@ class Orchestrator:
         if not user_already_committed:
             committed = self._append_message(
                 "user", user_text, command_id=command_id)
+            user_seq = committed.seq
             on_event("user", AgentEvent(
                 "committed", user_text,
                 meta={"seq": committed.seq, "command_id": command_id},
             ))
+        elif user_seq is None:
+            raise ValueError("已提交的讨论必须提供 user_seq")
         if recognized_naturally:
             on_event("system", AgentEvent(
                 "status",
@@ -1383,6 +1437,8 @@ class Orchestrator:
             role_targets,
             on_event,
             host_will_continue=request.moderator == HOST_NAME,
+            command_id=command_id,
+            max_seq=user_seq,
         )
         self._apply_session_role_changes(role_changes)
         active = list(request.participants)
@@ -1537,19 +1593,52 @@ class Orchestrator:
                                 assignment: str | None = None,
                                 execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
                                 ) -> tuple[str | None, int]:
-        """ACP 路径：session prepare 与 prompt 在 adapter writer lock 内
-        原子完成；返回（失败信息, 交付目标 seq）。
+        result = await self._consume_prepared(
+            name,
+            adapter,
+            on_event,
+            command_id,
+            lambda messages: self._build_prompt(
+                name, messages, assignment),
+            execution_mode,
+        )
+        # history 必须诚实：有回复记回复，失败了记失败，
+        # "无文本回复"只留给调用成功但真没说话的情况。
+        reply = result.text.strip()
+        if reply:
+            if result.failed is not None:
+                reply += f"\n\n（调用失败：{result.failed[:120]}）"
+            self._append_message(name, reply, command_id=command_id)
+        elif result.failed is not None:
+            self._append_message(
+                name,
+                f"（调用失败：{result.failed[:120]}）",
+                command_id=command_id,
+            )
+        else:
+            self._append_message(name, "（无文本回复）", command_id=command_id)
+        if result.failed is None:
+            # 只有成功轮（append 也已成功，否则上面已抛出）才发 done。
+            on_event(name, AgentEvent("done", meta=result.done_meta))
+        return result.failed, result.delivered_upto
 
-        make_prompt 是 checkpoint hook：在 prepare 判定之后、任何
-        event/prompt 之前执行——
-        a. fresh 且未 restored（load 失败/无 capability 回退 new）：新
-           session 没有旧上下文，cursor 归 0（走 bootstrap 窗口）；
-        b. load 成功（restored）或复用活跃 session（非 fresh）：保留
-           当前 cursor，继续增量；
-        c. 有 store：一次 set_agent_state 把 chosen cursor + 实际
-           session_id 原子落盘，成功后才更新内存 cursor；写失败抛
-           _CheckpointError，穿透本方法向 dispatch 传播——store 已
-           不可信，绝不能伪装成普通 agent 失败去 append timeline。
+    async def _consume_prepared(
+        self,
+        name: str,
+        adapter: AgentAdapter,
+        on_event: EventCallback,
+        command_id: str | None,
+        prompt_builder: Callable[[list[Message]], str],
+        execution_mode: ExecutionMode,
+        *,
+        emit_text: bool = True,
+        max_seq: int | None = None,
+    ) -> _PreparedStreamResult:
+        """Prepare/checkpoint/stream once without imposing timeline policy.
+
+        ``make_prompt`` remains the atomic checkpoint hook. Worker delivery
+        records captured text afterwards; host semantic calls parse the same
+        captured text without exposing route JSON or writing it to timeline.
         """
         resume_session_id = None
         if self.store is not None:
@@ -1571,9 +1660,9 @@ class Orchestrator:
                     raise _CheckpointError(
                         f"agent {name!r} checkpoint 写失败：{exc}") from exc
             self._cursors[name] = chosen
-            messages, upto = self._messages_for(name)
+            messages, upto = self._messages_for(name, max_seq=max_seq)
             delivered["upto"] = upto
-            return self._build_prompt(name, messages, assignment)
+            return prompt_builder(messages)
 
         parts: list[str] = []
         failed: str | None = None
@@ -1607,12 +1696,16 @@ class Orchestrator:
                         commit_post_submit_cursor()
                         continue
                     if ev.kind == "done":
-                        # done 不立即转发：等回复落盘成功后才发（见方法尾）
+                        # done 不立即转发：worker 要等回复落盘，host semantic
+                        # 则只把它作为本次捕获完成的内部事实。
                         done_meta = ev.meta
                         continue
-                    self._emit_adapter_event(on_event, name, ev)
                     if ev.kind == "text":
                         parts.append(ev.text)
+                        if emit_text:
+                            self._emit_adapter_event(on_event, name, ev)
+                    else:
+                        self._emit_adapter_event(on_event, name, ev)
             except AgentDeliveryUncertainError as exc:
                 # turn/start 的应答丢失时服务端可能已开始执行。诚实记录失败，
                 # 先持久 no-replay 边界，再做任何 callback/timeline 写入。
@@ -1648,22 +1741,37 @@ class Orchestrator:
         except Exception as exc:  # agent 崩溃不拖垮整个聊天室
             failed = str(exc)
             on_event(name, AgentEvent("error", failed))
-        # history 必须诚实：有回复记回复，失败了记失败，
-        # "无文本回复"只留给调用成功但真没说话的情况。
-        reply = "".join(parts).strip()
-        if reply:
-            if failed is not None:
-                reply += f"\n\n（调用失败：{failed[:120]}）"
-            self._append_message(name, reply, command_id=command_id)
-        elif failed is not None:
-            self._append_message(name, f"（调用失败：{failed[:120]}）",
-                                 command_id=command_id)
-        else:
-            self._append_message(name, "（无文本回复）", command_id=command_id)
-        if failed is None:
-            # 只有成功轮（append 也已成功，否则上面已抛出）才发 done
-            on_event(name, AgentEvent("done", meta=done_meta))
-        return failed, delivered["upto"]
+        return _PreparedStreamResult(
+            "".join(parts), done_meta, failed, delivered["upto"])
+
+    async def _run_host_semantic(
+        self,
+        prompt_builder: Callable[[str], str],
+        on_event: EventCallback,
+        command_id: str | None = None,
+        *,
+        max_seq: int,
+    ) -> str:
+        """Run one model-only host call through the durable prepared seam."""
+        adapter = self.host
+        async with self._delivery_lock(HOST_NAME):
+            if self._closed:
+                raise OrchestratorClosedError(
+                    "Orchestrator 已关闭，放弃 host 语义调用")
+            result = await self._consume_prepared(
+                HOST_NAME,
+                adapter,
+                on_event,
+                command_id,
+                lambda messages: prompt_builder(self._format(messages)),
+                ExecutionMode.READ_ONLY,
+                emit_text=False,
+                max_seq=max_seq,
+            )
+            if result.failed is not None:
+                raise RuntimeError(result.failed)
+            self._commit_cursor(HOST_NAME, result.delivered_upto)
+            return result.text
 
     async def _deliver(self, name: str, adapter: AgentAdapter,
                        messages: list[Message],
@@ -1725,7 +1833,7 @@ class Orchestrator:
 
     def _commit_cursor(self, name: str, delivered_upto: int) -> None:
         """先落盘再更新内存；成功轮与 post-submit no-replay 共用。"""
+        committed = max(self._cursors.get(name, 0), delivered_upto)
         if self.store is not None:
-            self.store.set_agent_state(name, cursor=delivered_upto)
-        self._cursors[name] = max(
-            self._cursors.get(name, 0), delivered_upto)
+            self.store.set_agent_state(name, cursor=committed)
+        self._cursors[name] = committed

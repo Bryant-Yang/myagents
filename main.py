@@ -5,7 +5,7 @@
     .venv/bin/python main.py /path/to/project   # 指定 agent 的工作目录
 
 聊天室里 @kimi / @opencode / @qwen / @workbuddy / @dsh / @pi / @codex 把消息派发给对应 agent，支持一条消息
-@多个（并发执行）。@host 叫主持人（由 codex 扮演）出来总结/仲裁；不带 @
+@多个（并发执行）。@host 叫 myagents 原生模型主持人出来总结/仲裁；不带 @
 的消息由 host 用一次调用直接回答或决定派给谁。
 `/discuss` 可在一个 CommandBus command 内安排 2–3 个 worker 做 1–3 轮
 有界讨论，再由指定 moderator 最终仲裁。
@@ -1420,7 +1420,7 @@ class ChatApp(App):
             host = status_by_name[HOST_NAME]
             agents.append((
                 HOST_NAME,
-                f"MODERATOR · {host.state.label}",
+                f"MODERATOR · NATIVE MODEL · {host.state.label}",
             ))
         agents.sort(
             key=lambda item: not status_by_name[item[0]].ready)
@@ -1589,7 +1589,7 @@ class ChatApp(App):
         transport_by_name = {
             spec.name: spec.transport.upper() for spec in self.orch.specs
         }
-        transport_by_name[HOST_NAME] = "MODERATOR"
+        transport_by_name[HOST_NAME] = "NATIVE-MODEL"
         rows = ["Agent 就绪状态："]
         for status in self.orch.agent_readiness_snapshot():
             rows.append(

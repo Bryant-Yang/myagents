@@ -1,6 +1,6 @@
 # myagents 工程契约（HARNESS）
 
-> 作者：Bryant Yang　最近更新：2026-08-26
+> 作者：Bryant Yang　最近更新：2026-08-27
 > Harness Framework：2.1.0（来源 commit：
 > `b3b8fd47ebc49b57abdc365f327688b33970d54c`）
 
@@ -13,7 +13,8 @@
 
 为不同 coding agent 提供一个统一、可验证的本地 TUI 编排面：路由和共享时间线
 只有一个中心；ACP、原生 RPC 与 app-server 负责有状态 agent 会话；adapter 隔离各 CLI 差异；权限默认
-拒绝；取消或退出后不留下仍能修改工作区的子进程。
+拒绝；myagents 原生 model runtime 让 host 不依赖第三方 Agent CLI；取消或退出后
+不留下仍能修改工作区的子进程。
 
 ## 1. 北极星原则
 
@@ -121,9 +122,9 @@ transport。
   每轮 assignment 必须注入当前权威角色状态；角色已清除时显式声明无角色，
   不得依赖有状态 runtime 自行忘记旧角色。
 - host 路由是纯分类与任务改写步骤，prompt 明确禁止调用工具、文件、命令、
-  网络或 skill；保持 Codex 默认配置继承，不用配置覆盖换取速度。底层若仍
-  产生安全的 status/tool/permission 事件，必须透传到执行日志与 TUI，不能
-  在 `decide()` 内静默吞掉。
+  网络或 skill；生产 host 由显式配置的原生 model provider 驱动，runtime
+  固定无工具且 `/yolo` 不得扩权。底层若仍产生安全的 status 事件，必须
+  透传到执行日志与 TUI，不能在语义调用中静默吞掉。
 - JSONL adapter 收 dispatch 时刻的有界 transcript 快照。
 - stateful ACP adapter 在每-agent delivery lock 内读取 cursor、构造增量、
   完成 stream 后推进 cursor。prompt 提交前或上游明确拒绝的失败不推进、
@@ -345,21 +346,21 @@ transport。
   `myagents_cancel_command` 共用一个取消原语；外部可通过
   `myagents_read_events` 读取持久进度。
 - 重启后最后事件非 terminal 的命令必须显示为“已中断”，不得伪装完成。
-- Codex host 继承用户默认配置，不覆盖 model、reasoning、plugin 或 MCP。
+- 原生 host 的 provider/model 只来自 ADR-0017 的显式环境配置；凭据不进入
+  readiness、事件或错误，host 固定无工具。
 
 ### 4.7 Codex app-server（M4）
 
 - 一个 adapter 独占一个 app-server 进程与当前 thread，同 adapter turn 串行；
-  Codex worker 连续轮次复用持久 thread，host 复用暖进程但每次建立干净的
-  ephemeral thread，内部路由不得写入 Codex 历史。
+  Codex worker 连续轮次复用持久 thread。历史 host ephemeral 能力继续由
+  adapter contract tests 保留，但生产 host 已由 ADR-0017 取代。
 - 启动与请求不得覆盖 model、effort、config、collaboration mode、plugin 或
-  MCP；只传协议必需字段、cwd、既有 host/worker sandbox 与 approval-policy
-  安全边界，以及 host 专用的 `ephemeral: true`，且不写
+  MCP；只传协议必需字段、cwd、worker sandbox 与 approval-policy，且不写
   `~/.codex/config.toml`。
 - `turn/completed` 是完成权威信号；取消发送 `turn/interrupt` 并等 terminal，
   未确认则关闭重建，下一轮不得与旧 turn 重叠。
 - worker thread 使用 `workspace-write + on-request`，越界操作进入统一权限
-  UI；host thread 使用 `read-only + never`。approval 无处理器默认 decline；
+  UI。approval 无处理器默认 decline；
   tool/command 元数据必须有界脱敏，reasoning 正文不可显示。
 - 仅在 initialize/thread prepare（尚未发送用户 turn）失败时允许 JSONL
   fallback；一旦发送 `turn/start` 就禁止自动重放，避免响应丢失时重复工具副作用。
@@ -386,11 +387,28 @@ transport。
 - 失败不得改变草稿或残留不完整文件。终端内图片预览、转换、删除与跨机器同步
   不在本阶段。
 
+### 4.9 原生模型 Host（M4.14）
+
+- `HostAgent` 是 moderator/supervisor 产品角色，不是 transport；生产底层必须
+  是 `NativeAgentRuntime`，不依赖 Kimi/Codex/Qwen 等第三方 Agent CLI。
+- `ModelProvider/ModelEvent` 保持 provider-neutral；OpenAI-compatible
+  `/models` + `/chat/completions` 只是首个实现。provider 选择和 wire schema 不得
+  进入 Orchestrator。
+- `MYAGENTS_MODEL_ID` 必须显式配置且与 `/v1/models` 精确一致；readiness 只检查
+  环境语法，不联网。API key 只进入 header，并在 repr/错误/事件中脱敏。
+- host 永久 `tool_policy=none`，请求不得携带 tools；`/yolo`、execution mode
+  和模型输出均不能授予文件、shell、网络、skill 或子 agent 能力。
+- runtime 每 room 隔离上下文并保持单 writer；提交后的取消、静默超时、断流和
+  非权威终态必须建立 no-replay 边界并重建 session，不跨 provider/agent 重放。
+- 缺配置、模型不存在或 provider 拒绝必须给出可操作错误；不存在到第三方 Agent
+  CLI 的隐式 fallback。完整契约和验收见 ADR-0017。
+
 ## 5. 测试策略
 
 | 层级 | 证据 |
 | --- | --- |
 | 路由/编排 | `tests/test_basic.py` |
+| 原生模型 provider/runtime/host | `tests/test_native_agent.py` + `tests/fake_openai_compatible_server.py` |
 | ACP 协议与取消 | `tests/test_acp.py` + `tests/fake_acp_server.py` |
 | Kimi hybrid transport | `tests/test_kimi_hybrid.py` + `tests/fake_acp_server.py` |
 | OpenCode hybrid transport | `tests/test_opencode_hybrid.py` + `tests/fake_acp_server.py` |
@@ -413,7 +431,7 @@ transport。
 | M4.3 剪贴板图片 | `tests/test_clipboard_image.py` + macOS 人工截图验收 |
 | 真实协议边界 | `docs/SPEC.md` 登记的 Kimi/OpenCode/WorkBuddy ACP + Textual/受限临时目录 E2E；Qwen 上游源码与本机启动证据；Pi 0.84.3 临时目录握手/短回复/逐次授权写入 E2E；DSH 仅登记 ADR-0015 真实验收清单，尚未宣称 E2E |
 
-普通测试禁止调用真实 Kimi/Codex/OpenCode/Qwen/WorkBuddy/DSH/Pi。真实 agent 验收必须由用户明确授权，
+普通测试禁止调用真实 Kimi/Codex/OpenCode/Qwen/WorkBuddy/DSH/Pi 或模型服务。真实 agent/provider 验收必须由用户明确授权，
 在临时目录运行，并在结束后检查没有残留进程。
 
 ## 6. 质量门禁
@@ -427,7 +445,7 @@ harness 文档引用 → redlines → py_compile → readiness → basic → 会
 → WorkBuddy ACP
 → DSH ACP
 → Pi RPC + permission bridge
-→ storage → M2.5 → M3 bus → M3 control → M3 MCP stdio → M4 app-server
+→ native model host → storage → M2.5 → M3 bus → M3 control → M3 MCP stdio → M4 app-server
 → M4.3 clipboard image
 ```
 
@@ -453,6 +471,9 @@ branch protection / required checks 需要单独配置后才能宣称生效。
   Streamable HTTP、远程认证或 A2A 仍需人工决策，M3 不做；
 - 真实工具调用的权限风险是否可接受；
 - TUI 的可用性、长会话 token/内存表现和真实 cancel 时延；
+- 原生 host 已于 2026-08-27 通过本机 LM Studio `/v1/models` + 单轮
+  `NATIVE_HOST_OK` 生产 runtime 探针；不同 provider 的兼容性、长上下文与成本
+  仍属人工边界；
 - 真实 Kimi `session/load` 与 MCP 端到端恢复已由
   `scripts/e2e-m3-real.py` 验收；它调用真实模型，不进默认快速 gate；
 - OpenCode 1.18.14 的 ACP 正常回合、重连 `session/load`、Bash 权限 deny、
@@ -483,8 +504,9 @@ branch protection / required checks 需要单独配置后才能宣称生效。
   默认 gate 仍只使用 fake RPC/extension fixture；真实路径逃逸、profile 重建、
   图片、abort 时延和长期 session 尚待人工验收。permission bridge 不是 OS
   sandbox，不支持不受信输入的无人值守执行；
-- `/discuss` 已于 2026-08-08 在同一持久房间恢复原 Kimi/OpenCode session，
-  经 MCP 完成两轮交叉讨论和 Codex host 仲裁；单 user、连续 timeline、跨轮
+- `/discuss` 的历史实测已于 2026-08-08 在同一持久房间恢复原
+  Kimi/OpenCode session，经 MCP 完成两轮交叉讨论和当时的 Codex host 仲裁；
+  单 user、连续 timeline、跨轮
   引用、无工具事件及退出回收均已核对。真实模型不进默认 gate；
 - 长会话 compaction 后的 restore、真实 cancel 时延仍需人工验收。
 

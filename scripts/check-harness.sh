@@ -28,6 +28,8 @@ required=(
   docs/adr/0013-natural-language-sequential-collaboration.md
   docs/adr/0014-pi-rpc-permission-bridge.md
   docs/adr/0015-dsh-acp-only-transport.md
+  docs/adr/0016-explicit-auto-approve-mode.md
+  docs/adr/0017-native-model-backed-host.md
   scripts/check-redlines.sh
   scripts/check-dsh-runtime-contract.py
   scripts/package-dsh-plugin.sh
@@ -77,6 +79,8 @@ docs = [
     root / "docs/adr/0013-natural-language-sequential-collaboration.md",
     root / "docs/adr/0014-pi-rpc-permission-bridge.md",
     root / "docs/adr/0015-dsh-acp-only-transport.md",
+    root / "docs/adr/0016-explicit-auto-approve-mode.md",
+    root / "docs/adr/0017-native-model-backed-host.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -109,13 +113,14 @@ fi
 
 .venv/bin/python -m py_compile \
   main.py myagents_mcp.py orchestrator.py host.py discussion.py collaboration.py workflow.py session_roles.py session_catalog.py session_manager.py tui_activity.py agent_readiness.py \
-  acp/*.py pi_rpc/*.py codex_app_server/*.py adapters/*.py control/*.py storage/*.py workspace/*.py tests/*.py \
+  acp/*.py pi_rpc/*.py codex_app_server/*.py native_agent/*.py adapters/*.py control/*.py storage/*.py workspace/*.py tests/*.py \
   scripts/e2e-m3-real.py scripts/e2e-m5-real.py
 .venv/bin/python tests/test_agent_readiness.py
 .venv/bin/python tests/test_basic.py
 .venv/bin/python tests/test_session_roles.py
 .venv/bin/python tests/test_tui_activity.py
 .venv/bin/python tests/test_tui_completion.py
+.venv/bin/python tests/test_native_agent.py
 .venv/bin/python tests/test_discussion.py
 .venv/bin/python tests/test_collaboration.py
 .venv/bin/python tests/test_workflow.py

@@ -1,7 +1,7 @@
 """Phase 2 里程碑测试：通用 ACP runtime 接入统一 TUI。
 
 覆盖：
-- AgentSpec 注册：kimi/opencode=ACP+JSONL、qwen/workbuddy/dsh=ACP、pi=RPC、codex=app-server
+- AgentSpec 注册：workers 保持各自协议，host 使用原生无工具模型 runtime
 - ACP 增量上下文：不重复完整 transcript、跳过自己回复、失败不丢增量
 - 权限：默认拒绝 / TUI 选择 / 等待可取消
 - 生命周期：TUI 退出统一 aclose，fake ACP 无残留
@@ -35,6 +35,7 @@ from adapters.opencode_adapter import OpenCodeAdapter
 from codex_app_server.adapter import CodexAppServerAdapter
 from dsh_acp import AcpDshAdapter
 from host import HostDecision
+from native_agent import NativeAgentRuntime
 from orchestrator import AGENTS, Orchestrator
 
 SERVER = str(Path(__file__).parent / "fake_acp_server.py")
@@ -163,9 +164,10 @@ def test_agent_specs() -> None:
     assert orch.adapters["pi"]._inactivity_timeout == 300
     assert getattr(orch.adapters["codex"], "stateful_session", False) is True
     assert orch.adapters["codex"].ephemeral_thread is False
-    assert isinstance(orch.host.adapter, CodexAppServerAdapter)
-    assert orch.host.adapter.ephemeral_thread is True
-    assert orch.host.adapter._fallback.ephemeral is True
+    assert isinstance(orch.host.adapter, NativeAgentRuntime)
+    assert orch.host.adapter.stateful_session is True
+    assert orch.host.adapter.tool_policy == "none"
+    assert not hasattr(orch.host.adapter, "set_permission_handler")
     assert isinstance(kimi._fallback, KimiAdapter)
     assert isinstance(opencode._fallback, OpenCodeAdapter)
     print("ok  AgentSpec 注册（kimi/opencode=ACP+JSONL，"

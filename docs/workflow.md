@@ -1,6 +1,6 @@
 # myagents 工作流
 
-> 作者：Bryant Yang　最近更新：2026-08-26
+> 作者：Bryant Yang　最近更新：2026-08-27
 >
 > 每次任务先在本表定位场景，再按需加载文档。顶层契约是
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -15,11 +15,12 @@
 | 4 | 改 TUI 或权限交互 | [`SPEC.md`](SPEC.md) 权限用例；[`adr/0016-explicit-auto-approve-mode.md`](adr/0016-explicit-auto-approve-mode.md)；`../HARNESS.md` §4.2–4.3 | R1、R3 | `main.py` + Textual pilot tests | UI 不阻塞；退出无 Future/进程残留；来源 agent 与当前权限模式可见 |
 | 5 | 只做 review / 文档 / Harness | 本文件；相关契约；必要时 [`harness-controls.md`](harness-controls.md) | 所有受影响红线 | 对应文档、Sensor 或 review 结论 | 引用无悬空；红线 gate 与相关测试通过 |
 | 6 | 改持久化、恢复、会话身份/切换、lease、command bus、可观测性或 MCP 入口 | [`adr/0001-persistent-room-command-bus-mcp.md`](adr/0001-persistent-room-command-bus-mcp.md)、[`adr/0002-durable-execution-observability.md`](adr/0002-durable-execution-observability.md)、[`adr/0005-project-conversation-sessions.md`](adr/0005-project-conversation-sessions.md)、[`adr/0010-multi-session-tui-management.md`](adr/0010-multi-session-tui-management.md)；[`SPEC.md`](SPEC.md) 房间/恢复/会话/控制/可观测用例 | R1–R4、单写者、执行事件不进 history | `storage/`、`control/`、`session_catalog.py`、`session_manager.py`、ACP adapter、MCP bridge、TUI、对应测试 | storage/M2.5/M3 与 session catalog/manager/TUI 测试通过；会话隔离且 default 兼容；后台事件/权限按 room_id 归属；取消不杀其他会话；MCP 不创建第二 Orchestrator、不获取 lease、不绕过 TUI 权限 |
-| 7 | 改 Codex app-server、thread、approval 或 fallback | [`adr/0003-codex-app-server-transport.md`](adr/0003-codex-app-server-transport.md)、[`adr/0004-ephemeral-codex-host-threads.md`](adr/0004-ephemeral-codex-host-threads.md)；[`SPEC.md`](SPEC.md) Codex 用例 | R1–R4、默认配置继承、已发送 `turn/start` 不重放 | `codex_app_server/`、fake server、M4 tests、注册表 | worker 两轮同 PID/thread；host thread 不落盘；取消确认；断线失败；close 无残留；真实 E2E 单独登记 |
+| 7 | 改 Codex app-server、thread、approval 或 fallback | [`adr/0003-codex-app-server-transport.md`](adr/0003-codex-app-server-transport.md)；[`adr/0004-ephemeral-codex-host-threads.md`](adr/0004-ephemeral-codex-host-threads.md) 仅作历史/adapter 能力；[`SPEC.md`](SPEC.md) Codex 用例 | R1–R4、默认配置继承、已发送 `turn/start` 不重放 | `codex_app_server/`、fake server、M4 tests、注册表 | worker 两轮同 PID/thread；取消确认；断线失败；close 无残留；真实 E2E 单独登记 |
 | 8 | 实现里程碑 workflow 或运行中 steering | [`adr/0009-bounded-milestone-workflow-steering.md`](adr/0009-bounded-milestone-workflow-steering.md)；[`SPEC.md`](SPEC.md) UC-WORKFLOW-001；`../HARNESS.md` §4 | R1–R4、R6、干净 Git fixed point、单 writer、固定阶段/角色/修复上限、read-only review/verify | workspace inspector、`workflow.py`、adapter execution mode、Orchestrator/CommandBus、control/MCP/TUI、对应 fake tests | baseline/candidate 指纹固定且漂移 fail-closed；最多六次调用；阶段结果 fail-closed；steering 只在阶段边界生效；写入只由 implementer 串行发生；取消/no-replay/回收契约通过 |
 | 9 | 新增或修改会话级自然语言角色 | [`adr/0011-session-scoped-natural-language-roles.md`](adr/0011-session-scoped-natural-language-roles.md)；`../HARNESS.md` §4.1 | R1–R6、固定 target 闭集、room 级原子状态、角色不扩权 | `session_roles.py`、host/Orchestrator、RoomStore、TUI、对应 tests | 设置/取消、跨任务持续、讨论跨轮、命名会话隔离与重启恢复；写失败不假提交；活动区明确标注本会话；`/roles` 查看/清空不进 timeline，运行中不跨阶段清空 |
 | 10 | 改 agent 安装探测、可用性或 setup 引导 | [`adr/0012-agent-readiness-and-setup-ux.md`](adr/0012-agent-readiness-and-setup-ux.md)；`../HARNESS.md` §4 | R2、R3、R5、R6 | `agent_readiness.py`、`AgentSpec`、Orchestrator/TUI、fake tests | 启动 probe 无进程/网络/安装副作用；未就绪在 timeline 前原子拒绝；host 只看 ready worker；rescan 无需重启 |
 | 11 | 改自然语言有序协作或步骤接力 | [`adr/0013-natural-language-sequential-collaboration.md`](adr/0013-natural-language-sequential-collaboration.md)；[`SPEC.md`](SPEC.md) UC-COLLAB-001；`../HARNESS.md` §4.1 | R1–R5 | `collaboration.py`、host/Orchestrator、TUI 状态、fake tests | 2–4 步、至少两个 worker、严格串行、前序产物可见、失败/取消即停、无递归/扩员 |
+| 12 | 改原生模型 provider/runtime/host | [`adr/0017-native-model-backed-host.md`](adr/0017-native-model-backed-host.md)；[`SPEC.md`](SPEC.md) UC-HOST-001；`../HARNESS.md` §4.9 | R1–R6、provider-neutral、host tool-less、no-replay | `native_agent/`、`host.py`、readiness/TUI、fake HTTP tests | 精确模型 id；无 tools；取消/超时/断流/secret/session 隔离反例通过；显式 @ 与既有 worker 路由不回归 |
 
 不在表内且会改变协议、安全或外部接口的任务，先向用户确认范围。
 
