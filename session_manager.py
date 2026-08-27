@@ -50,6 +50,8 @@ class SessionTerminal:
     command_id: str
     status: str
     error: str | None = None
+    created_at: str | None = None
+    finished_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +178,8 @@ class SessionManager:
         self._drafts: dict[str, tuple[str, int]] = {}
         self._detached_states: dict[str, tuple[str, bool]] = {}
         self._watchers: set[asyncio.Task] = set()
+        self._watcher_errors: list[BaseException] = []
+        self._watched_commands: set[tuple[str, str]] = set()
         self._active_id: str | None = None
         self._started = False
         self._closed = False
@@ -318,12 +322,7 @@ class SessionManager:
         runtime.status = snap.status.value
         runtime.last_used = self._clock()
         command = ManagedCommand(runtime.summary.room_id, snap.command_id)
-        watcher = asyncio.create_task(
-            self._watch(command),
-            name=f"session-command-{snap.command_id}",
-        )
-        self._watchers.add(watcher)
-        watcher.add_done_callback(self._watchers.discard)
+        self._watch_command(command)
         return command
 
     async def wait(self, command: ManagedCommand) -> dict:
@@ -484,13 +483,14 @@ class SessionManager:
             except BaseException as exc:
                 errors.append(exc)
         if self._watchers:
-            results = await asyncio.gather(
+            await asyncio.gather(
                 *tuple(self._watchers), return_exceptions=True
             )
-            errors.extend(
-                result for result in results
-                if isinstance(result, BaseException)
-            )
+        # done callback 负责消费异常并留存；让已完成 callback 有机会执行，
+        # 再统一作为关闭错误报告，避免后台 watcher 异常静默丢失。
+        await asyncio.sleep(0)
+        errors.extend(self._watcher_errors)
+        self._watcher_errors.clear()
         self._runtimes.clear()
         if errors:
             cancellation = next(
@@ -514,7 +514,16 @@ class SessionManager:
             gated,
             lambda name, event: self._on_event(summary.room_id, name, event),
         )
-        control = ControlServer(orch, bus) if self._enable_control else None
+        control = (
+            ControlServer(
+                orch,
+                bus,
+                command_submit_sink=lambda snapshot: self._watch_command(
+                    ManagedCommand(summary.room_id, snapshot.command_id)
+                ),
+            )
+            if self._enable_control else None
+        )
         runtime = _Runtime(
             summary=summary,
             orch=orch,
@@ -541,6 +550,73 @@ class SessionManager:
         if runtime.control is not None:
             await runtime.control.start()
 
+    def _watch_command(self, command: ManagedCommand) -> None:
+        key = (command.session_id, command.command_id)
+        if key in self._watched_commands:
+            return
+        self._watched_commands.add(key)
+        try:
+            watcher = asyncio.create_task(
+                self._watch(command),
+                name=f"session-command-{command.command_id}",
+            )
+        except Exception as exc:
+            self._watched_commands.discard(key)
+            if self._event_sink is not None:
+                try:
+                    self._event_sink(
+                        command.session_id,
+                        "system",
+                        AgentEvent(
+                            "error",
+                            "任务终态观察启动失败："
+                            f"{type(exc).__name__}",
+                            {"command_id": command.command_id},
+                        ),
+                    )
+                except Exception:
+                    pass
+            return
+        self._watchers.add(watcher)
+
+        def discard(done: asyncio.Task) -> None:
+            self._watchers.discard(done)
+            try:
+                watcher_error = done.exception()
+            except asyncio.CancelledError as exc:
+                watcher_error = exc
+            if watcher_error is not None:
+                self._watcher_errors.append(watcher_error)
+                if self._event_sink is not None:
+                    detail = redact_sensitive_text(
+                        str(watcher_error), limit=300)
+                    try:
+                        self._event_sink(
+                            command.session_id,
+                            "system",
+                            AgentEvent(
+                                "error",
+                                "会话终态同步失败："
+                                f"{type(watcher_error).__name__}: {detail}",
+                                {"command_id": command.command_id},
+                            ),
+                        )
+                    except Exception:
+                        pass
+            # 带 request_id 的命令在 CommandBus 生命周期内永久幂等；保留其
+            # observer key，避免重复 submit 再触发一次后台通知。普通命令 ID
+            # 不会被调用方重放，terminal 后即可释放。
+            try:
+                snapshot = self._runtime(command.session_id).bus.get(
+                    command.command_id)
+            except Exception:
+                self._watched_commands.discard(key)
+            else:
+                if snapshot.request_id is None:
+                    self._watched_commands.discard(key)
+
+        watcher.add_done_callback(discard)
+
     async def _watch(self, command: ManagedCommand) -> None:
         runtime = self._runtime(command.session_id)
         while True:
@@ -555,6 +631,8 @@ class SessionManager:
                 command_id=command.command_id,
                 status=result["status"],
                 error=result.get("error"),
+                created_at=result.get("created_at"),
+                finished_at=result.get("finished_at"),
             ))
         background = command.session_id != self._active_id
         if background:
@@ -695,6 +773,12 @@ class SessionManager:
             await runtime.orch.aclose()
         except BaseException as exc:
             errors.append(exc)
+        room_id = runtime.summary.room_id
+        self._watched_commands.difference_update(
+            tuple(
+                key for key in self._watched_commands if key[0] == room_id
+            )
+        )
         if errors:
             cancellation = next(
                 (

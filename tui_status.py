@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 
 _COMMAND_LABELS = {
@@ -26,6 +27,50 @@ _AGENT_LABELS = {
 _TERMINAL_AGENT_STATES = {
     "completed", "failed", "cancelled", "interrupted", "skipped",
 }
+_TERMINAL_COMMAND_STATES = {
+    "completed", "failed", "cancelled", "interrupted",
+}
+
+
+def format_response_duration(elapsed_seconds: float) -> str:
+    """把响应耗时压成短而明确的中文读数。"""
+    elapsed = max(0.0, float(elapsed_seconds))
+    if elapsed < 10:
+        value = f"{elapsed:.1f}".rstrip("0").rstrip(".")
+        return f"{value}秒"
+    seconds = int(elapsed)
+    if seconds < 60:
+        return f"{seconds}秒"
+    minutes, remaining = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}分{remaining:02d}秒"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}小时{minutes:02d}分{remaining:02d}秒"
+
+
+def command_elapsed_seconds(
+    created_at: str | None,
+    finished_at: str | None = None,
+    *,
+    now: datetime | None = None,
+    allow_open_interval: bool = True,
+) -> float | None:
+    """从 CommandBus 权威 UTC 时间计算总响应耗时。"""
+    if not created_at:
+        return None
+    if not finished_at and not allow_open_interval:
+        return None
+    try:
+        started = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        finished = (
+            datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+            if finished_at else (now or datetime.now(timezone.utc))
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if started.tzinfo is None or finished.tzinfo is None:
+        return None
+    return max(0.0, (finished - started).total_seconds())
 
 
 @dataclass
@@ -46,11 +91,23 @@ class TaskProgress:
     workflow_stage: str | None = None
     workflow_roles: dict[str, str] = field(default_factory=dict)
     steering_available: bool | None = None
+    elapsed_seconds: float | None = None
 
-    def set_command(self, status: str, error: str | None = None) -> None:
+    def set_command(
+        self,
+        status: str,
+        error: str | None = None,
+        *,
+        elapsed_seconds: float | None = None,
+    ) -> None:
         self.status = status
         if error:
             self.error = error[:500]
+        if elapsed_seconds is not None:
+            self.elapsed_seconds = max(0.0, float(elapsed_seconds))
+        elif status in _TERMINAL_COMMAND_STATES:
+            # 没有权威终点时不能把最后一次 running 读数冒充成终态耗时。
+            self.elapsed_seconds = None
 
     def set_agent(
         self,
@@ -118,11 +175,21 @@ class TaskProgress:
             return "部分完成"
         return _COMMAND_LABELS.get(self.status, self.status)
 
-    def render(self, elapsed_seconds: float) -> str:
-        seconds = max(0, int(elapsed_seconds))
-        duration = f"{seconds // 60:02d}:{seconds % 60:02d}"
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in _TERMINAL_COMMAND_STATES
+
+    def render(self, elapsed_seconds: float | None = None) -> str:
+        elapsed = self.elapsed_seconds if elapsed_seconds is None else max(
+            0.0, float(elapsed_seconds))
+        duration = (
+            format_response_duration(elapsed)
+            if elapsed is not None else "未知"
+        )
+        timing_label = "响应耗时" if self.is_terminal else "已用"
         line = (
-            f"任务 {self.command_id[:8]}  {self.overall_label}  {duration}"
+            f"任务 {self.command_id[:8]}  {self.overall_label}"
+            f"  ·  {timing_label} {duration}"
         )
         if self.status in {"queued", "running"}:
             line += "  Ctrl+X 取消"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,7 +16,11 @@ from adapters.base import AgentEvent
 from main import ChatApp
 from textual.widgets import RichLog
 from test_basic import make_orch
-from tui_status import TaskProgress
+from tui_status import (
+    TaskProgress,
+    command_elapsed_seconds,
+    format_response_duration,
+)
 
 
 def test_partial_completion_keeps_per_agent_truth() -> None:
@@ -30,7 +35,7 @@ def test_partial_completion_keeps_per_agent_truth() -> None:
     rendered = progress.render(elapsed_seconds=95)
     assert "任务 cmd-stat" in rendered
     assert "部分完成" in rendered
-    assert "01:35" in rendered
+    assert "响应耗时 1分35秒" in rendered
     assert "kimi 失败 · ACP 超时" in rendered
     assert "codex 完成 · 实现与 Review 完成" in rendered
 
@@ -49,6 +54,29 @@ def test_partial_completion_keeps_per_agent_truth() -> None:
     routed_failure.set_agent("kimi", "failed", "ACP 超时")
     routed_failure.set_command("failed", "kimi: ACP 超时")
     assert routed_failure.overall_label == "失败"
+    assert format_response_duration(0.84) == "0.8秒"
+    assert format_response_duration(8.44) == "8.4秒"
+    assert format_response_duration(61) == "1分01秒"
+    assert format_response_duration(3661) == "1小时01分01秒"
+    assert command_elapsed_seconds(
+        "2026-08-27T00:00:00Z",
+        "2026-08-27T00:01:01Z",
+    ) == 61
+    assert command_elapsed_seconds(
+        "2026-08-27T00:00:00Z",
+        now=datetime(2026, 8, 27, 0, 0, 8, 440000, tzinfo=timezone.utc),
+    ) == 8.44
+    assert command_elapsed_seconds(None) is None
+    assert command_elapsed_seconds("not-a-timestamp") is None
+    assert command_elapsed_seconds(
+        "2026-08-27T00:00:00Z",
+        allow_open_interval=False,
+    ) is None
+    active = TaskProgress("cmd-active", status="running")
+    assert "已用 8.4秒" in active.render(elapsed_seconds=8.44)
+    active.set_command("running", elapsed_seconds=8.44)
+    active.set_command("interrupted")
+    assert "响应耗时 未知" in active.render()
     print("ok  部分完成保留每个 agent 的真实终态")
 
 
@@ -76,14 +104,26 @@ def test_tui_status_panel_tracks_agent_lifecycle() -> None:
             app._on_agent_event("kimi", AgentEvent(
                 "error", "ACP 超时", {"command_id": command_id}))
             app._set_command_status(
-                command_id, "failed", "kimi: ACP 超时")
+                command_id,
+                "failed",
+                "kimi: ACP 超时",
+                elapsed_seconds=5.4,
+            )
             await pilot.pause()
 
             panel = str(app.query_one("#task-status").render())
             assert "部分完成" in panel, panel
             assert "kimi 失败" in panel, panel
             assert "codex 完成" in panel, panel
+            assert "响应耗时 5.4秒" in panel, panel
             assert "Ctrl+X" not in panel, panel
+            activity = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines)
+            assert "响应耗时 5.4秒" in activity, activity
+
+            app._render_task_status()
+            frozen = str(app.query_one("#task-status").render())
+            assert "响应耗时 5.4秒" in frozen, frozen
 
             workflow_id = "cmd-workflow"
             log = app.query_one(RichLog)
@@ -162,6 +202,7 @@ def test_interrupted_execution_restores_into_status_panel() -> None:
             panel = str(app.query_one("#task-status").render())
             assert "已中断" in panel, panel
             assert "kimi 已中断 · 工程子代理执行中" in panel, panel
+            assert "响应耗时 未知" in panel, panel
             assert "Ctrl+X" not in panel, panel
             app.orch.store = None
 

@@ -9,6 +9,8 @@ from __future__ import annotations
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 
+from tui_status import format_response_duration
+
 
 _COMMAND_LABELS = {
     "queued": "排队中",
@@ -72,6 +74,7 @@ class _ToolActivity:
 class _ActivityCard:
     command_id: str
     command_state: str = "running"
+    elapsed_seconds: float | None = None
     error: str = ""
     agents: OrderedDict[str, _AgentActivity] = field(
         default_factory=OrderedDict
@@ -120,8 +123,23 @@ class ActivityFeed:
     def begin(self, command_id: str, state: str = "running") -> bool:
         if command_id in self._cards:
             return False
-        self._cards[command_id] = _ActivityCard(command_id, state)
+        self._cards[command_id] = self._new_card(command_id, state)
         return True
+
+    def _new_card(
+        self, command_id: str, state: str = "running"
+    ) -> _ActivityCard:
+        return _ActivityCard(
+            command_id=command_id,
+            command_state=state,
+        )
+
+    def _ensure_card(self, command_id: str) -> _ActivityCard:
+        card = self._cards.get(command_id)
+        if card is None:
+            card = self._new_card(command_id)
+            self._cards[command_id] = card
+        return card
 
     def has(self, command_id: str) -> bool:
         return command_id in self._cards
@@ -139,7 +157,7 @@ class ActivityFeed:
         heartbeat: bool = False,
         session_role: str | None = None,
     ) -> bool:
-        card = self._cards.setdefault(command_id, _ActivityCard(command_id))
+        card = self._ensure_card(command_id)
         changed = False
         current = card.agents.get(agent)
         # heartbeat 只刷新等待证据，不覆盖更有意义的实际阶段。
@@ -172,7 +190,7 @@ class ActivityFeed:
         *,
         state: str | None = None,
     ) -> bool:
-        card = self._cards.setdefault(command_id, _ActivityCard(command_id))
+        card = self._ensure_card(command_id)
         changed = False
         key = (category, agent)
         if card.notes.get(key) != text:
@@ -205,7 +223,7 @@ class ActivityFeed:
         detail: str = "",
         identity_is_fallback: bool = False,
     ) -> bool:
-        card = self._cards.setdefault(command_id, _ActivityCard(command_id))
+        card = self._ensure_card(command_id)
         key = (agent, identity)
         inherited: _ToolActivity | None = None
         # 有些协议先只给 title，后续 update 才补 toolCallId；迁移 identity，
@@ -256,13 +274,26 @@ class ActivityFeed:
         return changed
 
     def set_command_state(
-        self, command_id: str, state: str, error: str | None = None
+        self,
+        command_id: str,
+        state: str,
+        error: str | None = None,
+        *,
+        elapsed_seconds: float | None = None,
     ) -> bool:
         card = self._cards.get(command_id)
         if card is None:
             return False
         normalized_error = error or ""
-        if card.command_state == state and card.error == normalized_error:
+        changed = (
+            card.command_state != state
+            or card.error != normalized_error
+        )
+        if elapsed_seconds is not None and card.elapsed_seconds is None:
+            normalized_elapsed = max(0.0, float(elapsed_seconds))
+            card.elapsed_seconds = normalized_elapsed
+            changed = True
+        if not changed:
             return False
         card.command_state = state
         card.error = normalized_error
@@ -324,8 +355,15 @@ class ActivityFeed:
             tool_summary = f"{count} 个工具（{tool_state}）"
         else:
             tool_summary = "0 个工具"
+        timing = ""
+        if card.command_state in _TERMINAL_STATES:
+            duration = (
+                format_response_duration(card.elapsed_seconds)
+                if card.elapsed_seconds is not None else "未知"
+            )
+            timing = f" · 响应耗时 {duration}"
         header = (
-            f"任务 {command_id[:8]} · {card.status_label()} · {focus}"
+            f"任务 {command_id[:8]} · {card.status_label()}{timing} · {focus}"
             f" · {tool_summary} · /details "
             f"{'收起' if expanded else '展开'}"
         )

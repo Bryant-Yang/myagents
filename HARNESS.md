@@ -342,6 +342,11 @@ transport。
   显示“部分完成”。活动详情默认折叠，仅由上述显式操作逐卡切换；展开态按
   room_id 隔离并在会话切换后恢复。active/queued 可精确取消，
   terminal cancel 幂等，取消不得杀死 worker。
+- 固定任务区的运行时长显示为“已用”，到达 terminal 后冻结为可读的
+  “响应耗时”；活动卡只在 terminal 后显示同一冻结读数，避免为逐秒计时重绘
+  整个 `RichLog`。时长以 CommandBus 的 `created_at` / `finished_at` 为权威，
+  终态计时不得继续增长；缺少历史边界时显示“未知”，不得伪造为 0 秒。秒、分、
+  小时按紧凑中文单位呈现，不得再使用无标签、易被误认作时钟的 `MM:SS`。
 - TUI `Ctrl+X`、control `command.cancel`、MCP
   `myagents_cancel_command` 共用一个取消原语；外部可通过
   `myagents_read_events` 读取持久进度。

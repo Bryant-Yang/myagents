@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 from adapters.base import AgentEvent
+from control import ControlClient
 from main import ChatApp
 from orchestrator import AgentSpec, Orchestrator
 from storage.store import RoomStore
@@ -43,12 +44,14 @@ def test_activity_feed_coalesces_progress_and_tool_updates() -> None:
         "cmd-activity", "kimi", "tool-1", "检查 JavaScript",
         status="completed", detail="node --check demo.js",
     )
-    feed.set_command_state("cmd-activity", "completed")
+    feed.set_command_state(
+        "cmd-activity", "completed", elapsed_seconds=5.4)
 
     collapsed = feed.render("cmd-activity", expanded=False)
     assert "任务 cmd-acti" in collapsed
     assert "已结束" in collapsed
     assert "1 个工具" in collapsed
+    assert "响应耗时 5.4秒" in collapsed
     assert "node --check demo.js" not in collapsed
     assert "/details 展开" in collapsed
 
@@ -57,6 +60,11 @@ def test_activity_feed_coalesces_progress_and_tool_updates() -> None:
     assert "node --check demo.js" in expanded
     assert "仍在运行（已等待 10 秒）" in expanded
     assert "/details 收起" in expanded
+
+    feed.set_command_state(
+        "cmd-activity", "completed", elapsed_seconds=999.0)
+    assert "响应耗时 5.4秒" in feed.render(
+        "cmd-activity", expanded=False)
 
     migrating = ActivityFeed()
     migrating.begin("cmd-migrate")
@@ -462,6 +470,73 @@ def test_activity_card_survives_background_session_switch() -> None:
                 )
                 assert "后台测试 · 已完成" in expanded
                 assert "python -m unittest" in expanded
+                assert "响应耗时" in expanded
+                assert "响应耗时 未知" not in expanded
+
+    asyncio.run(run())
+
+
+def test_external_background_command_freezes_authoritative_duration() -> None:
+    async def run() -> None:
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "project"
+            workdir.mkdir()
+            state_root = root / "state"
+            store = RoomStore(workdir, state_root=state_root)
+            _BackgroundActivityAdapter.started = asyncio.Event()
+            _BackgroundActivityAdapter.release = asyncio.Event()
+            orch = Orchestrator(
+                str(workdir),
+                specs=(
+                    AgentSpec(
+                        "worker", "jsonl", _BackgroundActivityAdapter),
+                ),
+                store=store,
+            )
+            app = ChatApp(workdir=str(workdir), orchestrator=orch)
+            client = ControlClient(workdir, state_root=state_root)
+            async with app.run_test() as pilot:
+                first_id = app.session_manager.active_session_id
+                await app.session_manager.create_session()
+                app._bind_active_runtime()
+                app._render_active_session()
+
+                submitted = await client.submit(
+                    "@worker 外部后台任务", request_id="external-background")
+                duplicate = await client.submit(
+                    "@worker 不应重放", request_id="external-background")
+                assert duplicate["command_id"] == submitted["command_id"]
+                await asyncio.wait_for(
+                    _BackgroundActivityAdapter.started.wait(), timeout=1)
+                queued = await client.submit("@worker 排队后取消")
+                cancelled = await client.cancel_command(queued["command_id"])
+                assert cancelled["status"] == "cancelled"
+                _BackgroundActivityAdapter.release.set()
+                result = await client.wait_command(
+                    submitted["command_id"], timeout=5)
+                assert result["status"] == "completed"
+                for _ in range(100):
+                    if app.session_manager.snapshot(first_id).status \
+                            == "completed":
+                        break
+                    await asyncio.sleep(0.01)
+
+                await app.session_manager.activate(first_id)
+                app._bind_active_runtime()
+                app._render_active_session()
+                await pilot.pause()
+                rendered = "\n".join(
+                    str(line.text) for line in app.query_one(RichLog).lines
+                )
+                assert "[worker] 后台回复已完成" in rendered
+                assert "响应耗时" in rendered
+                assert "响应耗时 未知" not in rendered
+                assert "已取消" in rendered
+                assert len([
+                    line for line in rendered.splitlines()
+                    if line.startswith("[activity] ")
+                ]) == 2, rendered
 
     asyncio.run(run())
 
@@ -534,5 +609,6 @@ if __name__ == "__main__":
     test_details_toggles_only_the_latest_activity_card()
     test_keyboard_navigates_and_toggles_one_activity_card()
     test_activity_card_survives_background_session_switch()
+    test_external_background_command_freezes_authoritative_duration()
     test_background_churn_does_not_reuse_stale_expansion_state()
     print("ok  TUI 执行活动折叠、展开与失败可见性")

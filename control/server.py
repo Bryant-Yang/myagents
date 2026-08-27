@@ -14,7 +14,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from control.command_bus import (
     MAX_WAIT_TIMEOUT,
@@ -23,6 +23,7 @@ from control.command_bus import (
     CommandBusError,
     CommandCapacityError,
     CommandNotFoundError,
+    CommandSnapshot,
     CommandValidationError,
 )
 from storage.store import DEFAULT_READ_LIMIT, MAX_READ_LIMIT
@@ -67,13 +68,20 @@ def _validate_keys(params: dict[str, Any], *, required: set[str],
 class ControlServer:
     """JSON-Lines control endpoint owned by one persistent ChatApp."""
 
-    def __init__(self, orchestrator: Any, command_bus: CommandBus) -> None:
+    def __init__(
+        self,
+        orchestrator: Any,
+        command_bus: CommandBus,
+        *,
+        command_submit_sink: Callable[[CommandSnapshot], None] | None = None,
+    ) -> None:
         store = getattr(orchestrator, "store", None)
         if store is None:
             raise ControlServerError("ControlServer 只支持 persistent room")
         self._orch = orchestrator
         self._store = store
         self._bus = command_bus
+        self._command_submit_sink = command_submit_sink
         self.socket_path = store.room_dir / "control.sock"
         self.endpoint_path = store.room_dir / "endpoint.json"
         self._server: asyncio.AbstractServer | None = None
@@ -356,6 +364,16 @@ class ControlServer:
                 params, required={"message"}, optional={"request_id"})
             snapshot = await self._bus.submit(
                 params["message"], request_id=params.get("request_id"))
+            if self._command_submit_sink is not None:
+                try:
+                    self._command_submit_sink(snapshot)
+                except Exception as exc:
+                    # 命令已经被 bus 持久接受，observer 故障不能把成功响应
+                    # 改写成 INTERNAL，诱使无 request_id 的调用方重复执行。
+                    asyncio.get_running_loop().call_exception_handler({
+                        "message": "control command submit observer failed",
+                        "exception": exc,
+                    })
             return snapshot.to_dict()
         if method == "command.get":
             _validate_keys(params, required={"command_id"})

@@ -926,7 +926,11 @@
   静默时长，TUI 对同一 command 原位更新；工具事件按
   `(command_id, agent, tool_call_id)` 聚合，缺 ID 时使用脱敏标题作为可见
   identity；同一状态不重复转发或持久化，状态迁移与其他安全摘要实时显示。
-  固定任务区显示 command 状态、耗时和每个 agent 的当前阶段。
+  固定任务区显示 command 状态、耗时和每个 agent 的当前阶段；运行中标为
+  “已用”，terminal 后冻结为“响应耗时”。活动卡只同步显示该终态耗时，不为
+  逐秒计时重绘整个 `RichLog`。时长以 CommandBus 的 `created_at` /
+  `finished_at` 为权威，缺少历史边界时显示“未知”；使用紧凑中文单位，不显示
+  无标签的 `MM:SS`。
 - **正文呈现**：agent/host 回复中的常用 Markdown（强调、行内代码、标题、
   列表、引用和 fenced code block）转换成安全的终端 `Text` 样式；不解释 Rich
   markup。用户原文、system 状态与活动卡保持字面值，持久历史和流式重绘使用

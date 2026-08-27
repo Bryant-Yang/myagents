@@ -191,6 +191,41 @@ def test_named_session_control_discovery() -> None:
     print("ok  命名会话 control 发现（default 不误连）")
 
 
+def test_submit_observer_failure_does_not_make_commit_uncertain() -> None:
+    async def run() -> None:
+        room = Room()
+        observed: list[dict] = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(
+            lambda _loop, context: observed.append(context)
+        )
+        room.server = ControlServer(
+            room.orch,
+            room.bus,
+            command_submit_sink=lambda _snapshot: (_ for _ in ()).throw(
+                RuntimeError("observer failed")
+            ),
+        )
+        try:
+            await room.start()
+            submitted = await room.client.submit("@kimi once")
+            result = await room.client.wait_command(
+                submitted["command_id"], timeout=5)
+            assert result["status"] == "completed"
+            assert len(room.agent.calls) == 1
+            assert "@kimi once" in room.agent.calls[0]
+            assert len(observed) == 1
+            assert isinstance(observed[0].get("exception"), RuntimeError)
+        finally:
+            loop.set_exception_handler(previous_handler)
+            await room.close()
+            room.cleanup()
+
+    asyncio.run(run())
+    print("ok  submit observer 失败不制造已提交但报失败的重放窗口")
+
+
 def test_permissions_cleanup_and_unavailable() -> None:
     async def run() -> None:
         room = Room()
@@ -509,6 +544,7 @@ def test_external_permission_stays_in_tui() -> None:
 if __name__ == "__main__":
     test_protocol_roundtrip()
     test_named_session_control_discovery()
+    test_submit_observer_failure_does_not_make_commit_uncertain()
     test_permissions_cleanup_and_unavailable()
     test_stale_recovery_and_active_refusal()
     test_protocol_errors_and_recovery()

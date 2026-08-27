@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 
 from adapters.base import AgentEvent, ExecutionMode
 from orchestrator import AgentSpec, Orchestrator
-from session_manager import SessionManager, SessionNotice
+from session_manager import SessionManager, SessionNotice, SessionTerminal
 from storage.store import RoomStore
 
 
@@ -275,11 +275,16 @@ def test_idle_reap_closes_only_inactive_background_runtime() -> None:
             second = await manager.create_session(workdir)
             second_id = second.summary.room_id
             await manager.activate(first_id)
+            manager._watched_commands.add((second_id, "keyed-terminal"))
 
             now[0] = 11.0
             reaped = await manager.reap_idle()
 
             assert reaped == (second_id,)
+            assert not any(
+                room_id == second_id
+                for room_id, _command_id in manager._watched_commands
+            )
             states = {
                 item.summary.room_id: item for item in manager.list_sessions()
             }
@@ -424,6 +429,52 @@ def test_background_terminal_sets_unread_notice_until_activation() -> None:
             await manager.activate(second_id)
             assert manager.snapshot(second_id).unread is False
             await manager.aclose()
+
+    asyncio.run(run())
+
+
+def test_terminal_watcher_failure_is_visible_and_reported_on_close() -> None:
+    async def run() -> None:
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "project"
+            workdir.mkdir()
+            events: list[AgentEvent] = []
+
+            def fail_terminal(_terminal: SessionTerminal) -> None:
+                raise RuntimeError("terminal sink failed")
+
+            manager = SessionManager(
+                workdir,
+                state_root=root / "state",
+                specs=(AgentSpec("worker", "jsonl", ImmediateAdapter),),
+                event_sink=lambda _sid, _name, event: events.append(event),
+                terminal_sink=fail_terminal,
+                enable_control=False,
+            )
+            await manager.start()
+            command = await manager.submit("@worker watcher error")
+            result = await manager.wait(command)
+            assert result["status"] == "completed"
+            for _ in range(20):
+                if manager._watcher_errors:
+                    break
+                await asyncio.sleep(0)
+            assert any(
+                event.kind == "error"
+                and "会话终态同步失败" in event.text
+                for event in events
+            )
+            try:
+                await manager.aclose()
+            except BaseExceptionGroup as exc:
+                assert any(
+                    isinstance(item, RuntimeError)
+                    and "terminal sink failed" in str(item)
+                    for item in exc.exceptions
+                )
+            else:
+                raise AssertionError("watcher 异常必须在关闭时 fail loudly")
 
     asyncio.run(run())
 
@@ -657,6 +708,7 @@ if __name__ == "__main__":
     test_idle_reap_closes_only_inactive_background_runtime()
     test_global_gate_limits_running_sessions_and_waiter_is_cancellable()
     test_background_terminal_sets_unread_notice_until_activation()
+    test_terminal_watcher_failure_is_visible_and_reported_on_close()
     test_background_permission_keeps_session_and_command_provenance()
     test_first_committed_message_derives_title_without_model_or_image_noise()
     test_permission_audit_failure_blocks_ui_decision_and_command()

@@ -24,7 +24,6 @@ import contextlib
 import json
 import re
 import shlex
-import time
 from pathlib import Path
 from typing import Callable
 
@@ -85,7 +84,7 @@ from tui_completion import (
     local_command_for,
     unknown_mentions,
 )
-from tui_status import TaskProgress
+from tui_status import TaskProgress, command_elapsed_seconds
 from tui_markdown import render_chat_markdown
 from tui_activity import ActivityFeed
 
@@ -809,7 +808,6 @@ class ChatApp(App):
         self._clipboard_image_capture = clipboard_image_capture
         self._image_paste_in_progress = False
         self._task_progresses: dict[str, TaskProgress] = {}
-        self._task_started_at: dict[str, float] = {}
         self._latest_task_id: str | None = None
         self._completion: CompletionContext | None = None
         self._completion_index = 0
@@ -941,15 +939,34 @@ class ChatApp(App):
     def _on_session_terminal(self, terminal: SessionTerminal) -> None:
         feed = self._activity_feeds.setdefault(
             terminal.session_id, ActivityFeed())
-        feed.set_command_state(
-            terminal.command_id, terminal.status, terminal.error)
-        if (
+        # control 可在 agent 产生 committed 事件前取消 queued command；仍要
+        # 为这条已发生的命令留下终态卡，而不是因为尚未建卡而静默丢失。
+        feed.begin(terminal.command_id, terminal.status)
+        elapsed = command_elapsed_seconds(
+            terminal.created_at,
+            terminal.finished_at,
+            allow_open_interval=False,
+        )
+        is_active = (
             self.is_mounted
             and self.session_manager is not None
             and terminal.session_id == self.session_manager.active_session_id
             and feed is self._activity_feed
-        ):
-            self._upsert_activity_card(terminal.command_id)
+        )
+        if is_active:
+            self._set_command_status(
+                terminal.command_id,
+                terminal.status,
+                terminal.error,
+                elapsed_seconds=elapsed,
+            )
+        else:
+            feed.set_command_state(
+                terminal.command_id,
+                terminal.status,
+                terminal.error,
+                elapsed_seconds=elapsed,
+            )
 
     def _record_background_activity(
         self, room_id: str, name: str, ev: AgentEvent
@@ -1238,17 +1255,29 @@ class ChatApp(App):
                 live = None
             if live is not None:
                 state = live.status.value
-                progress = self._ensure_task(item.command_id)
-                progress.set_command(state, live.error)
+                progress = self._update_command_progress(
+                    item.command_id,
+                    state,
+                    live.error,
+                    elapsed_seconds=command_elapsed_seconds(
+                        live.created_at,
+                        live.finished_at,
+                        allow_open_interval=state in {"queued", "running"},
+                    ),
+                )
                 progress.set_agent(
                     item.agent,
                     "queued" if state == "queued" else "running",
                     item.text,
                 )
                 continue
-            progress = self._ensure_task(item.command_id)
-            progress.set_command("interrupted", item.text)
+            progress = self._update_command_progress(
+                item.command_id, "interrupted", item.text)
             progress.set_agent(item.agent, "interrupted", item.text)
+            if self._activity_feed.set_command_state(
+                item.command_id, "interrupted", item.text
+            ):
+                self._upsert_activity_card(item.command_id)
             self._system(
                 f"上次任务 {item.command_id[:8]} 已中断；"
                 f"最后状态：{item.agent} {item.text}")
@@ -1853,6 +1882,11 @@ class ChatApp(App):
                     managed.command_id,
                     result["status"],
                     result.get("error"),
+                    elapsed_seconds=command_elapsed_seconds(
+                        result.get("created_at"),
+                        result.get("finished_at"),
+                        allow_open_interval=False,
+                    ),
                 )
                 if result["status"] == "failed":
                     self._write(
@@ -1872,7 +1906,15 @@ class ChatApp(App):
                 if not result["timed_out"]:
                     break
             self._set_command_status(
-                snap.command_id, result["status"], result.get("error"))
+                snap.command_id,
+                result["status"],
+                result.get("error"),
+                elapsed_seconds=command_elapsed_seconds(
+                    result.get("created_at"),
+                    result.get("finished_at"),
+                    allow_open_interval=False,
+                ),
+            )
             if result["status"] == "failed":
                 self._write("system", f"派发失败：{result['error']}", "bold red")
         # run_worker：agent 调用是长任务，不能阻塞 UI
@@ -1885,15 +1927,43 @@ class ChatApp(App):
         if progress is None:
             progress = TaskProgress(command_id)
             self._task_progresses[command_id] = progress
-            self._task_started_at[command_id] = time.monotonic()
+            self._activity_feed.begin(command_id)
         self._latest_task_id = command_id
+        return progress
+
+    def _update_command_progress(
+        self,
+        command_id: str,
+        status: str,
+        error: str | None = None,
+        *,
+        elapsed_seconds: float | None = None,
+    ) -> TaskProgress:
+        progress = self._ensure_task(command_id)
+        progress.set_command(
+            status, error, elapsed_seconds=elapsed_seconds)
         return progress
 
     def _set_command_status(
             self, command_id: str, status: str,
-            error: str | None = None) -> None:
-        self._ensure_task(command_id).set_command(status, error)
-        if self._activity_feed.set_command_state(command_id, status, error):
+            error: str | None = None, *,
+            elapsed_seconds: float | None = None) -> None:
+        progress = self._update_command_progress(
+            command_id,
+            status,
+            error,
+            elapsed_seconds=elapsed_seconds,
+        )
+        activity_changed = self._activity_feed.set_command_state(
+            command_id,
+            status,
+            error,
+            elapsed_seconds=(
+                progress.elapsed_seconds
+                if progress.is_terminal else None
+            ),
+        )
+        if activity_changed:
             self._upsert_activity_card(command_id)
         self._render_task_status()
 
@@ -1948,11 +2018,30 @@ class ChatApp(App):
             return
         with contextlib.suppress(Exception):
             snapshot = self.bus.get(progress.command_id)
-            progress.set_command(snapshot.status.value, snapshot.error)
-        started = self._task_started_at.get(
-            progress.command_id, time.monotonic())
-        panel.update(
-            warning + progress.render(time.monotonic() - started))
+            elapsed = command_elapsed_seconds(
+                snapshot.created_at,
+                snapshot.finished_at,
+                allow_open_interval=(
+                    snapshot.status.value in {"queued", "running"}
+                ),
+            )
+            progress = self._update_command_progress(
+                progress.command_id,
+                snapshot.status.value,
+                snapshot.error,
+                elapsed_seconds=elapsed,
+            )
+            if self._activity_feed.set_command_state(
+                progress.command_id,
+                snapshot.status.value,
+                snapshot.error,
+                elapsed_seconds=(
+                    progress.elapsed_seconds
+                    if progress.is_terminal else None
+                ),
+            ):
+                self._upsert_activity_card(progress.command_id)
+        panel.update(warning + progress.render())
 
     def action_cancel_active(self) -> None:
         if self.session_manager is not None:
@@ -2161,7 +2250,6 @@ class ChatApp(App):
         self._activity_line_fingerprint.clear()
         self._selected_activity_id = None
         self._task_progresses.clear()
-        self._task_started_at.clear()
         self._latest_task_id = None
         self.query_one(RichLog).clear()
         snapshot = self.session_manager.snapshot()
@@ -2207,7 +2295,6 @@ class ChatApp(App):
             # 用户消息已持久确认：此时才显示文本和派发状态
             self._write("user", ev.text)
             if command_id is not None:
-                self._activity_feed.begin(command_id)
                 self._set_command_status(command_id, "running")
             roles = ev.meta.get("workflow_roles")
             if ev.meta.get("workflow") is True and isinstance(roles, dict):

@@ -73,6 +73,11 @@ fan-out 中任一 worker 失败时，CommandBus 等其他 target 收尾后将 co
 标为 `failed`；失败前已有 partial 时必须同时标注调用失败。
 TUI 固定任务区独立保留每个 agent 的阶段和终态；总 command 失败但同时存在
 成功与失败 agent 时显示“部分完成”，并在运行期显示累计耗时和取消入口。
+运行中的累计时长明确标为“已用”；terminal 后冻结为“响应耗时”，活动卡只在
+terminal 后显示同一冻结读数，避免为逐秒计时重绘整个 `RichLog`。时长以
+CommandBus 的 `created_at` / `finished_at` 为权威；缺少历史边界时显示“未知”，
+不得伪造为 0 秒。秒、分、小时使用紧凑中文单位，不再显示无标签、易被误认为
+时钟的 `MM:SS`。
 
 有状态 transport 仅在不等待人工权限时应用 inactivity watchdog：普通静默统一
 为 300 秒，早期 plan/status 只重置计时；ACP 与 Pi RPC 在工具已创建且尚未终止
@@ -133,6 +138,9 @@ MCP bridge 对应新增 `myagents_read_events` 与
     仍作为独立聊天正文可见。
 15. 多 agent 交错更新时摘要焦点跟随最后活动者；切走会话、后台完成再切回后
     近期活动卡仍可展开；工具和终态卡超限后按固定窗口有界归档。
+16. 固定任务区运行中显示“已用”，terminal 后任务区和活动卡冻结同一
+    “响应耗时”；后续重绘不再增长，缺少历史边界时显示“未知”，且不出现
+    无标签的 `MM:SS`。
 
 ## 4. 后果
 
