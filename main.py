@@ -980,7 +980,9 @@ class ChatApp(App):
         command_id = str(command_value)
         feed = self._activity_feeds.setdefault(room_id, ActivityFeed())
         if ev.kind == "committed" and name == "user":
+            feed.mark_request_committed(command_id)
             feed.begin(command_id)
+            feed.set_command_state(command_id, "running")
             roles = ev.meta.get("workflow_roles")
             if ev.meta.get("workflow") is True and isinstance(roles, dict):
                 reviewer = str(roles.get("reviewer") or "")
@@ -1928,7 +1930,7 @@ class ChatApp(App):
                     self._write("system", f"派发失败：{exc}", "bold red")
                     return
                 if managed.session_id == self.session_manager.active_session_id:
-                    self._set_command_status(managed.command_id, "queued")
+                    self._set_queued_command(managed.command_id, text)
                 while True:
                     result = await self.session_manager.wait(managed)
                     if not result["timed_out"]:
@@ -1957,7 +1959,7 @@ class ChatApp(App):
             except Exception as exc:
                 self._write("system", f"派发失败：{exc}", "bold red")
                 return
-            self._set_command_status(snap.command_id, snap.status.value)
+            self._set_queued_command(snap.command_id, text)
             while True:  # agent 长任务可能超过单次 wait 上限，等到 terminal
                 result = await bus.wait(snap.command_id)
                 if not result["timed_out"]:
@@ -2020,9 +2022,18 @@ class ChatApp(App):
                 if progress.is_terminal else None
             ),
         )
-        if activity_changed:
-            self._upsert_activity_card(command_id)
+        if self.is_mounted and (
+                activity_changed or self._activity_feed.has(command_id)):
+            # queued 序号取决于同 room 其余卡片的状态；任一 command 出队或
+            # 终止时一起刷新，避免后续排队项停留在过期序号。
+            self._refresh_activity_cards()
         self._render_task_status()
+
+    def _set_queued_command(self, command_id: str, text: str) -> None:
+        """显示已入 CommandBus、但尚未 committed 到 timeline 的用户输入。"""
+        self._activity_feed.begin(command_id, "queued")
+        self._activity_feed.record_pending_request(command_id, text)
+        self._set_command_status(command_id, "queued")
 
     def _set_agent_status(
             self, command_id: str, name: str,
@@ -2350,6 +2361,8 @@ class ChatApp(App):
             self._set_workflow_status(command_id, ev.meta)
         if ev.kind == "committed" and name == "user":
             # 用户消息已持久确认：此时才显示文本和派发状态
+            if command_id is not None:
+                self._activity_feed.mark_request_committed(command_id)
             self._write("user", ev.text)
             if command_id is not None:
                 self._set_command_status(command_id, "running")

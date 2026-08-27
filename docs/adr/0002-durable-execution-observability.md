@@ -2,7 +2,7 @@
 
 - 状态：Accepted
 - 日期：2026-07-27
-- 补充：2026-08-11（每任务活动摘要卡与逐卡键盘导航）
+- 补充：2026-08-11（每任务活动摘要卡与逐卡键盘导航）、2026-08-27（排队输入可见性）
 - Owner：Bryant Yang
 - 里程碑：M3.1
 
@@ -61,6 +61,10 @@ password、authorization 字段在权限 UI 中隐藏。权限弹窗必须显示
   最近 100 张可展开终态卡，更早卡只留折叠归档；历史事件保持 append-only，
   是完整事实源。后台 runtime 被 idle reap 时一并释放其 UI feed。用户消息、
   agent 正文和失败仍留在聊天主线，不能被折叠卡隐藏。
+- TUI 本地连续提交时，CommandBus 接受成功后立即在活动卡显示有序的“待发送”
+  输入摘要。摘要只存在于当前 room 的 UI 执行模型，不提前写入对话 timeline；
+  command 出队并产生持久 `committed` 后移除摘要，由正式 user 消息接替，避免
+  重复。queued command 提前取消时保留“未发送”摘要，让用户能辨认被取消内容。
 
 CommandBus 在连续 10 秒没有 agent 事件时发 heartbeat，并持续记录累计静默
 时长。heartbeat 不是 agent 活动，不得重置静默计时；TUI 在同一 command 活动
@@ -142,6 +146,8 @@ MCP bridge 对应新增 `myagents_read_events` 与
 16. 固定任务区运行中显示“已用”，terminal 后任务区和活动卡冻结同一
     “响应耗时”；后续重绘不再增长，缺少历史边界时显示“未知”，且不出现
     无标签的 `MM:SS`。
+17. 连续提交的后续输入立即显示排队序号和有界摘要；出队后正文只出现一次，
+    queued 取消明确显示“未发送”，且摘要不提前进入 agent history。
 
 ## 4. 后果
 

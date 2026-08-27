@@ -942,7 +942,9 @@
   “已用”，terminal 后冻结为“响应耗时”。活动卡只同步显示该终态耗时，不为
   逐秒计时重绘整个 `RichLog`。时长以 CommandBus 的 `created_at` /
   `finished_at` 为权威，缺少历史边界时显示“未知”；使用紧凑中文单位，不显示
-  无标签的 `MM:SS`。
+  无标签的 `MM:SS`。同一 room 连续提交时，已入 FIFO 的后续输入立即显示有序
+  “待发送”摘要；出队 committed 后由唯一正式 user 消息接替，queued 取消则显示
+  “未发送”。临时摘要不进入对话 history。
 - **正文呈现**：agent/host 回复中的常用 Markdown（强调、行内代码、标题、
   列表、引用和 fenced code block）转换成安全的终端 `Text` 样式；不解释 Rich
   markup。用户原文、system 状态与活动卡保持字面值，持久历史和流式重绘使用
@@ -979,7 +981,8 @@
   `/details` 只切换当前或最近卡；展开态可见最新 heartbeat、工具终态与脱敏命令，错误仍在
   聊天主线单独可见；多 agent 交错更新时焦点跟随最后真实活动，会话切走、后台
   完成再切回后卡片仍在；工具/终态窗口超限后有界归档；旧房间安全补建；损坏
-  日志 fail loudly。
+  日志 fail loudly；连续输入在前一任务运行时可见排队序号和有界摘要，出队后
+  正文只出现一次，queued 取消可辨认原输入。
 - **证据**：`tests/test_storage.py`、`tests/test_acp.py`、
   `tests/test_phase2.py`、`tests/test_basic.py`、`tests/test_tui_activity.py`、
   `tests/test_tui_status.py`、

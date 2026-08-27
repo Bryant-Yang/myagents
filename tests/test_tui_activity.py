@@ -95,6 +95,39 @@ def test_activity_feed_coalesces_progress_and_tool_updates() -> None:
     assert "2 个工具" in opaque.render("cmd-opaque", expanded=False)
 
 
+def test_activity_feed_shows_pending_requests_without_duplicate_text() -> None:
+    feed = ActivityFeed()
+    feed.begin("cmd-running", "running")
+    feed.begin("cmd-queued-one", "queued")
+    feed.record_pending_request(
+        "cmd-queued-one", "@qwen   补充一个\n黄段子的例子")
+    feed.begin("cmd-queued-two", "queued")
+    feed.record_pending_request("cmd-queued-two", "@kimi 检查上一条结论")
+
+    first = feed.render("cmd-queued-one", expanded=False)
+    second = feed.render("cmd-queued-two", expanded=False)
+    assert "排队 1" in first
+    assert "待发送：@qwen 补充一个 黄段子的例子" in first
+    assert "排队 2" in second
+    assert "待发送：@kimi 检查上一条结论" in second
+
+    assert feed.mark_request_committed("cmd-queued-one")
+    feed.set_command_state("cmd-queued-one", "running")
+    assert "@qwen 补充一个" not in feed.render(
+        "cmd-queued-one", expanded=False)
+    assert "排队 1" in feed.render("cmd-queued-two", expanded=False)
+
+    feed.set_command_state("cmd-queued-two", "cancelled")
+    assert "未发送：@kimi 检查上一条结论" in feed.render(
+        "cmd-queued-two", expanded=False)
+
+    feed.begin("cmd-failed", "queued")
+    feed.record_pending_request("cmd-failed", "不能在失败卡残留的原文")
+    feed.set_command_state("cmd-failed", "failed")
+    assert "不能在失败卡残留的原文" not in feed.render(
+        "cmd-failed", expanded=False)
+
+
 def test_activity_feed_tracks_latest_agent_and_bounds_terminal_details() -> None:
     feed = ActivityFeed(max_terminal_cards=2, max_tools_per_card=2)
     feed.begin("cmd-focus")
@@ -411,6 +444,90 @@ class _BackgroundActivityAdapter:
         yield AgentEvent("done")
 
 
+def test_consecutive_tui_inputs_show_and_consume_pending_queue() -> None:
+    async def run() -> None:
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "project"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            _BackgroundActivityAdapter.started = asyncio.Event()
+            _BackgroundActivityAdapter.release = asyncio.Event()
+            orch = Orchestrator(
+                str(workdir),
+                specs=(AgentSpec(
+                    "worker", "jsonl", _BackgroundActivityAdapter),),
+                store=store,
+            )
+            app = ChatApp(workdir=str(workdir), orchestrator=orch)
+            async with app.run_test() as pilot:
+                app._dispatch_from_ui("@worker 第一条长任务")
+                await asyncio.wait_for(
+                    _BackgroundActivityAdapter.started.wait(), timeout=1)
+                app._dispatch_from_ui("@worker 第二条排队消息")
+
+                for _ in range(100):
+                    if len(app._activity_feed.command_ids()) == 2:
+                        break
+                    await asyncio.sleep(0.01)
+                await pilot.pause()
+                queued = "\n".join(
+                    str(line.text) for line in app.query_one(RichLog).lines)
+                assert "排队 1" in queued
+                assert "待发送：@worker 第二条排队消息" in queued
+                assert "[user] @worker 第二条排队消息" not in queued
+
+                _BackgroundActivityAdapter.release.set()
+                for _ in range(200):
+                    if not app.session_manager.active_runtime.bus.has_pending():
+                        break
+                    await asyncio.sleep(0.01)
+                await pilot.pause()
+                completed = "\n".join(
+                    str(line.text) for line in app.query_one(RichLog).lines)
+                assert completed.count("@worker 第二条排队消息") == 1
+                assert "[user] @worker 第二条排队消息" in completed
+                assert "待发送：@worker 第二条排队消息" not in completed
+
+    asyncio.run(run())
+
+
+def test_background_commit_clears_room_pending_preview() -> None:
+    async def run() -> None:
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "project"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            app = ChatApp(
+                workdir=str(workdir),
+                orchestrator=Orchestrator(str(workdir), store=store),
+            )
+            async with app.run_test():
+                room_id = app.session_manager.active_session_id
+                command_id = "cmd-background-pending"
+                feed = app._activity_feed
+                feed.begin(command_id, "queued")
+                feed.record_pending_request(command_id, "后台排队消息")
+
+                app._record_background_activity(
+                    room_id,
+                    "user",
+                    AgentEvent(
+                        "committed",
+                        "后台排队消息",
+                        {"command_id": command_id},
+                    ),
+                )
+
+                committed = feed.render(command_id, expanded=False)
+                assert "后台排队消息" not in committed
+                assert "运行中" in committed
+                assert "排队" not in committed
+
+    asyncio.run(run())
+
+
 def test_activity_card_survives_background_session_switch() -> None:
     async def run() -> None:
         with TemporaryDirectory(dir="/tmp") as tmp:
@@ -603,11 +720,14 @@ def test_background_churn_does_not_reuse_stale_expansion_state() -> None:
 
 if __name__ == "__main__":
     test_activity_feed_coalesces_progress_and_tool_updates()
+    test_activity_feed_shows_pending_requests_without_duplicate_text()
     test_activity_feed_tracks_latest_agent_and_bounds_terminal_details()
     test_tui_keeps_one_activity_card_and_primary_messages()
     test_tui_failure_stays_visible_outside_activity_details()
     test_details_toggles_only_the_latest_activity_card()
     test_keyboard_navigates_and_toggles_one_activity_card()
+    test_consecutive_tui_inputs_show_and_consume_pending_queue()
+    test_background_commit_clears_room_pending_preview()
     test_activity_card_survives_background_session_switch()
     test_external_background_command_freezes_authoritative_duration()
     test_background_churn_does_not_reuse_stale_expansion_state()

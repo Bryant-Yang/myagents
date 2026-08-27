@@ -48,6 +48,7 @@ _NOTE_LABELS = {
 }
 
 _MAX_NOTES = 12
+_MAX_REQUEST_PREVIEW_CHARS = 120
 _DEFAULT_MAX_TERMINAL_CARDS = 100
 _DEFAULT_MAX_TOOLS_PER_CARD = 50
 _TERMINAL_STATES = {
@@ -74,6 +75,7 @@ class _ToolActivity:
 class _ActivityCard:
     command_id: str
     command_state: str = "running"
+    pending_request: str = ""
     elapsed_seconds: float | None = None
     error: str = ""
     agents: OrderedDict[str, _AgentActivity] = field(
@@ -143,6 +145,29 @@ class ActivityFeed:
 
     def has(self, command_id: str) -> bool:
         return command_id in self._cards
+
+    def record_pending_request(self, command_id: str, text: str) -> bool:
+        """记录尚未进入 timeline 的用户输入，仅用于当前 room 的排队提示。"""
+        card = self._ensure_card(command_id)
+        compact = " ".join(text.split())
+        if len(compact) > _MAX_REQUEST_PREVIEW_CHARS:
+            compact = f"{compact[:_MAX_REQUEST_PREVIEW_CHARS - 1]}…"
+        if card.pending_request == compact:
+            return False
+        card.pending_request = compact
+        return True
+
+    def mark_request_committed(self, command_id: str) -> bool:
+        """正文已进入 timeline 后移除临时摘要，避免同一输入重复显示。"""
+        return self.clear_pending_request(command_id)
+
+    def clear_pending_request(self, command_id: str) -> bool:
+        """清除未提交摘要；持久化失败时不得把原文留在活动卡。"""
+        card = self._cards.get(command_id)
+        if card is None or not card.pending_request:
+            return False
+        card.pending_request = ""
+        return True
 
     def command_ids(self) -> tuple[str, ...]:
         return tuple(self._cards)
@@ -284,10 +309,14 @@ class ActivityFeed:
         card = self._cards.get(command_id)
         if card is None:
             return False
+        cleared_pending = state == "failed" and bool(card.pending_request)
+        if cleared_pending:
+            card.pending_request = ""
         normalized_error = error or ""
         changed = (
             card.command_state != state
             or card.error != normalized_error
+            or cleared_pending
         )
         if elapsed_seconds is not None and card.elapsed_seconds is None:
             normalized_elapsed = max(0.0, float(elapsed_seconds))
@@ -323,7 +352,12 @@ class ActivityFeed:
     def render(self, command_id: str, *, expanded: bool) -> str:
         card = self._cards[command_id]
         tool_count = len(card.tools)
-        if card.agents:
+        if card.pending_request:
+            prefix = (
+                "待发送" if card.command_state == "queued" else "未发送"
+            )
+            focus = f"{prefix}：{card.pending_request}"
+        elif card.agents:
             latest_name = next(reversed(card.agents))
             latest = card.agents[latest_name]
             phase = latest.phase.replace("\n", " ")
@@ -362,8 +396,16 @@ class ActivityFeed:
                 if card.elapsed_seconds is not None else "未知"
             )
             timing = f" · 响应耗时 {duration}"
+        status = card.status_label()
+        if card.command_state == "queued":
+            queued = [
+                queued_id
+                for queued_id, queued_card in self._cards.items()
+                if queued_card.command_state == "queued"
+            ]
+            status = f"排队 {queued.index(command_id) + 1}"
         header = (
-            f"任务 {command_id[:8]} · {card.status_label()}{timing} · {focus}"
+            f"任务 {command_id[:8]} · {status}{timing} · {focus}"
             f" · {tool_summary} · /details "
             f"{'收起' if expanded else '展开'}"
         )

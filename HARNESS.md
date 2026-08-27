@@ -336,6 +336,9 @@ transport。
 - CommandBus 静默 10 秒发 heartbeat，静默时长保持累计且 heartbeat 自身不
   重置活动时钟；TUI 在同一 command 活动卡内原位更新 heartbeat，而不是追加
   聊天行。用户消息、agent 正文和失败保持主线可见，活动折叠不得隐藏失败事实。
+  同一 room 连续提交时，已入 FIFO 但尚未 committed 的输入必须以有序“待发送”
+  摘要立即可见；出队 committed 后移除摘要并只保留一条正式 user 消息，提前取消
+  则标成“未发送”。该摘要只属于 TUI 执行模型，不得提前进入 agent history。
   活动模型按 room_id 隔离；切换会话和后台完成后切回，近期终态卡仍可展开。
   `completed` 只表示本轮调用正常结束，TUI 使用“本轮响应结束”，不声称用户
   任务已经验收。fan-out 要等待全部 target 收尾；任一 worker 失败时 command
