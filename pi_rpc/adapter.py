@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, Sequence
 
 from adapters.base import (
+    DEFAULT_AGENT_INACTIVITY_TIMEOUT,
     AgentDeliveryCancelledError,
     AgentDeliveryUncertainError,
     AgentEvent,
@@ -159,7 +160,7 @@ class PiRpcAdapter:
         permission_handler: AgentPermissionHandler | None = None,
         startup_timeout: float = 10.0,
         cancel_timeout: float = 10.0,
-        inactivity_timeout: float = 120.0,
+        inactivity_timeout: float = DEFAULT_AGENT_INACTIVITY_TIMEOUT,
         tool_inactivity_timeout: float = 900.0,
         request_timeout: float = 30.0,
     ) -> None:

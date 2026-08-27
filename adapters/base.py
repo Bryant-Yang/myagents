@@ -22,6 +22,12 @@ from enum import Enum
 from typing import AsyncIterator, Mapping, Protocol
 
 
+# Stateful transports may be silent while a local or remote model pre-fills a
+# long context. Keep one product-wide bounded default; protocol adapters may
+# accept shorter injected values for deterministic tests.
+DEFAULT_AGENT_INACTIVITY_TIMEOUT = 300.0
+
+
 class AgentDeliveryUncertainError(RuntimeError):
     """请求可能已被 agent 接受，调用方不得自动重投同一批消息。"""
 

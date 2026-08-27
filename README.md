@@ -112,10 +112,10 @@ Codex、OpenCode、Qwen Code、WorkBuddy、DeepSeek Harness（DSH）、Pi 等 co
 - 精确取消：TUI `Ctrl+X` 或 MCP 只取消当前 command，房间继续工作。
 - 权限 fail-closed：无处理器、异常或非法 option 一律拒绝。
 - 流式回复合并：ACP token/chunk 持续更新同一条 TUI 记录，不再一词一行。
-- ACP 卡死回收：普通分析连续 120 秒无协议事件才取消；已进入工具生命周期后
-  使用独立 15 分钟无活动上限，避免工程子代理或长命令被普通静默阈值误杀。
-  Qwen fresh session 只在首个协议活动前放宽到 300 秒，活动后与后续轮恢复
-  120 秒。
+- 有状态 agent 卡死回收：普通分析连续 300 秒无协议事件才取消；ACP 与 Pi RPC
+  在进入已跟踪的工具生命周期后使用独立 15 分钟无活动上限，避免工程子代理
+  或长命令被普通静默阈值误杀。Codex app-server 当前仍使用统一普通预算。
+  统一预算避免长 prompt prefill 被误判为卡死，任意协议活动都会重新计时。
   必要时重建连接，并将已提交轮次标为 no-replay，避免重复执行。
 - 完整进程回收：取消、超时和 TUI 退出都会清理 agent 进程组。
 

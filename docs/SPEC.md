@@ -306,8 +306,9 @@
   注册；普通轮启动 `qwen --acp --approval-mode default`，workflow `read_only`
   启动 `qwen --acp --approval-mode plan`，profile 切换时重建进程、丢弃 resume id
   并 `session/new`。两者复用通用 ACP 增量 cursor、权限 UI、取消和进程组回收
-  契约。Qwen 首轮长 prompt prefill 允许最长 300 秒无通知，仍由 adapter
-  有界看门狗与取消回收约束；其他 ACP 保持通用 120 秒。TUI 的 `@` 补全、
+  契约。所有带 inactivity watchdog 的有状态 adapter 每轮非工具静默统一允许
+  最长 300 秒，早期 plan/status 只会重置计时；仍由 adapter 有界看门狗与取消
+  回收约束。TUI 的 `@` 补全、
   `/agents` 与启动状态动态展示 `@qwen(ACP)`，编排器
   不增加任何按 qwen 名称分支。
 - **安全边界**：默认 `permission="deny"`，无处理器或非法 option 一律
@@ -628,9 +629,9 @@
 - **前置条件**：子进程使用独立进程组，adapter 拥有 session。
 - **主流程**：发送协议对应的 cancel/abort；等待原 prompt 结束；TUI 先收尾权限 Future，再
   `aclose`；SIGTERM 超时后 SIGKILL。
-- **异常分支**：不在等待人工权限时，prompt 连续 120 秒无任何 transport 事件才自动
-  cancel；Qwen fresh session 仅在首个 transport 活动前使用 300 秒，收到活动或
-  进入后续轮后恢复 120 秒。该轮已提交，先建立 no-replay 边界再公开失败。cancel 不确认则连接
+- **异常分支**：不在等待人工权限时，prompt 连续 300 秒无任何 transport 事件才自动
+  cancel。该轮已提交，先建立 no-replay
+  边界再公开失败。cancel 不确认则连接
   作废并在下轮重建；断线使 pending request 立即失败。
 - **验收**：人工权限等待不会触发 inactivity timeout；下一轮不与旧 prompt
   重叠；fake 子孙进程和 ACP/Pi RPC/DSH server 均无残留。
@@ -902,8 +903,9 @@
   更新继续进入该 room 的活动模型。每卡只保留最近 50 个工具明细、每 room
   只保留最近 100 张可展开终态卡，更早内容在当前视图冻结成折叠归档；完整事实仍从
   `events.jsonl` 读取；后台 runtime 经过 10 分钟 idle reap 后同步释放该 room
-  的 UI 活动模型。活跃工具使用 15 分钟独立 watchdog，普通分析使用 120 秒
-  阈值；Qwen fresh session 只在首个活动前使用 300 秒。
+  的 UI 活动模型。ACP 与 Pi RPC 的活跃工具使用 15 分钟独立 watchdog；所有
+  带 inactivity watchdog 的有状态 adapter 普通静默统一使用 300 秒阈值，
+  Codex app-server 当前不切换独立工具预算。
 - **重启分支**：最后事件非 terminal 的 command 显示为上次中断及最后状态。
 - **完成语义**：`completed` 只表示本轮调用正常结束，不等同于用户任务验收；
   TUI 显示“本轮响应结束”，不显示“agent 完成”。fan-out 任一 worker

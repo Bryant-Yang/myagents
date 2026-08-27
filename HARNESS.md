@@ -220,9 +220,10 @@ transport。
 
 - 每个 stateful adapter 是其原生 session 的唯一 writer。
 - 同一 stateful agent 的 prompt 串行；不同 agent 可以并发 fan-out。
-- 不在等待人工权限且没有活跃工具时，prompt 连续 120 秒无任何 ACP 通知或
-  终止响应才自动取消；Qwen fresh session 仅在首个活动前允许 300 秒，收到
-  任意活动或进入后续轮立即恢复 120 秒。活跃工具使用独立 15 分钟 watchdog。
+- 不在等待人工权限且没有活跃工具时，prompt 连续 300 秒无任何 transport 事件或
+  终止响应才自动取消；早期 plan/status 更新只重置计时，不缩短后续 provider
+  prefill 的统一预算。ACP 与 Pi RPC 对已跟踪的活跃工具使用独立 15 分钟
+  watchdog；Codex app-server 当前仍使用统一普通预算。
   这些超时都是提交后结果不确定，按 no-replay 失败处理。
 - cancel 后必须等待原 prompt 停止；超时则关闭并重建连接。
 - ACP 只有 `stopReason=end_turn` 能产生成功 done；max-token、turn-limit、refusal、

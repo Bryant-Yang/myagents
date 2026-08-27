@@ -73,11 +73,11 @@ fan-out 中任一 worker 失败时，CommandBus 等其他 target 收尾后将 co
 TUI 固定任务区独立保留每个 agent 的阶段和终态；总 command 失败但同时存在
 成功与失败 agent 时显示“部分完成”，并在运行期显示累计耗时和取消入口。
 
-ACP 仅在不等待人工权限时应用 inactivity watchdog：没有活跃工具时为 120 秒；
-Qwen fresh session 只在首个活动前为 300 秒，收到活动或进入后续轮恢复 120 秒；
-工具已创建且尚未终止时为 15 分钟。后者用于工程子代理和长命令，任何协议更新
-仍会重置计时。该轮已提交，因此 timeout 必须建立 no-replay cursor，不能
-自动补发。
+有状态 transport 仅在不等待人工权限时应用 inactivity watchdog：普通静默统一
+为 300 秒，早期 plan/status 只重置计时；ACP 与 Pi RPC 在工具已创建且尚未终止
+时使用 15 分钟，Codex app-server 当前仍使用普通预算。独立工具预算用于工程
+子代理和长命令，任何协议更新仍会重置计时。该轮已提交，因此 timeout 必须建立
+no-replay cursor，不能自动补发。
 
 ### 2.3 精确取消
 
@@ -124,7 +124,7 @@ MCP bridge 对应新增 `myagents_read_events` 与
     脱敏命令和终态仍完整可见。
 12. 固定任务区显示每个 agent 的阶段；混合终态显示“部分完成”，terminal 后
     不再显示取消提示。
-13. 活跃工具超过普通 120 秒阈值不会被误杀；独立工具 watchdog 到期仍按
+13. 活跃工具超过普通 300 秒阈值不会被误杀；独立工具 watchdog 到期仍按
     no-replay 失败处理。
 14. 折叠时不显示工具命令；`Ctrl+G`、`↑↓`、`Enter`、`Esc` 可完成逐卡键盘
     浏览，`/details` 只切换当前或最近卡；展开后显示脱敏命令和最近过程，错误

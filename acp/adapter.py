@@ -43,6 +43,7 @@ from typing import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequen
 from urllib.parse import urlparse
 
 from adapters.base import (
+    DEFAULT_AGENT_INACTIVITY_TIMEOUT,
     AgentAdapter,
     AgentDeliveryCancelledError,
     AgentDeliveryUncertainError,
@@ -68,7 +69,6 @@ from .client import (
 _CANCEL_TIMEOUT = 10  # 等 agent 确认 cancelled 的有限超时（秒）
 _SESSION_PREPARE_TIMEOUT = 30  # initialize 后 new/load 不得无界挂起
 _SESSION_CLOSE_TIMEOUT = 2  # 有 close capability 时的有界 session 收尾（秒）
-_INACTIVITY_TIMEOUT = 120  # prompt 连续无任何 ACP 事件的上限（秒）
 _TOOL_INACTIVITY_TIMEOUT = 900  # 活跃工具允许更长的无输出窗口（秒）
 _AUTH_TIMEOUT = 300  # 浏览器登录的有限等待上限（秒）
 _AUTH_NOTIFICATION_QUEUE_LIMIT = 64  # 认证期通知有界；溢出即协议失败
@@ -153,11 +153,6 @@ QWEN_ACP_DEFAULT_CMD = (
 QWEN_ACP_READ_ONLY_CMD = (
     "qwen", "--acp", "--approval-mode", "plan",
 )
-# Qwen Code 会在首轮把系统提示、工具 schema 与项目说明一并送给 provider。
-# 本地 30B+ 模型的长 prompt prefill 可能超过通用 120 秒且期间没有 ACP
-# notification；保持有界，但给首 token 留出五分钟，避免把正常慢推理误判为卡死。
-QWEN_ACP_INITIAL_INACTIVITY_TIMEOUT = 300
-
 _WORKBUDDY_CLI_ENV = "MYAGENTS_WORKBUDDY_CLI"
 WORKBUDDY_ACP_DEFAULT_ARGS = (
     "--acp", "--acp-transport", "stdio",
@@ -366,8 +361,7 @@ class AcpAdapter:
         permission: str = "deny",  # 默认拒绝；auto 必须显式 opt-in
         cancel_timeout: float = _CANCEL_TIMEOUT,
         session_prepare_timeout: float = _SESSION_PREPARE_TIMEOUT,
-        inactivity_timeout: float = _INACTIVITY_TIMEOUT,
-        initial_inactivity_timeout: float | None = None,
+        inactivity_timeout: float = DEFAULT_AGENT_INACTIVITY_TIMEOUT,
         tool_inactivity_timeout: float = _TOOL_INACTIVITY_TIMEOUT,
         inbound_frame_byte_limit: int = _ACP_INBOUND_FRAME_BYTE_LIMIT,
         prompt_update_queue_byte_limit: int = (
@@ -398,9 +392,6 @@ class AcpAdapter:
             raise ValueError("session_prepare_timeout 必须大于 0")
         if inactivity_timeout <= 0:
             raise ValueError("inactivity_timeout 必须大于 0")
-        if (initial_inactivity_timeout is not None
-                and initial_inactivity_timeout <= 0):
-            raise ValueError("initial_inactivity_timeout 必须大于 0")
         if tool_inactivity_timeout <= 0:
             raise ValueError("tool_inactivity_timeout 必须大于 0")
         if inbound_frame_byte_limit <= 0:
@@ -447,11 +438,6 @@ class AcpAdapter:
         self._cancel_timeout = cancel_timeout
         self._session_prepare_timeout = session_prepare_timeout
         self._inactivity_timeout = inactivity_timeout
-        self._initial_inactivity_timeout = (
-            inactivity_timeout
-            if initial_inactivity_timeout is None
-            else initial_inactivity_timeout
-        )
         self._tool_inactivity_timeout = tool_inactivity_timeout
         self._inbound_frame_byte_limit = inbound_frame_byte_limit
         self._prompt_update_queue_byte_limit = prompt_update_queue_byte_limit
@@ -951,14 +937,7 @@ class AcpAdapter:
                 verb = "已恢复" if prep.restored else "已建立"
                 yield AgentEvent("info", f"ACP session {verb}：{prep.session_id}")
             inner = self._prompt_locked(
-                prep.session_id,
-                prompt,
-                execution_mode,
-                initial_inactivity_timeout=(
-                    self._initial_inactivity_timeout
-                    if prep.fresh else self._inactivity_timeout
-                ),
-            )
+                prep.session_id, prompt, execution_mode)
             try:
                 async for ev in inner:
                     yield ev
@@ -1022,8 +1001,6 @@ class AcpAdapter:
         session_id: str,
         prompt: str,
         execution_mode: ExecutionMode,
-        *,
-        initial_inactivity_timeout: float,
     ) -> AsyncIterator[AgentEvent]:
         """锁内执行一轮 prompt 并映射事件；取消契约见 stream_prepared。"""
         updates: asyncio.Queue = asyncio.Queue(
@@ -1043,7 +1020,6 @@ class AcpAdapter:
         cancel_prompt_not_sent = False
         cancel_result: object | None = None
         cancel_result_observed = False
-        initial_activity_seen = False
         client = self._client
 
         def poison_update_queue(error: AcpError) -> None:
@@ -1164,24 +1140,15 @@ class AcpAdapter:
                     else:
                         timeout = (
                             self._tool_inactivity_timeout
-                            if active_tools else (
-                                self._inactivity_timeout
-                                if initial_activity_seen
-                                else initial_inactivity_timeout
-                            )
+                            if active_tools else self._inactivity_timeout
                         )
                         method, payload, item_bytes = await asyncio.wait_for(
                             updates.get(), timeout=timeout)
                     queued_update_bytes -= item_bytes
-                    initial_activity_seen = True
                 except asyncio.TimeoutError:
                     timeout = (
                         self._tool_inactivity_timeout
-                        if active_tools else (
-                            self._inactivity_timeout
-                            if initial_activity_seen
-                            else initial_inactivity_timeout
-                        )
+                        if active_tools else self._inactivity_timeout
                     )
                     scope = "活跃工具" if active_tools else "会话"
                     raise AgentDeliveryUncertainError(
@@ -1580,7 +1547,6 @@ class AcpQwenAdapter(AcpAdapter):
             "qwen",
             QWEN_ACP_DEFAULT_CMD,
             permission=permission,
-            initial_inactivity_timeout=QWEN_ACP_INITIAL_INACTIVITY_TIMEOUT,
             execution_cmd_overrides={
                 ExecutionMode.READ_ONLY: QWEN_ACP_READ_ONLY_CMD,
             },

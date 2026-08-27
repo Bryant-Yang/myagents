@@ -298,10 +298,9 @@ ask。这样既隔离 `allow_always`，也避免 OpenCode 在 ask 被 cancelled 
 TUI 的 auto/yolo；只读轮用上游 plan mode 在 runtime 层阻断写入/有副作用命令，
 profile 前后同样重建进程与 fresh session。WorkBuddy 先尝试 `session/new` 复用
 CLI 既有登录态；只在明确的认证错误后发送标准 ACP `authenticate(methodId)`。
-Qwen Code 的系统提示和工具 schema 会让本地大模型首轮 prefill 很长；其具体
-adapter 只在 fresh session 首个活动前把无通知看门狗有界放宽到 300 秒，避免
-120 秒误杀；收到任意活动或进入后续轮即恢复 120 秒，其他 ACP 默认值不变，
-取消/close 仍可立即打断。
+大型本地模型可能在系统提示、工具 schema 和长上下文的 prefill 期间不产生
+transport event。ACP、Pi RPC 与 Codex app-server 等有状态 adapter 因此共享
+300 秒普通静默看门狗；早期 plan/status 只重置计时，取消/close 仍可立即打断。
 默认 method 是 `internal`，可由环境变量覆盖，但必须属于 server 当次公布的集合。私有
 `_codebuddy.ai/authUrl` 通知只允许打开官方 HTTPS 域名，认证等待最多 300 秒，
 失败时整条连接原子回收。
@@ -374,10 +373,11 @@ Pi 必须看到最终 assistant `message_end`，且 stop reason 属于
 `tool_execution_end.result.terminate=true` 也属于已提交失败，而不是成功的空回复。
 自动重试后的最后一条 assistant 成功可覆盖中间 error。
 
-不在等待人工权限且没有活跃工具时，prompt 连续 120 秒无 ACP 通知或终止响应
-会触发 inactivity cancel；Qwen fresh session 只在首个活动前放宽到 300 秒；
-工具已创建且尚未进入终态时改用独立 15 分钟 watchdog，避免工程子代理和长命令
-被普通分析阈值误杀。由于 prompt 已经提交，
+不在等待人工权限且没有活跃工具时，prompt 连续 300 秒无 transport 事件或终止响应
+会触发 inactivity cancel；
+ACP 与 Pi RPC 在工具已创建且尚未进入终态时改用独立 15 分钟 watchdog，避免
+工程子代理和长命令被普通分析阈值误杀；Codex app-server 当前仍使用普通预算。
+由于 prompt 已经提交，
 这不是安全重试点：
 Orchestrator 必须先持久化 no-replay cursor，再记录调用失败。
 

@@ -136,11 +136,14 @@ def test_agent_specs() -> None:
     kimi = orch.adapters["kimi"]
     assert isinstance(kimi, AcpAdapter)
     assert kimi._cmd == ["kimi", "acp"]
+    assert kimi._inactivity_timeout == 300
     assert getattr(kimi, "stateful_session", False) is True
     assert type(orch.adapters["codex"]) is CodexAppServerAdapter
+    assert orch.adapters["codex"]._inactivity_timeout == 300
     opencode = orch.adapters["opencode"]
     assert isinstance(opencode, AcpOpenCodeAdapter)
     assert opencode._cmd == ["opencode", "acp"]
+    assert opencode._inactivity_timeout == 300
     qwen = orch.adapters["qwen"]
     assert isinstance(qwen, AcpQwenAdapter)
     assert qwen._cmd == list(QWEN_ACP_DEFAULT_CMD)
@@ -148,14 +151,16 @@ def test_agent_specs() -> None:
     assert qwen._execution_cmd_overrides[ExecutionMode.READ_ONLY] == list(
         QWEN_ACP_READ_ONLY_CMD)
     assert qwen._fallback is None
-    assert qwen._inactivity_timeout == 120
-    assert qwen._initial_inactivity_timeout == 300
+    assert qwen._inactivity_timeout == 300
     workbuddy = orch.adapters["workbuddy"]
     assert isinstance(workbuddy, AcpWorkBuddyAdapter)
     assert workbuddy._fallback is None
+    assert workbuddy._inactivity_timeout == 300
     dsh = orch.adapters["dsh"]
     assert isinstance(dsh, AcpDshAdapter)
     assert dsh._fallback is None
+    assert dsh._inactivity_timeout == 300
+    assert orch.adapters["pi"]._inactivity_timeout == 300
     assert getattr(orch.adapters["codex"], "stateful_session", False) is True
     assert orch.adapters["codex"].ephemeral_thread is False
     assert isinstance(orch.host.adapter, CodexAppServerAdapter)

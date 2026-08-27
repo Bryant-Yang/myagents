@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable
 
 from adapters.base import (
+    DEFAULT_AGENT_INACTIVITY_TIMEOUT,
     AgentAdapter,
     AgentDeliveryCancelledError,
     AgentDeliveryUncertainError,
@@ -63,7 +64,7 @@ class CodexAppServerAdapter:
         fallback_jsonl: bool | None = None,
         fallback_adapter: AgentAdapter | None = None,
         cancel_timeout: float = 10.0,
-        inactivity_timeout: float = 120.0,
+        inactivity_timeout: float = DEFAULT_AGENT_INACTIVITY_TIMEOUT,
         request_timeout: float = 30.0,
     ) -> None:
         if cmd is not None and command is not None:

@@ -1174,81 +1174,61 @@ def test_inactivity_timeout_unblocks_next_round() -> None:
     print("ok  ACP 无活动超时 → 自动取消并放行下一轮")
 
 
-def test_initial_inactivity_timeout_only_covers_fresh_prefill() -> None:
-    """延长值只覆盖 fresh 首个活动前；活动后和后续轮恢复普通阈值。"""
-    async def expect_timeout(adapter: AcpAdapter, prompt: str) -> None:
+def test_configured_inactivity_timeout_covers_updates_and_later_rounds() -> None:
+    """具体 adapter 的静默预算在状态更新后和后续轮都保持一致。"""
+    async def consume(adapter: AcpAdapter, prompt: str) -> None:
+        async for _ in adapter.stream(prompt, "/tmp"):
+            pass
+
+    async def wait_until_prompt(prompt: str) -> None:
+        for _ in range(200):
+            if f"prompt:{prompt}" in state_events():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"fake server 未收到 prompt：{prompt}")
+
+    async def cancel_pending(task: asyncio.Task) -> None:
+        task.cancel()
         try:
-            async for _ in adapter.stream(prompt, "/tmp"):
-                pass
-        except AgentDeliveryUncertainError as exc:
-            assert "0.05 秒无活动" in str(exc), exc
-        else:
-            raise AssertionError(f"{prompt!r} 应使用普通 inactivity timeout")
+            await task
+        except AgentDeliveryCancelledError:
+            pass
 
     async def run() -> None:
         with patch.dict(os.environ, {
             "FAKE_ACP_CANCEL_DELAY": "0.01",
         }, clear=False):
             reset_state()
-            prefill = AcpAdapter(
+            adapter = AcpAdapter(
                 "fake",
                 [sys.executable, SERVER],
-                inactivity_timeout=0.05,
-                initial_inactivity_timeout=0.5,
+                inactivity_timeout=0.5,
                 cancel_timeout=0.1,
             )
-            pending = asyncio.create_task(
-                _consume(prefill.stream(
-                    "silent-slow initial-prefill", "/tmp")))
-            for _ in range(200):
-                if "prompt:silent-slow initial-prefill" in state_events():
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                raise AssertionError("fake server 未收到 fresh prefill prompt")
-            await asyncio.sleep(0.12)
-            assert not pending.done(), (
-                "fresh 首个活动前不应误用普通 0.05 秒阈值")
-            pending.cancel()
             try:
-                await pending
-            except AgentDeliveryCancelledError:
-                pass
-            await prefill.aclose()
+                # fake 先发一条 text/status 等价活动，再保持静默。
+                after_update = asyncio.create_task(
+                    consume(adapter, "slow after-update"))
+                await wait_until_prompt("slow after-update")
+                await asyncio.sleep(0.12)
+                assert not after_update.done(), (
+                    "收到早期状态后仍应保留具体 adapter 的完整静默预算")
+                await cancel_pending(after_update)
 
-            after_activity = AcpAdapter(
-                "fake",
-                [sys.executable, SERVER],
-                inactivity_timeout=0.05,
-                initial_inactivity_timeout=0.5,
-                cancel_timeout=0.1,
-            )
-            # 首轮先收到 chunk，再静默；不能继续占用 0.5 秒首活动预算。
-            await asyncio.wait_for(
-                expect_timeout(after_activity, "slow task"), timeout=0.25)
-            await after_activity.aclose()
-
-            later_round = AcpAdapter(
-                "fake",
-                [sys.executable, SERVER],
-                inactivity_timeout=0.05,
-                initial_inactivity_timeout=0.5,
-                cancel_timeout=0.1,
-            )
-            async for _ in later_round.stream("fast round", "/tmp"):
-                pass
-            await asyncio.wait_for(
-                expect_timeout(later_round, "silent-slow task"),
-                timeout=0.25,
-            )
-            await later_round.aclose()
-
-    async def _consume(stream) -> None:
-        async for _ in stream:
-            pass
+                async for _ in adapter.stream("fast round", "/tmp"):
+                    pass
+                later = asyncio.create_task(
+                    consume(adapter, "silent-slow later-round"))
+                await wait_until_prompt("silent-slow later-round")
+                await asyncio.sleep(0.12)
+                assert not later.done(), (
+                    "后续轮仍应使用具体 adapter 配置的静默预算")
+                await cancel_pending(later)
+            finally:
+                await adapter.aclose()
 
     asyncio.run(run())
-    print("ok  fresh 首活动前延长；活动后/后续轮恢复普通静默阈值")
+    print("ok  配置的静默预算覆盖早期状态更新与后续轮")
 
 
 def test_close_during_prompt() -> None:
@@ -2427,7 +2407,7 @@ if __name__ == "__main__":
     test_stream_aclose_requires_exact_cancelled_terminal()
     test_inactivity_cancel_requires_exact_cancelled_terminal()
     test_inactivity_timeout_unblocks_next_round()
-    test_initial_inactivity_timeout_only_covers_fresh_prefill()
+    test_configured_inactivity_timeout_covers_updates_and_later_rounds()
     test_close_during_prompt()
     test_initialize_failure()
     test_session_new_failure_atomic()

@@ -20,12 +20,15 @@ from typing import AsyncIterator, Callable, Mapping
 
 from acp.adapter import AcpAdapter, AgentPermissionHandler, SessionPreparation
 from acp.client import AcpClient, AcpError
-from adapters.base import AgentEvent, ExecutionMode
+from adapters.base import (
+    DEFAULT_AGENT_INACTIVITY_TIMEOUT,
+    AgentEvent,
+    ExecutionMode,
+)
 from agent_readiness import AgentReadiness, ExecutableResolver, ReadinessState
 from clipboard_image import prompt_images
 
 _CANCEL_TIMEOUT = 10
-_INACTIVITY_TIMEOUT = 120
 _TOOL_INACTIVITY_TIMEOUT = 900
 
 _DSH_CLI_ENV = "MYAGENTS_DSH_CLI"
@@ -913,7 +916,7 @@ class AcpDshAdapter(AcpAdapter):
         permission: str = "deny",
         *,
         cancel_timeout: float = _CANCEL_TIMEOUT,
-        inactivity_timeout: float = _INACTIVITY_TIMEOUT,
+        inactivity_timeout: float = DEFAULT_AGENT_INACTIVITY_TIMEOUT,
         tool_inactivity_timeout: float = _TOOL_INACTIVITY_TIMEOUT,
     ) -> None:
         self._configuration_error: str | None = None
