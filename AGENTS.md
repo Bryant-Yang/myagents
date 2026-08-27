@@ -112,10 +112,13 @@ app-server），同时仅为已获证路径保留 JSONL 兼容回退。
   probe 只能被动读取环境/PATH/文件属性，不得安装、卸载或启动真实 agent。
 - 新增 agent 时实现统一 `AgentAdapter`，在 `AGENT_SPECS` 注册；不要把
   name-specific 逻辑散进编排器。
-- `HostAgent` 是 moderator/supervisor 产品角色，生产底层必须使用
-  ADR-0017 的 myagents 原生无工具 model runtime；model provider 只能在
-  `native_agent/` 内选择，通用 Orchestrator 不感知 Responses/Chat/Anthropic
-  wire protocol。`/yolo` 不得突破 host 的 `tool_policy=none`。
+- `HostAgent` 是 moderator/supervisor 产品角色；room 默认使用 ADR-0017 的
+  myagents 原生无工具 model runtime，也可显式选择由
+  `AgentSpec.host_factory/host_probe` 声明的 host-safe agent backend。model
+  provider 只能在 `native_agent/` 内选择，agent Host 必须使用独立 adapter/
+  session/writer 并强制 `READ_ONLY`；通用 Orchestrator 不感知具体 provider wire
+  protocol，也不得按 agent 名分支。`/yolo` 不得突破 Host profile，未就绪选择
+  必须阻断且不得自动 fallback。
 - 权限处理器返回值必须绑定本次 `params.options` 校验；异常、空值或未知
   `optionId` 一律 cancelled。
 - ACP session 同一时刻只有一个 writer；不要让独立 native TUI 与 ACP client

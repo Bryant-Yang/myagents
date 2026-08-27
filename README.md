@@ -53,9 +53,9 @@ Codex、OpenCode、Qwen Code、WorkBuddy、DeepSeek Harness（DSH）、Pi 等 co
   hard-deny；授权弹窗只会在本轮 no-replay checkpoint 已持久化后出现。图片每轮
   最多 16 张、合计 20 MiB；不提供
   ACP 或 JSON/JSONL fallback。
-- `@host`：由 myagents 自有的无工具 native model runtime 驱动，负责意图识别、
-  路由、直接回答、讨论主持和总结；不依赖任何第三方 Agent CLI，`/yolo` 也不能
-  赋予它文件、shell、网络或 skill。
+- `@host`：负责意图识别、路由、直接回答、讨论主持和总结。默认由 myagents
+  自有的无工具 native model runtime 驱动，也可按会话显式切换到注册为 host-safe
+  的完整 agent；agent Host 独立于同名 worker 且始终只读，`/yolo` 不扩权。
 - Agent 就绪中心：启动时只读取当前进程的 PATH、环境变量和可执行文件属性，
   不启动或安装 agent。`/agents` 显示注册项的可用状态和设置提示，
   `/agents rescan` 在用户修复 PATH 或安装后被动重扫；缺失目标会在时间线写入前
@@ -293,7 +293,7 @@ chmod 600 "$myagents_config_home/myagents/config.toml"
 .venv/bin/python main.py
 ```
 
-配置文件内容：
+配置文件内容（兼容的默认 profile）：
 
 ```toml
 [host.model]
@@ -304,10 +304,43 @@ model_id = "把这里替换为 /v1/models 返回的精确 id"
 
 默认路径遵守 XDG：`$XDG_CONFIG_HOME/myagents/config.toml`，否则使用
 `~/.config/myagents/config.toml`；相对的 `XDG_CONFIG_HOME` 无效并回退该默认
-路径。文件必须为普通文件且权限精确为 0600，不接受符号链接。其他 OpenAI-compatible
-服务可在同一节配置 `base_url` 与可选 `api_key`；`MYAGENTS_MODEL_*` 仅用于
-当前进程临时覆盖。myagents 不会猜模型别名或自动切换；`/agents` 可查看 host
-配置来源和状态。
+路径。文件必须为普通文件且权限精确为 0600，不接受符号链接。
+
+也可以配置多个命名 profile；远程凭据只引用环境变量名：
+
+```toml
+[host.models.local]
+provider = "openai-compatible"
+base_url = "http://127.0.0.1:1234/v1"
+model_id = "从 /v1/models 返回的精确 id"
+models_discovery = true
+
+[host.models.glm]
+provider = "openai-compatible"
+base_url = "由你明确配置的服务地址"
+model_id = "glm-5.3-flash"
+api_key_env = "ZAI_API_KEY"
+models_discovery = false
+```
+
+`models_discovery=true` 会先用 `/models` 精确校验；不提供模型列表的服务设为
+`false`，由首次 chat 请求接受或拒绝 exact `model_id`。myagents 不猜别名、不
+伪造模型列表，也不自动 fallback。`glm-5.3-flash` 在此是用户指定的精确 ID，
+不是本文对厂商模型枚举的声明。`MYAGENTS_MODEL_*` 仅用于当前进程临时覆盖。
+
+Host 可在当前会话中查看和切换；命令不进入聊天时间线：
+
+```text
+/host
+/host model local
+/host model glm
+/host agent codex
+```
+
+切换只允许在当前会话无运行/排队任务时执行并持久恢复。Codex Host 与
+`@codex` worker 使用独立进程/session/writer，Host 永远只读；`/yolo` 不扩权。
+选择不可用时保留选择并显示错误，不会偷偷换回其他 backend。`/agents` 也会显示
+当前 Host transport/readiness。
 
 也可以指定 agent 的工作目录：
 
@@ -694,7 +727,7 @@ myagents/
 - [docs/adr/0014-pi-rpc-permission-bridge.md](docs/adr/0014-pi-rpc-permission-bridge.md)：Pi 原生 RPC、启动 attestation、逐次权限 bridge 与三 profile。
 - [docs/adr/0015-dsh-acp-only-transport.md](docs/adr/0015-dsh-acp-only-transport.md)：DSH 专用 ACP 入口、两 profile、stateful lifecycle gate 与零 fallback。
 - [docs/adr/0016-explicit-auto-approve-mode.md](docs/adr/0016-explicit-auto-approve-mode.md)：`/yolo` 会话级自动批准、持续危险提示与只读硬边界。
-- [docs/adr/0017-native-model-backed-host.md](docs/adr/0017-native-model-backed-host.md)：原生模型 provider/runtime、无工具 host 与 LM Studio 接入。
+- [docs/adr/0017-native-model-backed-host.md](docs/adr/0017-native-model-backed-host.md)：会话级 HostBackend、原生模型 provider/runtime 与只读 agent Host。
 - [docs/concepts.md](docs/concepts.md)：相关协议与编排模式。
 - [docs/knowledge-map.html](docs/knowledge-map.html)：可交互知识地图。
 

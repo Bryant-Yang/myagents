@@ -144,6 +144,14 @@ class AgentReadinessRegistry:
             setup_hint or previous.setup_hint,
         )
 
+    def set_status(self, status: AgentReadiness) -> None:
+        """Replace one registered status after a backend-specific probe."""
+        if status.name not in self._probes:
+            raise KeyError(f"未注册 readiness probe：{status.name!r}")
+        if not isinstance(status.state, ReadinessState):
+            raise TypeError("status 包含未知 readiness state")
+        self._statuses[status.name] = status
+
 
 def executable_probe(
     name: str,

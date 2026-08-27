@@ -11,8 +11,10 @@ from typing import Any
 
 
 class FakeOpenAICompatibleServer(AbstractContextManager):
-    def __init__(self, models: tuple[str, ...] = ("fake-model",)) -> None:
+    def __init__(self, models: tuple[str, ...] = ("fake-model",), *,
+                 models_discovery: bool = True) -> None:
         self.models = models
+        self.models_discovery = models_discovery
         self.requests: list[dict[str, Any]] = []
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self._thread = threading.Thread(
@@ -53,7 +55,7 @@ class FakeOpenAICompatibleServer(AbstractContextManager):
                 return
 
             def do_GET(self) -> None:
-                if self.path != "/v1/models":
+                if self.path != "/v1/models" or not fixture.models_discovery:
                     self._json(404, {"error": {"message": "not found"}})
                     return
                 fixture.requests.append({
@@ -85,6 +87,11 @@ class FakeOpenAICompatibleServer(AbstractContextManager):
                 })
                 if self.path != "/v1/chat/completions":
                     self._json(404, {"error": {"message": "not found"}})
+                    return
+                if payload.get("model") not in fixture.models:
+                    self._json(400, {
+                        "error": {"message": "unknown exact model id"},
+                    })
                     return
                 messages = [
                     item for item in payload.get("messages", [])

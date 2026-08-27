@@ -16,7 +16,9 @@ from adapters.base import redact_sensitive_text
 
 from .model import (
     ModelEvent,
+    ModelDeliveryState,
     ModelMessage,
+    ModelProviderCapabilities,
     ModelTerminal,
     ModelProviderError,
     ModelProviderUncertainError,
@@ -38,11 +40,14 @@ class OpenAICompatibleProvider:
         api_key: str | None = None,
         connect_timeout: float = 10.0,
         request_timeout: float = 30.0,
+        models_discovery: bool = True,
     ) -> None:
         if connect_timeout <= 0 or request_timeout <= 0:
             raise ValueError("provider timeout 必须大于 0")
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
+        self.capabilities = ModelProviderCapabilities(
+            models_discovery=models_discovery)
         headers = {
             "Accept": "application/json",
             "Accept-Encoding": "identity",
@@ -59,10 +64,13 @@ class OpenAICompatibleProvider:
             ),
         )
         self._model_ids: tuple[str, ...] | None = None
+        self.delivery_state = ModelDeliveryState.NOT_ATTEMPTED
         self._closed = False
 
     async def list_models(self) -> tuple[str, ...]:
         self._require_open()
+        if not self.capabilities.models_discovery:
+            raise ModelProviderError("当前模型 provider 不支持模型列表发现")
         try:
             async with self._client.stream(
                 "GET",
@@ -107,21 +115,32 @@ class OpenAICompatibleProvider:
         self._model_ids = model_ids
         return model_ids
 
-    async def stream(
+    def stream(
         self,
         messages: Sequence[ModelMessage],
         *,
         model_id: str,
     ) -> AsyncIterator[ModelEvent]:
+        """Reset delivery state synchronously before returning the iterator."""
         self._require_open()
-        model_ids = self._model_ids or await self.list_models()
-        if model_id not in model_ids:
-            available = "、".join(model_ids[:10])
-            suffix = "…" if len(model_ids) > 10 else ""
-            raise ModelProviderError(
-                self._safe(
-                    f"模型 {model_id!r} 不在 /v1/models 中；可用："
-                    f"{available}{suffix}"))
+        self.delivery_state = ModelDeliveryState.NOT_ATTEMPTED
+        return self._stream(messages, model_id=model_id)
+
+    async def _stream(
+        self,
+        messages: Sequence[ModelMessage],
+        *,
+        model_id: str,
+    ) -> AsyncIterator[ModelEvent]:
+        if self.capabilities.models_discovery:
+            model_ids = self._model_ids or await self.list_models()
+            if model_id not in model_ids:
+                available = "、".join(model_ids[:10])
+                suffix = "…" if len(model_ids) > 10 else ""
+                raise ModelProviderError(
+                    self._safe(
+                        f"模型 {model_id!r} 不在 /v1/models 中；可用："
+                        f"{available}{suffix}"))
         payload = {
             "model": model_id,
             "messages": [
@@ -130,14 +149,12 @@ class OpenAICompatibleProvider:
             ],
             "stream": True,
         }
-        # HTTP has no ACP-style accepted-turn acknowledgement. Persist the
-        # no-replay boundary immediately before the POST attempt: this may
-        # conservatively suppress a retry if cancellation lands in the tiny
-        # checkpoint-to-write window, but it can never duplicate a request
-        # that the server accepted before headers were lost.
-        committed = True
+        # A non-2xx response is an authoritative pre-commit rejection.  Once
+        # 2xx headers arrive the service has accepted the turn, so every later
+        # transport failure is uncertain and must not be replayed.
+        committed = False
         terminal_reason: str | None = None
-        yield ModelEvent("committed")
+        self.delivery_state = ModelDeliveryState.ATTEMPTED
         try:
             async with self._client.stream(
                 "POST",
@@ -145,11 +162,15 @@ class OpenAICompatibleProvider:
                 json=payload,
             ) as response:
                 if response.status_code < 200 or response.status_code >= 300:
+                    self.delivery_state = ModelDeliveryState.REJECTED
                     body, _overflow = await self._read_limited(
                         response, _MAX_ERROR_BYTES)
                     raise ModelProviderError(
                         f"模型请求返回 HTTP {response.status_code}："
                         f"{self._safe(body.decode('utf-8', errors='replace'))}")
+                committed = True
+                self.delivery_state = ModelDeliveryState.COMMITTED
+                yield ModelEvent("committed")
                 async for line in self._iter_sse_lines(response):
                     line = line.strip()
                     if not line:
@@ -198,7 +219,10 @@ class OpenAICompatibleProvider:
             raise
         except httpx.HTTPError as exc:
             message = self._safe(str(exc))
-            if committed:
+            if self.delivery_state in {
+                ModelDeliveryState.ATTEMPTED,
+                ModelDeliveryState.COMMITTED,
+            }:
                 raise ModelProviderUncertainError(
                     f"模型流在提交后断开：{message}") from exc
             raise ModelProviderError(f"模型请求失败：{message}") from exc

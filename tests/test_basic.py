@@ -206,8 +206,8 @@ def test_transcript_snapshot() -> None:
     print("ok  transcript 快照（并发不串话）")
 
 
-def test_decide_failure_fallback() -> None:
-    """P2 回归：host 路由抛异常 → error 事件 + 确定性回退到第一个工人。"""
+def test_decide_failure_does_not_fallback() -> None:
+    """Host 路由失败必须终止，不能把同一请求偷偷交给其他 backend。"""
     orch = make_orch()
 
     async def boom(
@@ -217,16 +217,19 @@ def test_decide_failure_fallback() -> None:
     orch.host.decide = boom
 
     events = []
-    asyncio.run(orch.dispatch("随便一条消息", lambda n, e: events.append((n, e))))
+    outcome = asyncio.run(orch.dispatch(
+        "随便一条消息", lambda n, e: events.append((n, e))))
     assert any(n == "host" and e.kind == "error" and "处理失败" in e.text
                for n, e in events)
-    # 回退到第一个工人 kimi，而不是可能同样故障的 host
-    assert [m.speaker for m in orch.history] == ["user", "kimi"]
-    print("ok  decide 异常兜底（error 事件 + 回退第一个工人）")
+    assert [m.speaker for m in orch.history] == ["user"]
+    assert [(item.agent, item.error) for item in outcome.failures] == [
+        ("host", "codex 挂了")]
+    assert orch.adapters["kimi"].last_prompt is None
+    print("ok  host 路由失败终止（无跨 backend fallback）")
 
 
-def test_persistent_failure() -> None:
-    """P2 契约回归：路由和工人持续故障时，history 诚实记录"调用失败"。"""
+def test_host_failure_never_runs_available_worker() -> None:
+    """即使 worker 可用，Host 失败也不能改变已选择的执行引擎。"""
     orch = make_orch()
 
     async def boom(
@@ -235,20 +238,14 @@ def test_persistent_failure() -> None:
         raise RuntimeError("codex 挂了")
     orch.host.decide = boom
 
-    class FailingAdapter(FakeAdapter):
-        async def stream(self, prompt: str, workdir: str):
-            raise RuntimeError("kimi 也挂了")
-            yield  # pragma: no cover - 让函数保持 async generator
-    orch.adapters["kimi"] = FailingAdapter("kimi")
-
     events = []
-    asyncio.run(orch.dispatch("随便一条消息", lambda n, e: events.append((n, e))))
+    outcome = asyncio.run(orch.dispatch(
+        "随便一条消息", lambda n, e: events.append((n, e))))
     kinds = [(n, e.kind) for n, e in events]
-    assert ("host", "error") in kinds and ("kimi", "error") in kinds
-    last = orch.history[-1]
-    assert last.speaker == "kimi" and "调用失败" in last.text
-    assert "无文本回复" not in last.text
-    print("ok  持续失败契约（error 事件 + 诚实的 history）")
+    assert ("host", "error") in kinds and ("kimi", "error") not in kinds
+    assert [m.speaker for m in orch.history] == ["user"]
+    assert outcome.failures[0].agent == "host"
+    print("ok  worker 可用时仍不做 Host backend fallback")
 
 
 def test_route_dedupe() -> None:
@@ -268,6 +265,12 @@ def test_route_dedupe() -> None:
     decision = host._parse("这是主持人的直接回答", choices)
     assert decision.targets == [] and decision.answer == "这是主持人的直接回答"
     assert "禁止调用工具" in host._build_route_prompt("对话", choices)
+    try:
+        host._parse("", choices)
+    except RuntimeError as exc:
+        assert "未返回" in str(exc)
+    else:
+        raise AssertionError("host 空输出不得 fallback 到 worker")
     print("ok  路由目标去重 + 明确任务解析 + host 路由禁用工具")
 
 
@@ -829,8 +832,8 @@ if __name__ == "__main__":
     test_host_answers_itself()
     test_at_host_explicit()
     test_transcript_snapshot()
-    test_decide_failure_fallback()
-    test_persistent_failure()
+    test_decide_failure_does_not_fallback()
+    test_host_failure_never_runs_available_worker()
     test_route_dedupe()
     test_host_decide_surfaces_safe_progress_events()
     test_host_progress_sink_failure_propagates()

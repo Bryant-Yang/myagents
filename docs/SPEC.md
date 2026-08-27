@@ -280,44 +280,51 @@
   read-only 不能被上层 allow 结果突破。
 - **里程碑**：M4.13。
 
-### UC-HOST-001 原生模型驱动的 Host
+### UC-HOST-001 会话级可切换 HostBackend
 
 - **角色 / 触发**：用户发送无 mention 消息、显式 `@host`，或有界讨论/
-  workflow 进入 host moderator/final 阶段。
-- **前置条件**：XDG 配置文件 `~/.config/myagents/config.toml` 的
-  `[host.model].model_id` 已配置，且与 `base_url/models` 返回的完整 `id` 精确
-  一致；当前 provider 为 `openai-compatible`。`MYAGENTS_MODEL_*` 可作当前进程
-  临时覆盖。未配置、文件权限不是 0600 或 TOML 损坏时 host 为“未就绪”，在
-  timeline 写入前拒绝并显示配置文件与 `/v1/models` 引导。
-- **主流程**：`HostAgent` 仍是 moderator/supervisor 产品角色，底层由
-  `NativeAgentRuntime` 驱动。runtime 通过中立 `ModelProvider/ModelEvent`
-  契约流式调用模型、维护 room 内独立上下文和 session；首个 provider 使用
-  OpenAI-compatible `/models` + `/chat/completions`，但通用 Orchestrator 不感知
-  provider wire protocol。host 单次调用可以直接回答或输出经普通代码验证的
-  route/discussion/collaboration JSON，终局主持继续复用既有有界状态机。
-- **权限边界**：host 固定 `tool_policy=none`，请求不携带 `tools` 或
-  `tool_choice`，不能读写文件、运行 shell、访问网络、调用 skill 或递归派发。
-  `/yolo` 与 execution mode 不改变该 profile。需要执行动作时只能路由到已就绪
-  worker；`MODERATOR` 是 UI 角色，不是 transport。
-- **会话与失败**：每个 room 独占 runtime/context/writer lock。只有权威
-  `finish_reason + [DONE]` 才更新模型上下文。提交后的取消、静默超时、断流或
-  非权威终止形成 no-replay cursor 并重建 session；模型不存在在 POST 前拒绝。
-  不自动降级或跨协议重放到任何第三方 Agent CLI。配置文件限制为 64 KiB 且
-  必须是 0600；API key 在 repr、状态、错误和事件中脱敏。
-- **验收**：fake HTTP server 覆盖流式正文、结构化路由、直接回答、discussion
-  moderator、session 隔离、取消、超时、部分流 EOF、错误映射、未配置、模型
-  不存在、配置文件/环境覆盖、权限/损坏 TOML、secret 不泄露和 host 无工具；
-  显式 `@worker` 证明零 host HTTP 请求。
-  TUI 显示 `MODERATOR · NATIVE MODEL` 与 `NATIVE-MODEL` readiness。真实 LM
-  Studio 只做只读模型列表和一次有界最小回复，不修改用户配置。
-- **独立证据来源**：ADR-0017、`tests/test_native_agent.py`、
-  `tests/fake_openai_compatible_server.py`、`tests/test_phase2.py`、
-  `tests/test_tui_completion.py`。
+  workflow 进入 host moderator/final 阶段。`HostAgent` 是产品角色，backend
+  可以是直接模型或明确注册为 host-safe 的完整 agent。
+- **查看 / 切换**：`/host` 展示当前 room 的 backend 类型、选择、实际 target、
+  transport 与 readiness；`/host model <profile-or-exact-model-id>` 切换直接模型，
+  `/host agent <agent>` 切换完整 agent。三者都是本地命令，不进 timeline。
+  首个正式 agent Host 为 Codex。
+- **切换边界**：选择按 room 持久化和恢复。运行/排队中或 Host delivery lock
+  已占用时原子拒绝；空闲时有界关闭旧 runtime，原子保存选择并清空 Host
+  session，把 cursor 与 replay floor 至少推进到当前 timeline 边界，再发布 fresh
+  runtime；此后每次 Host 投递确认都与 cursor 原子推进 replay floor。跨 backend
+  不复用 session、不重放
+  不确定 turn；同名 worker 的 adapter/session/writer 不受影响。
+- **模型 profile**：`[host.model]` 是兼容 default，推荐
+  `[host.models.<name>]`。命名 profile 记录 provider/base_url/model_id/
+  api_key_env/models_discovery，不保存 key。discovery provider 必须经 `/models`
+  精确验证完整 id；无 discovery capability 的 provider 直接使用配置的 exact id，
+  由首个 chat 请求接受或拒绝，不伪造模型列表。`glm-5.3-flash` 必须按该精确
+  字符串透传；SPEC 不据此推断厂商模型枚举。
+- **权限边界**：model Host 固定 `tool_policy=none`；agent Host 由独立
+  `AgentSpec.host_factory` 构造，每次调用强制 `ExecutionMode.READ_ONLY`，不继承
+  worker/TUI permission handler。Codex Host 还固定 read-only sandbox、never
+  approval、无 JSONL fallback。`/yolo` 不得突破这些 profile。
+- **失败策略**：未知 agent、未声明 host-safe factory、未就绪 backend、损坏配置、
+  模型服务拒绝均明确 block。恢复到未就绪选择时保留选择并在 timeline 前拒绝，
+  不自动 fallback。2xx 后取消/超时/断流/非权威终态与 POST headers 丢失形成
+  no-replay；服务端非 2xx 是 pre-commit 拒绝。
+- **安全配置**：文件必须为非 symlink 普通文件、权限 0600、最大 64 KiB；API key
+  只由环境引用进入 header，在选择、repr、状态、错误和事件中脱敏。readiness
+  只读本地配置/CLI 属性，不联网、不启动或修改服务。
+- **验收**：fake 覆盖 native→Codex→native、room 隔离/恢复、运行中拒绝、旧
+  runtime 回收、同名 Host/worker 双实例、read-only 与 `/yolo` 反例、unknown/
+  unready、无 fallback、provider discovery/no-discovery、GLM 精确 ID、TUI 命令与
+  显式 `@worker` 回归。
+- **独立证据来源**：ADR-0017、`tests/test_host_backend.py`、
+  `tests/test_native_agent.py`、`tests/fake_openai_compatible_server.py`、
+  `tests/test_phase2.py`、`tests/test_tui_completion.py`。
 - **真实验收证据**：2026-08-27 只读获取本机 LM Studio 的 3 个模型 id，选择
   当前已加载的精确 id
   `qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive`，经生产 provider/runtime
   收到 `delivery_committed`、4 个 text chunk 和权威 done，合并正文严格为
   `NATIVE_HOST_OK`；未修改 LM Studio 或用户配置。
+- **本次远程边界**：未调用真实 GLM，不读取或消耗用户远程凭据/额度。
 - **人工验收边界**：不同本地模型的路由 JSON 可靠性、长上下文质量、吞吐、成本
   与 provider 兼容范围不能由 fake contract 证明。
 - **里程碑**：M4.14。
@@ -1027,9 +1034,9 @@
 - **角色 / 触发**：用户连续点名 `@codex`，或编排器将 Codex 选为 worker。
 - **前置条件**：本机 Codex CLI 支持 `codex app-server`；adapter 独占其进程。
 - **主流程**：一次 initialize 后建立 thread；worker 的连续 turn 复用同一
-  app-server PID/thread 并按 cursor 接收增量。历史 Codex host 的 ephemeral
-  thread 能力仍由 adapter contract tests 保留，但生产 host 已由 ADR-0017 的
-  native model runtime 取代。
+  app-server PID/thread 并按 cursor 接收增量。选择 Codex Host 时由 ADR-0017
+  的 host-safe factory 创建另一套 read-only adapter/process/thread/session，
+  不得复用此 worker。
 - **配置边界**：不发送 model、effort、config、collaboration mode、plugin 或
   MCP 覆盖，不修改 Codex 全局配置；仅传 cwd、既有 sandbox、approval policy，
   worker 为 `workspace-write + on-request`，越界操作进入统一权限 UI。

@@ -351,14 +351,15 @@ transport。
   `myagents_cancel_command` 共用一个取消原语；外部可通过
   `myagents_read_events` 读取持久进度。
 - 重启后最后事件非 terminal 的命令必须显示为“已中断”，不得伪装完成。
-- 原生 host 的 provider/model 只来自 ADR-0017 的 XDG 私有配置文件与显式环境
-  临时覆盖；凭据不进入 readiness、事件或错误，host 固定无工具。
+- model Host 的 provider/model 只来自 ADR-0017 的 XDG 私有配置文件与显式环境
+  临时覆盖；凭据不进入 readiness、事件或错误。agent Host 只来自
+  `AgentSpec.host_factory`，独立于同名 worker 并固定 read-only。
 
 ### 4.7 Codex app-server（M4）
 
 - 一个 adapter 独占一个 app-server 进程与当前 thread，同 adapter turn 串行；
-  Codex worker 连续轮次复用持久 thread。历史 host ephemeral 能力继续由
-  adapter contract tests 保留，但生产 host 已由 ADR-0017 取代。
+  Codex worker 连续轮次复用持久 thread。Host 选择 Codex 时必须由独立的
+  host-safe factory 创建 read-only app-server，不能复用 worker thread。
 - 启动与请求不得覆盖 model、effort、config、collaboration mode、plugin 或
   MCP；只传协议必需字段、cwd、worker sandbox 与 approval-policy，且不写
   `~/.codex/config.toml`。
@@ -392,19 +393,25 @@ transport。
 - 失败不得改变草稿或残留不完整文件。终端内图片预览、转换、删除与跨机器同步
   不在本阶段。
 
-### 4.9 原生模型 Host（M4.14）
+### 4.9 可切换 HostBackend 与原生模型 Runtime（M4.14）
 
-- `HostAgent` 是 moderator/supervisor 产品角色，不是 transport；生产底层必须
-  是 `NativeAgentRuntime`，不依赖 Kimi/Codex/Qwen 等第三方 Agent CLI。
+- `HostAgent` 是 moderator/supervisor 产品角色，不是 transport；room 可显式
+  选择直接模型或声明了 host-safe factory 的完整 agent，默认是原生模型。
+- `HostBackendSelection` 只持久化 kind/target/reference；切换只在 Host 空闲或
+  阶段边界执行，有界关闭旧 runtime 后创建 fresh session，不跨 backend 重放。
+  持久选择不可用时必须阻断，不得自动 fallback。
 - `ModelProvider/ModelEvent` 保持 provider-neutral；OpenAI-compatible
-  `/models` + `/chat/completions` 只是首个实现。provider 选择和 wire schema 不得
-  进入 Orchestrator。
+  Chat Completions 只是首个实现。模型发现是 provider capability：支持者用
+  `/models` 精确验证，不支持者用配置的 exact id 由首个 chat 请求验证。
+  provider 选择和 wire schema 不得进入 Orchestrator。
 - 原生 host 配置默认来自 XDG 私有文件 `~/.config/myagents/config.toml` 的
-  `[host.model]`；`MYAGENTS_MODEL_*` 只作当前进程临时覆盖。`model_id` 必须与
-  `/v1/models` 精确一致；readiness 只读文件/环境语法与 0600 权限，不联网。
+  `[host.model]` 兼容 default 与 `[host.models.<name>]` 命名 profile；命名 profile
+  只引用 `api_key_env`。readiness 只读文件/环境语法与 0600 权限，不联网。
   API key 只进入 header，并在 repr/错误/事件中脱敏。
-- host 永久 `tool_policy=none`，请求不得携带 tools；`/yolo`、execution mode
-  和模型输出均不能授予文件、shell、网络、skill 或子 agent 能力。
+- model Host 永久 `tool_policy=none`；agent Host 必须由独立 factory 构造并
+  强制 `READ_ONLY`，不复用同名 worker session/writer。`/yolo` 不得扩权。
+- `/host`、`/host model <profile-or-id>`、`/host agent <agent>` 是不进 timeline
+  的 room 本地命令；只有明确注册 host capability 的 agent 可被选择。
 - runtime 每 room 隔离上下文并保持单 writer；提交后的取消、静默超时、断流和
   非权威终态必须建立 no-replay 边界并重建 session，不跨 provider/agent 重放。
 - 缺配置、模型不存在或 provider 拒绝必须给出可操作错误；不存在到第三方 Agent

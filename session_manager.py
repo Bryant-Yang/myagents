@@ -174,6 +174,10 @@ class SessionManager:
             initial_orchestrator.host_readiness_probe
             if initial_orchestrator is not None else None
         )
+        self._host_model_factory = (
+            initial_orchestrator.host_model_factory
+            if initial_orchestrator is not None else None
+        )
         self._runtimes: dict[str, _Runtime] = {}
         self._drafts: dict[str, tuple[str, int]] = {}
         self._detached_states: dict[str, tuple[str, bool]] = {}
@@ -241,6 +245,7 @@ class SessionManager:
                 session_name=self.initial_session_name,
                 discover_agents=self._discover_agents,
                 host_probe=self._host_probe,
+                host_model_factory=self._host_model_factory,
             )
             self._build_runtime(summary, orch)
             self._active_id = summary.room_id
@@ -294,6 +299,7 @@ class SessionManager:
                 session_name=summary.session_name,
                 discover_agents=self._discover_agents,
                 host_probe=self._host_probe,
+                host_model_factory=self._host_model_factory,
             )
             runtime = self._build_runtime(summary, orch)
             try:

@@ -62,6 +62,9 @@ def test_completion_parser_and_command_boundary() -> None:
     roles = completion_context("/ro", 3, AGENTS)
     assert roles is not None
     assert [item.value for item in roles.items] == ["/roles", "/roles clear"]
+    host = completion_context("/host a", 7, AGENTS)
+    assert host is not None
+    assert [item.value for item in host.items] == ["/host agent"]
 
     assert local_command_for("/new") is not None
     assert local_command_for("/discuss") is not None
@@ -70,6 +73,7 @@ def test_completion_parser_and_command_boundary() -> None:
     assert local_command_for("/yolo").description == "切换当前会话自动完全授权"
     assert local_command_for("/roles").description == "查看当前会话角色"
     assert local_command_for("/roles clear").description == "清空当前会话角色"
+    assert local_command_for("/host").description == "查看当前会话主持后端"
     assert local_command_for("/agents rescan").description == "重新检测本机 agent"
     assert local_command_for("/details").description == "展开或收起当前活动卡"
     assert local_command_for("/discuss @kimi @opencode -- 主题") is None
@@ -638,6 +642,50 @@ def test_roles_clear_waits_for_current_command_boundary() -> None:
     print("ok  /roles clear 不跨越运行中 command 边界")
 
 
+def test_host_command_switches_locally_without_timeline_write() -> None:
+    from textual.widgets import RichLog
+
+    class Adapter:
+        session_id = None
+
+        async def stream(self, _prompt, _workdir, **_kwargs):
+            yield AgentEvent("done")
+
+        async def aclose(self):
+            return None
+
+    specs = (AgentSpec(
+        "codex", "app-server", Adapter, None, Adapter, None),)
+    orch = Orchestrator(
+        ".", specs=specs, persistent=False,
+        host_model_factory=lambda _selection: Adapter())
+
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test() as pilot:
+            box = app.query_one("#composer", ComposerInput)
+            box.value = "/host"
+            box.cursor_position = len(box.value)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert orch.history == []
+
+            box.value = "/host agent codex"
+            box.cursor_position = len(box.value)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert orch.host_backend_selection.kind == "agent"
+            assert orch.host_backend_selection.target == "codex"
+            assert orch.history == []
+            rendered = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines)
+            assert "当前会话 Host" in rendered
+            assert "Host 已切换：agent:codex" in rendered
+
+    asyncio.run(run())
+    print("ok  /host 查看与切换均为会话本地命令且不进 timeline")
+
+
 if __name__ == "__main__":
     test_completion_parser_and_command_boundary()
     test_agent_completion_keyboard_and_focus()
@@ -649,4 +697,5 @@ if __name__ == "__main__":
     test_tui_starts_with_zero_or_all_fake_clis()
     test_roles_commands_view_and_clear_without_dispatch()
     test_roles_clear_waits_for_current_command_boundary()
+    test_host_command_switches_locally_without_timeline_write()
     print("\nTUI completion 全部通过")

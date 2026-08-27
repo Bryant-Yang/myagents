@@ -121,6 +121,7 @@ fi
 .venv/bin/python tests/test_tui_activity.py
 .venv/bin/python tests/test_tui_completion.py
 .venv/bin/python tests/test_native_agent.py
+.venv/bin/python tests/test_host_backend.py
 .venv/bin/python tests/test_discussion.py
 .venv/bin/python tests/test_collaboration.py
 .venv/bin/python tests/test_workflow.py

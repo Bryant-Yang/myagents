@@ -26,7 +26,9 @@ from adapters.base import (
 from host import HostAgent
 from native_agent import (
     ModelEvent,
+    ModelDeliveryState,
     ModelMessage,
+    ModelProviderCapabilities,
     ModelProviderError,
     NativeAgentRuntime,
     NativeModelConfig,
@@ -53,11 +55,15 @@ class _Worker:
 
 
 class _BareDoneProvider:
+    capabilities = ModelProviderCapabilities(models_discovery=True)
+    delivery_state = ModelDeliveryState.NOT_ATTEMPTED
+
     async def list_models(self):
         return ("fake-model",)
 
     async def stream(self, _messages, *, model_id):
         assert model_id == "fake-model"
+        self.delivery_state = ModelDeliveryState.COMMITTED
         yield ModelEvent("committed")
         yield ModelEvent("text", "untrusted")
         yield ModelEvent("done")
@@ -126,11 +132,14 @@ def test_native_host_uses_private_xdg_config_with_environment_overrides() -> Non
                 'provider = "openai-compatible"\n'
                 f'base_url = "{server.base_url}"\n'
                 'model_id = "fake-model"\n'
-                'api_key = "file-secret"\n',
+                'api_key_env = "TEST_MODEL_API_KEY"\n',
                 encoding="utf-8",
             )
             config_path.chmod(0o600)
-            environ = {"XDG_CONFIG_HOME": raw}
+            environ = {
+                "XDG_CONFIG_HOME": raw,
+                "TEST_MODEL_API_KEY": "file-secret",
+            }
 
             ready = native_host_readiness_probe(environ=environ)
             assert ready.state is ReadinessState.READY
@@ -146,6 +155,7 @@ def test_native_host_uses_private_xdg_config_with_environment_overrides() -> Non
                 environ={
                     "XDG_CONFIG_HOME": raw,
                     "MYAGENTS_MODEL_ID": "temporary-model",
+                    "TEST_MODEL_API_KEY": "file-secret",
                 },
             )
             assert overridden.model_id == "temporary-model"
@@ -214,6 +224,19 @@ def test_native_host_rejects_unsafe_or_broken_config_file() -> None:
             environ={"XDG_CONFIG_HOME": raw})
         assert fifo.state is ReadinessState.INVALID
         assert "普通文件" in fifo.detail
+
+        config_path.unlink()
+        config_path.write_text(
+            '[host.model]\nmodel_id = "fake-model"\n'
+            'api_key = "must-not-be-persisted"\n',
+            encoding="utf-8",
+        )
+        config_path.chmod(0o600)
+        inline_secret = native_host_readiness_probe(
+            environ={"XDG_CONFIG_HOME": raw})
+        assert inline_secret.state is ReadinessState.INVALID
+        assert "api_key_env" in inline_secret.detail
+        assert "must-not-be-persisted" not in repr(inline_secret)
 
         config_path.unlink()
         config_path.write_text(

@@ -31,6 +31,10 @@ from session_roles import (
     SessionRoleValidationError,
     normalize_session_roles,
 )
+from host_backend import (
+    HostBackendSelection,
+    HostBackendValidationError,
+)
 
 APP_NAME = "myagents"
 STATE_SCHEMA_VERSION = 1
@@ -428,6 +432,8 @@ class RoomStore:
             "session_name": self.session_name,
             "agents": {},
             "session_roles": {},
+            "host_backend": HostBackendSelection.default().to_state(),
+            "host_replay_floor": 0,
         }
         self._write_state(state)
         self._state = state
@@ -480,6 +486,16 @@ class RoomStore:
         except SessionRoleValidationError as exc:
             raise CorruptedStorageError(
                 f"state.json 的 session_roles 非法：{exc}") from exc
+        try:
+            HostBackendSelection.from_state(data.get("host_backend"))
+        except HostBackendValidationError as exc:
+            raise CorruptedStorageError(
+                f"state.json 的 host_backend 非法：{exc}") from exc
+        replay_floor = data.get("host_replay_floor", 0)
+        if (not isinstance(replay_floor, int) or isinstance(replay_floor, bool)
+                or replay_floor < 0):
+            raise CorruptedStorageError(
+                "state.json 的 host_replay_floor 必须是非负整数")
         if "session_title" in data:
             try:
                 normalize_session_title(data["session_title"])
@@ -693,6 +709,58 @@ class RoomStore:
             "session_roles": {
                 name: role.to_state() for name, role in normalized.items()
             },
+        }
+        self._write_state(new_state)
+        self._state = new_state
+
+    def get_host_backend(self) -> HostBackendSelection:
+        """Return the room selection; legacy rooms default to native model."""
+        try:
+            return HostBackendSelection.from_state(
+                self._state.get("host_backend"))
+        except HostBackendValidationError as exc:
+            raise CorruptedStorageError(
+                f"state.json 的 host_backend 非法：{exc}") from exc
+
+    def get_host_replay_floor(self) -> int:
+        """Lowest timeline cursor any fresh Host runtime may replay from."""
+        return int(self._state.get("host_replay_floor", 0))
+
+    def set_host_backend(
+        self,
+        selection: HostBackendSelection,
+        *,
+        cursor: int,
+    ) -> None:
+        """Persist a fresh backend at a durable cross-backend replay boundary."""
+        selected = selection.validated()
+        if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+            raise ValueError("host backend cursor 必须是非负整数")
+        host_state = {"cursor": cursor, "session_id": None}
+        new_state = {
+            **self._state,
+            "host_backend": selected.to_state(),
+            "host_replay_floor": cursor,
+            "agents": {**self._state["agents"], "host": host_state},
+        }
+        self._write_state(new_state)
+        self._state = new_state
+
+    def commit_host_cursor(self, cursor: int) -> None:
+        """Atomically advance Host cursor and its durable no-replay floor."""
+        if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+            raise ValueError("host cursor 必须是非负整数")
+        current = self.get_agent_state("host")
+        committed = max(current["cursor"], cursor)
+        host_state = {
+            "cursor": committed,
+            "session_id": current["session_id"],
+        }
+        new_state = {
+            **self._state,
+            "host_replay_floor": max(
+                self.get_host_replay_floor(), committed),
+            "agents": {**self._state["agents"], "host": host_state},
         }
         self._write_state(new_state)
         self._state = new_state

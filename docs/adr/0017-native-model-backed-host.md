@@ -1,4 +1,4 @@
-# ADR-0017：原生模型驱动的 myagents Host
+# ADR-0017：可切换 HostBackend 与原生模型 Runtime
 
 - 状态：Accepted
 - 日期：2026-08-27
@@ -8,140 +8,151 @@
 
 ## 1. 背景
 
-此前 `HostAgent` 是 moderator/supervisor 产品角色，但生产实现由一个只读
-`CodexAppServerAdapter` 驱动。这使无 mention 路由、直接回答、讨论总结和
-`@host` 都依赖 Codex CLI；“host 是什么”和“host 当前借用哪家 agent”也被
-混在一起。用户只安装模型服务、没有任何第三方 coding-agent CLI 时，聊天室
-无法独立工作。
+`HostAgent` 是 moderator/supervisor 产品角色，不是协议。Host 既应能在没有
+第三方 coding-agent CLI 时直接调用模型，也应能按会话切换到一个完整 agent
+作为推理引擎。模型 API 与 coding-agent transport 仍是两层：Responses、Chat
+Completions、Anthropic Messages 属于 provider wire protocol；ACP、app-server、
+RPC 与 JSONL 属于 agent/runtime protocol。
 
-模型 API 与 coding agent 协议也不是同一层抽象。Responses API、Chat
-Completions 和 Anthropic Messages 是 provider wire protocol；ACP、app-server、
-RPC 与 JSONL 是 agent/runtime protocol。把任一模型 API 写进 Orchestrator 会把
-路由、会话、权限和厂商请求形状耦合在一起。
+因此不能把某个模型 API 或 agent 名写进通用 Orchestrator，也不能把 Host
+固化成单一 native runtime。
 
 ## 2. 决策
 
-### 2.1 角色和分层
+### 2.1 HostBackend 分层
 
-- `HostAgent` 继续表示 moderator/supervisor 产品角色；`MODERATOR` 只用于 UI
-  描述，不是 transport。
-- `ModelProvider` 是中立模型边界，只接收 `ModelMessage`，输出
-  `ModelEvent(committed/text/activity/usage/done)`。它不知道 room、worker、
-  workflow、权限或 TUI。
-- `OpenAICompatibleProvider` 是首个 provider 实现，使用 `/models` 与
-  `/chat/completions` SSE。未来 Responses API、Anthropic 或其他 provider 必须
-  作为同级实现加入，不能在 Orchestrator 或 `NativeAgentRuntime` 事件循环中按
-  provider/name 分支。
-- `NativeAgentRuntime` 把 provider 映射为统一 `AgentAdapter`：单 writer、
-  房间内会话上下文、流式事件、取消、静默超时、权威终态、session prepare 与
-  no-replay 均由它负责。
-- 生产 `HostAgent` 默认且仅由这个 myagents-owned runtime 驱动。Codex
-  app-server 继续作为 `@codex` worker 的 transport，不再是 host 依赖。
+- `HostAgent` 继续承载路由、直接回答、角色提取、讨论主持与总结语义。
+- `HostBackendSelection` 是 room 级持久选择，只有 `model` 与 `agent` 两类；
+  不保存凭据、runtime session id 或 provider 对象。
+- model backend 由 `NativeAgentRuntime` 驱动；它只依赖中立
+  `ModelProvider/ModelEvent`，负责流式输出、上下文、单 writer、取消、静默超时、
+  权威终态与 no-replay。
+- agent backend 只能来自 `AgentSpec.host_factory/host_probe` 明确声明的
+  host-safe factory。首个正式实现是 Codex app-server。通用层按 capability
+  查找，不按 agent 名分支。
+- `@codex` worker 与 Codex Host 每次由不同 factory 构造，拥有不同 adapter、
+  process/thread/session/writer；两者绝不复用。
 
-### 2.2 配置和模型选择
+默认选择仍是 `model/profile:default`，但不是唯一生产 Host。
 
-默认配置文件遵守 XDG，路径为 `$XDG_CONFIG_HOME/myagents/config.toml`；未设置
-`XDG_CONFIG_HOME` 时使用 `~/.config/myagents/config.toml`：
+### 2.2 会话级命令与切换生命周期
+
+本地命令不进入 timeline：
+
+```text
+/host
+/host model <profile-or-exact-model-id>
+/host agent <agent>
+```
+
+`/host` 显示类型、选择、实际模型/agent、transport 与 readiness。切换只在当前
+room 生效并写入 `state.json.host_backend`；其他 room 不变。切换必须发生在 Host
+空闲/阶段边界：TUI 有运行或排队任务时拒绝，Orchestrator 的 Host delivery lock
+也做原子拒绝。
+
+成功切换的顺序为：验证候选并构造惰性新实例 → 有界关闭旧 runtime → 原子持久化
+新选择并将 `agents.host` 写为
+`{cursor: 当前 timeline 边界, session_id: null}`，同时持久化不可回退的
+`host_replay_floor` → 发布新实例。新 backend 的任何 fresh session 都只允许
+从该 floor 之后取增量。该 floor 单调推进：切换时至少推进
+到当前 timeline 边界，此后每个 `delivery_committed` 都与 Host cursor 原子推进，
+所以重启或 session 恢复失败也不会重放已投递 turn。fresh session 不 bootstrap
+floor 之前的历史；因此既不恢复
+旧 provider/agent session，也不跨 backend 重放已投递或不确定 turn。关闭或持久化
+失败时不伪装成功；候选被回收，原选择保持。旧 runtime 未能确认关闭时不创建第二
+writer；持久化失败且旧 runtime 已关闭时才以 fresh runtime 恢复原选择。
+
+恢复房间时若已选择的 backend 不可用，选择保持但 Host 标记未就绪并在 timeline
+之前阻断；禁止偷偷切回默认模型或其他 agent。
+
+### 2.3 模型 profile 与 provider capability
+
+配置文件默认是 `$XDG_CONFIG_HOME/myagents/config.toml`，未设置时为
+`~/.config/myagents/config.toml`。保留 `[host.model]` 作为兼容 default profile；
+推荐使用命名 profile：
 
 ```toml
-[host.model]
+[host.models.local]
 provider = "openai-compatible"
 base_url = "http://127.0.0.1:1234/v1"
 model_id = "从 /v1/models 选择的精确 id"
+models_discovery = true
+
+[host.models.glm]
+provider = "openai-compatible"
+base_url = "由用户明确配置的服务地址"
+model_id = "glm-5.3-flash"
+api_key_env = "ZAI_API_KEY"
+models_discovery = false
 ```
 
-对应的当前进程环境变量可临时覆盖文件字段，但不作为持久配置：
+这里的 `glm-5.3-flash` 是用户指定、由实际服务首个 chat 请求接受或拒绝的精确
+字符串；本文不据此声明任何厂商公开模型枚举。
 
-- `MYAGENTS_MODEL_PROVIDER`：默认且当前唯一值 `openai-compatible`；
-- `MYAGENTS_MODEL_BASE_URL`：默认 `http://127.0.0.1:1234/v1`；
-- `MYAGENTS_MODEL_ID`：必填，必须与 `/v1/models` 返回的某个完整 `id` 精确相等；
-- `MYAGENTS_MODEL_API_KEY`：可选，只进入 Authorization header，不进入 repr、
-  readiness、timeline、event 或可见错误。
+模型发现是 `ModelProviderCapabilities.models_discovery`，不是所有
+OpenAI-compatible provider 的强制能力：
 
-相对的 `XDG_CONFIG_HOME` 无效并回退默认路径。配置文件必须是普通文件（不接受
-符号链接）、权限精确为 0600 且不超过 64 KiB；未知层级/字段、非字符串值、损坏
-TOML 一律 fail-closed。base URL 只接受无内嵌凭据、query 和 fragment
-的 HTTP(S) URL。readiness 只被动检查本地文件、权限与环境覆盖语法，不联网、不
-启动服务、不修改 LM Studio；模型是否真实存在由 provider 首次请求前调用
-`/models` 独立验证。缺失配置显示为未就绪，不会崩溃或误报 ready。provider 名、
-base URL、model id 与 API key 分别限制为 64、2048、512 与 8192 字符；拒绝信息
-不回显凭据或无界配置值。
+- discovery=true 时，请求前调用 `/models` 并精确匹配完整 id；
+- discovery=false 时，不伪造或请求模型清单，直接使用 profile 中的 exact
+  `model_id`，由首次 chat 请求的 2xx/非 2xx 结果验证；服务端非 2xx 是可操作的
+  pre-commit 拒绝，POST 后无响应则按不确定投递建立 no-replay 边界。
 
-### 2.3 会话、取消和 no-replay
+命名 profile 只保存 `api_key_env`，不保存 key。凭据只从当前进程环境解析并进入
+Authorization header，不进入 selection、repr、readiness、timeline 或错误。
+`[host.model]` 与命名 profile 都拒绝持久化 `api_key`；本地文件只保存
+`api_key_env` 引用。`MYAGENTS_MODEL_API_KEY` 仅作为当前进程的临时覆盖，绝不
+写入房间状态或时间线。
 
-每个 room 的 Orchestrator 拥有独立 runtime、session id、消息上下文和 writer
-lock，不跨房间共享。正常完成后才把 user/assistant 消息加入模型上下文。
+配置文件必须是非符号链接普通文件、权限精确 0600、最大 64 KiB。base URL 不得
+内嵌凭据、query 或 fragment。readiness 只读本地配置/CLI 属性，不联网、不启动
+服务、不修改用户配置。
 
-provider 在开始 Chat Completions 投递时产生 `committed`；runtime 将其转换为
-内部 `delivery_committed`，沿用 Orchestrator 的 checkpoint-before-visible-event
-契约。提交后的静默超时、断流、无 `[DONE]`、无 `finish_reason` 或取消均不自动
-重放：持久 cursor 先推进，runtime 丢弃不可信上下文并建立新 session。干净启动
-可按现有 bootstrap 上限恢复有界 timeline；提交后不确定轮次的下一 session
-禁止倒退 cursor。
+### 2.4 权限
 
-无 mention 路由、角色提取与协作提取在 user record 提交时冻结本次
-`committed.seq`。即使随后等待 host 单写锁，prompt 也只读取该 seq 及之前的
-timeline，cursor 只单调推进而不把后来并发提交的消息混进本次语义判断。
+- model Host 永久 `tool_policy=none`，请求不携带 tools/tool_choice。
+- agent Host 的每次 `stream/stream_prepared` 都由 `HostAgent` 强制
+  `ExecutionMode.READ_ONLY`，不继承 worker/TUI permission handler。
+- Codex Host factory 额外固定 `sandbox=read-only`、`approval_policy=never`、
+  `fallback_jsonl=false`。
+- `/yolo` 不能放宽任一 Host profile。未知 agent、无 host-safe factory、未就绪
+  target 均明确 block。
 
-默认连续无活动上限继续使用产品统一的 300 秒；测试可以注入更短值。`done`
-必须同时具备 provider finish reason 和流终止标记，正文或 HTTP 200 不能代替
-权威终态。
+### 2.5 错误与 no-replay
 
-### 2.4 权限与能力
+不存在跨 model/agent backend 的自动 fallback。候选不可用、模型 id 被拒绝、
+配置损坏与旧 runtime 关闭失败均保留当前选择并显示可操作错误。
 
-原生 host 永久 `tool_policy=none`：请求不发送 `tools` / `tool_choice`，system
-与 moderator prompt 也明确禁止文件、shell、网络、skill 和子 agent。runtime
-没有 permission handler 或进程启动 seam；`/yolo`、workflow execution mode
-以及模型输出都不能扩大该 profile。
-
-本阶段不提供原生 coding worker、写工具或 shell。需要执行动作时 host 只能在
-已就绪 worker 闭集内路由；没有 worker 时只给出说明。图片仍应路由给具备视觉
-能力的 worker，host provider 不自动获得本地文件访问。
-
-### 2.5 错误和降级
-
-不存在到 Kimi、Codex、Qwen 或其他 agent CLI 的自动 fallback。未配置、模型 id
-不存在、HTTP 拒绝和提交前失败返回可操作错误；提交后的传输不确定映射为
-`AgentDeliveryUncertainError`，取消映射为 `AgentDeliveryCancelledError`。
-所有 provider 错误有长度上限并经过通用凭据脱敏。
-
-Host 失败后 Orchestrator 现有确定性 worker 回退仍可用于路由可用性，但它只从
-已就绪 worker 中选择，且不会把同一已提交 native model turn 跨协议重放。
+原生 provider 通过中立 `ModelDeliveryState` 显式公开当前请求的
+not-attempted/attempted/committed/rejected 状态，而不是依赖具体实现的私有属性。
+在 2xx headers 后产生 `committed`；随后取消、静默超时、断流、
+缺少 `[DONE]` 或 `finish_reason` 均是不确定终态。POST 已尝试但 headers 丢失也
+保守建立 no-replay。只有正常完成才把 user/assistant 加入 provider context。
 
 ## 3. 验收
 
-1. 本地 fake OpenAI-compatible server 覆盖精确 `/models`、SSE 正文、结构化
-   路由、直接回答、讨论 moderator、session 隔离与 context。
-2. 取消、提交后静默超时、部分正文后 EOF、缺少权威终态均形成 no-replay
-   失败；模型不存在在 POST 前拒绝。
-3. XDG 配置、环境覆盖优先级、0600 权限与损坏 TOML 均有反例；HTTP 错误回显
-   Authorization 时 API key 不出现在异常；超长配置、模型清单和 SSE 均有界；
-   所有请求都没有 `tools` 和 `tool_choice`。
-4. 未配置 host 在 timeline 前阻断并提供设置引导；TUI 将 transport 显示为
-   `NATIVE-MODEL`，不把 `MODERATOR` 当协议。
-5. 显式 `@worker` 不触发 provider；原有 discussion、collaboration、workflow、
-   会话角色和 worker adapter 测试全部回归；Host 锁竞争时前一 dispatch 的
-   prompt 不得包含后一条 user record。
-6. 真实 LM Studio 只允许读取 `/v1/models` 后选择一个精确 id，并进行一次有界
-   最小对话；不修改 LM Studio、模型或用户配置。未运行时必须明确登记。
+自动验收覆盖：
 
-自动证据：`tests/test_native_agent.py`、
-`tests/fake_openai_compatible_server.py`、`tests/test_phase2.py` 与
-`tests/test_tui_completion.py`。
+1. native → Codex agent → native，旧 runtime 有界关闭且每次 fresh；
+2. room 隔离与重启恢复；Host 写入跨 backend cursor 边界并清空 session，
+   不碰 `@codex` worker；
+3. 运行中拒绝、unknown/unready block、持久 unready 不自动 fallback；
+4. Host/worker 双实例单 writer，agent Host 强制 read-only，`/yolo` 反例；
+5. discovery 与 no-discovery provider、`glm-5.3-flash` 精确透传、非 2xx pre-commit；
+6. `/host` TUI 展示/切换不进 timeline，显式 `@worker` 不回归；
+7. 原有取消、超时、断流、secret、配置权限、讨论和 workflow tests 全部回归。
 
-真实证据：2026-08-27 本机 LM Studio `/v1/models` 只读返回 3 个 id；选择当时
-已加载的精确 id `qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive`，通过生产
-`OpenAICompatibleProvider + NativeAgentRuntime` 完成一次有界短回复，事件为
-`delivery_committed → 4×text → done`，正文严格为 `NATIVE_HOST_OK`。探针未修改
-LM Studio、模型或用户配置。
+主要证据：`tests/test_host_backend.py`、`tests/test_native_agent.py`、
+`tests/fake_openai_compatible_server.py`、`tests/test_tui_completion.py`。
 
-## 4. 后果与明确非目标
+真实 LM Studio 证据沿用 2026-08-27 已完成的只读 `/v1/models` 与一次有界最小
+对话。本次没有调用真实 GLM，也没有读取或消耗远程凭据/额度。
 
-- myagents 的基本主持能力不再依赖第三方 Agent CLI；worker 仍按各自 adapter
-  独立安装和探测。
-- 首版每个 room 的模型上下文驻留进程内；持久事实仍以 room timeline/cursor 为
-  准，不新增第二套记忆数据库。
-- Chat Completions 的兼容差异由 provider contract tests 承担；provider 协议
-  漂移不能泄漏到通用编排器。
-- 完整 coding 工具集、provider 热切换、模型管理 UI、成本预算和上下文压缩不在
-  本阶段；需要时必须新增明确契约和权限反例。
+## 4. 后果与非目标
+
+- 基本主持能力仍可完全不依赖第三方 Agent CLI；需要时可显式选择受约束的完整
+  agent Host。
+- room timeline/cursor 仍是持久事实，不新增第二套记忆数据库。
+- 新 provider 作为 `ModelProvider` 实现加入；新 agent Host 通过 `AgentSpec`
+  capability 加入，均不得污染通用路由。
+- 完整原生 coding 工具集、自动 backend fallback、模型别名猜测、自动迁移
+  profile、成本预算和上下文压缩不在本阶段。

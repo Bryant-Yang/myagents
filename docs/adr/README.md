@@ -22,4 +22,4 @@
 | [0014](0014-pi-rpc-permission-bridge.md) | Accepted | M4.11 Pi 原生 RPC、唯一权限 bridge、wrapper 工具闭集与三 profile 隔离 |
 | [0015](0015-dsh-acp-only-transport.md) | Accepted | M4.12 标准 myagents bundle + stock `dsh --profile myagents`、不可变 DSH、两 execution safety profile、stateful lifecycle gate 与零 fallback |
 | [0016](0016-explicit-auto-approve-mode.md) | Accepted | M4.13 `/yolo` 会话级自动批准、只选 allow-once、持续危险提示与 read-only 硬边界 |
-| [0017](0017-native-model-backed-host.md) | Accepted | M4.14 myagents 原生模型 runtime、无工具 host 与 OpenAI-compatible provider |
+| [0017](0017-native-model-backed-host.md) | Accepted | M4.14 会话级 HostBackend、原生模型 runtime 与独立只读 agent Host |

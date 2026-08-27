@@ -5,8 +5,9 @@
     .venv/bin/python main.py /path/to/project   # 指定 agent 的工作目录
 
 聊天室里 @kimi / @opencode / @qwen / @workbuddy / @dsh / @pi / @codex 把消息派发给对应 agent，支持一条消息
-@多个（并发执行）。@host 叫 myagents 原生模型主持人出来总结/仲裁；不带 @
-的消息由 host 用一次调用直接回答或决定派给谁。
+@多个（并发执行）。@host 叫当前会话选择的 HostBackend 出来总结/仲裁；不带 @
+的消息由 host 用一次调用直接回答或决定派给谁。Host 可在直接模型与明确注册的
+只读 agent backend 之间切换。
 `/discuss` 可在一个 CommandBus command 内安排 2–3 个 worker 做 1–3 轮
 有界讨论，再由指定 moderator 最终仲裁。
 
@@ -45,6 +46,7 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from agent_readiness import AgentUnavailableError
+from host_backend import HostBackendValidationError, parse_host_command
 from orchestrator import HOST_NAME, Orchestrator
 from adapters.base import (
     AgentEvent,
@@ -1447,9 +1449,10 @@ class ChatApp(App):
         ]
         if all(name != HOST_NAME for name, _ in agents):
             host = status_by_name[HOST_NAME]
+            backend = self.orch.host_backend_status()
             agents.append((
                 HOST_NAME,
-                f"MODERATOR · NATIVE MODEL · {host.state.label}",
+                f"MODERATOR · {backend.transport} · {host.state.label}",
             ))
         agents.sort(
             key=lambda item: not status_by_name[item[0]].ready)
@@ -1589,6 +1592,23 @@ class ChatApp(App):
             return
 
         command = local_command_for(text)
+        try:
+            host_command = parse_host_command(text)
+        except HostBackendValidationError as exc:
+            self._write("system", str(exc), "bold red")
+            event.input.value = event.value
+            event.input.cursor_position = original_cursor
+            event.input.focus()
+            return
+        if host_command is not None:
+            event.input.value = ""
+            self.close_completion()
+            if host_command.action == "show":
+                self.action_show_host()
+            else:
+                await self._switch_host_backend(
+                    host_command.kind or "", host_command.target or "")
+            return
         if command is not None:
             # 本地命令必须在持久化/路由之前截获；未注册的 slash 文本仍按
             # 普通消息提交，避免猜测用户语义。
@@ -1618,7 +1638,7 @@ class ChatApp(App):
         transport_by_name = {
             spec.name: spec.transport.upper() for spec in self.orch.specs
         }
-        transport_by_name[HOST_NAME] = "NATIVE-MODEL"
+        transport_by_name[HOST_NAME] = self.orch.host_backend_status().transport
         rows = ["Agent 就绪状态："]
         for status in self.orch.agent_readiness_snapshot():
             rows.append(
@@ -1629,6 +1649,43 @@ class ChatApp(App):
                 rows.append(f"  建议：{status.setup_hint}")
         rows.append("重新检测：/agents rescan（不会安装或改动任何 agent）")
         self._system("\n".join(rows))
+
+    def action_show_host(self) -> None:
+        status = self.orch.host_backend_status()
+        selection = status.selection
+        kind = "直接模型" if selection.kind == "model" else "完整 Agent"
+        reference = (
+            f"{selection.reference}={selection.target}"
+            if selection.kind == "model" else f"agent={selection.target}"
+        )
+        self._system(
+            "当前会话 Host：\n"
+            f"类型：{kind}\n"
+            f"选择：{reference}\n"
+            f"目标：{status.resolved_target}\n"
+            f"状态：{status.readiness.state.label} · {status.transport}\n"
+            f"详情：{status.readiness.detail}\n"
+            "切换：/host model <profile-or-exact-model-id> 或 "
+            "/host agent <agent>"
+        )
+
+    async def _switch_host_backend(self, kind: str, target: str) -> None:
+        if self.bus.has_pending():
+            self._write(
+                "system",
+                "当前会话有任务正在运行或排队；结束后再切换 Host",
+                "bold red",
+            )
+            return
+        try:
+            status = await self.orch.switch_host_backend(kind, target)
+        except Exception as exc:
+            self._write("system", f"切换 Host 失败：{exc}", "bold red")
+            return
+        self._system(
+            f"Host 已切换：{status.selection.label} · "
+            f"{status.resolved_target} · {status.transport}"
+        )
 
     def action_rescan_agents(self) -> None:
         try:

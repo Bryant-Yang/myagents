@@ -17,6 +17,7 @@ from adapters.base import (
 
 from .model import (
     ModelEvent,
+    ModelDeliveryState,
     ModelMessage,
     ModelProvider,
     ModelProviderError,
@@ -217,7 +218,13 @@ class NativeAgentRuntime:
                 except StopAsyncIteration:
                     break
                 except TimeoutError:
-                    if committed:
+                    delivery_state = provider.delivery_state
+                    if committed or delivery_state in {
+                        ModelDeliveryState.ATTEMPTED,
+                        ModelDeliveryState.COMMITTED,
+                    }:
+                        if not committed:
+                            yield AgentEvent("delivery_committed")
                         self._poison_session()
                         raise AgentDeliveryUncertainError(
                             "原生模型会话连续 "
@@ -243,10 +250,23 @@ class NativeAgentRuntime:
                 if mapped is not None:
                     yield mapped
         except ModelProviderUncertainError as exc:
+            delivery_state = provider.delivery_state
+            if delivery_state in {
+                ModelDeliveryState.ATTEMPTED,
+                ModelDeliveryState.COMMITTED,
+            } and not committed:
+                yield AgentEvent("delivery_committed")
             self._poison_session()
             raise AgentDeliveryUncertainError(str(exc)) from exc
         except asyncio.CancelledError as exc:
-            if committed:
+            delivery_state = provider.delivery_state
+            request_attempted = delivery_state in {
+                ModelDeliveryState.ATTEMPTED,
+                ModelDeliveryState.COMMITTED,
+            }
+            if committed or request_attempted:
+                if not committed:
+                    yield AgentEvent("delivery_committed")
                 self._poison_session()
                 raise AgentDeliveryCancelledError(
                     "原生模型请求已提交并被取消") from exc

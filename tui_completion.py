@@ -41,6 +41,9 @@ LOCAL_COMMANDS: tuple[LocalCommand, ...] = (
         "agents rescan", "重新检测本机 agent", "action_rescan_agents"),
     LocalCommand("roles", "查看当前会话角色", "action_show_roles"),
     LocalCommand("roles clear", "清空当前会话角色", "action_clear_roles"),
+    LocalCommand("host", "查看当前会话主持后端", "action_show_host"),
+    LocalCommand("host model", "切换为模型主持后端", "action_show_host"),
+    LocalCommand("host agent", "切换为完整 agent 主持后端", "action_show_host"),
     LocalCommand("yolo", "切换当前会话自动完全授权", "action_toggle_yolo"),
     LocalCommand("help", "查看本地命令与快捷键", "action_show_help"),
 )
@@ -51,7 +54,8 @@ _MENTION_AT_CURSOR_RE = re.compile(r"(?<!\w)@(\w*)$")
 # 仍会被现有路由识别为显式 mention。
 _MENTION_RE = re.compile(r"@(\w+)")
 _TOKEN_TAIL_RE = re.compile(r"[\w-]*")
-_SLASH_AT_CURSOR_RE = re.compile(r"^(\s*)/([\w-]*)$")
+_SLASH_AT_CURSOR_RE = re.compile(
+    r"^(\s*)/([\w-]*(?:\s+[\w-]*)?)$")
 
 
 @dataclass(frozen=True)

@@ -10,9 +10,9 @@ from adapters.base import DEFAULT_AGENT_INACTIVITY_TIMEOUT
 
 from .config import (
     MODEL_ID_ENV,
-    NativeModelConfig,
     NativeModelConfigurationError,
     native_model_setup_hint,
+    resolve_native_model_config,
 )
 from .model import ModelProvider, ModelProviderError
 from .openai_compatible import OpenAICompatibleProvider
@@ -25,11 +25,15 @@ class OpenAICompatibleConfigResolver:
 
     environ: Mapping[str, str] | None = None
     config_path: str | os.PathLike[str] | None = None
+    target: str = "default"
+    reference: str = "profile"
 
     def __call__(self) -> tuple[ModelProvider, str]:
         try:
-            config = NativeModelConfig.from_sources(
-                self.environ,
+            config = resolve_native_model_config(
+                self.target,
+                reference=self.reference,
+                environ=self.environ,
                 config_path=self.config_path,
             )
         except NativeModelConfigurationError as exc:
@@ -45,6 +49,7 @@ class OpenAICompatibleConfigResolver:
             OpenAICompatibleProvider(
                 config.base_url,
                 api_key=config.api_key,
+                models_discovery=config.models_discovery,
             ),
             config.model_id,
         )
@@ -55,10 +60,13 @@ def create_native_host_runtime(
     environ: Mapping[str, str] | None = None,
     config_path: str | os.PathLike[str] | None = None,
     inactivity_timeout: float = DEFAULT_AGENT_INACTIVITY_TIMEOUT,
+    target: str = "default",
+    reference: str = "profile",
 ) -> NativeAgentRuntime:
     """Production factory for the myagents-owned, tool-less host runtime."""
     return NativeAgentRuntime.from_resolver(
-        OpenAICompatibleConfigResolver(environ, config_path),
+        OpenAICompatibleConfigResolver(
+            environ, config_path, target, reference),
         name="host",
         system_prompt=HOST_SYSTEM_PROMPT,
         inactivity_timeout=inactivity_timeout,

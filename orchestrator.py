@@ -55,6 +55,7 @@ from adapters.base import (
     ExecutionMode,
 )
 from codex_app_server.adapter import CodexAppServerAdapter
+from clipboard_image import prompt_images
 from dsh_acp import AcpDshAdapter, dsh_readiness_probe
 from pi_rpc.adapter import PiRpcAdapter
 from collaboration import (
@@ -73,7 +74,18 @@ from discussion import (
     participant_assignment,
 )
 from host import MODERATOR_TEMPLATE, HostAgent
-from native_agent import native_host_readiness_probe
+from host_backend import (
+    HostBackendSelection,
+    HostBackendStatus,
+    HostBackendValidationError,
+)
+from native_agent import (
+    NativeModelConfigurationError,
+    create_native_host_runtime,
+    native_model_profile_names,
+    native_host_readiness_probe,
+    resolve_native_model_config,
+)
 from session_roles import (
     SessionRole,
     SessionRoleChanges,
@@ -124,6 +136,8 @@ class AgentSpec:
     transport: str  # "acp" | "acp+jsonl" | "app-server" | "rpc" | "jsonl"
     factory: Callable[[], AgentAdapter]
     probe: ReadinessProbe | None = None
+    host_factory: Callable[[], AgentAdapter] | None = None
+    host_probe: ReadinessProbe | None = None
 
 
 @dataclass(frozen=True)
@@ -190,11 +204,44 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
     AgentSpec(
         "codex", "app-server", CodexAppServerAdapter,
         executable_probe("codex", ("codex",), "安装 Codex CLI"),
+        lambda: CodexAppServerAdapter(
+            sandbox="read-only",
+            approval_policy="never",
+            fallback_jsonl=False,
+        ),
+        executable_probe("codex", ("codex",), "安装 Codex CLI"),
     ),
 )
 AGENTS: dict[str, AgentSpec] = {spec.name: spec for spec in AGENT_SPECS}
 
 _HOST_READINESS_PROBE = native_host_readiness_probe
+_HOST_CLOSE_TIMEOUT = 10.0
+
+
+class _UnavailableHostAdapter:
+    """Fail-closed placeholder for a persisted but unavailable selection."""
+
+    name = HOST_NAME
+    session_id = None
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+
+    async def stream(self, *_args, **_kwargs):
+        raise RuntimeError(self.detail)
+        yield AgentEvent("done")  # pragma: no cover
+
+
+async def _close_host_bounded(host: HostAgent) -> None:
+    await asyncio.wait_for(host.aclose(), timeout=_HOST_CLOSE_TIMEOUT)
+
+
+async def _close_host_quietly(host: HostAgent) -> None:
+    """Best-effort candidate cleanup without hiding the primary switch error."""
+    try:
+        await _close_host_bounded(host)
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 def _ready_probe(name: str) -> ReadinessProbe:
@@ -341,12 +388,16 @@ class Orchestrator:
                  session_name: str = DEFAULT_SESSION_NAME,
                  workspace_inspector=None,
                  discover_agents: bool = False,
-                 host_probe: ReadinessProbe | None = None) -> None:
+                 host_probe: ReadinessProbe | None = None,
+                 host_model_factory: Callable[
+                     [HostBackendSelection], AgentAdapter] | None = None,
+                 ) -> None:
         self.workdir = workdir
         self.session_name = normalize_session_name(session_name)
         self.history_limit = history_limit
         self.specs = specs
         self.discover_agents = discover_agents
+        self._host_model_factory = host_model_factory
         self._registered_names = tuple(
             dict.fromkeys((*[spec.name for spec in specs], HOST_NAME)))
         probes: dict[str, ReadinessProbe] = {
@@ -382,12 +433,6 @@ class Orchestrator:
                     spec.name,
                     f"adapter 初始化失败：{exc}",
                 )
-        # 主持人也注册进 adapters：@host 时和工人走同一条派发路径，
-        # 只是 _build_prompt 会给它主持人角色的 prompt。
-        # host 是产品级 moderator/supervisor；底层由 myagents 自有、无工具的
-        # native model runtime 驱动，不依赖任何第三方 agent CLI。
-        self.host = HostAgent(workers=[spec.name for spec in specs])
-        self.adapters[HOST_NAME] = self.host
         # 持久化：persistent=True 默认按 workdir/session 打开 RoomStore；
         # 调用方也可注入自己的 store（必须属于同一房间，fail loudly）。
         # persistent=False 用于测试/一次性场景，不触碰任何磁盘状态。
@@ -406,6 +451,37 @@ class Orchestrator:
                     f"store 属于会话 {store.session_name!r}，"
                     f"与请求会话 {self.session_name!r} 不一致")
             self.store = store
+        self._host_backend = (
+            self.store.get_host_backend()
+            if self.store is not None
+            else HostBackendSelection.default()
+        )
+        host_status = self._probe_host_backend(self._host_backend)
+        self._readiness.set_status(host_status)
+        host_adapter: AgentAdapter
+        if host_status.ready:
+            try:
+                host_adapter = self._create_host_adapter(self._host_backend)
+            except Exception as exc:
+                host_status = AgentReadiness(
+                    HOST_NAME,
+                    ReadinessState.INVALID,
+                    f"host backend 初始化失败：{exc}",
+                    host_status.setup_hint,
+                )
+                self._readiness.set_status(host_status)
+                host_adapter = _UnavailableHostAdapter(host_status.detail)
+        else:
+            host_adapter = _UnavailableHostAdapter(host_status.detail)
+        # Host is always a separate instance, even when its backend target is
+        # also registered as a worker (for example @codex).
+        self.host = HostAgent(
+            host_adapter,
+            workers=[spec.name for spec in specs],
+            backend_kind=self._host_backend.kind,
+            fresh_replay_floor=self._host_fresh_replay_floor(),
+        )
+        self.adapters[HOST_NAME] = self.host
         self._session_roles: dict[str, SessionRole] = (
             self.store.get_session_roles()
             if self.store is not None else {}
@@ -414,7 +490,9 @@ class Orchestrator:
             self.store.room_dir / "attachments"
             if self.store is not None else None
         )
-        for adapter in self.adapters.values():
+        for name, adapter in self.adapters.items():
+            if name == HOST_NAME:
+                continue
             setter = getattr(adapter, "set_attachment_root", None)
             if setter is not None:
                 setter(self._attachment_root)
@@ -451,6 +529,16 @@ class Orchestrator:
                         f"agent {name!r} 的持久化 cursor={cursor} 超出当前 "
                         f"timeline 最大 seq={max_seq}")
             self._cursors[name] = cursor
+        if self.store is not None:
+            boundary = self._host_fresh_replay_floor()
+            host_cursor = self.store.get_agent_state(HOST_NAME)["cursor"]
+            if boundary > max_seq or boundary > host_cursor:
+                raise CorruptedStorageError(
+                    "host backend replay boundary 超出 timeline/cursor")
+            # An unavailable Host uses a stateless fail-closed placeholder, but
+            # its durable cursor remains valid and must survive until a later
+            # readiness rescan can construct the selected backend.
+            self._cursors[HOST_NAME] = host_cursor
         # 单写者 lease：只读加载/校验全部通过后、返回给调用方前获取；
         # 之后本房间的所有写入都受 lease 保护。获取失败（RoomBusyError）
         # 时构造失败，此时尚无 lease 需要释放。
@@ -462,6 +550,11 @@ class Orchestrator:
         # dispatch 会都按旧 cursor 构造 prompt，重复/乱序投递。
         self._delivery_locks: dict[str, asyncio.Lock] = {}
         self._active_workflows: dict[str, MilestoneWorkflow] = {}
+        self._active_dispatches = 0
+        # A timed-out/failed Host close may leave the old runtime alive. Keep
+        # the room fail-closed until restart; a passive rescan cannot prove the
+        # process was reaped and therefore must not revive readiness.
+        self._host_close_failure: str | None = None
         # 关闭标志：aclose() 原子置位；dispatch 与排队中的 _run_one 据此
         # 拒绝新工作，closed 后不再写 timeline、不再 start/load/prompt。
         self._closed = False
@@ -500,6 +593,207 @@ class Orchestrator:
     def host_readiness_probe(self) -> ReadinessProbe:
         """供同一 TUI 创建的新 room 复用完全相同的 host 探测契约。"""
         return self._host_readiness_probe
+
+    @property
+    def host_model_factory(
+        self,
+    ) -> Callable[[HostBackendSelection], AgentAdapter] | None:
+        """Propagate an injected model factory to sibling room runtimes."""
+        return self._host_model_factory
+
+    @property
+    def host_backend_selection(self) -> HostBackendSelection:
+        return self._host_backend
+
+    def host_backend_status(self) -> HostBackendStatus:
+        readiness = next(
+            item for item in self._readiness.snapshot()
+            if item.name == HOST_NAME)
+        selection = self._host_backend
+        resolved = selection.target
+        transport = "NATIVE-MODEL"
+        if selection.kind == "agent":
+            spec = self._host_agent_spec(selection.target)
+            if spec is not None:
+                transport = f"HOST-AGENT/{spec.transport.upper()}"
+        else:
+            try:
+                config = resolve_native_model_config(
+                    selection.target,
+                    reference=selection.reference or "profile",
+                )
+                resolved = config.model_id
+            except NativeModelConfigurationError:
+                pass
+        return HostBackendStatus(
+            selection, readiness, transport, resolved)
+
+    def _host_agent_spec(self, name: str) -> AgentSpec | None:
+        return next((spec for spec in self.specs if spec.name == name), None)
+
+    def _probe_host_backend(
+        self,
+        selection: HostBackendSelection,
+    ) -> AgentReadiness:
+        if selection.kind == "model":
+            if not self.discover_agents:
+                return self._host_readiness_probe()
+            if selection.reference == "model":
+                return native_host_readiness_probe(
+                    exact_model_id=selection.target)
+            if selection.target == "default" \
+                    and self._host_readiness_probe is not _HOST_READINESS_PROBE:
+                return self._host_readiness_probe()
+            return native_host_readiness_probe(profile=selection.target)
+        spec = self._host_agent_spec(selection.target)
+        if spec is None or spec.host_factory is None:
+            return AgentReadiness(
+                HOST_NAME,
+                ReadinessState.INVALID,
+                f"agent {selection.target!r} 未声明 host-safe read-only factory",
+                "使用 /host agent <支持的 agent> 或 /host model <profile>",
+            )
+        probe = spec.host_probe or spec.probe
+        if not self.discover_agents or probe is None:
+            return AgentReadiness(
+                HOST_NAME,
+                ReadinessState.READY,
+                f"agent host {selection.target} 已注册独立只读实例",
+                "无需本机 CLI 探测",
+            )
+        try:
+            source = probe()
+        except Exception as exc:
+            return AgentReadiness(
+                HOST_NAME,
+                ReadinessState.INVALID,
+                f"agent host {selection.target} 探测失败：{exc}",
+                "执行 /agents rescan",
+            )
+        return AgentReadiness(
+            HOST_NAME,
+            source.state,
+            f"agent host {selection.target}：{source.detail}",
+            source.setup_hint,
+            source.executable,
+        )
+
+    def _create_host_adapter(
+        self,
+        selection: HostBackendSelection,
+    ) -> AgentAdapter:
+        if selection.kind == "model":
+            if self._host_model_factory is not None:
+                return self._host_model_factory(selection)
+            return create_native_host_runtime(
+                target=selection.target,
+                reference=selection.reference or "profile",
+            )
+        spec = self._host_agent_spec(selection.target)
+        if spec is None or spec.host_factory is None:
+            raise HostBackendValidationError(
+                f"agent {selection.target!r} 不能作为 host")
+        return spec.host_factory()
+
+    def _host_fresh_replay_floor(self) -> int:
+        """Return the durable no-replay floor for fresh Host sessions."""
+        if self.store is None:
+            return 0
+        return self.store.get_host_replay_floor()
+
+    def _create_host(
+        self,
+        selection: HostBackendSelection,
+        *,
+        fresh_replay_floor: int,
+    ) -> HostAgent:
+        return HostAgent(
+            self._create_host_adapter(selection),
+            workers=[spec.name for spec in self.specs],
+            backend_kind=selection.kind,
+            fresh_replay_floor=fresh_replay_floor,
+        )
+
+    def _selection_for_model_target(
+        self,
+        target: str,
+    ) -> HostBackendSelection:
+        if target in native_model_profile_names():
+            return HostBackendSelection.model_profile(target)
+        if target == "default":
+            return HostBackendSelection.model_profile(target)
+        return HostBackendSelection.exact_model(target)
+
+    async def switch_host_backend(
+        self,
+        kind: str,
+        target: str,
+    ) -> HostBackendStatus:
+        """Atomically switch this room to a fresh, independently owned host."""
+        if self._closed:
+            raise OrchestratorClosedError("Orchestrator 已关闭，拒绝切换 host")
+        if self._host_close_failure is not None:
+            raise RuntimeError(
+                "旧 host runtime 未确认关闭；为避免双 writer，"
+                "请重启当前会话后再切换")
+        if self._active_dispatches:
+            raise RuntimeError("当前仍有运行或已进入派发的任务；结束后再切换 host")
+        selection = (
+            self._selection_for_model_target(target)
+            if kind == "model"
+            else HostBackendSelection.agent(target)
+        )
+        status = self._probe_host_backend(selection)
+        if not status.ready:
+            raise AgentUnavailableError([status], purpose="切换 host")
+        lock = self._delivery_lock(HOST_NAME)
+        if lock.locked():
+            raise RuntimeError("host 正在运行；请在当前阶段结束后再切换")
+        boundary = self.history[-1].seq if self.history else 0
+        candidate = self._create_host(
+            selection, fresh_replay_floor=boundary)
+
+        await lock.acquire()
+        old_host = self.host
+        old_selection = self._host_backend
+        try:
+            try:
+                await _close_host_bounded(old_host)
+            except BaseException as exc:
+                await _close_host_quietly(candidate)
+                self._host_close_failure = str(exc)
+                old_status = self._probe_host_backend(old_selection)
+                self._readiness.set_status(AgentReadiness(
+                    HOST_NAME,
+                    ReadinessState.INVALID,
+                    f"旧 host runtime 关闭失败：{exc}",
+                    old_status.setup_hint,
+                    old_status.executable,
+                ))
+                # Keep the original handle so final room shutdown can retry its
+                # bounded close. Publishing a replacement here could create a
+                # second writer while the old runtime is still alive.
+                raise
+            try:
+                if self.store is not None:
+                    self.store.set_host_backend(selection, cursor=boundary)
+            except BaseException:
+                await _close_host_quietly(candidate)
+                replacement = self._create_host(
+                    old_selection,
+                    fresh_replay_floor=self._host_fresh_replay_floor(),
+                )
+                self.host = replacement
+                self.adapters[HOST_NAME] = replacement
+                raise
+            self._host_backend = selection
+            self.host = candidate
+            self.adapters[HOST_NAME] = candidate
+            self._cursors[HOST_NAME] = boundary
+            self._readiness.set_status(status)
+        finally:
+            lock.release()
+        return self.host_backend_status()
 
     def ready_worker_names(self) -> list[str]:
         """返回可安全派发且 adapter 已构造的 worker，保持注册顺序。"""
@@ -562,6 +856,32 @@ class Orchestrator:
             self.adapters[spec.name] = adapter
             if cursor is not None:
                 self._cursors[spec.name] = cursor
+        host_status = self._probe_host_backend(self._host_backend)
+        if self._host_close_failure is not None:
+            host_status = AgentReadiness(
+                HOST_NAME,
+                ReadinessState.INVALID,
+                f"旧 host runtime 关闭失败：{self._host_close_failure}",
+                "重启当前会话，确认旧 runtime 已回收后再试",
+            )
+        self._readiness.set_status(host_status)
+        if host_status.ready and isinstance(
+                self.host.adapter, _UnavailableHostAdapter):
+            try:
+                host = self._create_host(
+                    self._host_backend,
+                    fresh_replay_floor=self._host_fresh_replay_floor(),
+                )
+                self.host = host
+                self.adapters[HOST_NAME] = host
+                if host.stateful_session:
+                    cursor = 0
+                    if self.store is not None:
+                        cursor = self.store.get_agent_state(HOST_NAME)["cursor"]
+                    self._cursors[HOST_NAME] = cursor
+            except Exception as exc:
+                self._readiness.mark_invalid(
+                    HOST_NAME, f"host backend 初始化失败：{exc}")
         return self._readiness.snapshot()
 
     def require_message_agents(self, text: str) -> None:
@@ -774,7 +1094,7 @@ class Orchestrator:
         else:
             msgs = [m for m in snapshot[-self.history_limit:]
                     if m.speaker != name]
-        if not msgs:
+        if not msgs and cursor == 0:
             # 没有新消息也要给出触发点（快照窗口里可能只剩自己的发言）
             msgs = [m for m in snapshot if m.speaker != name][-1:]
         return msgs, snapshot_end_seq
@@ -826,6 +1146,17 @@ class Orchestrator:
 
     async def dispatch(self, user_text: str, on_event: EventCallback,
                        command_id: str | None = None) -> DispatchOutcome:
+        """Gate HostBackend switching across the whole accepted dispatch."""
+        if self._closed:
+            raise OrchestratorClosedError("Orchestrator 已关闭，拒绝 dispatch")
+        self._active_dispatches += 1
+        try:
+            return await self._dispatch(user_text, on_event, command_id)
+        finally:
+            self._active_dispatches -= 1
+
+    async def _dispatch(self, user_text: str, on_event: EventCallback,
+                        command_id: str | None = None) -> DispatchOutcome:
         """处理一条用户消息：记录 → 路由/计划 → 派发 → 收回回复。
 
         路由规则：显式 @ 普通情况下直接 fan-out；明确先后关系时，host 只在
@@ -871,6 +1202,18 @@ class Orchestrator:
             return await self._dispatch_discussion(
                 discussion, user_text, on_event, command_id)
         targets = self.parse_mentions(user_text)
+        image_routed_from_host = False
+        if HOST_NAME in targets and prompt_images(
+                user_text, self._attachment_root):
+            worker_targets = [name for name in targets if name != HOST_NAME]
+            if not worker_targets:
+                worker_targets = self.ready_worker_names()[:1]
+            if not worker_targets:
+                raise RuntimeError(
+                    "host 没有图片能力，且当前没有可用 worker 可接收附件")
+            self._readiness.require(worker_targets, purpose="图片任务")
+            targets = worker_targets
+            image_routed_from_host = True
         explicit_collaboration = self._is_explicit_collaboration_candidate(
             user_text, targets)
         natural_discussion = (
@@ -895,6 +1238,15 @@ class Orchestrator:
         on_event("user", AgentEvent("committed", user_text,
                                     meta={"seq": committed.seq,
                                           "command_id": command_id}))
+        if image_routed_from_host:
+            on_event(HOST_NAME, AgentEvent(
+                "info",
+                f"图片路由 → {'、'.join(targets)}",
+                meta={
+                    "route_targets": list(targets),
+                    "phase": "图片路由完成",
+                },
+            ))
         # 快照（在第一个 await 之前）：等待 host 处理或 agent 启动期间，
         # 用户可能又提交了新消息进 history。JSONL agent 和 host 路由的
         # prompt 必须用快照拼接，否则并发消息会串话（agent 执行错任务）。
@@ -908,10 +1260,9 @@ class Orchestrator:
         collaboration: CollaborationPlan | None = None
         routed_by_host = not targets
         if routed_by_host:
-            # decide 不在 _run_one 的异常保护里，自己兜底。契约：
-            # 路由失败 → error 事件 + 确定性回退到第一个工人（可用性
-            # 最高的路径）。绝不回退到 host adapter 本身——路由失败
-            # 大概率就是它挂了，再调一次只会伪造出"无文本回复"。
+            # Host backend failure is terminal for this command. It must never
+            # silently execute the same request through a different worker or
+            # backend because the original model/agent may already have seen it.
             on_event(HOST_NAME, AgentEvent(
                 "status",
                 "正在路由",
@@ -949,15 +1300,7 @@ class Orchestrator:
                 return DispatchOutcome((AgentFailure(HOST_NAME, str(exc)),))
             except Exception as exc:
                 on_event(HOST_NAME, AgentEvent("error", f"host 处理失败：{exc}"))
-                ready_workers = self.ready_worker_names()
-                if not ready_workers:
-                    return DispatchOutcome((AgentFailure(
-                        HOST_NAME,
-                        "host 路由失败，且当前没有可用 worker；"
-                        "请执行 /agents 查看状态",
-                    ),))
-                targets = ready_workers[:1]
-                reason = f"路由失败，回退到 {targets[0]}"
+                return DispatchOutcome((AgentFailure(HOST_NAME, str(exc)),))
             else:
                 if decision.answer is not None:
                     # host 在“判断是否路由”的同一次 LLM 调用里已经给出最终
@@ -1552,6 +1895,11 @@ class Orchestrator:
             # 构造——否则并发的两个 dispatch 都按旧 cursor 构造 prompt，
             # 第二轮会重复/乱序投递。不同 agent 持不同的锁，并行扇出不受影响。
             async with self._delivery_lock(name):
+                # HostBackend 可能在本轮等锁时完成切换。
+                # adapter 必须在锁内重新解析，否则会对已关闭的旧
+                # runtime 发起请求。worker 的 adapter 不会被切换，
+                # 但复用这一统一规则避免通用层按名分支。
+                adapter = self.adapters[name]
                 if self._closed:
                     # 用户消息已提交、但本轮排队期间 orchestrator 已关闭：
                     # 绝不 start/load/prompt agent
@@ -1649,7 +1997,10 @@ class Orchestrator:
             if (prep.fresh and not prep.restored
                     and getattr(
                         adapter, "replay_history_on_fresh_session", True)):
-                chosen = 0
+                chosen = max(
+                    0,
+                    int(getattr(adapter, "fresh_replay_floor", 0)),
+                )
             else:
                 chosen = self._cursors.get(name, 0)
             if self.store is not None:
@@ -1753,8 +2104,11 @@ class Orchestrator:
         max_seq: int,
     ) -> str:
         """Run one model-only host call through the durable prepared seam."""
-        adapter = self.host
         async with self._delivery_lock(HOST_NAME):
+            # A backend switch may finish while this semantic call waits for
+            # the Host writer lock. Resolve the published Host only after the
+            # lock is acquired, exactly like the explicit @host path.
+            adapter = self.host
             if self._closed:
                 raise OrchestratorClosedError(
                     "Orchestrator 已关闭，放弃 host 语义调用")
@@ -1835,5 +2189,8 @@ class Orchestrator:
         """先落盘再更新内存；成功轮与 post-submit no-replay 共用。"""
         committed = max(self._cursors.get(name, 0), delivered_upto)
         if self.store is not None:
-            self.store.set_agent_state(name, cursor=committed)
+            if name == HOST_NAME:
+                self.store.commit_host_cursor(committed)
+            else:
+                self.store.set_agent_state(name, cursor=committed)
         self._cursors[name] = committed

@@ -471,14 +471,14 @@ transport adapter 执行；Orchestrator/workflow 不直接启动子进程。外�
   Orchestrator、不获取 lease、不绕过 TUI 权限。细节见
   [ADR-0001](adr/0001-persistent-room-command-bus-mcp.md)
 - [x] **Phase 4**：Codex 官方 app-server worker 接入：长驻进程、thread/turn、
-  流式 item、approval、interrupt、恢复和安全 JSONL fallback；历史 host
-  ephemeral contract 仍保留，但生产 host 已由 ADR-0017 取代。详见
+  流式 item、approval、interrupt、恢复和安全 JSONL fallback；ADR-0017 允许
+  通过独立 read-only factory 将 Codex 显式选为 Host，但不复用 worker。详见
   [ADR-0003](adr/0003-codex-app-server-transport.md)与
   [ADR-0004](adr/0004-ephemeral-codex-host-threads.md)。Claude 尚未注册；
   后续按其可靠官方协议单独接入，不把厂商协议强行伪装成 ACP。
-- [x] **Phase 4.14**：myagents 原生模型 runtime 驱动 host；首个
-  OpenAI-compatible provider 覆盖 LM Studio，host 永久无工具并保持
-  session/cancel/timeout/no-replay。见 ADR-0017。
+- [x] **Phase 4.14**：会话级 HostBackend 支持原生模型 runtime 与明确注册的
+  独立只读 agent Host；首个 OpenAI-compatible provider 覆盖 LM Studio，保持
+  session/cancel/timeout/no-replay 与零自动 fallback。见 ADR-0017。
 - [x] **Phase 4.4**：Kimi hybrid transport：保持 ACP-first，仅在新连接
   prepare 失败时进入内置只读 JSONL profile；伪 checkpoint 下轮新建
   ACP session，prompt 拒绝与 post-submit 失败禁止重放。见 ADR-0006。

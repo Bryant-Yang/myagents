@@ -237,6 +237,69 @@ def test_local_image_uses_fake_wire_contract() -> None:
     print("ok  Codex fake contract 接收 localImage")
 
 
+def test_agent_host_routes_image_to_worker_without_host_local_image() -> None:
+    """Host has no image transport; explicit @host images route to a worker."""
+    async def body() -> None:
+        reset_state()
+        with TemporaryDirectory() as tmp:
+            workdir = Path(tmp) / "work"
+            workdir.mkdir()
+            store = RoomStore(workdir, Path(tmp) / "state")
+            attachments = store.room_dir / "attachments"
+            attachments.mkdir(mode=0o700)
+            image = attachments / "img-0001.png"
+            image.write_bytes(_PNG)
+            image.chmod(0o600)
+            spec = AgentSpec(
+                "codex",
+                "app-server",
+                lambda: CodexAppServerAdapter(CMD, fallback_jsonl=False),
+                host_factory=lambda: CodexAppServerAdapter(
+                    CMD,
+                    sandbox="read-only",
+                    approval_policy="never",
+                    fallback_jsonl=False,
+                ),
+            )
+            orch = Orchestrator(
+                str(workdir), specs=(spec,), store=store)
+            events: list[tuple[str, AgentEvent]] = []
+            try:
+                await orch.switch_host_backend("agent", "codex")
+                await orch.dispatch(
+                    "@host [图片 1] 看看这张图",
+                    lambda name, event: events.append((name, event)),
+                )
+            finally:
+                await orch.aclose()
+
+            turn_params = [
+                json.loads(line.split(":", 1)[1])
+                for line in state_events()
+                if line.startswith("turn-params:")
+            ]
+            assert len(turn_params) == 1, state_events()
+            assert any(
+                item.get("type") == "localImage"
+                and item.get("path") == str(image.resolve())
+                for item in turn_params[0]["input"]
+            )
+            assert any(
+                name == "host"
+                and event.kind == "info"
+                and event.meta.get("phase") == "图片路由完成"
+                for name, event in events
+            )
+            assert any(
+                name == "codex" and event.kind == "done"
+                for name, event in events
+            )
+        assert_no_violation()
+
+    run(body())
+    print("ok  agent Host 图片确定性路由到 worker（Host 无 localImage）")
+
+
 def test_command_approval_default_deny() -> None:
     """验收 5：server 反向 command 审批请求，client 默认拒绝。"""
     async def body() -> None:
@@ -1185,6 +1248,7 @@ def test_aclose_is_bounded_when_owner_swallows_cancellation() -> None:
 if __name__ == "__main__":
     test_handshake_two_turns_same_thread_and_pid()
     test_local_image_uses_fake_wire_contract()
+    test_agent_host_routes_image_to_worker_without_host_local_image()
     test_command_approval_default_deny()
     test_pending_request_fails_on_disconnect()
     test_client_close_is_bounded_when_event_queue_is_full()

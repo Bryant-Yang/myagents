@@ -14,7 +14,8 @@ M3 能提交命令并查询 queued/running/terminal，但 agent 在一轮内长�
 
 这不是自然语言路由问题，也不能靠为 `hi` 等输入建立关键词白名单解决。
 当时的 Codex host 模型、reasoning、plugin 与 MCP 配置继续继承用户默认配置；
-生产 host 已于 ADR-0017 改为显式配置的原生无工具 model runtime。
+ADR-0017 后默认 Host 是显式配置的原生无工具 model runtime，也可按 room 切换到
+由独立 host-safe factory 构造的 read-only agent Host。
 
 ## 2. 决策
 

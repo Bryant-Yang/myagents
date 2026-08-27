@@ -184,14 +184,24 @@ class HostCollaboration:
 
 
 class HostAgent:
-    """Product-level supervisor over a tool-less native agent runtime."""
+    """Product supervisor over either a model or host-safe agent backend."""
 
     name = "host"
 
     def __init__(self, adapter: AgentAdapter | None = None,
-                 workers: list[str] | None = None) -> None:
+                 workers: list[str] | None = None, *,
+                 backend_kind: str = "model",
+                 fresh_replay_floor: int = 0) -> None:
+        if backend_kind not in {"model", "agent"}:
+            raise ValueError(f"未知 host backend kind：{backend_kind!r}")
+        if (not isinstance(fresh_replay_floor, int)
+                or isinstance(fresh_replay_floor, bool)
+                or fresh_replay_floor < 0):
+            raise ValueError("host fresh replay floor 必须是非负整数")
         self.adapter = adapter or create_native_host_runtime()
         self.workers = workers or []
+        self.backend_kind = backend_kind
+        self.fresh_replay_floor = fresh_replay_floor
 
     @property
     def session_id(self) -> str | None:  # 满足 AgentAdapter 协议
@@ -340,6 +350,9 @@ class HostAgent:
         if self.stateful_session:
             raise RuntimeError(
                 "有状态 host 语义调用必须通过 prepared delivery seam")
+        if self.backend_kind == "agent":
+            return self.stream(
+                prompt, workdir, execution_mode=ExecutionMode.READ_ONLY)
         return self.adapter.stream(prompt, workdir)
 
     async def extract_collaboration_plan(
@@ -436,9 +449,7 @@ class HostAgent:
                 "host 返回的讨论意图不是合法 JSON")
         if raw:
             return HostDecision([], "host 直接回答", raw)
-        # 空输出没有可展示答案；确定性回退到首个 worker 保持可用性。
-        targets = choices[:1]
-        return HostDecision(targets, "host 无输出，回退到 worker")
+        raise RuntimeError("host 未返回可处理内容")
 
     def stream(
         self,
@@ -448,6 +459,8 @@ class HostAgent:
         execution_mode: ExecutionMode = ExecutionMode.DEFAULT,
     ) -> AsyncIterator[AgentEvent]:
         """让 host 也能像普通 agent 一样被 dispatch（@host 时走这条路）。"""
+        if self.backend_kind == "agent":
+            execution_mode = ExecutionMode.READ_ONLY
         if execution_mode is ExecutionMode.DEFAULT:
             return self.adapter.stream(prompt, workdir)
         return self.adapter.stream(
@@ -465,6 +478,8 @@ class HostAgent:
         prepared = getattr(self.adapter, "stream_prepared", None)
         if prepared is None:
             raise RuntimeError("host 底层 adapter 不支持 stateful prepare")
+        if self.backend_kind == "agent":
+            execution_mode = ExecutionMode.READ_ONLY
         if execution_mode is ExecutionMode.DEFAULT:
             return prepared(make_prompt, workdir, resume_session_id)
         return prepared(
@@ -475,19 +490,15 @@ class HostAgent:
         )
 
     def set_permission_handler(self, handler) -> None:
-        """把通用权限处理器转发给底层 adapter，并保留 host 身份。"""
+        """Model host has no tools; agent host never inherits worker approval."""
+        if self.backend_kind == "agent":
+            return
         setter = getattr(self.adapter, "set_permission_handler", None)
         if setter is not None:
             if handler is None:
                 setter(None)
             else:
                 setter(lambda _agent_name, params: handler(self.name, params))
-
-    def set_attachment_root(self, root) -> None:
-        """把当前房间附件信任根转发给底层 transport。"""
-        setter = getattr(self.adapter, "set_attachment_root", None)
-        if setter is not None:
-            setter(root)
 
     async def aclose(self) -> None:
         """回收底层长驻 transport；无生命周期能力的旧 adapter 无操作。"""
