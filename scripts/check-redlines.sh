@@ -52,7 +52,7 @@ required_deny_defaults = {
     ROOT / "acp/client.py": {"AcpClient"},
     ROOT / "acp/adapter.py": {
         "AcpAdapter", "AcpKimiAdapter", "AcpOpenCodeAdapter",
-        "AcpQwenAdapter", "AcpWorkBuddyAdapter"},
+        "AcpQwenAdapter", "AcpCodeBuddyAdapter"},
     ROOT / "dsh_acp/adapter.py": {"AcpDshAdapter"},
 }
 for path, classes in required_deny_defaults.items():
@@ -84,7 +84,7 @@ for path, classes in required_deny_defaults.items():
 # R2: generic orchestration/runtime may register names, but may not branch on
 # specific worker literals.
 worker_names = {
-    "kimi", "codex", "opencode", "qwen", "workbuddy", "dsh", "pi",
+    "kimi", "codex", "opencode", "qwen", "codebuddy", "workbuddy", "dsh", "pi",
     "claude"}
 for path in [ROOT / "orchestrator.py", ROOT / "acp/client.py"]:
     tree = parse(path)
@@ -125,7 +125,7 @@ for path in [
                      f"上层直接调用 {attr}；改由 ACP/JSONL adapter 执行")
 
 # R4: production Kimi/OpenCode remain constrained ACP-first;
-# Qwen/WorkBuddy/DSH remain ACP-only; Pi remains attested RPC-only. JSONL is
+# Qwen/CodeBuddy/DSH remain ACP-only; Pi remains attested RPC-only. JSONL is
 # allowed only behind each verified prepare-only seam.
 orchestrator = ROOT / "orchestrator.py"
 source = orchestrator.read_text(encoding="utf-8")
@@ -157,7 +157,7 @@ expected_specs = {
     ("kimi", "acp+jsonl", "AcpKimiAdapter"),
     ("opencode", "acp+jsonl", "AcpOpenCodeAdapter"),
     ("qwen", "acp", "AcpQwenAdapter"),
-    ("workbuddy", "acp", "AcpWorkBuddyAdapter"),
+    ("codebuddy", "acp", "AcpCodeBuddyAdapter"),
     ("dsh", "acp", "AcpDshAdapter"),
     ("pi", "rpc", "PiRpcAdapter"),
 }
@@ -165,9 +165,23 @@ for name, transport, factory in sorted(expected_specs - registered_specs):
     errors.append(
         f"[R4] orchestrator.py: {name} 生产注册必须是 "
         f'AgentSpec("{name}", "{transport}", {factory}, ...)')
+if any(name == "workbuddy" for name, _transport, _factory in registered_specs):
+    errors.append(
+        "[R4] orchestrator.py: 旧 @workbuddy 不得继续注册；"
+        "独立 CLI 的产品身份必须是 @codebuddy")
 
 acp_adapter = ROOT / "acp/adapter.py"
 acp_source = acp_adapter.read_text(encoding="utf-8")
+for legacy_name in (
+    "AcpWorkBuddyAdapter",
+    "MYAGENTS_WORKBUDDY_CLI",
+    "MYAGENTS_WORKBUDDY_AUTH_METHOD",
+    "WORKBUDDY_ACP_DEFAULT_ARGS",
+    "WORKBUDDY_ACP_READ_ONLY_ARGS",
+):
+    if legacy_name in acp_source:
+        errors.append(
+            f"[R4] acp/adapter.py: 旧 CodeBuddy 身份标识仍存在：{legacy_name}")
 if "KimiAdapter.readonly_fallback()" not in acp_source:
     errors.append(
         "[R4] acp/adapter.py: AcpKimiAdapter 必须通过 "
@@ -281,15 +295,15 @@ if ("execution_cmd_overrides" not in qwen_adapter_source
     errors.append(
         "[R4] acp/adapter.py: Qwen 必须普通轮 default、read_only 轮 plan")
 
-expected_workbuddy_args = {
-    "WORKBUDDY_ACP_DEFAULT_ARGS": (
+expected_codebuddy_args = {
+    "CODEBUDDY_ACP_DEFAULT_ARGS": (
         "--acp", "--acp-transport", "stdio",
         "--permission-mode", "default",
         "--subagent-permission-mode", "dontAsk",
         "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
         "--setting-sources", "",
     ),
-    "WORKBUDDY_ACP_READ_ONLY_ARGS": (
+    "CODEBUDDY_ACP_READ_ONLY_ARGS": (
         "--acp", "--acp-transport", "stdio",
         "--permission-mode", "dontAsk",
         "--subagent-permission-mode", "dontAsk",
@@ -298,43 +312,43 @@ expected_workbuddy_args = {
         "--setting-sources", "",
     ),
 }
-workbuddy_args = {}
+codebuddy_args = {}
 for node in parse(acp_adapter).body:
     if not isinstance(node, ast.Assign):
         continue
     for target in node.targets:
         if (isinstance(target, ast.Name)
-                and target.id in expected_workbuddy_args):
+                and target.id in expected_codebuddy_args):
             try:
-                workbuddy_args[target.id] = ast.literal_eval(node.value)
+                codebuddy_args[target.id] = ast.literal_eval(node.value)
             except (ValueError, TypeError):
-                workbuddy_args[target.id] = None
-for name, expected in expected_workbuddy_args.items():
-    if workbuddy_args.get(name) != expected:
+                codebuddy_args[target.id] = None
+for name, expected in expected_codebuddy_args.items():
+    if codebuddy_args.get(name) != expected:
         errors.append(
-            f"[R4] acp/adapter.py: {name} 必须固定 WorkBuddy runtime profile")
-workbuddy_adapter_class = next(
+            f"[R4] acp/adapter.py: {name} 必须固定 CodeBuddy runtime profile")
+codebuddy_adapter_class = next(
     (node for node in parse(acp_adapter).body
-     if isinstance(node, ast.ClassDef) and node.name == "AcpWorkBuddyAdapter"),
+     if isinstance(node, ast.ClassDef) and node.name == "AcpCodeBuddyAdapter"),
     None,
 )
-workbuddy_adapter_source = (
-    ast.get_source_segment(acp_source, workbuddy_adapter_class)
-    if workbuddy_adapter_class is not None else ""
+codebuddy_adapter_source = (
+    ast.get_source_segment(acp_source, codebuddy_adapter_class)
+    if codebuddy_adapter_class is not None else ""
 )
-if ("execution_cmd_overrides" not in workbuddy_adapter_source
-        or "ExecutionMode.READ_ONLY" not in workbuddy_adapter_source
-        or "WORKBUDDY_ACP_DEFAULT_ARGS" not in workbuddy_adapter_source
-        or "WORKBUDDY_ACP_READ_ONLY_ARGS" not in workbuddy_adapter_source
-        or "MYAGENTS_WORKBUDDY_AUTH_METHOD" not in workbuddy_adapter_source
-        or "_workbuddy_auth_notification" not in workbuddy_adapter_source
-        or "auth_timeout" not in workbuddy_adapter_source
-        or "auth_required=True" not in workbuddy_adapter_source
-        or "authenticate_on_demand=True" not in workbuddy_adapter_source
-        or "CODEBUDDY_INTERNET_ENVIRONMENT" not in workbuddy_adapter_source
-        or '"internal"' not in workbuddy_adapter_source):
+if ("execution_cmd_overrides" not in codebuddy_adapter_source
+        or "ExecutionMode.READ_ONLY" not in codebuddy_adapter_source
+        or "CODEBUDDY_ACP_DEFAULT_ARGS" not in codebuddy_adapter_source
+        or "CODEBUDDY_ACP_READ_ONLY_ARGS" not in codebuddy_adapter_source
+        or "MYAGENTS_CODEBUDDY_AUTH_METHOD" not in codebuddy_adapter_source
+        or "_codebuddy_auth_notification" not in codebuddy_adapter_source
+        or "auth_timeout" not in codebuddy_adapter_source
+        or "auth_required=True" not in codebuddy_adapter_source
+        or "authenticate_on_demand=True" not in codebuddy_adapter_source
+        or "CODEBUDDY_INTERNET_ENVIRONMENT" not in codebuddy_adapter_source
+        or '"internal"' not in codebuddy_adapter_source):
     errors.append(
-        "[R4] acp/adapter.py: WorkBuddy 必须普通轮 default、read_only 轮 "
+        "[R4] acp/adapter.py: CodeBuddy 必须普通轮 default、read_only 轮 "
         "dontAsk + 只读工具闭集，固定中国区环境、按需有界认证并通过进程级 "
         "profile 隔离")
 acp_base_class = next(
@@ -356,54 +370,54 @@ if ("type(exc.code) is int" not in auth_required_guard_source
         or 'exc.remote_message == "Authentication required"'
         not in auth_required_guard_source):
     errors.append(
-        "[R4] acp/adapter.py: WorkBuddy 按需认证只允许原生整数 -32000 与"
+        "[R4] acp/adapter.py: CodeBuddy 按需认证只允许原生整数 -32000 与"
         "精确 Authentication required 消息触发")
-if ("_WORKBUDDY_APP_CLI" in acp_source
+if ("_CODEBUDDY_APP_CLI" in acp_source
         or "/Applications/WorkBuddy.app" in acp_source):
     errors.append(
-        "[R4] acp/adapter.py: WorkBuddy 只能使用可独立运行的官方 CLI，"
+        "[R4] acp/adapter.py: CodeBuddy 只能使用可独立运行的官方 CLI，"
         "不得回退到 App 包内私有二进制")
-workbuddy_resolver = next(
+codebuddy_resolver = next(
     (node for node in parse(acp_adapter).body
      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-     and node.name == "_resolve_workbuddy_cli"),
+     and node.name == "_resolve_codebuddy_cli"),
     None,
 )
-workbuddy_finder = next(
+codebuddy_finder = next(
     (node for node in parse(acp_adapter).body
      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-     and node.name == "_find_workbuddy_cli"),
+     and node.name == "_find_codebuddy_cli"),
     None,
 )
-workbuddy_validator = next(
+codebuddy_validator = next(
     (node for node in parse(acp_adapter).body
      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-     and node.name == "_validated_workbuddy_cli"),
+     and node.name == "_validated_codebuddy_cli"),
     None,
 )
-workbuddy_resolver_source = (
-    ast.get_source_segment(acp_source, workbuddy_resolver)
-    if workbuddy_resolver is not None else ""
+codebuddy_resolver_source = (
+    ast.get_source_segment(acp_source, codebuddy_resolver)
+    if codebuddy_resolver is not None else ""
 )
-workbuddy_finder_source = (
-    ast.get_source_segment(acp_source, workbuddy_finder)
-    if workbuddy_finder is not None else ""
+codebuddy_finder_source = (
+    ast.get_source_segment(acp_source, codebuddy_finder)
+    if codebuddy_finder is not None else ""
 )
-workbuddy_validator_source = (
-    ast.get_source_segment(acp_source, workbuddy_validator)
-    if workbuddy_validator is not None else ""
+codebuddy_validator_source = (
+    ast.get_source_segment(acp_source, codebuddy_validator)
+    if codebuddy_validator is not None else ""
 )
-if workbuddy_finder_source.count("_validated_workbuddy_cli") < 2:
+if codebuddy_finder_source.count("_validated_codebuddy_cli") < 2:
     errors.append(
-        "[R4] acp/adapter.py: WorkBuddy 显式 CLI 与 PATH 候选都必须经过"
+        "[R4] acp/adapter.py: CodeBuddy 显式 CLI 与 PATH 候选都必须经过"
         "独立可执行文件校验")
-if ("resolve(strict=True)" not in workbuddy_validator_source
-        or "os.access" not in workbuddy_validator_source
-        or "os.X_OK" not in workbuddy_validator_source
-        or 'endswith(".app")' not in workbuddy_validator_source
-        or '== "contents"' not in workbuddy_validator_source):
+if ("resolve(strict=True)" not in codebuddy_validator_source
+        or "os.access" not in codebuddy_validator_source
+        or "os.X_OK" not in codebuddy_validator_source
+        or 'endswith(".app")' not in codebuddy_validator_source
+        or '== "contents"' not in codebuddy_validator_source):
     errors.append(
-        "[R4] acp/adapter.py: WorkBuddy CLI 校验必须 canonicalize、要求可执行，"
+        "[R4] acp/adapter.py: CodeBuddy CLI 校验必须 canonicalize、要求可执行，"
         "并拒绝 App bundle 内目标（含符号链接）")
 
 # DSH is ACP-only. Both installed and source-backed launches use the official
@@ -1598,7 +1612,7 @@ if errors:
 print("✓ R1 权限默认 fail-closed")
 print("✓ R2 通用层无 agent-name 协议分支")
 print("✓ R3 子进程仅由 transport 层启动")
-print("✓ R4 Kimi/OpenCode 受限 ACP-first + Qwen/WorkBuddy/DSH ACP-only + Pi attested RPC-only")
+print("✓ R4 Kimi/OpenCode 受限 ACP-first + Qwen/CodeBuddy/DSH ACP-only + Pi attested RPC-only")
 print("✓ R5 自然语言讨论、/discuss 与有序协作均有界且不递归 dispatch")
 print("✓ R6 /workflow 固定阶段/单 writer/一次 repair/steering 有界")
 PY

@@ -49,7 +49,7 @@ def make_orch() -> Orchestrator:
     orch.adapters = {
         n: FakeAdapter(n)
         for n in (
-            "kimi", "opencode", "qwen", "workbuddy", "dsh", "pi", "codex"
+            "kimi", "opencode", "qwen", "codebuddy", "dsh", "pi", "codex"
         )
     }
     orch.host = FakeHost()
@@ -63,7 +63,8 @@ def test_parse_mentions() -> None:
     assert orch.parse_mentions("@kimi @opencode 比比谁快") == ["kimi", "opencode"]
     assert orch.parse_mentions("@kimi @kimi 重复只算一次") == ["kimi"]
     assert orch.parse_mentions("@qwen 看看这个") == ["qwen"]
-    assert orch.parse_mentions("@workbuddy 看看这个") == ["workbuddy"]
+    assert orch.parse_mentions("@codebuddy 看看这个") == ["codebuddy"]
+    assert orch.parse_mentions("@workbuddy 旧名字不再注册") == []
     assert orch.parse_mentions("@dsh 看看这个") == ["dsh"]
     assert orch.parse_mentions("@nobody 不存在") == []
     assert orch.parse_mentions("没有提到任何人") == []

@@ -34,7 +34,7 @@
 - probe 只允许读取环境变量、PATH、文件类型与可执行位；不得启动 CLI、联网、
   打开浏览器、读取登录会话、执行安装器或修改 shell 配置。
 - 不自动执行 `brew`、`npm` 或其他安装命令，不删除、移动或替换现有安装。
-- WorkBuddy 继续复用 R4 的 canonical executable 校验；App bundle 内私有 CLI
+- CodeBuddy 继续复用 R4 的 canonical executable 校验；App bundle 内私有 CLI
   或其他无效候选记为 `invalid`，不能为了显示 ready 而放宽安全策略。
 - `/agents rescan` 重新读取当前进程环境并同步所有已加载 room；新发现的 adapter
   只为后续任务启用，不取消或重建正在运行的任务。之后新建的 room 复用同一组

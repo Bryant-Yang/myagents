@@ -35,9 +35,9 @@ from acp.adapter import (
     AcpKimiAdapter,
     AcpOpenCodeAdapter,
     AcpQwenAdapter,
-    AcpWorkBuddyAdapter,
+    AcpCodeBuddyAdapter,
     AgentPermissionHandler,
-    workbuddy_readiness_probe,
+    codebuddy_readiness_probe,
 )
 from agent_readiness import (
     AgentReadiness,
@@ -190,8 +190,8 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         executable_probe("qwen", ("qwen",), "安装 Qwen Code CLI"),
     ),
     AgentSpec(
-        "workbuddy", "acp", AcpWorkBuddyAdapter,
-        workbuddy_readiness_probe,
+        "codebuddy", "acp", AcpCodeBuddyAdapter,
+        codebuddy_readiness_probe,
     ),
     AgentSpec(
         "dsh", "acp", AcpDshAdapter,

@@ -219,7 +219,7 @@ def make_plan_orchestrator(plan: CollaborationPlan):
     adapters = {
         name: RecordingAdapter(name, calls)
         for name in (
-            "kimi", "opencode", "qwen", "workbuddy", "dsh", "pi", "codex"
+            "kimi", "opencode", "qwen", "codebuddy", "dsh", "pi", "codex"
         )
     }
     host = PlanHost(calls, plan)
@@ -423,7 +423,7 @@ def test_too_many_explicit_participants_fail_before_timeline() -> None:
     orch, _adapters, _host, _calls = make_plan_orchestrator(plan)
     try:
         asyncio.run(orch.dispatch(
-            "先让 @kimi @opencode @qwen @workbuddy @codex 调查，再统一交付",
+            "先让 @kimi @opencode @qwen @codebuddy @codex 调查，再统一交付",
             lambda _name, _event: None,
         ))
     except CollaborationValidationError as exc:

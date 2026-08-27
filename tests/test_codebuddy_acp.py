@@ -1,6 +1,6 @@
-"""WorkBuddy ACP-only 生产接入契约。
+"""CodeBuddy ACP-only 生产接入契约。
 
-运行：.venv/bin/python tests/test_workbuddy_acp.py
+运行：.venv/bin/python tests/test_codebuddy_acp.py
 """
 
 from __future__ import annotations
@@ -19,9 +19,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from acp.adapter import (
-    AcpWorkBuddyAdapter,
+    AcpCodeBuddyAdapter,
     _open_browser,
-    _resolve_workbuddy_cli,
+    _resolve_codebuddy_cli,
 )
 from acp.client import AcpError, AcpRemoteError
 from adapters.base import ExecutionMode
@@ -30,20 +30,20 @@ from orchestrator import AGENTS, Orchestrator
 SERVER = Path(__file__).resolve().parent / "fake_acp_server.py"
 
 
-def test_workbuddy_is_registered_as_acp_only() -> None:
-    spec = AGENTS["workbuddy"]
+def test_codebuddy_is_registered_as_acp_only() -> None:
+    spec = AGENTS["codebuddy"]
     assert spec.transport == "acp"
 
     orch = Orchestrator("/tmp", persistent=False)
-    adapter = orch.adapters["workbuddy"]
-    assert isinstance(adapter, AcpWorkBuddyAdapter)
-    assert adapter.name == "workbuddy"
+    adapter = orch.adapters["codebuddy"]
+    assert isinstance(adapter, AcpCodeBuddyAdapter)
+    assert adapter.name == "codebuddy"
     assert adapter._fallback is None
 
 
-def test_workbuddy_runtime_profiles_are_isolated() -> None:
+def test_codebuddy_runtime_profiles_are_isolated() -> None:
     async def run() -> None:
-        with tempfile.TemporaryDirectory(prefix="myagents-workbuddy-fake-") as raw:
+        with tempfile.TemporaryDirectory(prefix="myagents-codebuddy-fake-") as raw:
             root = Path(raw)
             wrapper = root / "codebuddy"
             argv_log = root / "argv.jsonl"
@@ -51,21 +51,21 @@ def test_workbuddy_runtime_profiles_are_isolated() -> None:
             wrapper.write_text(
                 "#!/usr/bin/env python3\n"
                 "import json, os, sys\n"
-                "with open(os.environ['FAKE_WORKBUDDY_ARGV'], 'a') as f:\n"
+                "with open(os.environ['FAKE_CODEBUDDY_ARGV'], 'a') as f:\n"
                 "    f.write(json.dumps({\n"
                 "        'argv': sys.argv[1:],\n"
                 "        'internet_environment': os.environ.get(\n"
                 "            'CODEBUDDY_INTERNET_ENVIRONMENT'),\n"
                 "    }) + '\\n')\n"
                 "os.execv(sys.executable, [sys.executable, "
-                "os.environ['FAKE_WORKBUDDY_SERVER']])\n",
+                "os.environ['FAKE_CODEBUDDY_SERVER']])\n",
                 encoding="utf-8",
             )
             wrapper.chmod(0o700)
             env = {
-                "MYAGENTS_WORKBUDDY_CLI": str(wrapper),
-                "FAKE_WORKBUDDY_ARGV": str(argv_log),
-                "FAKE_WORKBUDDY_SERVER": str(SERVER),
+                "MYAGENTS_CODEBUDDY_CLI": str(wrapper),
+                "FAKE_CODEBUDDY_ARGV": str(argv_log),
+                "FAKE_CODEBUDDY_SERVER": str(SERVER),
                 "FAKE_ACP_STATE": str(state),
                 "FAKE_ACP_REQUIRE_AUTH": "1",
                 "FAKE_ACP_AUTH_AT_NEW": "1",
@@ -78,7 +78,7 @@ def test_workbuddy_runtime_profiles_are_isolated() -> None:
                 return True
 
             with patch.dict(os.environ, env, clear=False):
-                adapter = AcpWorkBuddyAdapter(
+                adapter = AcpCodeBuddyAdapter(
                     auth_url_opener=open_url,
                 )
                 try:
@@ -139,24 +139,24 @@ def test_workbuddy_runtime_profiles_are_isolated() -> None:
     asyncio.run(run())
 
 
-def test_workbuddy_uses_product_name_in_tui() -> None:
+def test_codebuddy_uses_product_name_in_tui() -> None:
     from main import ChatApp
 
-    rendered = ChatApp._line("workbuddy", "收到")
+    rendered = ChatApp._line("codebuddy", "收到")
     assert rendered.spans[0].style == "bold bright_magenta"
 
     orch = Orchestrator("/tmp", persistent=False)
     assert any(
-        spec.name == "workbuddy" and spec.transport == "acp"
+        spec.name == "codebuddy" and spec.transport == "acp"
         for spec in orch.specs
     )
-    assert "codebuddy" not in {spec.name for spec in orch.specs}
+    assert "workbuddy" not in {spec.name for spec in orch.specs}
     assert "cbc" not in {spec.name for spec in orch.specs}
 
 
-def test_workbuddy_authentication_is_bounded_and_fail_closed() -> None:
+def test_codebuddy_authentication_is_bounded_and_fail_closed() -> None:
     async def run() -> None:
-        with tempfile.TemporaryDirectory(prefix="myagents-workbuddy-auth-") as raw:
+        with tempfile.TemporaryDirectory(prefix="myagents-codebuddy-auth-") as raw:
             root = Path(raw)
             wrapper = root / "codebuddy"
             state = root / "state.log"
@@ -164,13 +164,13 @@ def test_workbuddy_authentication_is_bounded_and_fail_closed() -> None:
                 "#!/usr/bin/env python3\n"
                 "import os, sys\n"
                 "os.execv(sys.executable, [sys.executable, "
-                "os.environ['FAKE_WORKBUDDY_SERVER']])\n",
+                "os.environ['FAKE_CODEBUDDY_SERVER']])\n",
                 encoding="utf-8",
             )
             wrapper.chmod(0o700)
             env = {
-                "MYAGENTS_WORKBUDDY_CLI": str(wrapper),
-                "FAKE_WORKBUDDY_SERVER": str(SERVER),
+                "MYAGENTS_CODEBUDDY_CLI": str(wrapper),
+                "FAKE_CODEBUDDY_SERVER": str(SERVER),
                 "FAKE_ACP_STATE": str(state),
                 "FAKE_ACP_REQUIRE_AUTH": "1",
                 "FAKE_ACP_AUTH_AT_NEW": "1",
@@ -184,7 +184,7 @@ def test_workbuddy_authentication_is_bounded_and_fail_closed() -> None:
                 return True
 
             with patch.dict(os.environ, env, clear=False):
-                adapter = AcpWorkBuddyAdapter(
+                adapter = AcpCodeBuddyAdapter(
                     auth_timeout=0.1,
                     auth_url_opener=open_url,
                 )
@@ -211,9 +211,9 @@ def test_workbuddy_authentication_is_bounded_and_fail_closed() -> None:
     asyncio.run(run())
 
 
-def test_workbuddy_rejects_untrusted_authentication_url() -> None:
+def test_codebuddy_rejects_untrusted_authentication_url() -> None:
     async def run() -> None:
-        with tempfile.TemporaryDirectory(prefix="myagents-workbuddy-url-") as raw:
+        with tempfile.TemporaryDirectory(prefix="myagents-codebuddy-url-") as raw:
             root = Path(raw)
             wrapper = root / "codebuddy"
             state = root / "state.log"
@@ -221,13 +221,13 @@ def test_workbuddy_rejects_untrusted_authentication_url() -> None:
                 "#!/usr/bin/env python3\n"
                 "import os, sys\n"
                 "os.execv(sys.executable, [sys.executable, "
-                "os.environ['FAKE_WORKBUDDY_SERVER']])\n",
+                "os.environ['FAKE_CODEBUDDY_SERVER']])\n",
                 encoding="utf-8",
             )
             wrapper.chmod(0o700)
             env = {
-                "MYAGENTS_WORKBUDDY_CLI": str(wrapper),
-                "FAKE_WORKBUDDY_SERVER": str(SERVER),
+                "MYAGENTS_CODEBUDDY_CLI": str(wrapper),
+                "FAKE_CODEBUDDY_SERVER": str(SERVER),
                 "FAKE_ACP_STATE": str(state),
                 "FAKE_ACP_REQUIRE_AUTH": "1",
                 "FAKE_ACP_AUTH_AT_NEW": "1",
@@ -241,7 +241,7 @@ def test_workbuddy_rejects_untrusted_authentication_url() -> None:
                 return True
 
             with patch.dict(os.environ, env, clear=False):
-                adapter = AcpWorkBuddyAdapter(
+                adapter = AcpCodeBuddyAdapter(
                     auth_url_opener=open_url,
                 )
                 try:
@@ -259,9 +259,9 @@ def test_workbuddy_rejects_untrusted_authentication_url() -> None:
     asyncio.run(run())
 
 
-def test_workbuddy_auth_timeout_can_cancel_slow_browser_opener() -> None:
+def test_codebuddy_auth_timeout_can_cancel_slow_browser_opener() -> None:
     async def run() -> None:
-        with tempfile.TemporaryDirectory(prefix="myagents-workbuddy-slow-open-") as raw:
+        with tempfile.TemporaryDirectory(prefix="myagents-codebuddy-slow-open-") as raw:
             root = Path(raw)
             wrapper = root / "codebuddy"
             state = root / "state.log"
@@ -269,13 +269,13 @@ def test_workbuddy_auth_timeout_can_cancel_slow_browser_opener() -> None:
                 "#!/usr/bin/env python3\n"
                 "import os, sys\n"
                 "os.execv(sys.executable, [sys.executable, "
-                "os.environ['FAKE_WORKBUDDY_SERVER']])\n",
+                "os.environ['FAKE_CODEBUDDY_SERVER']])\n",
                 encoding="utf-8",
             )
             wrapper.chmod(0o700)
             env = {
-                "MYAGENTS_WORKBUDDY_CLI": str(wrapper),
-                "FAKE_WORKBUDDY_SERVER": str(SERVER),
+                "MYAGENTS_CODEBUDDY_CLI": str(wrapper),
+                "FAKE_CODEBUDDY_SERVER": str(SERVER),
                 "FAKE_ACP_STATE": str(state),
                 "FAKE_ACP_REQUIRE_AUTH": "1",
                 "FAKE_ACP_AUTH_AT_NEW": "1",
@@ -293,7 +293,7 @@ def test_workbuddy_auth_timeout_can_cancel_slow_browser_opener() -> None:
 
             started = time.monotonic()
             with patch.dict(os.environ, env, clear=False):
-                adapter = AcpWorkBuddyAdapter(
+                adapter = AcpCodeBuddyAdapter(
                     auth_timeout=0.05,
                     auth_url_opener=slow_opener,
                 )
@@ -313,9 +313,9 @@ def test_workbuddy_auth_timeout_can_cancel_slow_browser_opener() -> None:
     asyncio.run(run())
 
 
-def test_workbuddy_rejects_blocking_browser_opener() -> None:
+def test_codebuddy_rejects_blocking_browser_opener() -> None:
     try:
-        AcpWorkBuddyAdapter(
+        AcpCodeBuddyAdapter(
             auth_url_opener=lambda _url: True,  # type: ignore[arg-type]
         )
     except TypeError as exc:
@@ -324,10 +324,10 @@ def test_workbuddy_rejects_blocking_browser_opener() -> None:
         raise AssertionError("同步 opener 会阻塞 read loop，必须在启动前拒绝")
 
 
-def test_workbuddy_reuses_existing_login_without_reauthentication() -> None:
+def test_codebuddy_reuses_existing_login_without_reauthentication() -> None:
     async def run() -> None:
         with tempfile.TemporaryDirectory(
-            prefix="myagents-workbuddy-preauthenticated-",
+            prefix="myagents-codebuddy-preauthenticated-",
         ) as raw:
             root = Path(raw)
             wrapper = root / "codebuddy"
@@ -336,13 +336,13 @@ def test_workbuddy_reuses_existing_login_without_reauthentication() -> None:
                 "#!/usr/bin/env python3\n"
                 "import os, sys\n"
                 "os.execv(sys.executable, [sys.executable, "
-                "os.environ['FAKE_WORKBUDDY_SERVER']])\n",
+                "os.environ['FAKE_CODEBUDDY_SERVER']])\n",
                 encoding="utf-8",
             )
             wrapper.chmod(0o700)
             env = {
-                "MYAGENTS_WORKBUDDY_CLI": str(wrapper),
-                "FAKE_WORKBUDDY_SERVER": str(SERVER),
+                "MYAGENTS_CODEBUDDY_CLI": str(wrapper),
+                "FAKE_CODEBUDDY_SERVER": str(SERVER),
                 "FAKE_ACP_STATE": str(state),
                 "FAKE_ACP_REQUIRE_AUTH": "1",
                 "FAKE_ACP_AUTH_AT_NEW": "1",
@@ -355,7 +355,7 @@ def test_workbuddy_reuses_existing_login_without_reauthentication() -> None:
                 return True
 
             with patch.dict(os.environ, env, clear=False):
-                adapter = AcpWorkBuddyAdapter(auth_url_opener=open_url)
+                adapter = AcpCodeBuddyAdapter(auth_url_opener=open_url)
                 try:
                     events = [
                         event async for event in adapter.stream("hello", raw)
@@ -375,17 +375,17 @@ def test_workbuddy_reuses_existing_login_without_reauthentication() -> None:
     asyncio.run(run())
 
 
-def test_workbuddy_never_falls_back_to_app_private_cli() -> None:
+def test_codebuddy_never_falls_back_to_app_private_cli() -> None:
     with (
         patch.dict(os.environ, {}, clear=True),
         patch("acp.adapter.shutil.which", return_value=None),
     ):
-        assert _resolve_workbuddy_cli() == "codebuddy"
+        assert _resolve_codebuddy_cli() == "codebuddy"
 
 
-def test_workbuddy_rejects_app_private_cli_from_env_and_path_symlink() -> None:
+def test_codebuddy_rejects_app_private_cli_from_env_and_path_symlink() -> None:
     with tempfile.TemporaryDirectory(
-        prefix="myagents-workbuddy-private-cli-",
+        prefix="myagents-codebuddy-private-cli-",
     ) as raw:
         root = Path(raw)
         private_cli = (
@@ -399,11 +399,11 @@ def test_workbuddy_rejects_app_private_cli_from_env_and_path_symlink() -> None:
 
         with patch.dict(
             os.environ,
-            {"MYAGENTS_WORKBUDDY_CLI": str(private_cli)},
+            {"MYAGENTS_CODEBUDDY_CLI": str(private_cli)},
             clear=False,
         ):
             try:
-                _resolve_workbuddy_cli()
+                _resolve_codebuddy_cli()
             except AcpError as exc:
                 assert "App 包内私有 CLI" in str(exc)
             else:
@@ -414,16 +414,16 @@ def test_workbuddy_rejects_app_private_cli_from_env_and_path_symlink() -> None:
             patch("acp.adapter.shutil.which", return_value=str(outside_link)),
         ):
             try:
-                _resolve_workbuddy_cli()
+                _resolve_codebuddy_cli()
             except AcpError as exc:
                 assert "App 包内私有 CLI" in str(exc)
             else:
                 raise AssertionError("PATH symlink 不得绕过私有 CLI 禁令")
 
 
-def test_workbuddy_authentication_required_match_is_exact() -> None:
+def test_codebuddy_authentication_required_match_is_exact() -> None:
     exact = AcpRemoteError(-32000, "Authentication required")
-    assert AcpWorkBuddyAdapter._is_authentication_required(exact) is True
+    assert AcpCodeBuddyAdapter._is_authentication_required(exact) is True
 
     near_misses = (
         AcpRemoteError(-32000, "authentication required"),
@@ -434,7 +434,7 @@ def test_workbuddy_authentication_required_match_is_exact() -> None:
         AcpRemoteError(-32001, "Authentication required"),
     )
     assert not any(
-        AcpWorkBuddyAdapter._is_authentication_required(error)
+        AcpCodeBuddyAdapter._is_authentication_required(error)
         for error in near_misses
     )
 
@@ -442,7 +442,7 @@ def test_workbuddy_authentication_required_match_is_exact() -> None:
 def test_browser_launcher_cancellation_reaps_process_group() -> None:
     async def run() -> None:
         with tempfile.TemporaryDirectory(
-            prefix="myagents-workbuddy-launcher-",
+            prefix="myagents-codebuddy-launcher-",
         ) as raw:
             root = Path(raw)
             launcher = root / "xdg-open"
@@ -505,9 +505,9 @@ def test_browser_launcher_cancellation_reaps_process_group() -> None:
     asyncio.run(run())
 
 
-def test_workbuddy_requires_advertised_authentication_method() -> None:
+def test_codebuddy_requires_advertised_authentication_method() -> None:
     async def run() -> None:
-        with tempfile.TemporaryDirectory(prefix="myagents-workbuddy-no-auth-") as raw:
+        with tempfile.TemporaryDirectory(prefix="myagents-codebuddy-no-auth-") as raw:
             root = Path(raw)
             wrapper = root / "codebuddy"
             state = root / "state.log"
@@ -515,18 +515,18 @@ def test_workbuddy_requires_advertised_authentication_method() -> None:
                 "#!/usr/bin/env python3\n"
                 "import os, sys\n"
                 "os.execv(sys.executable, [sys.executable, "
-                "os.environ['FAKE_WORKBUDDY_SERVER']])\n",
+                "os.environ['FAKE_CODEBUDDY_SERVER']])\n",
                 encoding="utf-8",
             )
             wrapper.chmod(0o700)
             env = {
-                "MYAGENTS_WORKBUDDY_CLI": str(wrapper),
-                "FAKE_WORKBUDDY_SERVER": str(SERVER),
+                "MYAGENTS_CODEBUDDY_CLI": str(wrapper),
+                "FAKE_CODEBUDDY_SERVER": str(SERVER),
                 "FAKE_ACP_STATE": str(state),
                 "FAKE_ACP_AUTH_AT_NEW": "1",
             }
             with patch.dict(os.environ, env, clear=False):
-                adapter = AcpWorkBuddyAdapter()
+                adapter = AcpCodeBuddyAdapter()
                 try:
                     try:
                         async for _event in adapter.stream("hello", raw):
@@ -534,7 +534,7 @@ def test_workbuddy_requires_advertised_authentication_method() -> None:
                     except AcpError as exc:
                         assert "未公布认证方式" in str(exc)
                     else:
-                        raise AssertionError("WorkBuddy 不得跳过空 authMethods")
+                        raise AssertionError("CodeBuddy 不得跳过空 authMethods")
                 finally:
                     await adapter.aclose()
             events = (
@@ -548,9 +548,9 @@ def test_workbuddy_requires_advertised_authentication_method() -> None:
     asyncio.run(run())
 
 
-def test_workbuddy_rejects_unadvertised_authentication_method() -> None:
+def test_codebuddy_rejects_unadvertised_authentication_method() -> None:
     async def run() -> None:
-        with tempfile.TemporaryDirectory(prefix="myagents-workbuddy-method-") as raw:
+        with tempfile.TemporaryDirectory(prefix="myagents-codebuddy-method-") as raw:
             root = Path(raw)
             wrapper = root / "codebuddy"
             state = root / "state.log"
@@ -558,20 +558,20 @@ def test_workbuddy_rejects_unadvertised_authentication_method() -> None:
                 "#!/usr/bin/env python3\n"
                 "import os, sys\n"
                 "os.execv(sys.executable, [sys.executable, "
-                "os.environ['FAKE_WORKBUDDY_SERVER']])\n",
+                "os.environ['FAKE_CODEBUDDY_SERVER']])\n",
                 encoding="utf-8",
             )
             wrapper.chmod(0o700)
             env = {
-                "MYAGENTS_WORKBUDDY_CLI": str(wrapper),
-                "MYAGENTS_WORKBUDDY_AUTH_METHOD": "invented",
-                "FAKE_WORKBUDDY_SERVER": str(SERVER),
+                "MYAGENTS_CODEBUDDY_CLI": str(wrapper),
+                "MYAGENTS_CODEBUDDY_AUTH_METHOD": "invented",
+                "FAKE_CODEBUDDY_SERVER": str(SERVER),
                 "FAKE_ACP_STATE": str(state),
                 "FAKE_ACP_REQUIRE_AUTH": "1",
                 "FAKE_ACP_AUTH_AT_NEW": "1",
             }
             with patch.dict(os.environ, env, clear=False):
-                adapter = AcpWorkBuddyAdapter()
+                adapter = AcpCodeBuddyAdapter()
                 try:
                     try:
                         async for _event in adapter.stream("hello", raw):
@@ -595,18 +595,18 @@ def test_workbuddy_rejects_unadvertised_authentication_method() -> None:
 
 
 if __name__ == "__main__":
-    test_workbuddy_is_registered_as_acp_only()
-    test_workbuddy_runtime_profiles_are_isolated()
-    test_workbuddy_uses_product_name_in_tui()
-    test_workbuddy_authentication_is_bounded_and_fail_closed()
-    test_workbuddy_rejects_untrusted_authentication_url()
-    test_workbuddy_auth_timeout_can_cancel_slow_browser_opener()
-    test_workbuddy_rejects_blocking_browser_opener()
-    test_workbuddy_reuses_existing_login_without_reauthentication()
-    test_workbuddy_never_falls_back_to_app_private_cli()
-    test_workbuddy_rejects_app_private_cli_from_env_and_path_symlink()
-    test_workbuddy_authentication_required_match_is_exact()
+    test_codebuddy_is_registered_as_acp_only()
+    test_codebuddy_runtime_profiles_are_isolated()
+    test_codebuddy_uses_product_name_in_tui()
+    test_codebuddy_authentication_is_bounded_and_fail_closed()
+    test_codebuddy_rejects_untrusted_authentication_url()
+    test_codebuddy_auth_timeout_can_cancel_slow_browser_opener()
+    test_codebuddy_rejects_blocking_browser_opener()
+    test_codebuddy_reuses_existing_login_without_reauthentication()
+    test_codebuddy_never_falls_back_to_app_private_cli()
+    test_codebuddy_rejects_app_private_cli_from_env_and_path_symlink()
+    test_codebuddy_authentication_required_match_is_exact()
     test_browser_launcher_cancellation_reaps_process_group()
-    test_workbuddy_requires_advertised_authentication_method()
-    test_workbuddy_rejects_unadvertised_authentication_method()
-    print("\nWorkBuddy ACP 接入契约测试全部通过")
+    test_codebuddy_requires_advertised_authentication_method()
+    test_codebuddy_rejects_unadvertised_authentication_method()
+    print("\nCodeBuddy ACP 接入契约测试全部通过")

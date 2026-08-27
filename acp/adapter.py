@@ -153,15 +153,15 @@ QWEN_ACP_DEFAULT_CMD = (
 QWEN_ACP_READ_ONLY_CMD = (
     "qwen", "--acp", "--approval-mode", "plan",
 )
-_WORKBUDDY_CLI_ENV = "MYAGENTS_WORKBUDDY_CLI"
-WORKBUDDY_ACP_DEFAULT_ARGS = (
+_CODEBUDDY_CLI_ENV = "MYAGENTS_CODEBUDDY_CLI"
+CODEBUDDY_ACP_DEFAULT_ARGS = (
     "--acp", "--acp-transport", "stdio",
     "--permission-mode", "default",
     "--subagent-permission-mode", "dontAsk",
     "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
     "--setting-sources", "",
 )
-WORKBUDDY_ACP_READ_ONLY_ARGS = (
+CODEBUDDY_ACP_READ_ONLY_ARGS = (
     "--acp", "--acp-transport", "stdio",
     "--permission-mode", "dontAsk",
     "--subagent-permission-mode", "dontAsk",
@@ -171,15 +171,15 @@ WORKBUDDY_ACP_READ_ONLY_ARGS = (
 )
 
 
-def _validated_workbuddy_cli(candidate: str, source: str) -> str:
+def _validated_codebuddy_cli(candidate: str, source: str) -> str:
     """解析并校验独立 CLI；拒绝任何 App bundle 内私有可执行文件。"""
     path = Path(candidate).expanduser()
     try:
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
-        raise AcpError(f"{source} 指定的 WorkBuddy CLI 不存在：{path}") from exc
+        raise AcpError(f"{source} 指定的 CodeBuddy CLI 不存在：{path}") from exc
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
-        raise AcpError(f"{source} 指定的 WorkBuddy CLI 不可执行：{resolved}")
+        raise AcpError(f"{source} 指定的 CodeBuddy CLI 不可执行：{resolved}")
     parts = resolved.parts
     if any(
         part.lower().endswith(".app")
@@ -194,42 +194,42 @@ def _validated_workbuddy_cli(candidate: str, source: str) -> str:
     return str(resolved)
 
 
-def _find_workbuddy_cli() -> str | None:
+def _find_codebuddy_cli() -> str | None:
     """被动查找独立 CLI；不启动进程，也不借用 App 包内私有文件。"""
-    explicit = os.environ.get(_WORKBUDDY_CLI_ENV, "").strip()
+    explicit = os.environ.get(_CODEBUDDY_CLI_ENV, "").strip()
     if explicit:
-        return _validated_workbuddy_cli(explicit, _WORKBUDDY_CLI_ENV)
+        return _validated_codebuddy_cli(explicit, _CODEBUDDY_CLI_ENV)
     for name in ("codebuddy", "cbc"):
         resolved = shutil.which(name)
         if resolved:
-            return _validated_workbuddy_cli(resolved, f"PATH 中的 {name}")
+            return _validated_codebuddy_cli(resolved, f"PATH 中的 {name}")
     return None
 
 
-def workbuddy_readiness_probe() -> AgentReadiness:
-    """供 AgentSpec 使用的 WorkBuddy 被动就绪探测。"""
+def codebuddy_readiness_probe() -> AgentReadiness:
+    """供 AgentSpec 使用的 CodeBuddy 被动就绪探测。"""
     setup_hint = (
-        "安装官方独立 CodeBuddy CLI，或用 MYAGENTS_WORKBUDDY_CLI "
+        "安装官方独立 CodeBuddy CLI，或用 MYAGENTS_CODEBUDDY_CLI "
         "指向该可执行文件"
     )
     try:
-        executable = _find_workbuddy_cli()
+        executable = _find_codebuddy_cli()
     except AcpError as exc:
         return AgentReadiness(
-            "workbuddy",
+            "codebuddy",
             ReadinessState.INVALID,
             str(exc),
             setup_hint,
         )
     if executable is None:
         return AgentReadiness(
-            "workbuddy",
+            "codebuddy",
             ReadinessState.NOT_FOUND,
             "当前进程 PATH 未检测到 codebuddy / cbc",
             setup_hint,
         )
     return AgentReadiness(
-        "workbuddy",
+        "codebuddy",
         ReadinessState.READY,
         f"已检测到 CLI：{executable}",
         setup_hint,
@@ -237,13 +237,13 @@ def workbuddy_readiness_probe() -> AgentReadiness:
     )
 
 
-def _resolve_workbuddy_cli() -> str:
+def _resolve_codebuddy_cli() -> str:
     """仅使用可独立运行的官方 CLI，不借用 App 包内私有进程。"""
-    executable = _find_workbuddy_cli()
+    executable = _find_codebuddy_cli()
     if executable is not None:
         return executable
     # 保持其他可选 agent 的惰性启动语义：TUI 可以正常打开，用户实际点名
-    # WorkBuddy 时由 transport 报出标准的 executable-not-found 错误。
+    # CodeBuddy 时由 transport 报出标准的 executable-not-found 错误。
     return "codebuddy"
 
 
@@ -281,10 +281,10 @@ async def _open_browser(url: str) -> bool:
         raise
 
 
-def _workbuddy_auth_notification(
+def _codebuddy_auth_notification(
     opener: Callable[[str], Awaitable[bool]],
 ) -> Callable[[str, dict], Awaitable[None]]:
-    """只处理 WorkBuddy ACP 的登录 URL 通知，并拒绝非官方地址。"""
+    """只处理 CodeBuddy ACP 的登录 URL 通知，并拒绝非官方地址。"""
     trusted_domains = ("tencent.com", "codebuddy.cn", "codebuddy.ai")
 
     async def handle(method: str, params: dict) -> None:
@@ -302,13 +302,13 @@ def _workbuddy_auth_notification(
             )
         )
         if not trusted:
-            raise AcpError("WorkBuddy 返回了不可信的认证地址，已拒绝打开")
+            raise AcpError("CodeBuddy 返回了不可信的认证地址，已拒绝打开")
         try:
             opened = await opener(url)
         except Exception as exc:
-            raise AcpError("WorkBuddy 认证页面打开失败") from exc
+            raise AcpError("CodeBuddy 认证页面打开失败") from exc
         if opened is not True:
-            raise AcpError("WorkBuddy 认证页面打开失败")
+            raise AcpError("CodeBuddy 认证页面打开失败")
 
     return handle
 
@@ -706,7 +706,7 @@ class AcpAdapter:
                         and self._is_authentication_required(exc)
                     ):
                         raise
-                    # WorkBuddy 的独立 CLI 会复用已有登录；只有在
+                    # CodeBuddy 的独立 CLI 会复用已有登录；只有在
                     # session prepare 明确返回 Authentication required 时
                     # 才打开登录页，避免每次启动强制注销已有会话。
                     assert auth_notifications is not None
@@ -1553,8 +1553,8 @@ class AcpQwenAdapter(AcpAdapter):
         )
 
 
-class AcpWorkBuddyAdapter(AcpAdapter):
-    """WorkBuddy 的 ACP-only 生产 adapter。"""
+class AcpCodeBuddyAdapter(AcpAdapter):
+    """CodeBuddy 的 ACP-only 生产 adapter。"""
 
     def __init__(
         self,
@@ -1571,17 +1571,17 @@ class AcpWorkBuddyAdapter(AcpAdapter):
                 getattr(auth_url_opener, "__call__", None))
         ):
             raise TypeError("auth_url_opener 必须是 async callable")
-        executable = _resolve_workbuddy_cli()
+        executable = _resolve_codebuddy_cli()
         auth_method = (
-            os.environ.get("MYAGENTS_WORKBUDDY_AUTH_METHOD", "internal").strip()
+            os.environ.get("MYAGENTS_CODEBUDDY_AUTH_METHOD", "internal").strip()
             or "internal"
         )
-        default_cmd = (executable, *WORKBUDDY_ACP_DEFAULT_ARGS)
+        default_cmd = (executable, *CODEBUDDY_ACP_DEFAULT_ARGS)
         # plan 会继承进入前的权限基线，不是硬只读。dontAsk 配合工具闭集
         # 让 write/edit/bash/network/subagent 在 runtime 层根本不可调用。
-        read_only_cmd = (executable, *WORKBUDDY_ACP_READ_ONLY_ARGS)
+        read_only_cmd = (executable, *CODEBUDDY_ACP_READ_ONLY_ARGS)
         super().__init__(
-            "workbuddy",
+            "codebuddy",
             default_cmd,
             permission=permission,
             env_overrides={
@@ -1593,7 +1593,7 @@ class AcpWorkBuddyAdapter(AcpAdapter):
             },
             auth_method=auth_method,
             auth_timeout=auth_timeout,
-            auth_notification_handler=_workbuddy_auth_notification(
+            auth_notification_handler=_codebuddy_auth_notification(
                 auth_url_opener),
             auth_required=True,
             authenticate_on_demand=True,

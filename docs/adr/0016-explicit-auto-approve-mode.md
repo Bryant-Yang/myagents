@@ -30,7 +30,7 @@ read-only 硬边界。
   持续显示高风险状态；非 transport 镜像的权限结果仍进入 events/活动卡。
 - adapter 和 client 构造器仍默认 `permission="deny"`，生产代码不显式构造
   `permission="auto"`。显式模式只是可替换的上层决策器。
-- `read_only` 仍由 OpenCode/Qwen/WorkBuddy/DSH/Pi/Codex 各自 runtime/profile/
+- `read_only` 仍由 OpenCode/Qwen/CodeBuddy/DSH/Pi/Codex 各自 runtime/profile/
   adapter 硬拒绝写入和升权。Kimi/OpenCode JSONL fallback 仍是固定只读白名单。
 - MCP/control 没有开启或关闭该模式的方法；它们提交到已启动 TUI 的任务
   会遵守目标 room 当前的进程内模式。

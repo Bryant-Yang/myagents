@@ -25,7 +25,7 @@
 | M4.6 | 完成 | Qwen Code `qwen --acp` 接入、TUI 点名与 ACP-only 安全边界 |
 | M4.7 | 完成 | 多项目会话目录、后台执行、资源 gate、未读通知与图片短引用 |
 | M4.8 | 完成 | 聊天主线降噪、每任务活动摘要卡与逐卡键盘展开 |
-| M4.9 | 完成 | WorkBuddy ACP-only 接入、按需有界认证与读写 profile 隔离 |
+| M4.9 | 完成 | CodeBuddy ACP-only 接入、按需有界认证与读写 profile 隔离 |
 | M4.10 | 完成 | Agent 被动就绪探测、原子派发门与 `/agents` 设置体验 |
 | M4.11 | 完成 | Pi 原生 RPC、启动 attestation、逐次权限 bridge 与三 profile 隔离 |
 | M4.12 | 完成 | DSH ACP-only adapter、标准 bundle + stock `myagents` profile、权限隔离与真实恢复验收 |
@@ -383,14 +383,14 @@
   跨进程 `session/load` 恢复和取消时延尚未验收。默认 gate 不调用外部模型。
 - **里程碑**：M4.6。
 
-### UC-ACP-004 WorkBuddy ACP-only 接入
+### UC-ACP-004 CodeBuddy ACP-only 接入
 
-- **角色 / 触发**：用户在聊天室输入 `@workbuddy`，或把 WorkBuddy 选为满足
-  既有约束的讨论/workflow worker。产品身份始终显示为 WorkBuddy，不把内部
-  二进制名 `codebuddy`/`cbc` 暴露成另一个 agent。
+- **角色 / 触发**：用户在聊天室输入 `@codebuddy`，或把 CodeBuddy 选为满足
+  既有约束的讨论/workflow worker。产品身份与独立 CLI 均为 CodeBuddy；旧的
+  `@workbuddy` 不再注册，也不得把独立 CLI 宣称为 WorkBuddy App。
 - **主流程**：`AGENT_SPECS` 以
-  `AgentSpec("workbuddy", "acp", AcpWorkBuddyAdapter)` 注册。adapter 依次查找
-  `MYAGENTS_WORKBUDDY_CLI` 和 PATH 中的 `codebuddy`/`cbc`，只使用可独立运行的
+  `AgentSpec("codebuddy", "acp", AcpCodeBuddyAdapter)` 注册。adapter 依次查找
+  `MYAGENTS_CODEBUDDY_CLI` 和 PATH 中的 `codebuddy`/`cbc`，只使用可独立运行的
   官方 CLI，不调用 WorkBuddy.app 包内私有二进制。使用
   `--acp --acp-transport stdio` 并固定官方中国区 `internal` 环境；先尝试直接
   `session/new` 复用既有登录态，只有服务端明确返回 `-32000 Authentication
@@ -404,14 +404,14 @@
   避免继承普通轮授权。server 未公布所选认证 method、登录 URL 非官方 HTTPS、
   浏览器无法打开、认证超时或 ACP prepare 失败均 fail-closed 并原子回收，不跨
   协议重放。
-- **验收**：`tests/test_workbuddy_acp.py` 固定 ACP-only 注册、产品命名、CLI
+- **验收**：`tests/test_codebuddy_acp.py` 固定 ACP-only 注册、产品命名、CLI
   参数、普通/只读两次 fresh 进程/session、既有登录不重复认证、显式认证错误才
   打开官方 URL、恶意 URL 拒绝、认证超时、launcher 进程组回收及禁止 App 私有
   CLI fallback；`tests/test_phase2.py` 覆盖统一注册/增量路径，TUI 补全来自动态
-  AgentSpec。完整 Harness 不调用真实 WorkBuddy。
+  AgentSpec。完整 Harness 不调用真实 CodeBuddy。
 - **真实协议证据**：2026-08-12 本机安装官方独立 CodeBuddy CLI 2.134.0。生产
-  `AcpWorkBuddyAdapter` 在 `internal` 环境直接复用既有登录，default profile 建立
-  session `fbcc8cb1-2ee9-440f-b202-3e81a3007f05`，返回
+  `AcpCodeBuddyAdapter` 在 `internal` 环境直接复用既有登录，default profile 建立
+  session `fbcc8cb1-2ee9-440f-b202-3e81a3007f05`，返回当时验收提示词要求的
   `WORKBUDDY_PRODUCTION_OK` 并以 `end_turn` 完成。read_only profile 建立 session
   `066e9648-0f94-4508-a01f-63e70c2fe47f`，Write 与 Bash 均为 `Tool Not Found`；
   session `0e8460bd-bd12-4cea-ada8-6356d066faf2` 中 WebFetch 与 Agent/subagent
@@ -419,7 +419,12 @@
   `codebuddy` 进程残留。WorkBuddy.app 包内 CodeBuddy CLI 2.115.0 能完成
   initialize/session new，但真实 prompt 长时间无正文，因此被明确排除为 standalone
   fallback。
-- **人工验收边界**：登录账户/计费由 WorkBuddy 管理；真实跨进程
+- **产品边界**：这一接入只代表独立 CodeBuddy CLI。WorkBuddy App、其 Electron
+  进程、私有 owner runtime、connector-proxy、连接器登录态与授权均不属于
+  `@codebuddy`，也不得被 adapter 读取、复用或对外宣称为已接入。改名不重写
+  历史 timeline，也不导入旧 `agents.workbuddy` 的 session/cursor；首次
+  `@codebuddy` 使用 fresh session，避免继续继承错误产品身份。
+- **人工验收边界**：登录账户/计费由 CodeBuddy 管理；真实跨进程
   `session/load`、取消时延、图片与长期 session 稳定性尚未验收。国际版与私有化
   region profile 尚无独立安全证据，当前产品只启用已验收的中国区 `internal`。
 - **里程碑**：M4.9。
@@ -631,7 +636,7 @@
   TUI 在清空输入前调用同一资格门，因此错误后草稿与焦点保持。
 - **安全边界**：probe 不得启动 CLI、联网、打开浏览器、读取登录态、执行包管理器
   或修改 shell/PATH；产品不自动安装、卸载、移动或替换 agent。`not_found` 只表述
-  “当前进程 PATH 未检测到”，不得推断用户没有安装。WorkBuddy 候选继续受独立
+  “当前进程 PATH 未检测到”，不得推断用户没有安装。CodeBuddy 候选继续受独立
   CLI canonical path 与 App bundle 拒绝规则约束。DSH 只接受官方 installed `dsh`，
   或 `MYAGENTS_DSH_SOURCE_ROOT` 中已构建的官方 CLI，并要求 stock `myagents` profile
   及 exact myagents bundle ready；CLI/profile/dependency/bundle/name/version/entry/patch

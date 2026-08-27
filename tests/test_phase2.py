@@ -26,7 +26,7 @@ from acp.adapter import (
     AcpAdapter,
     AcpOpenCodeAdapter,
     AcpQwenAdapter,
-    AcpWorkBuddyAdapter,
+    AcpCodeBuddyAdapter,
 )
 from acp.client import AcpClient, AcpError
 from adapters.base import AgentEvent, ExecutionMode
@@ -115,7 +115,7 @@ def make_orch(**adapters) -> Orchestrator:
     """真实 Orchestrator + 假 adapter；未指定的工人用 FakeJsonl 占位。"""
     orch = Orchestrator(workdir="/tmp", persistent=False)
     for name in (
-            "kimi", "opencode", "qwen", "workbuddy", "dsh", "pi", "codex"):
+            "kimi", "opencode", "qwen", "codebuddy", "dsh", "pi", "codex"):
         orch.adapters[name] = adapters.get(name, FakeJsonl(name))
     orch.host = FakeHost()
     orch.adapters["host"] = orch.host
@@ -129,7 +129,7 @@ def test_agent_specs() -> None:
     assert AGENTS["codex"].transport == "app-server"
     assert AGENTS["opencode"].transport == "acp+jsonl"
     assert AGENTS["qwen"].transport == "acp"
-    assert AGENTS["workbuddy"].transport == "acp"
+    assert AGENTS["codebuddy"].transport == "acp"
     assert AGENTS["dsh"].transport == "acp"
     assert AGENTS["pi"].transport == "rpc"
 
@@ -153,10 +153,10 @@ def test_agent_specs() -> None:
         QWEN_ACP_READ_ONLY_CMD)
     assert qwen._fallback is None
     assert qwen._inactivity_timeout == 300
-    workbuddy = orch.adapters["workbuddy"]
-    assert isinstance(workbuddy, AcpWorkBuddyAdapter)
-    assert workbuddy._fallback is None
-    assert workbuddy._inactivity_timeout == 300
+    codebuddy = orch.adapters["codebuddy"]
+    assert isinstance(codebuddy, AcpCodeBuddyAdapter)
+    assert codebuddy._fallback is None
+    assert codebuddy._inactivity_timeout == 300
     dsh = orch.adapters["dsh"]
     assert isinstance(dsh, AcpDshAdapter)
     assert dsh._fallback is None
@@ -171,7 +171,7 @@ def test_agent_specs() -> None:
     assert isinstance(kimi._fallback, KimiAdapter)
     assert isinstance(opencode._fallback, OpenCodeAdapter)
     print("ok  AgentSpec 注册（kimi/opencode=ACP+JSONL，"
-          "qwen/workbuddy/dsh=ACP，pi=RPC，codex=app-server）")
+          "qwen/codebuddy/dsh=ACP，pi=RPC，codex=app-server）")
 
 
 # ---- 2. ACP 增量上下文 ----

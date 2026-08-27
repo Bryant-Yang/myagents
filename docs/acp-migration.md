@@ -4,7 +4,7 @@
 `AgentAdapter` 是 TUI 与不同 coding agent 的
 统一行为契约；wire protocol 按厂商能力选择：`acp/` 是通用 ACP runtime，
 Kimi/OpenCode 分别走 `kimi acp` / `opencode acp`，只在 ACP prepare
-失败前使用各自受限 JSONL fallback；Qwen Code 走 `qwen --acp`、WorkBuddy
+失败前使用各自受限 JSONL fallback；Qwen Code 走 `qwen --acp`、CodeBuddy
 走官方独立 CodeBuddy CLI `--acp --acp-transport stdio`，两者保持 ACP-only；
 DeepSeek Harness（DSH）只走专用 `dsh-myagents-acp` host，保持 ACP-only；
 Pi 走官方 `pi --mode rpc` 与 myagents 权限 bridge，保持 RPC-only；Codex 走官方
@@ -80,7 +80,7 @@ orchestrator.py（AgentAdapter 接口不变；AGENT_SPECS 注册表）
    │    opencode → acp+jsonl → AcpOpenCodeAdapter
    │                         └→ OpenCodeAdapter（prepare-only，隔离只读配置）
    │    qwen     → acp       → AcpQwenAdapter（default/plan，无自动降级）
-   │    workbuddy→ acp       → AcpWorkBuddyAdapter（default/受限只读，无自动降级）
+   │    codebuddy→ acp       → AcpCodeBuddyAdapter（default/受限只读，无自动降级）
    │    dsh      → acp       → AcpDshAdapter（workspace-write/read-only，无自动降级）
    │    pi       → rpc       → PiRpcAdapter（唯一 permission bridge，三 profile，无降级）
    │
@@ -109,10 +109,10 @@ Kimi/OpenCode hybrid 的完整时机、权限与 checkpoint 契约见
 `stream-json` 输入仍在上游文档中标记为未完成，且项目尚无独立只读 fallback
 profile 的安全证据，因此生产只注册 ACP 路径，不做跨协议自动重放；普通 ACP
 轮强制 `--approval-mode default`，workflow 只读轮强制 `plan`。
-WorkBuddy 同样保持 ACP-only。adapter 优先解析显式
-`MYAGENTS_WORKBUDDY_CLI`、PATH 中的 `codebuddy`/`cbc`，只接受可独立运行的
+CodeBuddy 同样保持 ACP-only。adapter 优先解析显式
+`MYAGENTS_CODEBUDDY_CLI`、PATH 中的 `codebuddy`/`cbc`，只接受可独立运行的
 官方 CLI，不使用 WorkBuddy.app 包内私有二进制；产品身份始终显示为
-`workbuddy`。普通轮固定
+`codebuddy`，不再注册 `workbuddy`，也不声称接入 WorkBuddy App。普通轮固定
 `--permission-mode default`，workflow 只读轮使用 `dontAsk`、
 `--subagent-permission-mode dontAsk` 与 `Read,Glob,Grep` 工具闭集，并用空 setting
 sources + strict 空 MCP 配置阻断用户/项目配置扩权；profile 切换会重建进程和
@@ -296,7 +296,7 @@ allow。其 workflow `read_only` profile 改为 unknown/risky=deny、只允许�
 ask。这样既隔离 `allow_always`，也避免 OpenCode 在 ask 被 cancelled 后直接
 `end_turn` 且零正文。Qwen 普通 ACP 轮强制 approval `default`，避免继承 native
 TUI 的 auto/yolo；只读轮用上游 plan mode 在 runtime 层阻断写入/有副作用命令，
-profile 前后同样重建进程与 fresh session。WorkBuddy 先尝试 `session/new` 复用
+profile 前后同样重建进程与 fresh session。CodeBuddy 先尝试 `session/new` 复用
 CLI 既有登录态；只在明确的认证错误后发送标准 ACP `authenticate(methodId)`。
 大型本地模型可能在系统提示、工具 schema 和长上下文的 prefill 期间不产生
 transport event。ACP、Pi RPC 与 Codex app-server 等有状态 adapter 因此共享
@@ -392,7 +392,7 @@ DSH 广告的活跃 session 在 profile reset 与 `aclose()` 时先有界
 ## 可见状态（Phase 2 新增）
 
 - TUI 启动行显示每个 agent 的传输协议：`@kimi(ACP+JSONL) @opencode(ACP+JSONL)
-  @qwen(ACP) @workbuddy(ACP) @dsh(ACP) @pi(RPC) @codex(APP-SERVER)`。
+  @qwen(ACP) @codebuddy(ACP) @dsh(ACP) @pi(RPC) @codex(APP-SERVER)`。
 - native session id 建立后通过 info 事件展示一次（每次建立一次，不刷屏）。Pi 的
   session info 只能在 `delivery_committed` 已被消费后显示；其可信图片每轮最多
   16 张、读取前合计最多 20 MiB。Pi attestation 只显示可操作状态，不泄漏 nonce

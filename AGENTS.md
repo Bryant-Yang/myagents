@@ -50,13 +50,14 @@ app-server），同时仅为已获证路径保留 JSONL 兼容回退。
   必须由 `AcpQwenAdapter` 注册为 ACP-only：普通轮强制 approval `default`，
   workflow 只读轮强制 `plan` 并在 profile 切换时重建进程/session；在只读
   fallback 安全契约得到独立证据前不得自动降级到 headless JSONL。
-  WorkBuddy 必须由 `AcpWorkBuddyAdapter` 注册为 ACP-only：普通轮固定
+  CodeBuddy 必须由 `AcpCodeBuddyAdapter` 注册为 ACP-only：普通轮固定
   `default`，workflow 只读轮固定 `dontAsk` + `Read,Glob,Grep` 工具闭集，
   profile 切换时重建进程/session；只允许可独立运行的官方 CLI，不得借用 App
   包内私有二进制，运行环境固定为已验收的中国区 `internal`。已有登录态直接
   复用，只有明确的 `Authentication required` 才按需认证；认证只能使用 server
   公布的 ACP method，登录 URL 必须是官方 HTTPS 地址且等待有界，在独立
-  fallback 安全契约获证前不得自动降级。
+  fallback 安全契约获证前不得自动降级。该注册只代表独立 CodeBuddy CLI；不得
+  声称它是 WorkBuddy App，也不得读取或复用 App 的私有 runtime、连接器或授权。
   DeepSeek Harness（DSH）必须以
   `AgentSpec("dsh", "acp", AcpDshAdapter, ...)` 注册为 ACP-only：安装模式只接受
   `MYAGENTS_DSH_CLI` 指向或 PATH 解析出的官方 `dsh`，源码模式只用

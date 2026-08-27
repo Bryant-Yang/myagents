@@ -30,7 +30,7 @@ AGENTS = (
     ("kimi", "ACP"),
     ("opencode", "ACP+JSONL"),
     ("qwen", "ACP"),
-    ("workbuddy", "ACP"),
+    ("codebuddy", "ACP"),
     ("dsh", "ACP"),
     ("pi", "RPC"),
     ("codex", "APP-SERVER"),
@@ -46,13 +46,14 @@ def visible_widget_text(widget: OptionList) -> str:
 def test_completion_parser_and_command_boundary() -> None:
     mention = completion_context("@co", 3, AGENTS)
     assert mention is not None
-    assert [item.value for item in mention.items] == ["@codex"]
+    assert [item.value for item in mention.items] == [
+        "@codebuddy", "@codex"]
 
     multi = completion_context("@kimi @", 7, AGENTS)
     assert multi is not None
     assert "@kimi" not in [item.value for item in multi.items]
     assert [item.value for item in multi.items] == [
-        "@opencode", "@qwen", "@workbuddy", "@dsh", "@pi", "@codex",
+        "@opencode", "@qwen", "@codebuddy", "@dsh", "@pi", "@codex",
         "@host"]
 
     slash = completion_context("/ca", 3, AGENTS)
@@ -106,7 +107,7 @@ def test_agent_completion_keyboard_and_focus() -> None:
             await pilot.pause()
             assert app._completion is not None
             assert [item.value for item in app._completion.items] == [
-                "@kimi", "@opencode", "@qwen", "@workbuddy", "@dsh", "@pi",
+                "@kimi", "@opencode", "@qwen", "@codebuddy", "@dsh", "@pi",
                 "@codex", "@host"]
             popup = app.query_one("#completion-list", OptionList)
             assert "@dsh" in visible_widget_text(popup)
@@ -129,7 +130,7 @@ def test_agent_completion_keyboard_and_focus() -> None:
             # 第二个 mention 按前缀筛选，Tab 补全且保留第一个目标。
             await pilot.press("@", "c", "o", "tab")
             await pilot.pause()
-            assert box.value == "@opencode @codex "
+            assert box.value == "@opencode @codebuddy "
             assert app._completion is None
             assert orch.history == []
 
@@ -263,7 +264,7 @@ def test_unready_dsh_remains_visible_after_ready_candidates() -> None:
         ("kimi", "acp+jsonl"),
         ("opencode", "acp+jsonl"),
         ("qwen", "acp"),
-        ("workbuddy", "acp"),
+        ("codebuddy", "acp"),
         ("dsh", "acp"),
         ("pi", "rpc"),
         ("codex", "app-server"),

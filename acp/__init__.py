@@ -9,7 +9,7 @@ from .adapter import (
     AcpKimiAdapter,
     AcpOpenCodeAdapter,
     AcpQwenAdapter,
-    AcpWorkBuddyAdapter,
+    AcpCodeBuddyAdapter,
 )
 
 __all__ = [
@@ -21,5 +21,5 @@ __all__ = [
     "AcpKimiAdapter",
     "AcpOpenCodeAdapter",
     "AcpQwenAdapter",
-    "AcpWorkBuddyAdapter",
+    "AcpCodeBuddyAdapter",
 ]

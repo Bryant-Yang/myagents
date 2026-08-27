@@ -131,7 +131,7 @@ fi
 .venv/bin/python tests/test_session_manager.py
 .venv/bin/python tests/test_session_tui.py
 .venv/bin/python tests/test_acp.py
-.venv/bin/python tests/test_workbuddy_acp.py
+.venv/bin/python tests/test_codebuddy_acp.py
 .venv/bin/python tests/test_dsh_acp.py
 .venv/bin/python tests/test_pi_rpc_client.py
 .venv/bin/python tests/test_pi_adapter.py
