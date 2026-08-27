@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -28,9 +29,12 @@ from native_agent import (
     ModelMessage,
     ModelProviderError,
     NativeAgentRuntime,
+    NativeModelConfig,
+    OpenAICompatibleConfigResolver,
     OpenAICompatibleProvider,
     create_native_host_runtime,
     native_host_readiness_probe,
+    native_model_config_path,
 )
 from orchestrator import AgentSpec, Orchestrator
 from tests.fake_openai_compatible_server import FakeOpenAICompatibleServer
@@ -71,7 +75,8 @@ def test_native_host_readiness_requires_explicit_model_configuration() -> None:
     missing = native_host_readiness_probe(environ={})
     assert missing.state is ReadinessState.NOT_FOUND
     assert "未配置原生 host 模型" in missing.detail
-    assert "MYAGENTS_MODEL_ID" in missing.setup_hint
+    assert ".config/myagents/config.toml" in missing.setup_hint
+    assert "MYAGENTS_MODEL_*" in missing.setup_hint
     assert "/v1/models" in missing.setup_hint
 
     invalid = native_host_readiness_probe(environ={
@@ -106,6 +111,151 @@ def test_native_host_readiness_requires_explicit_model_configuration() -> None:
     assert oversized.state is ReadinessState.INVALID
     assert len(oversized.detail) < 300
     assert "p" * 1000 not in repr(oversized)
+
+
+def test_native_host_uses_private_xdg_config_with_environment_overrides() -> None:
+    async def run() -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="myagents-native-config-",
+        ) as raw, FakeOpenAICompatibleServer() as server:
+            config_dir = Path(raw) / "myagents"
+            config_dir.mkdir(mode=0o700)
+            config_path = config_dir / "config.toml"
+            config_path.write_text(
+                "[host.model]\n"
+                'provider = "openai-compatible"\n'
+                f'base_url = "{server.base_url}"\n'
+                'model_id = "fake-model"\n'
+                'api_key = "file-secret"\n',
+                encoding="utf-8",
+            )
+            config_path.chmod(0o600)
+            environ = {"XDG_CONFIG_HOME": raw}
+
+            ready = native_host_readiness_probe(environ=environ)
+            assert ready.state is ReadinessState.READY
+            assert "fake-model" in ready.detail
+            assert "配置文件" in ready.detail
+
+            loaded = NativeModelConfig.from_sources(environ=environ)
+            assert loaded.model_id == "fake-model"
+            assert loaded.base_url == server.base_url
+            assert "file-secret" not in repr(loaded)
+
+            overridden = NativeModelConfig.from_sources(
+                environ={
+                    "XDG_CONFIG_HOME": raw,
+                    "MYAGENTS_MODEL_ID": "temporary-model",
+                },
+            )
+            assert overridden.model_id == "temporary-model"
+            assert overridden.base_url == server.base_url
+
+            runtime = create_native_host_runtime(environ=environ)
+            try:
+                events = [
+                    event
+                    async for event in runtime.stream(
+                        "PROVIDER_STREAM", "/tmp")
+                ]
+            finally:
+                await runtime.aclose()
+            assert "".join(
+                event.text for event in events if event.kind == "text"
+            ) == "hello native"
+            post = next(
+                request for request in server.requests
+                if request["method"] == "POST"
+            )
+            assert post["authorization"] == "Bearer file-secret"
+
+    asyncio.run(run())
+
+
+def test_native_host_rejects_unsafe_or_broken_config_file() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="myagents-native-bad-config-",
+    ) as raw:
+        config_dir = Path(raw) / "myagents"
+        config_dir.mkdir(mode=0o700)
+        config_path = config_dir / "config.toml"
+        config_path.write_text(
+            '[host.model]\nmodel_id = "fake-model"\n',
+            encoding="utf-8",
+        )
+        config_path.chmod(0o644)
+        insecure = native_host_readiness_probe(
+            environ={"XDG_CONFIG_HOME": raw})
+        assert insecure.state is ReadinessState.INVALID
+        assert "0600" in insecure.detail
+
+        config_path.chmod(0o400)
+        overly_restrictive = native_host_readiness_probe(
+            environ={"XDG_CONFIG_HOME": raw})
+        assert overly_restrictive.state is ReadinessState.INVALID
+        assert "0600" in overly_restrictive.detail
+
+        target_path = config_dir / "target.toml"
+        target_path.write_text(
+            '[host.model]\nmodel_id = "fake-model"\n',
+            encoding="utf-8",
+        )
+        target_path.chmod(0o600)
+        config_path.unlink()
+        config_path.symlink_to(target_path)
+        symlinked = native_host_readiness_probe(
+            environ={"XDG_CONFIG_HOME": raw})
+        assert symlinked.state is ReadinessState.INVALID
+        assert "安全读取" in symlinked.detail
+
+        config_path.unlink()
+        os.mkfifo(config_path, mode=0o600)
+        fifo = native_host_readiness_probe(
+            environ={"XDG_CONFIG_HOME": raw})
+        assert fifo.state is ReadinessState.INVALID
+        assert "普通文件" in fifo.detail
+
+        config_path.unlink()
+        config_path.write_text(
+            '[host.model]\napi_key = "must-not-leak\n',
+            encoding="utf-8",
+        )
+        config_path.chmod(0o600)
+        broken = native_host_readiness_probe(
+            environ={"XDG_CONFIG_HOME": raw})
+        assert broken.state is ReadinessState.INVALID
+        assert "TOML" in broken.detail
+        assert "must-not-leak" not in repr(broken)
+
+
+def test_relative_xdg_config_home_falls_back_to_user_config_home() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="myagents-native-relative-xdg-",
+    ) as raw:
+        fake_home = Path(raw) / "home"
+        expected = fake_home / ".config/myagents/config.toml"
+        with patch("native_agent.config.Path.home", return_value=fake_home):
+            assert native_model_config_path({
+                "XDG_CONFIG_HOME": "workspace-config",
+            }) == expected
+
+
+def test_custom_config_path_is_preserved_in_runtime_setup_hint() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="myagents-native-custom-config-",
+    ) as raw:
+        custom_path = Path(raw) / "config.toml"
+        resolver = OpenAICompatibleConfigResolver(
+            environ={},
+            config_path=custom_path,
+        )
+        try:
+            resolver()
+        except ModelProviderError as exc:
+            assert str(custom_path) in str(exc)
+        else:
+            raise AssertionError(
+                "missing custom config must fail with its path")
 
 
 def test_openai_compatible_provider_lists_exact_models_and_streams_text() -> None:
@@ -500,7 +650,11 @@ def test_orchestrator_production_host_is_native_and_missing_config_blocks_cleanl
     finally:
         asyncio.run(orch.aclose())
 
-    with patch.dict(os.environ, {}, clear=True):
+    with tempfile.TemporaryDirectory(
+        prefix="myagents-native-missing-config-",
+    ) as raw, patch.dict(
+        os.environ, {"XDG_CONFIG_HOME": raw}, clear=True,
+    ):
         unavailable = Orchestrator(
             "/tmp",
             specs=(),
@@ -511,12 +665,12 @@ def test_orchestrator_production_host_is_native_and_missing_config_blocks_cleanl
             status = unavailable.agent_readiness_snapshot()[0]
             assert status.name == "host"
             assert status.state is ReadinessState.NOT_FOUND
-            assert "MYAGENTS_MODEL_ID" in status.setup_hint
+            assert "myagents/config.toml" in status.setup_hint
             try:
                 unavailable.require_message_agents("你好")
             except AgentUnavailableError as exc:
                 assert "host" in str(exc)
-                assert "MYAGENTS_MODEL_ID" in str(exc)
+                assert "myagents/config.toml" in str(exc)
             else:
                 raise AssertionError("unconfigured native host must be blocked")
         finally:
@@ -690,6 +844,10 @@ def test_native_host_route_freezes_dispatch_snapshot_while_lock_is_busy() -> Non
 
 if __name__ == "__main__":
     test_native_host_readiness_requires_explicit_model_configuration()
+    test_native_host_uses_private_xdg_config_with_environment_overrides()
+    test_native_host_rejects_unsafe_or_broken_config_file()
+    test_relative_xdg_config_home_falls_back_to_user_config_home()
+    test_custom_config_path_is_preserved_in_runtime_setup_hint()
     test_openai_compatible_provider_lists_exact_models_and_streams_text()
     test_native_runtime_streams_and_preserves_isolated_session_context()
     test_native_runtime_sessions_are_isolated_and_environment_factory_is_lazy()

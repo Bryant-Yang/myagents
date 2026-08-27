@@ -283,14 +283,31 @@ import json, urllib.request
 print(*(item["id"] for item in json.load(
     urllib.request.urlopen("http://127.0.0.1:1234/v1/models"))["data"]), sep="\n")
 PY
-export MYAGENTS_MODEL_ID='把这里替换为上一条命令返回的精确 id'
+case "${XDG_CONFIG_HOME:-}" in
+  /*) myagents_config_home="$XDG_CONFIG_HOME" ;;
+  *) myagents_config_home="$HOME/.config" ;;
+esac
+install -d -m 700 "$myagents_config_home/myagents"
+$EDITOR "$myagents_config_home/myagents/config.toml"
+chmod 600 "$myagents_config_home/myagents/config.toml"
 .venv/bin/python main.py
 ```
 
-默认模型地址是 LM Studio 的 `http://127.0.0.1:1234/v1`。其他
-OpenAI-compatible 服务可设置 `MYAGENTS_MODEL_BASE_URL`；需要凭据时再设置
-`MYAGENTS_MODEL_API_KEY`。模型 id 必须与 `/v1/models` 的完整返回值精确一致，
-myagents 不会猜别名或自动切换模型。`/agents` 可查看 host 配置状态。
+配置文件内容：
+
+```toml
+[host.model]
+provider = "openai-compatible"
+base_url = "http://127.0.0.1:1234/v1"
+model_id = "把这里替换为 /v1/models 返回的精确 id"
+```
+
+默认路径遵守 XDG：`$XDG_CONFIG_HOME/myagents/config.toml`，否则使用
+`~/.config/myagents/config.toml`；相对的 `XDG_CONFIG_HOME` 无效并回退该默认
+路径。文件必须为普通文件且权限精确为 0600，不接受符号链接。其他 OpenAI-compatible
+服务可在同一节配置 `base_url` 与可选 `api_key`；`MYAGENTS_MODEL_*` 仅用于
+当前进程临时覆盖。myagents 不会猜模型别名或自动切换；`/agents` 可查看 host
+配置来源和状态。
 
 也可以指定 agent 的工作目录：
 

@@ -284,10 +284,11 @@
 
 - **角色 / 触发**：用户发送无 mention 消息、显式 `@host`，或有界讨论/
   workflow 进入 host moderator/final 阶段。
-- **前置条件**：`MYAGENTS_MODEL_ID` 已配置，且与
-  `MYAGENTS_MODEL_BASE_URL/models` 返回的完整 `id` 精确一致；当前 provider 为
-  `openai-compatible`。未配置时 host 为“未就绪”，在 timeline 写入前拒绝并
-  显示 `/v1/models` 与环境变量引导。
+- **前置条件**：XDG 配置文件 `~/.config/myagents/config.toml` 的
+  `[host.model].model_id` 已配置，且与 `base_url/models` 返回的完整 `id` 精确
+  一致；当前 provider 为 `openai-compatible`。`MYAGENTS_MODEL_*` 可作当前进程
+  临时覆盖。未配置、文件权限不是 0600 或 TOML 损坏时 host 为“未就绪”，在
+  timeline 写入前拒绝并显示配置文件与 `/v1/models` 引导。
 - **主流程**：`HostAgent` 仍是 moderator/supervisor 产品角色，底层由
   `NativeAgentRuntime` 驱动。runtime 通过中立 `ModelProvider/ModelEvent`
   契约流式调用模型、维护 room 内独立上下文和 session；首个 provider 使用
@@ -301,11 +302,12 @@
 - **会话与失败**：每个 room 独占 runtime/context/writer lock。只有权威
   `finish_reason + [DONE]` 才更新模型上下文。提交后的取消、静默超时、断流或
   非权威终止形成 no-replay cursor 并重建 session；模型不存在在 POST 前拒绝。
-  不自动降级或跨协议重放到任何第三方 Agent CLI。API key 仅来自环境且在
-  repr、状态、错误和事件中脱敏。
+  不自动降级或跨协议重放到任何第三方 Agent CLI。配置文件限制为 64 KiB 且
+  必须是 0600；API key 在 repr、状态、错误和事件中脱敏。
 - **验收**：fake HTTP server 覆盖流式正文、结构化路由、直接回答、discussion
   moderator、session 隔离、取消、超时、部分流 EOF、错误映射、未配置、模型
-  不存在、secret 不泄露和 host 无工具；显式 `@worker` 证明零 host HTTP 请求。
+  不存在、配置文件/环境覆盖、权限/损坏 TOML、secret 不泄露和 host 无工具；
+  显式 `@worker` 证明零 host HTTP 请求。
   TUI 显示 `MODERATOR · NATIVE MODEL` 与 `NATIVE-MODEL` readiness。真实 LM
   Studio 只做只读模型列表和一次有界最小回复，不修改用户配置。
 - **独立证据来源**：ADR-0017、`tests/test_native_agent.py`、

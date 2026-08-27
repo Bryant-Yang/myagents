@@ -346,8 +346,8 @@ transport。
   `myagents_cancel_command` 共用一个取消原语；外部可通过
   `myagents_read_events` 读取持久进度。
 - 重启后最后事件非 terminal 的命令必须显示为“已中断”，不得伪装完成。
-- 原生 host 的 provider/model 只来自 ADR-0017 的显式环境配置；凭据不进入
-  readiness、事件或错误，host 固定无工具。
+- 原生 host 的 provider/model 只来自 ADR-0017 的 XDG 私有配置文件与显式环境
+  临时覆盖；凭据不进入 readiness、事件或错误，host 固定无工具。
 
 ### 4.7 Codex app-server（M4）
 
@@ -394,8 +394,10 @@ transport。
 - `ModelProvider/ModelEvent` 保持 provider-neutral；OpenAI-compatible
   `/models` + `/chat/completions` 只是首个实现。provider 选择和 wire schema 不得
   进入 Orchestrator。
-- `MYAGENTS_MODEL_ID` 必须显式配置且与 `/v1/models` 精确一致；readiness 只检查
-  环境语法，不联网。API key 只进入 header，并在 repr/错误/事件中脱敏。
+- 原生 host 配置默认来自 XDG 私有文件 `~/.config/myagents/config.toml` 的
+  `[host.model]`；`MYAGENTS_MODEL_*` 只作当前进程临时覆盖。`model_id` 必须与
+  `/v1/models` 精确一致；readiness 只读文件/环境语法与 0600 权限，不联网。
+  API key 只进入 header，并在 repr/错误/事件中脱敏。
 - host 永久 `tool_policy=none`，请求不得携带 tools；`/yolo`、execution mode
   和模型输出均不能授予文件、shell、网络、skill 或子 agent 能力。
 - runtime 每 room 隔离上下文并保持单 writer；提交后的取消、静默超时、断流和

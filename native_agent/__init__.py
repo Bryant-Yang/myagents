@@ -4,6 +4,8 @@ from .config import (
     NativeModelConfig,
     NativeModelConfigurationError,
     native_host_readiness_probe,
+    native_model_config_path,
+    native_model_setup_hint,
 )
 from .model import (
     ModelEvent,
@@ -16,6 +18,7 @@ from .model import (
 )
 from .openai_compatible import OpenAICompatibleProvider
 from .factory import (
+    OpenAICompatibleConfigResolver,
     OpenAICompatibleEnvironmentResolver,
     create_native_host_runtime,
 )
@@ -37,9 +40,12 @@ __all__ = [
     "ModelTerminal",
     "OpenAICompatibleProvider",
     "OpenAICompatibleEnvironmentResolver",
+    "OpenAICompatibleConfigResolver",
     "NativeAgentRuntime",
     "NativeSessionPreparation",
     "HOST_SYSTEM_PROMPT",
     "create_native_host_runtime",
     "native_host_readiness_probe",
+    "native_model_config_path",
+    "native_model_setup_hint",
 ]

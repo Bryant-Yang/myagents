@@ -40,7 +40,17 @@ RPC 与 JSONL 是 agent/runtime protocol。把任一模型 API 写进 Orchestrat
 
 ### 2.2 配置和模型选择
 
-配置只从当前进程环境读取：
+默认配置文件遵守 XDG，路径为 `$XDG_CONFIG_HOME/myagents/config.toml`；未设置
+`XDG_CONFIG_HOME` 时使用 `~/.config/myagents/config.toml`：
+
+```toml
+[host.model]
+provider = "openai-compatible"
+base_url = "http://127.0.0.1:1234/v1"
+model_id = "从 /v1/models 选择的精确 id"
+```
+
+对应的当前进程环境变量可临时覆盖文件字段，但不作为持久配置：
 
 - `MYAGENTS_MODEL_PROVIDER`：默认且当前唯一值 `openai-compatible`；
 - `MYAGENTS_MODEL_BASE_URL`：默认 `http://127.0.0.1:1234/v1`；
@@ -48,11 +58,14 @@ RPC 与 JSONL 是 agent/runtime protocol。把任一模型 API 写进 Orchestrat
 - `MYAGENTS_MODEL_API_KEY`：可选，只进入 Authorization header，不进入 repr、
   readiness、timeline、event 或可见错误。
 
-base URL 只接受无内嵌凭据、query 和 fragment 的 HTTP(S) URL。readiness 只被动
-检查环境变量语法，不联网、不启动服务、不修改 LM Studio 或用户配置；模型是否
-真实存在由 provider 首次请求前调用 `/models` 独立验证。缺失配置显示为未就绪，
-不会崩溃或误报 ready。provider 名、base URL、model id 与 API key 分别限制为
-64、2048、512 与 8192 字符；拒绝信息不回显凭据或无界配置值。
+相对的 `XDG_CONFIG_HOME` 无效并回退默认路径。配置文件必须是普通文件（不接受
+符号链接）、权限精确为 0600 且不超过 64 KiB；未知层级/字段、非字符串值、损坏
+TOML 一律 fail-closed。base URL 只接受无内嵌凭据、query 和 fragment
+的 HTTP(S) URL。readiness 只被动检查本地文件、权限与环境覆盖语法，不联网、不
+启动服务、不修改 LM Studio；模型是否真实存在由 provider 首次请求前调用
+`/models` 独立验证。缺失配置显示为未就绪，不会崩溃或误报 ready。provider 名、
+base URL、model id 与 API key 分别限制为 64、2048、512 与 8192 字符；拒绝信息
+不回显凭据或无界配置值。
 
 ### 2.3 会话、取消和 no-replay
 
@@ -101,8 +114,9 @@ Host 失败后 Orchestrator 现有确定性 worker 回退仍可用于路由可�
    路由、直接回答、讨论 moderator、session 隔离与 context。
 2. 取消、提交后静默超时、部分正文后 EOF、缺少权威终态均形成 no-replay
    失败；模型不存在在 POST 前拒绝。
-3. HTTP 错误回显 Authorization 时 API key 不出现在异常；超长配置、模型清单
-   和 SSE 均有界；所有请求都没有 `tools` 和 `tool_choice`。
+3. XDG 配置、环境覆盖优先级、0600 权限与损坏 TOML 均有反例；HTTP 错误回显
+   Authorization 时 API key 不出现在异常；超长配置、模型清单和 SSE 均有界；
+   所有请求都没有 `tools` 和 `tool_choice`。
 4. 未配置 host 在 timeline 前阻断并提供设置引导；TUI 将 transport 显示为
    `NATIVE-MODEL`，不把 `MODERATOR` 当协议。
 5. 显式 `@worker` 不触发 provider；原有 discussion、collaboration、workflow、
