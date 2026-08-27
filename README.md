@@ -271,6 +271,37 @@ myagents 不会自动安装、卸载或修改这些 CLI。聊天室启动后可�
 查看“当前进程检测到的状态”；完成外部安装或 PATH 调整后输入
 `/agents rescan` 即可，无需重启聊天室。
 
+## 源码级全局命令
+
+使用 uv 的 editable tool 安装后，可以在任意目录运行 `myagents`，同时始终加载
+当前 checkout 中的源码，不复制另一份代码，也不修改 shell 配置：
+
+```bash
+uv tool install --editable /absolute/path/to/myagents
+myagents --help
+```
+
+直接修改 Python 源码后，下一次启动立即生效。只有 `pyproject.toml` 中的依赖或
+命令入口发生变化时，才需要刷新 tool 环境：
+
+```bash
+uv tool install --editable --force /absolute/path/to/myagents
+```
+
+不带工作目录参数时，启动命令所在的当前目录就是 agent workspace；也可以显式
+指定项目和命名会话：
+
+```bash
+myagents /absolute/path/to/project
+myagents --session review /absolute/path/to/project
+```
+
+卸载全局入口不会删除源码或会话状态：
+
+```bash
+uv tool uninstall myagents
+```
+
 ## 快速开始
 
 ```bash

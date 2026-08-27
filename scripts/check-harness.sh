@@ -116,6 +116,7 @@ fi
   acp/*.py pi_rpc/*.py codex_app_server/*.py native_agent/*.py adapters/*.py control/*.py storage/*.py workspace/*.py tests/*.py \
   scripts/e2e-m3-real.py scripts/e2e-m5-real.py
 .venv/bin/python tests/test_agent_readiness.py
+.venv/bin/python tests/test_packaging.py
 .venv/bin/python tests/test_basic.py
 .venv/bin/python tests/test_session_roles.py
 .venv/bin/python tests/test_tui_activity.py

@@ -433,6 +433,7 @@ transport。
 | DSH ACP-only 官方 CLI/profile/bundle readiness、execution profile、恢复/图片/终局 | `tests/test_dsh_acp.py` + `tests/fake_acp_server.py`（临时 `DSH_HOME`，不调用真实 DSH） |
 | Pi RPC/attestation/权限 bridge/profile | `tests/test_pi_rpc_client.py` + `tests/test_pi_adapter.py` + `tests/test_pi_permission_bridge.py` + `tests/fake_pi_rpc_server.py`（只调用 fixture，不调用真实 Pi） |
 | Agent 被动就绪探测/原子资格门/TUI | `tests/test_agent_readiness.py` + `tests/test_tui_completion.py`（仅 fake resolver/临时文件） |
+| 源码级全局命令打包 | `tests/test_packaging.py` + 临时目录 `uv build` 人工验收 |
 | 会话级自然语言角色 | `tests/test_session_roles.py` + `tests/test_discussion.py` + `tests/test_tui_completion.py` + TUI 纯状态模型 |
 | 自然语言有界讨论 | `tests/test_discussion.py`（显式 mention、host 路由、边界与同一状态机） |
 | 自然语言有序协作 | `tests/test_collaboration.py`（纯内存 fake host/adapter + CommandBus 取消） |
