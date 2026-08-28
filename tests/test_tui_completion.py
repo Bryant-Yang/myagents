@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -11,7 +12,11 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 from adapters.base import AgentEvent
-from agent_readiness import AgentReadiness, ReadinessState
+from agent_readiness import (
+    AgentEnablementConfig,
+    AgentReadiness,
+    ReadinessState,
+)
 from main import ChatApp, ComposerInput
 from host import HostDecision
 from orchestrator import AgentSpec, Orchestrator
@@ -66,6 +71,12 @@ def test_completion_parser_and_command_boundary() -> None:
     host = completion_context("/host a", 7, AGENTS)
     assert host is not None
     assert [item.value for item in host.items] == ["/host agent"]
+    disable = completion_context("/agents disable q", 17, AGENTS)
+    assert disable is not None
+    assert [item.value for item in disable.items] == ["qwen"]
+    all_workers = completion_context("/agents enable ", 15, AGENTS)
+    assert all_workers is not None
+    assert "host" not in [item.value for item in all_workers.items]
 
     assert local_command_for("/new") is not None
     assert local_command_for("/discuss") is not None
@@ -473,6 +484,63 @@ def test_agent_readiness_status_rescan_and_draft_preservation() -> None:
     print("ok  Agent 状态/重新检测/缺失目标草稿保留")
 
 
+def test_agent_global_switch_command_updates_tui_without_dispatch() -> None:
+    from textual.widgets import RichLog
+
+    class Adapter:
+        session_id = None
+
+        async def stream(self, _prompt, _workdir):
+            yield AgentEvent("done")
+
+    with tempfile.TemporaryDirectory(prefix="myagents-tui-enable-") as raw:
+        config = AgentEnablementConfig(Path(raw) / "config.toml")
+        orch = Orchestrator(
+            ".",
+            specs=(AgentSpec(
+                "kimi",
+                "acp",
+                Adapter,
+                lambda: AgentReadiness(
+                    "kimi", ReadinessState.READY, "fake ready", "none"),
+            ),),
+            persistent=False,
+            discover_agents=True,
+            host_probe=lambda: AgentReadiness(
+                "host", ReadinessState.READY, "fake host", "none"),
+            agent_enablement=config,
+        )
+
+        async def run() -> None:
+            app = ChatApp(workdir=".", orchestrator=orch)
+            async with app.run_test() as pilot:
+                box = app.query_one("#composer", ComposerInput)
+                box.value = "/agents disable kimi"
+                box.cursor_position = len(box.value)
+                await pilot.press("enter")
+                await pilot.pause()
+                assert box.value == ""
+                assert orch.history == []
+                status = orch.agent_readiness_snapshot()[0]
+                assert status.state is ReadinessState.DISABLED
+                completion = dict(app._completion_agents())
+                assert "已禁用" in completion["kimi"]
+
+                box.value = "/agents enable kimi"
+                box.cursor_position = len(box.value)
+                await pilot.press("enter")
+                await pilot.pause()
+                assert orch.agent_readiness_snapshot()[0].ready
+                assert orch.history == []
+                rendered = "\n".join(
+                    str(line.text) for line in app.query_one(RichLog).lines)
+                assert "已全局禁用 @kimi" in rendered
+                assert "已全局启用 @kimi" in rendered
+
+        asyncio.run(run())
+    print("ok  /agents enable|disable 全局切换且不进入 timeline")
+
+
 def test_tui_starts_with_zero_or_all_fake_clis() -> None:
     class Adapter:
         session_id = None
@@ -804,6 +872,7 @@ if __name__ == "__main__":
     test_slash_commands_unknown_agent_and_submit_behaviour()
     test_yolo_is_session_scoped_visible_and_not_dispatched()
     test_agent_readiness_status_rescan_and_draft_preservation()
+    test_agent_global_switch_command_updates_tui_without_dispatch()
     test_tui_starts_with_zero_or_all_fake_clis()
     test_roles_commands_view_and_clear_without_dispatch()
     test_roles_clear_waits_for_current_command_boundary()

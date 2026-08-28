@@ -39,6 +39,10 @@ LOCAL_COMMANDS: tuple[LocalCommand, ...] = (
     LocalCommand("agents", "查看 agent 就绪状态", "action_show_agents"),
     LocalCommand(
         "agents rescan", "重新检测本机 agent", "action_rescan_agents"),
+    LocalCommand(
+        "agents disable", "全局禁用指定 agent", "action_show_agents"),
+    LocalCommand(
+        "agents enable", "全局启用指定 agent", "action_show_agents"),
     LocalCommand("roles", "查看当前会话角色", "action_show_roles"),
     LocalCommand("roles clear", "清空当前会话角色", "action_clear_roles"),
     LocalCommand("host", "查看当前会话主持后端", "action_show_host"),
@@ -56,6 +60,8 @@ _MENTION_RE = re.compile(r"@(\w+)")
 _TOKEN_TAIL_RE = re.compile(r"[\w-]*")
 _SLASH_AT_CURSOR_RE = re.compile(
     r"^(\s*)/([\w-]*(?:\s+[\w-]*)?)$")
+_AGENT_CONTROL_AT_CURSOR_RE = re.compile(
+    r"^(\s*/agents\s+(?:enable|disable)\s+)([A-Za-z0-9_-]*)$")
 
 
 @dataclass(frozen=True)
@@ -97,6 +103,23 @@ def completion_context(
     left = value[:cursor]
     tail_match = _TOKEN_TAIL_RE.match(value[cursor:])
     end = cursor + (len(tail_match.group(0)) if tail_match else 0)
+
+    agent_control = _AGENT_CONTROL_AT_CURSOR_RE.match(left)
+    if agent_control is not None:
+        prefix = agent_control.group(2).lower()
+        items = tuple(
+            CompletionItem(name, name, transport)
+            for name, transport in agents
+            if name != "host" and name.lower().startswith(prefix)
+        )
+        if items:
+            return CompletionContext(
+                "agent_control",
+                len(agent_control.group(1)),
+                end,
+                items,
+            )
+        return None
 
     slash = _SLASH_AT_CURSOR_RE.match(left)
     if slash is not None:

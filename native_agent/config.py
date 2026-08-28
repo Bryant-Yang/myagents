@@ -432,7 +432,7 @@ def _validate_model_id(value: str) -> str:
 
 def _read_host_config_file(path: Path) -> dict[str, object]:
     payload = _read_private_toml(path)
-    if set(payload) - {"host"}:
+    if set(payload) - {"host", "agents"}:
         raise NativeModelConfigurationError(
             "原生 host 配置文件包含未知顶层字段")
     host = payload.get("host", {})

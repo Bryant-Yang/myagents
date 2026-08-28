@@ -40,6 +40,8 @@ from acp.adapter import (
     codebuddy_readiness_probe,
 )
 from agent_readiness import (
+    AgentEnablementConfig,
+    AgentEnablementError,
     AgentReadiness,
     AgentReadinessRegistry,
     AgentUnavailableError,
@@ -408,6 +410,7 @@ class Orchestrator:
                  host_probe: ReadinessProbe | None = None,
                  host_model_factory: Callable[
                      [HostBackendSelection], AgentAdapter] | None = None,
+                 agent_enablement: AgentEnablementConfig | None = None,
                  ) -> None:
         self.workdir = workdir
         self.session_name = normalize_session_name(session_name)
@@ -415,6 +418,7 @@ class Orchestrator:
         self.specs = specs
         self.discover_agents = discover_agents
         self._host_model_factory = host_model_factory
+        self._agent_enablement = agent_enablement
         self._registered_names = tuple(
             dict.fromkeys((*[spec.name for spec in specs], HOST_NAME)))
         probes: dict[str, ReadinessProbe] = {
@@ -432,7 +436,7 @@ class Orchestrator:
         probes[HOST_NAME] = self._host_readiness_probe
         self._readiness = AgentReadinessRegistry(probes)
         readiness = {
-            item.name: item for item in self._readiness.refresh()
+            item.name: item for item in self._refresh_registered_readiness()
         }
         self.workspace_inspector = (
             workspace_inspector or GitWorkspaceInspector())
@@ -610,6 +614,49 @@ class Orchestrator:
         return self._readiness.snapshot()
 
     @property
+    def agent_enablement(self) -> AgentEnablementConfig | None:
+        return self._agent_enablement
+
+    def _refresh_registered_readiness(self) -> tuple[AgentReadiness, ...]:
+        disabled: frozenset[str] = frozenset()
+        config_error: AgentEnablementError | None = None
+        if self._agent_enablement is not None:
+            try:
+                disabled = self._agent_enablement.disabled_names(
+                    spec.name for spec in self.specs)
+            except AgentEnablementError as exc:
+                config_error = exc
+        statuses = self._readiness.refresh(disabled_names=disabled)
+        if config_error is not None:
+            for spec in self.specs:
+                self._readiness.mark_invalid(
+                    spec.name,
+                    f"全局 Agent 开关配置无效：{config_error}",
+                    setup_hint=(
+                        f"修复 {self._agent_enablement.path} 后执行 "
+                        "/agents rescan"
+                    ),
+                )
+            statuses = self._readiness.snapshot()
+        return statuses
+
+    def set_agent_enabled(
+        self,
+        name: str,
+        *,
+        enabled: bool,
+        write_config: bool = True,
+    ) -> tuple[AgentReadiness, ...]:
+        if name not in {spec.name for spec in self.specs}:
+            raise AgentEnablementError(
+                f"未知 worker agent：{name!r}；请从 /agents 中选择")
+        if self._agent_enablement is None:
+            raise AgentEnablementError("当前运行未启用全局 Agent 开关配置")
+        if write_config:
+            self._agent_enablement.set_enabled(name, enabled)
+        return self.refresh_agent_readiness()
+
+    @property
     def host_readiness_probe(self) -> ReadinessProbe:
         """供同一 TUI 创建的新 room 复用完全相同的 host 探测契约。"""
         return self._host_readiness_probe
@@ -672,6 +719,21 @@ class Orchestrator:
                 ReadinessState.INVALID,
                 f"agent {selection.target!r} 未声明 host-safe read-only factory",
                 "使用 /host agent <支持的 agent> 或 /host model <profile>",
+            )
+        worker_status = next(
+            (
+                item for item in self._readiness.snapshot()
+                if item.name == selection.target
+            ),
+            None,
+        )
+        if worker_status is not None and not worker_status.ready:
+            return AgentReadiness(
+                HOST_NAME,
+                worker_status.state,
+                f"agent host {selection.target}：{worker_status.detail}",
+                worker_status.setup_hint,
+                worker_status.executable,
             )
         probe = spec.host_probe or spec.probe
         if not self.discover_agents or probe is None:
@@ -830,9 +892,7 @@ class Orchestrator:
         """重新执行被动探测，并为新就绪的 agent 惰性构造 adapter。"""
         if self._closed:
             raise OrchestratorClosedError("Orchestrator 已关闭，拒绝重新探测")
-        if not self.discover_agents:
-            return self._readiness.snapshot()
-        statuses = self._readiness.refresh()
+        statuses = self._refresh_registered_readiness()
         by_name = {item.name: item for item in statuses}
         for spec in self.specs:
             if not by_name[spec.name].ready or spec.name in self.adapters:

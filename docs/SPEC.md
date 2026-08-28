@@ -630,10 +630,15 @@
   数；`@` 候选保留所有注册项但 ready 优先；`/agents` 显示状态、transport、
   原因和人工设置提示；`/agents rescan` 重新读取环境、同步所有已加载会话，并为
   新 ready 的目标惰性构造 adapter，不重启 TUI。新建会话继承同一 probe 配置。
+  用户可用 `/agents disable <agent>` / `/agents enable <agent>` 修改私有 XDG
+  配置中的全局开关；`disabled` 项仍可见但不再具备派发资格，命令立即同步当前
+  进程内所有已加载会话，其他进程通过 `/agents rescan` 观察新值。
 - **原子边界**：显式多目标、discussion 全体与 moderator、workflow 全部固定
   角色及 final host 必须同时 ready，否则在 timeline/Git baseline/adapter 调用前
   整条拒绝。无 mention 消息要求 host ready；host 只看 ready worker 候选。
   TUI 在清空输入前调用同一资格门，因此错误后草稿与焦点保持。
+  禁用不会取消已运行任务，但排队任务在真正 dispatch 前再次资格检查；禁用项
+  同时从 host worker 候选中排除，也不能被选为 agent Host backend。
 - **安全边界**：probe 不得启动 CLI、联网、打开浏览器、读取登录态、执行包管理器
   或修改 shell/PATH；产品不自动安装、卸载、移动或替换 agent。`not_found` 只表述
   “当前进程 PATH 未检测到”，不得推断用户没有安装。CodeBuddy 候选继续受独立
@@ -641,12 +646,16 @@
   或 `MYAGENTS_DSH_SOURCE_ROOT` 中已构建的官方 CLI，并要求 stock `myagents` profile
   及 exact myagents bundle ready；CLI/profile/dependency/bundle/name/version/entry/patch
   任一缺失为 invalid，probe 不 build、不启动且不创建 persistence/profile 目录。
+  全局开关仅写 0600 的 `~/.config/myagents/config.toml`，拒绝符号链接和非法
+  TOML，并以锁和原子替换保留 Host 配置；它不删除登录态、session、cursor、
+  role 或历史，也不突破任何 permission/profile。
 - **异常分支**：probe 异常、不可执行文件、无效显式路径或 adapter 构造失败记为
   `invalid` 并 fail-closed；状态错误不删除角色、cursor、session id 或历史事实。
   Pi 只被动解析 `pi` 可执行文件；probe 不以启动 RPC/attestation 代替 readiness。
 - **验收**：`tests/test_agent_readiness.py` 使用 fake resolver、临时文件与符号链接
-  覆盖零/部分/新增 CLI、原子门和 host 候选；`tests/test_tui_completion.py` 覆盖
-  ready 排序、状态文案、rescan 及草稿保留。完整 Harness 不调用真实 agent。
+  覆盖零/部分/新增 CLI、原子门、全局开关、跨 room 同步和 host 候选；
+  `tests/test_tui_completion.py` 覆盖 ready 排序、状态文案、rescan、enable/disable
+  及草稿保留。完整 Harness 不调用真实 agent。
 - **人工验收边界**：安装器、包管理器选择、登录和 shell 配置仍由用户在产品外
   完成；myagents 只给出可操作提示并在用户要求时重新检测。
 - **里程碑**：M4.10。

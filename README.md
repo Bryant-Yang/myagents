@@ -60,7 +60,8 @@ Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 co
 - Agent 就绪中心：启动时只读取当前进程的 PATH、环境变量和可执行文件属性，
   不启动或安装 agent。`/agents` 显示注册项的可用状态和设置提示，
   `/agents rescan` 在用户修复 PATH 或安装后被动重扫；缺失目标会在时间线写入前
-  整条拒绝并保留输入草稿。
+  整条拒绝并保留输入草稿。`/agents disable kimi` 可全局禁用一个 worker，
+  `/agents enable kimi` 无需重装即可恢复；禁用不删除登录态、会话或历史。
 - 无显式 mention：host 用一次调用决定“直接回答”或输出结构化 worker
   路由；直接回答时不再发起第二次 host 调用。
 - 多 agent fan-out：同一消息可同时点名多个 agent，并发执行。
@@ -275,6 +276,19 @@ OpenAI-compatible 接口。
 myagents 不会自动安装、卸载或修改这些 CLI。聊天室启动后可输入 `/agents`
 查看“当前进程检测到的状态”；完成外部安装或 PATH 调整后输入
 `/agents rescan` 即可，无需重启聊天室。
+
+不再使用某个 Agent 时，可在聊天室执行：
+
+```text
+/agents disable kimi
+/agents enable kimi
+```
+
+开关保存在私有的 `~/.config/myagents/config.toml` 中，对之后启动的聊天室也生效。
+当前进程的所有已加载会话立即同步；其他已经运行的 myagents 进程执行
+`/agents rescan` 后同步。被禁用项仍出现在候选和 `/agents` 状态中，但不能参与
+显式派发、Host 路由、讨论、协作、workflow 或充当 Agent Host。正在执行的任务
+不会被强制中断。
 
 ## 源码级全局命令
 

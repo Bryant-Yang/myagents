@@ -132,7 +132,9 @@ def test_native_host_uses_private_xdg_config_with_environment_overrides() -> Non
                 'provider = "openai-compatible"\n'
                 f'base_url = "{server.base_url}"\n'
                 'model_id = "fake-model"\n'
-                'api_key_env = "TEST_MODEL_API_KEY"\n',
+                'api_key_env = "TEST_MODEL_API_KEY"\n'
+                "\n[agents.kimi]\n"
+                "enabled = false\n",
                 encoding="utf-8",
             )
             config_path.chmod(0o600)

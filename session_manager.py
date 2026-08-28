@@ -181,6 +181,10 @@ class SessionManager:
             initial_orchestrator.host_model_factory
             if initial_orchestrator is not None else None
         )
+        self._agent_enablement = (
+            initial_orchestrator.agent_enablement
+            if initial_orchestrator is not None else None
+        )
         self._runtimes: dict[str, _Runtime] = {}
         self._drafts: dict[str, tuple[str, int]] = {}
         self._detached_states: dict[str, tuple[str, bool]] = {}
@@ -229,6 +233,32 @@ class SessionManager:
             raise RuntimeError("活动会话未完成 agent 重新检测")
         return active_statuses
 
+    def set_agent_enabled(
+        self,
+        name: str,
+        *,
+        enabled: bool,
+    ) -> tuple[AgentReadiness, ...]:
+        """写入一次全局开关，再同步所有已加载 room。"""
+        self._require_started()
+        active = self.active_runtime.orch
+        active.set_agent_enabled(name, enabled=enabled, write_config=True)
+        errors: list[Exception] = []
+        active_statuses = active.agent_readiness_snapshot()
+        for room_id, runtime in self._runtimes.items():
+            if room_id == self._active_id:
+                continue
+            try:
+                runtime.orch.set_agent_enabled(
+                    name, enabled=enabled, write_config=False)
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            if len(errors) == 1:
+                raise errors[0]
+            raise ExceptionGroup("部分会话未同步 Agent 开关", errors)
+        return active_statuses
+
     async def start(self) -> SessionSnapshot:
         if self._closed:
             raise RuntimeError("SessionManager 已关闭")
@@ -249,6 +279,7 @@ class SessionManager:
                 discover_agents=self._discover_agents,
                 host_probe=self._host_probe,
                 host_model_factory=self._host_model_factory,
+                agent_enablement=self._agent_enablement,
             )
             self._build_runtime(summary, orch)
             self._active_id = summary.room_id
@@ -303,6 +334,7 @@ class SessionManager:
                 discover_agents=self._discover_agents,
                 host_probe=self._host_probe,
                 host_model_factory=self._host_model_factory,
+                agent_enablement=self._agent_enablement,
             )
             runtime = self._build_runtime(summary, orch)
             try:

@@ -17,11 +17,14 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from agent_readiness import (
+    AgentEnablementConfig,
+    AgentEnablementError,
     AgentReadiness,
     AgentReadinessRegistry,
     AgentUnavailableError,
     ReadinessState,
     executable_probe,
+    parse_agent_control_command,
 )
 from adapters.base import AgentEvent
 from host import HostAgent, HostDecision
@@ -144,6 +147,80 @@ def test_probe_canonicalizes_symlink_without_executing_target() -> None:
         assert status.executable == str(target.resolve())
         assert os.path.exists(status.executable)
         assert not marker.exists(), "readiness probe 不得执行候选 CLI"
+
+
+def test_global_switch_config_preserves_host_and_is_private() -> None:
+    with tempfile.TemporaryDirectory(prefix="myagents-enable-config-") as raw:
+        path = Path(raw) / "config.toml"
+        path.write_text(
+            "# keep this comment\n"
+            "[host.model]\n"
+            'provider = "openai-compatible"\n'
+            'base_url = "http://127.0.0.1:1234/v1"\n'
+            'model_id = "fixture-model"\n',
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        config = AgentEnablementConfig(path)
+
+        config.set_enabled("kimi", False)
+        source = path.read_text(encoding="utf-8")
+        assert "# keep this comment" in source
+        assert 'model_id = "fixture-model"' in source
+        assert "[agents.kimi]\nenabled = false" in source
+        assert config.disabled_names(("kimi", "qwen")) == frozenset({"kimi"})
+        assert path.stat().st_mode & 0o777 == 0o600
+
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "enabled = false", "enabled = false # keep switch note"),
+            encoding="utf-8",
+        )
+        config.set_enabled("kimi", True)
+        assert config.disabled_names(("kimi",)) == frozenset()
+        assert path.read_text(encoding="utf-8").count("[agents.kimi]") == 1
+        assert "enabled = true # keep switch note" in path.read_text(
+            encoding="utf-8")
+
+
+def test_global_switch_config_fails_closed_on_unsafe_or_invalid_file() -> None:
+    with tempfile.TemporaryDirectory(prefix="myagents-enable-invalid-") as raw:
+        root = Path(raw)
+        path = root / "config.toml"
+        path.write_text("[agents.kimi]\nenabled = false\n", encoding="utf-8")
+        path.chmod(0o644)
+        config = AgentEnablementConfig(path)
+        try:
+            config.disabled_names(("kimi",))
+        except AgentEnablementError as exc:
+            assert "0600" in str(exc)
+        else:
+            raise AssertionError("宽松权限的开关配置必须 fail-closed")
+
+        path.chmod(0o600)
+        link = root / "linked.toml"
+        link.symlink_to(path)
+        try:
+            AgentEnablementConfig(link).set_enabled("kimi", True)
+        except AgentEnablementError as exc:
+            assert "安全读取" in str(exc)
+        else:
+            raise AssertionError("不得跟随配置符号链接")
+
+
+def test_agent_control_command_parser_is_strict() -> None:
+    assert parse_agent_control_command("/agents").action == "show"
+    assert parse_agent_control_command("/agents rescan").action == "rescan"
+    command = parse_agent_control_command("/agents disable kimi")
+    assert command is not None
+    assert (command.action, command.name) == ("disable", "kimi")
+    assert parse_agent_control_command("hello") is None
+    try:
+        parse_agent_control_command("/agents disable")
+    except AgentEnablementError as exc:
+        assert "/agents disable <agent>" in str(exc)
+    else:
+        raise AssertionError("不完整开关命令不得进入模型路由")
 
 
 class FakeAdapter:
@@ -411,6 +488,122 @@ def test_host_routes_only_to_ready_workers() -> None:
     asyncio.run(run())
 
 
+def test_global_switch_blocks_dispatch_and_host_routing_without_deleting_state() -> None:
+    async def run() -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="myagents-enable-routing-"
+        ) as raw:
+            path = Path(raw) / "config.toml"
+            config = AgentEnablementConfig(path)
+            worker = FakeAdapter("worker")
+            orch = Orchestrator(
+                ".",
+                specs=(AgentSpec(
+                    "worker", "jsonl", lambda: worker,
+                    probe=_fixed_probe("worker", ReadinessState.READY),
+                ),),
+                persistent=False,
+                discover_agents=True,
+                host_probe=_fixed_probe("host", ReadinessState.READY),
+                agent_enablement=config,
+            )
+            try:
+                original_adapter = orch.adapters["worker"]
+                orch.set_agent_enabled("worker", enabled=False)
+                status = {
+                    item.name: item
+                    for item in orch.agent_readiness_snapshot()
+                }["worker"]
+                assert status.state is ReadinessState.DISABLED
+                assert orch.adapters["worker"] is original_adapter
+                assert orch.history == []
+                try:
+                    await orch.dispatch(
+                        "@worker do it", lambda _name, _event: None)
+                except AgentUnavailableError as exc:
+                    assert exc.names == ("worker",)
+                    assert "全局配置禁用" in str(exc)
+                else:
+                    raise AssertionError("已禁用 agent 不得接受新派发")
+                assert worker.calls == []
+                assert orch.history == []
+
+                assert orch.ready_worker_names() == []
+
+                orch.set_agent_enabled("worker", enabled=True)
+                assert orch.ready_worker_names() == ["worker"]
+                await orch.dispatch("@worker do it", lambda _name, _event: None)
+                assert worker.calls
+            finally:
+                await orch.aclose()
+
+    asyncio.run(run())
+
+
+def test_disabled_agent_cannot_be_selected_as_host_backend() -> None:
+    async def run() -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="myagents-enable-host-"
+        ) as raw:
+            config = AgentEnablementConfig(Path(raw) / "config.toml")
+            orch = Orchestrator(
+                ".",
+                specs=(AgentSpec(
+                    "worker",
+                    "app-server",
+                    lambda: FakeAdapter("worker"),
+                    probe=_fixed_probe("worker", ReadinessState.READY),
+                    host_factory=lambda: FakeAdapter("worker-host"),
+                    host_probe=_fixed_probe("worker", ReadinessState.READY),
+                ),),
+                persistent=False,
+                discover_agents=True,
+                host_probe=_fixed_probe("host", ReadinessState.READY),
+                host_model_factory=lambda _selection: FakeAdapter("host"),
+                agent_enablement=config,
+            )
+            try:
+                orch.set_agent_enabled("worker", enabled=False)
+                try:
+                    await orch.switch_host_backend("agent", "worker")
+                except AgentUnavailableError as exc:
+                    assert exc.names == ("host",)
+                    assert "全局配置禁用" in str(exc)
+                else:
+                    raise AssertionError("已禁用 worker 不得成为 Host backend")
+                assert orch.host_backend_selection.kind == "model"
+            finally:
+                await orch.aclose()
+
+    asyncio.run(run())
+
+
+def test_global_switch_applies_when_system_discovery_is_disabled() -> None:
+    with tempfile.TemporaryDirectory(prefix="myagents-enable-embedded-") as raw:
+        config = AgentEnablementConfig(Path(raw) / "config.toml")
+        orch = Orchestrator(
+            ".",
+            specs=(AgentSpec(
+                "worker", "jsonl", lambda: FakeAdapter("worker")),),
+            persistent=False,
+            discover_agents=False,
+            agent_enablement=config,
+        )
+        try:
+            assert orch.agent_readiness_snapshot()[0].ready
+            orch.set_agent_enabled("worker", enabled=False)
+            assert orch.agent_readiness_snapshot()[0].state \
+                is ReadinessState.DISABLED
+            try:
+                orch.require_message_agents("@worker task")
+            except AgentUnavailableError:
+                pass
+            else:
+                raise AssertionError("关闭系统探测时仍必须应用全局禁用覆盖")
+        finally:
+            asyncio.run(orch.aclose())
+
+
 def test_host_route_prompt_excludes_unready_workers() -> None:
     host = HostAgent(adapter=FakeAdapter("host"), workers=["ready", "missing"])
     prompt = host._build_route_prompt("[user] task", ["ready"])
@@ -599,20 +792,71 @@ def test_multisession_rescan_updates_all_loaded_rooms_and_reuses_probes() -> Non
     asyncio.run(run())
 
 
+def test_global_switch_syncs_all_loaded_rooms() -> None:
+    async def run() -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="myagents-enable-sessions-"
+        ) as raw:
+            root = Path(raw)
+            workdir = root / "work"
+            workdir.mkdir()
+            config = AgentEnablementConfig(root / "config.toml")
+            spec = AgentSpec(
+                "worker", "jsonl", lambda: FakeAdapter("worker"),
+                probe=_fixed_probe("worker", ReadinessState.READY),
+            )
+            initial = Orchestrator(
+                str(workdir),
+                specs=(spec,),
+                store=RoomStore(workdir, state_root=root / "state"),
+                discover_agents=True,
+                host_probe=_fixed_probe("host", ReadinessState.READY),
+                agent_enablement=config,
+            )
+            manager = SessionManager(
+                workdir,
+                specs=(spec,),
+                initial_orchestrator=initial,
+                enable_control=False,
+            )
+            await manager.start()
+            first_id = manager.active_session_id
+            second_id = (await manager.create_session(workdir)).summary.room_id
+            try:
+                manager.set_agent_enabled("worker", enabled=False)
+                for room_id in (first_id, second_id):
+                    await manager.activate(room_id)
+                    status = manager.active_runtime.orch \
+                        .agent_readiness_snapshot()[0]
+                    assert status.state is ReadinessState.DISABLED
+                assert config.disabled_names(("worker",)) == {"worker"}
+            finally:
+                await manager.aclose()
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     test_snapshot_distinguishes_ready_missing_and_invalid()
     test_require_is_atomic_and_actionable()
     test_refresh_observes_fake_install_without_restart()
     test_probe_canonicalizes_symlink_without_executing_target()
+    test_global_switch_config_preserves_host_and_is_private()
+    test_global_switch_config_fails_closed_on_unsafe_or_invalid_file()
+    test_agent_control_command_parser_is_strict()
     test_explicit_missing_target_is_rejected_before_timeline()
     test_workflow_missing_role_is_rejected_before_git_baseline()
     test_discussion_missing_participant_is_rejected_atomically()
     test_missing_host_blocks_unmentioned_message_before_timeline()
     test_local_steering_does_not_require_host_readiness()
     test_host_routes_only_to_ready_workers()
+    test_global_switch_blocks_dispatch_and_host_routing_without_deleting_state()
+    test_disabled_agent_cannot_be_selected_as_host_backend()
+    test_global_switch_applies_when_system_discovery_is_disabled()
     test_host_route_prompt_excludes_unready_workers()
     test_rescan_constructs_newly_ready_adapter_without_restart()
     test_rescan_does_not_publish_partially_restored_adapter()
     test_rescan_does_not_publish_adapter_when_setup_fails()
     test_multisession_rescan_updates_all_loaded_rooms_and_reuses_probes()
+    test_global_switch_syncs_all_loaded_rooms()
     print("\nAgent readiness 核心契约测试全部通过")

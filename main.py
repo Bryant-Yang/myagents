@@ -45,7 +45,12 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
-from agent_readiness import AgentUnavailableError
+from agent_readiness import (
+    AgentEnablementConfig,
+    AgentEnablementError,
+    AgentUnavailableError,
+    parse_agent_control_command,
+)
 from host_backend import HostBackendValidationError, parse_host_command
 from orchestrator import HOST_NAME, Orchestrator
 from adapters.base import (
@@ -764,6 +769,7 @@ class ChatApp(App):
                 persistent=persistent,
                 session_name=requested_session,
                 discover_agents=True,
+                agent_enablement=AgentEnablementConfig(),
             )
         self.session_name = self.orch.session_name
         # 持久模式由 SessionManager 集中拥有多个隔离 runtime；非持久测试仍沿用
@@ -1562,7 +1568,8 @@ class ChatApp(App):
         )
         # 已经完整输入本地命令时，Enter 应直接提交；不能被候选层吞掉，
         # 迫使用户再按一次 Enter。
-        if context.kind == "command" and completed_value == box.value:
+        if context.kind in {"command", "agent_control"} \
+                and completed_value == box.value:
             self.close_completion()
             return False
         self._suppress_completion_value = completed_value
@@ -1599,6 +1606,28 @@ class ChatApp(App):
             event.input.value = event.value
             event.input.cursor_position = original_cursor
             event.input.focus()
+            return
+
+        try:
+            agent_command = parse_agent_control_command(text)
+        except AgentEnablementError as exc:
+            self._write("system", str(exc), "bold red")
+            event.input.value = event.value
+            event.input.cursor_position = original_cursor
+            event.input.focus()
+            return
+        if agent_command is not None:
+            event.input.value = ""
+            self.close_completion()
+            if agent_command.action == "show":
+                self.action_show_agents()
+            elif agent_command.action == "rescan":
+                self.action_rescan_agents()
+            else:
+                self.action_set_agent_enabled(
+                    agent_command.name or "",
+                    enabled=agent_command.action == "enable",
+                )
             return
 
         command = local_command_for(text)
@@ -1658,6 +1687,8 @@ class ChatApp(App):
             if not status.ready:
                 rows.append(f"  建议：{status.setup_hint}")
         rows.append("重新检测：/agents rescan（不会安装或改动任何 agent）")
+        rows.append(
+            "全局开关：/agents disable <agent> · /agents enable <agent>")
         self._system("\n".join(rows))
 
     def action_show_host(self) -> None:
@@ -1707,6 +1738,24 @@ class ChatApp(App):
             self._write("system", f"重新检测失败：{exc}", "bold red")
             return
         self._system("已重新检测；未安装或改动任何 agent")
+        self.action_show_agents()
+
+    def action_set_agent_enabled(self, name: str, *, enabled: bool) -> None:
+        try:
+            if self.session_manager is not None:
+                self.session_manager.set_agent_enabled(name, enabled=enabled)
+            else:
+                self.orch.set_agent_enabled(name, enabled=enabled)
+        except Exception as exc:
+            verb = "启用" if enabled else "禁用"
+            self._write("system", f"{verb} @{name} 失败：{exc}", "bold red")
+            return
+        verb = "启用" if enabled else "禁用"
+        self._system(
+            f"已全局{verb} @{name}；当前进程内所有已加载会话已同步，"
+            "其他正在运行的 myagents 进程请执行 /agents rescan。"
+            "已在执行的任务不会被中断。"
+        )
         self.action_show_agents()
 
     def action_show_roles(self) -> None:

@@ -24,7 +24,7 @@
   probe。协议和路径差异留在具体 probe/adapter，不进入通用路由分支。
 - 通用 `AgentReadinessRegistry` 只暴露 `snapshot()`、`require()`、`refresh()`：
   TUI、Orchestrator、discussion 与 workflow 不自行解释 PATH 或厂商错误。
-- 首版状态为 `ready`、`not_found`、`invalid`。文案使用“当前进程未检测到 CLI”，
+- 状态为 `ready`、`not_found`、`invalid`、`disabled`。文案使用“当前进程未检测到 CLI”，
   不把 PATH 不可见武断写成“未安装”。每个状态携带有界原因和人工 setup hint。
 - production TUI 在启动/新建 runtime 时探测；测试和嵌入调用可以注入 fake probe
   或关闭系统探测，避免自动化依赖真实安装。
@@ -39,6 +39,11 @@
 - `/agents rescan` 重新读取当前进程环境并同步所有已加载 room；新发现的 adapter
   只为后续任务启用，不取消或重建正在运行的任务。之后新建的 room 复用同一组
   probe，不退回依赖本机状态的另一套默认配置。
+- 全局开关写在私有 XDG 配置 `~/.config/myagents/config.toml` 的
+  `[agents.<name>].enabled`。`/agents disable <agent>` 与
+  `/agents enable <agent>` 使用 0600、no-follow、进程间锁和同目录原子替换，
+  只改目标 table 并保留 `[host]` 及其他配置。配置无效时所有 worker
+  fail-closed，Host 的独立模型配置仍可诊断。
 
 ### 2.3 派发资格与原子边界
 
@@ -50,6 +55,9 @@
   不可用时进入手动点名模式，不回退到第一个注册 worker。
 - session role 可以继续保存对暂时未就绪 agent 的定义；只有实际派发受阻，
   readiness 不删除角色、cursor、session id 或 timeline 事实。
+- `disabled` 保留注册项、adapter/session/cursor/历史与登录态，但从显式派发、
+  Host 候选、discussion、collaboration、workflow 和 agent Host 选择中排除。
+  切换不取消已运行任务；后续及排队任务在 Orchestrator 的第二次资格门处阻断。
 - 外部 CommandBus/MCP 同样在 Orchestrator 内受资格门约束。TUI 额外在清空输入框
   前调用同一资格门，使本地用户保留原草稿；这不是第二套判断逻辑。
 
@@ -59,7 +67,8 @@
 - `@` 候选保留全部已知 agent，ready 项优先；未就绪项置后并显示状态，保持
   可发现性但不伪装可派发。
 - `/agents` 展示 worker 与 host 的状态、transport、原因和 setup hint；
-  `/agents rescan` 只做被动重扫并显示结果。
+  `/agents rescan` 只做被动重扫并显示结果；`enable/disable` 立即同步当前进程内
+  所有已加载 room，其他正在运行的 myagents 进程在下一次 rescan 后观察新值。
 - 未就绪、discussion/workflow 资格错误均显示可操作的本地错误，原输入文本和
   光标保持不变，不进入 timeline、不调用模型。
 
@@ -87,6 +96,9 @@
    `/agents` 与 `/agents rescan` 都是本地命令，不写 timeline、不调用模型。
 6. probe 测试使用注入 resolver、临时普通文件和符号链接；不得安装、卸载、移动
    或启动真实 agent。完整 Harness 与 R1–R6 继续通过。
+7. 临时私有配置验证 Host section 无损保留、宽松权限/符号链接 fail-closed、
+   开关跨已加载 room 同步；禁用项不能显式派发、进入 Host 候选或切换为 agent
+   Host，重新启用后无需重启即可恢复。
 
 ## 5. 后果
 
