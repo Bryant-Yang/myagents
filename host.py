@@ -149,11 +149,86 @@ MODERATOR_TEMPLATE = """\
 只能基于已有记录提出建议或明确指出应交给 worker，不得声称已经执行。
 """
 
-_JSON_RE = re.compile(r"\{.*\}", re.S)
 _COLLABORATION_MARKER_RE = re.compile(
     r"(?:\{|,)\s*[\"']?collaboration[\"']?\s*(?::|\}|\{|$)",
     re.IGNORECASE,
 )
+_ROUTE_MARKER_RE = re.compile(
+    r"(?:\{|,)\s*[\"']?(?:discussion|collaboration|targets)[\"']?"
+    r"\s*(?::|\}|\{|$)",
+    re.IGNORECASE,
+)
+
+
+class _DuplicateJsonKeyError(ValueError):
+    """A model route object is ambiguous after JSON key decoding."""
+
+
+def _object_without_duplicate_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonKeyError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _json_objects(raw: str) -> tuple[dict, ...]:
+    """Decode complete JSON objects without greedily joining separate braces.
+
+    Model backends sometimes wrap the one requested object in a fenced block
+    or precede it with a short braced note. Each successfully decoded object
+    remains independent; callers must still select exactly one contract shape.
+    """
+    objects: list[dict] = []
+    cursor = 0
+    while cursor < len(raw):
+        start = raw.find("{", cursor)
+        if start < 0:
+            break
+        depth = 0
+        in_string = False
+        escaped = False
+        end: int | None = None
+        for index in range(start, len(raw)):
+            char = raw[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+        if end is None:
+            # An unmatched outer object owns the rest of the text. Never scan
+            # inside it for a nested route that could be mistaken as complete.
+            break
+        try:
+            value = json.loads(
+                raw[start:end],
+                object_pairs_hook=_object_without_duplicate_keys,
+            )
+        except json.JSONDecodeError:
+            cursor = end
+            continue
+        if isinstance(value, dict):
+            objects.append(value)
+        cursor = end
+    return tuple(objects)
+
+
 _DISCUSSION_MARKER_RE = re.compile(
     r"(?:\{|,)\s*[\"']?discussion[\"']?\s*(?::|\}|\{|$)",
     re.IGNORECASE,
@@ -317,14 +392,20 @@ class HostAgent:
         choices: list[str],
     ) -> HostCollaboration:
         raw = raw.strip()
-        match = _JSON_RE.search(raw)
-        if match is None:
-            raise CollaborationValidationError("host 未返回协作计划 JSON")
         try:
-            payload = json.loads(match.group(0))
-        except json.JSONDecodeError as exc:
+            candidates = [
+                payload for payload in _json_objects(raw)
+                if "steps" in payload
+            ]
+        except _DuplicateJsonKeyError as exc:
             raise CollaborationValidationError(
-                "host 返回的协作计划不是合法 JSON") from exc
+                "host 返回的协作计划包含重复 JSON key") from exc
+        if not candidates:
+            raise CollaborationValidationError("host 未返回协作计划 JSON")
+        if len(candidates) != 1:
+            raise CollaborationValidationError(
+                "host 返回多个协作计划 JSON，无法唯一判定")
+        payload = candidates[0]
         plan = parse_collaboration_payload(
             payload,
             choices,
@@ -385,10 +466,34 @@ class HostAgent:
         raw = raw.strip()
         collaboration_marker = _COLLABORATION_MARKER_RE.search(raw) is not None
         discussion_marker = _DISCUSSION_MARKER_RE.search(raw) is not None
-        m = _JSON_RE.search(raw)
-        if m:
+        route_marker_count = len(_ROUTE_MARKER_RE.findall(raw))
+        try:
+            route_candidates = [
+                payload for payload in _json_objects(raw)
+                if {"discussion", "collaboration", "targets"}.intersection(
+                    payload)
+            ]
+        except _DuplicateJsonKeyError as exc:
+            raise CollaborationValidationError(
+                "host 返回的路由包含重复 JSON key") from exc
+        if (
+            len(route_candidates) > 1
+            or route_marker_count > len(route_candidates)
+        ):
+            if discussion_marker and not collaboration_marker:
+                raise DiscussionValidationError(
+                    "host 返回多个讨论/路由 JSON，无法唯一判定")
+            raise CollaborationValidationError(
+                "host 返回多个、嵌套或不完整的路由 JSON，无法唯一判定")
+        if route_candidates:
             try:
-                data = json.loads(m.group(0))
+                data = route_candidates[0]
+                route_keys = {
+                    "discussion", "collaboration", "targets"
+                }.intersection(data)
+                if len(route_keys) != 1:
+                    raise CollaborationValidationError(
+                        "host 路由 JSON 必须且只能包含一种路由类型")
                 if isinstance(data, dict) and "discussion" in data:
                     request = parse_discussion_payload(
                         data["discussion"], choices)
@@ -413,8 +518,15 @@ class HostAgent:
                     )
                 # 校验 + 按序去重：LLM 可能返回 ["kimi", "kimi"]，
                 # 不去重会在同一工作目录并发跑两遍相同任务
+                raw_targets = data.get("targets")
+                if (
+                    not isinstance(raw_targets, list)
+                    or any(not isinstance(target, str) for target in raw_targets)
+                ):
+                    raise CollaborationValidationError(
+                        "host 返回的 targets 不是字符串数组")
                 targets: list[str] = []
-                for t in data.get("targets", []):
+                for t in raw_targets:
                     if t in choices and t not in targets:
                         targets.append(t)
                 reason = str(data.get("reason", ""))[:80]
@@ -432,9 +544,11 @@ class HostAgent:
                         targets[:2], reason or "主持人判断",
                         tasks=tasks,
                         role_changes=role_changes)
+                raise CollaborationValidationError(
+                    "host 返回的 targets 不包含可用 agent")
             except DiscussionValidationError:
                 raise
-            except (json.JSONDecodeError, AttributeError, TypeError) as exc:
+            except (AttributeError, TypeError) as exc:
                 if discussion_marker:
                     raise DiscussionValidationError(
                         "host 返回的讨论意图不是合法 JSON") from exc

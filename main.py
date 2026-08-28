@@ -579,7 +579,7 @@ class ComposerInput(Input):
         Binding("up", "completion_previous", show=False),
         Binding("down", "completion_next", show=False),
         Binding("tab", "completion_accept", show=False),
-        Binding("alt+up", "interject", "插话", priority=True),
+        Binding("alt+up", "interject", "提升排队", priority=True),
         Binding("escape", "completion_close", show=False),
         *Input.BINDINGS,
     ]
@@ -834,7 +834,7 @@ class ChatApp(App):
         yield ComposerInput(
             placeholder=(
                 "输入 @ 选择 agent；/new 或 Ctrl+N 新会话；"
-                "Alt+↑ 插话；Esc 取消任务；Ctrl+O 会话；Ctrl+G 活动；Ctrl+C 退出"
+                "Alt+↑ 提升最早排队输入；Esc 取消任务；Ctrl+O 会话；Ctrl+G 活动；Ctrl+C 退出"
             ),
             id="composer",
         )
@@ -2195,24 +2195,19 @@ class ChatApp(App):
         self.run_worker(runner())
 
     def action_interject(self) -> None:
-        """把当前草稿提交给唯一可安全插话的活动 delivery。"""
+        """把当前会话 FIFO 中最早的排队输入提升为运行中插话。"""
         box = self.query_one("#composer", ComposerInput)
-        instruction = box.value.strip()
-        if not instruction:
-            self._write("system", "请输入插话内容后再按 Alt+↑", "bold red")
-            return
         active = self.bus.active()
         if active is None:
             self._write(
-                "system", "当前没有运行中的任务；可按 Enter 正常发送", "bold red")
+                "system", "当前没有运行中的任务，无法提升排队输入", "bold red")
             return
-        original = box.value
         target_bus = self.bus
         target_room_id = self._activity_room_id
 
         async def runner() -> None:
             try:
-                await target_bus.interject(active.command_id, instruction)
+                await target_bus.interject_next(active.command_id)
             except Exception as exc:
                 if self._activity_room_id == target_room_id:
                     self._write("system", f"插话失败：{exc}", "bold red")
@@ -2225,15 +2220,8 @@ class ChatApp(App):
                     )
                 return
             if self._activity_room_id == target_room_id:
-                if box.value == original:
-                    box.value = ""
                 self.close_completion()
                 box.focus()
-            elif self.session_manager is not None:
-                snapshot = self.session_manager.snapshot(target_room_id)
-                if snapshot.draft == original:
-                    self.session_manager.save_draft(
-                        "", cursor_position=0, session_id=target_room_id)
 
         self.run_worker(runner())
 

@@ -115,10 +115,11 @@ Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 co
 - 默认权限弹窗：显示来源 agent、工具标题、命令上下文和 agent 提供的 options。
 - 精确取消：正常输入态按 `Esc`（`Ctrl+X` 仍兼容）或通过 MCP，只取消当前
   command，房间继续工作；补全、会话弹窗和活动导航先关闭自身。
-- 运行中插话：在草稿中按 `Alt+↑`。workflow 在下一阶段边界采纳；普通任务
-  只有唯一活动且 adapter 有已验收能力时接受（当前 Pi 走官方 native `steer`）。
-  ACP/Codex/native host、多目标或无活动目标明确拒绝并保留草稿，可改按 Enter
-  排队或 Esc 取消。
+- 运行中插话：先按 Enter 把输入加入 FIFO，再按 `Alt+↑` 提升最早的排队输入。
+  workflow 在下一阶段边界采纳；普通任务只有唯一活动且 adapter 有已验收能力时
+  接受（当前 Pi 走官方 native `steer`，Codex 走 app-server `turn/steer`）。输入框
+  里尚未提交的草稿不参与；ACP/native host、多目标或无活动目标明确拒绝，原队列
+  顺序保持不变。
 - 权限 fail-closed：无处理器、异常或非法 option 一律拒绝。
 - 流式回复合并：ACP token/chunk 持续更新同一条 TUI 记录，不再一词一行。
 - 有状态 agent 卡死回收：普通分析连续 300 秒无协议事件才取消；ACP 与 Pi RPC
@@ -460,8 +461,9 @@ owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id
 /steer -- 额外覆盖空输入，保持现有公开 API
 ```
 
-前一任务运行时，Enter 仍按 FIFO 排队；`Alt+↑` 才是尝试影响当前运行。插话不
-创建新 command，也不进入共享对话历史。完整边界见
+前一任务运行时，Enter 先按 FIFO 排队；`Alt+↑` 把队首等待输入提升为尝试影响
+当前运行的插话。有多条时只取最早一条，其余继续排队；输入框草稿不参与。
+插话不创建新 command，也不进入共享对话历史。完整边界见
 [ADR-0018](docs/adr/0018-capability-bounded-runtime-interjection.md)。
 
 自然语言协作与普通多点名是两种不同语义：`一起、分别、各自` 保持并发 fan-out；
@@ -783,7 +785,7 @@ myagents/
 - [docs/adr/0015-dsh-acp-only-transport.md](docs/adr/0015-dsh-acp-only-transport.md)：DSH 专用 ACP 入口、两 profile、stateful lifecycle gate 与零 fallback。
 - [docs/adr/0016-explicit-auto-approve-mode.md](docs/adr/0016-explicit-auto-approve-mode.md)：`/yolo` 会话级自动批准、持续危险提示与只读硬边界。
 - [docs/adr/0017-native-model-backed-host.md](docs/adr/0017-native-model-backed-host.md)：会话级 HostBackend、原生模型 provider/runtime 与只读 agent Host。
-- [docs/adr/0018-capability-bounded-runtime-interjection.md](docs/adr/0018-capability-bounded-runtime-interjection.md)：Esc 精确取消、Alt+↑ 能力受限插话与 Pi native steer。
+- [docs/adr/0018-capability-bounded-runtime-interjection.md](docs/adr/0018-capability-bounded-runtime-interjection.md)：Esc 精确取消、Alt+↑ 能力受限插话，以及 Pi/Codex 原生同轮 steer。
 - [docs/concepts.md](docs/concepts.md)：相关协议与编排模式。
 - [docs/knowledge-map.html](docs/knowledge-map.html)：可交互知识地图。
 

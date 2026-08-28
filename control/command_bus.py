@@ -58,6 +58,10 @@ class CommandBusError(Exception):
     """CommandBus 公共异常基类。"""
 
 
+class CommandInterjectionUncertainError(CommandBusError):
+    """插话可能已写入 transport，原排队命令不得再次执行。"""
+
+
 class CommandBusClosedError(CommandBusError):
     """bus 已关闭：拒绝 submit / start。"""
 
@@ -172,6 +176,7 @@ class CommandBus:
         self._commands: dict[str, _Command] = {}      # command_id → 记录（保序）
         self._by_request_id: dict[str, str] = {}      # request_id → command_id，永不清理
         self._queue: asyncio.Queue[_Command] | None = None
+        self._queue_gate: asyncio.Lock | None = None
         self._cond: asyncio.Condition | None = None
         self._worker_task: asyncio.Task | None = None
         self._active: _Command | None = None          # worker 已取走、未 terminal 的命令
@@ -199,6 +204,7 @@ class CommandBus:
             return
         if self._queue is None:
             self._queue = asyncio.Queue()
+            self._queue_gate = asyncio.Lock()
             self._cond = asyncio.Condition()
         self._worker_task = asyncio.create_task(
             self._run_worker(), name="command-bus-worker")
@@ -308,11 +314,11 @@ class CommandBus:
             self._event_sink("user", event)
         return receipt.to_dict()
 
-    async def interject(
+    async def _interject(
         self,
         command_id: str,
         instruction: str,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], AgentEvent]:
         """向当前 command 的安全边界插话；不支持的 transport 明确拒绝。"""
         cmd = self._lookup(command_id)
         if cmd.status is not CommandStatus.RUNNING or self._active is not cmd:
@@ -342,14 +348,7 @@ class CommandBus:
                 receipt.to_dict()
                 if hasattr(receipt, "to_dict") else dict(receipt)
             )
-            self._last_activity = asyncio.get_running_loop().time()
-            if self._event_sink is not None:
-                self._event_sink("user", AgentEvent(
-                    event.kind,
-                    event.text,
-                    {**event.meta, "command_id": command_id},
-                ))
-            return {**result, "mode": "boundary"}
+            return {**result, "mode": "boundary"}, event
 
         # Native in-flight transport 先把用户意图作为 no-replay 边界持久化；
         # 随后才写协议。失败/不确定都只记结果，绝不重投同一条插话。
@@ -363,53 +362,137 @@ class CommandBus:
             # commit coroutine may have been cancelled after the transport
             # write. Record uncertainty before propagating cancellation; the
             # persisted request must never be replayed on recovery.
-            self._append_execution_event(
-                command_id,
-                "system",
-                "interjection_uncertain",
-                "CancelledError: 插话提交被取消，发送结果未知",
-            )
+            try:
+                self._append_execution_event(
+                    command_id,
+                    "system",
+                    "interjection_uncertain",
+                    "CancelledError: 插话提交被取消，发送结果未知",
+                )
+            except Exception as persist_exc:
+                self._report_event_persistence_error(
+                    command_id, persist_exc)
             raise
         except Exception as exc:
+            uncertain = isinstance(exc, AgentDeliveryUncertainError)
             kind = (
-                "interjection_uncertain"
-                if isinstance(exc, AgentDeliveryUncertainError)
+                "interjection_uncertain" if uncertain
                 else "interjection_failed"
             )
             detail = f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_CHARS]
-            self._append_execution_event(
-                command_id, "system", kind, detail)
+            try:
+                self._append_execution_event(
+                    command_id, "system", kind, detail)
+            except Exception as persist_exc:
+                # The transport result remains authoritative even when its
+                # audit event cannot be appended. In particular, an uncertain
+                # write must still prevent the source command from replaying.
+                self._report_event_persistence_error(
+                    command_id, persist_exc)
+            if uncertain:
+                raise CommandInterjectionUncertainError(
+                    f"运行中插话结果不确定：{exc}") from exc
             raise CommandBusError(f"运行中插话失败：{exc}") from exc
         result = (
             receipt.to_dict()
             if hasattr(receipt, "to_dict") else dict(receipt)
         )
-        agent = str(result.get("agent") or event.meta.get("agent") or "agent")
-        self._append_execution_event(
-            command_id,
-            "system",
-            "interjection_accepted",
-            f"{agent} 已接受运行中插话",
-        )
-        self._last_activity = asyncio.get_running_loop().time()
-        if self._event_sink is not None:
-            self._event_sink("user", AgentEvent(
-                "interjection",
-                clean,
-                {**event.meta, **result, "command_id": command_id},
-            ))
-        return result
+        return result, event
+
+    async def interject_next(self, command_id: str) -> dict[str, Any]:
+        """把 FIFO 中最早的 queued command 提升为当前任务插话。"""
+        gate = self._queue_gate
+        if gate is None:
+            raise CommandBusError("CommandBus 尚未启动")
+        async with gate:
+            active = self._lookup(command_id)
+            if (
+                active.status is not CommandStatus.RUNNING
+                or self._active is not active
+            ):
+                raise CommandValidationError("插话只接受当前 running command")
+            queued = next(
+                (
+                    command for command in self._commands.values()
+                    if command.status is CommandStatus.QUEUED
+                ),
+                None,
+            )
+            if queued is None:
+                raise CommandValidationError(
+                    "当前没有排队输入；请先按 Enter 入队")
+            try:
+                result, event = await self._interject(
+                    command_id, queued.message)
+            except CommandInterjectionUncertainError:
+                detail = "插话结果不确定；为避免重复执行，已移出排队队列"
+                await self._safe_terminal(
+                    queued,
+                    CommandStatus.FAILED,
+                    error=detail,
+                    terminal_text=detail,
+                )
+                raise
+            except asyncio.CancelledError:
+                detail = "插话提交被取消且结果未知；为避免重复执行，已移出排队队列"
+                await self._safe_terminal(
+                    queued,
+                    CommandStatus.FAILED,
+                    error=detail,
+                    terminal_text=detail,
+                )
+                raise
+            # The transport has accepted the promoted input. Terminalize its
+            # source command before any further fallible audit/UI work so the
+            # stale queue node can never dispatch the same input normally.
+            await self._safe_terminal(
+                queued,
+                CommandStatus.COMPLETED,
+                terminal_text=f"已作为插话提交到任务 {command_id[:8]}",
+            )
+            agent = str(
+                result.get("agent") or event.meta.get("agent") or "agent")
+            try:
+                self._append_execution_event(
+                    command_id,
+                    "system",
+                    "interjection_accepted",
+                    f"{agent} 已接受运行中插话",
+                )
+                self._last_activity = asyncio.get_running_loop().time()
+                if self._event_sink is not None:
+                    self._event_sink("user", AgentEvent(
+                        event.kind,
+                        event.text,
+                        {**event.meta, **result, "command_id": command_id},
+                    ))
+            except Exception as exc:
+                self._report_event_persistence_error(command_id, exc)
+                raise CommandBusError(
+                    "插话已被 transport 接受，但结果事件发布失败；"
+                    "源输入已终止且不会重投"
+                ) from exc
+            return {**result, "source_command_id": queued.command_id}
 
     async def cancel(self, command_id: str) -> CommandSnapshot:
         """精确取消 queued/running 命令；terminal 命令幂等返回。"""
         cmd = self._lookup(command_id)
         if cmd.status in TERMINAL_STATUSES:
             return cmd.snapshot()
-        self._cancel_requested.add(command_id)
         if cmd.status is CommandStatus.QUEUED:
-            await self._transition(
-                cmd, CommandStatus.CANCELLED, error="用户取消")
-            return cmd.snapshot()
+            gate = self._queue_gate
+            if gate is None:
+                raise CommandBusError("CommandBus 尚未启动")
+            # 与 Alt+Up 队列提升互斥。若提升已提交，cancel 只能看到其
+            # terminal 结果；若提升失败，原命令仍在原 FIFO 位置并可取消。
+            async with gate:
+                if cmd.status in TERMINAL_STATUSES:
+                    return cmd.snapshot()
+                if cmd.status is CommandStatus.QUEUED:
+                    await self._transition(
+                        cmd, CommandStatus.CANCELLED, error="用户取消")
+                    return cmd.snapshot()
+        self._cancel_requested.add(command_id)
         if self._event_sink is not None:
             # 同步通知 TUI 先结束权限等待；否则 ACP server 可能正阻塞在
             # request_permission，收不到随后发出的 session/cancel。
@@ -468,10 +551,11 @@ class CommandBus:
         """
         try:
             while True:
-                cmd = await self._queue.get()
-                if cmd.status in TERMINAL_STATUSES:
-                    continue
-                self._active = cmd
+                async with self._queue_gate:
+                    cmd = await self._queue.get()
+                    if cmd.status in TERMINAL_STATUSES:
+                        continue
+                    self._active = cmd
                 try:
                     await self._run_one(cmd)
                 finally:
@@ -619,9 +703,15 @@ class CommandBus:
             if self._event_sink is not None:
                 self._event_sink("system", event)
 
-    async def _transition(self, cmd: _Command, status: CommandStatus,
-                          error: str | None = None) -> None:
-        text = {
+    async def _transition(
+        self,
+        cmd: _Command,
+        status: CommandStatus,
+        error: str | None = None,
+        *,
+        terminal_text: str | None = None,
+    ) -> None:
+        text = terminal_text or {
             CommandStatus.RUNNING: "开始执行",
             # completed 只表示本轮调用正常结束，不声称自然语言任务已验收。
             CommandStatus.COMPLETED: "本轮调用结束",
@@ -649,10 +739,12 @@ class CommandBus:
 
     async def _safe_terminal(
             self, cmd: _Command, status: CommandStatus,
-            error: str | None = None) -> None:
+            error: str | None = None, *,
+            terminal_text: str | None = None) -> None:
         """terminal event 落盘失败时仍唤醒 waiter，且唯一 worker 继续服务。"""
         try:
-            await self._transition(cmd, status, error=error)
+            await self._transition(
+                cmd, status, error=error, terminal_text=terminal_text)
             return
         except Exception as exc:
             storage_error = (
@@ -674,14 +766,20 @@ class CommandBus:
 
     def _report_event_persistence_error(
             self, command_id: str, exc: Exception) -> None:
+        """Best-effort diagnostic; never replace the authoritative outcome."""
         if self._event_sink is None:
             return
         detail = (
             str(exc) if isinstance(exc, _ExecutionEventPersistenceError)
             else f"执行事件持久化失败：{type(exc).__name__}: {exc}")
-        self._event_sink("system", AgentEvent(
-            "error", detail,
-            {"command_id": command_id}))
+        try:
+            self._event_sink("system", AgentEvent(
+                "error", detail,
+                {"command_id": command_id}))
+        except Exception:
+            # This path already handles a persistence failure. A broken UI
+            # sink must not mask uncertain delivery and re-enable replay.
+            pass
 
     def _persist_agent_event(
             self, command_id: str, agent: str, event: AgentEvent) -> None:

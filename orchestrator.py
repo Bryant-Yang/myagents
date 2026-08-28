@@ -1823,7 +1823,7 @@ class Orchestrator:
         if not callable(submit):
             raise RuntimeError(
                 f"当前 {name} transport 不支持安全的运行中插话；"
-                "可按 Esc 取消，或按 Enter 排队")
+                "该输入仍在队首，可等待正常出队，或按 Esc 取消当前任务")
         clean = instruction.strip()
         event = AgentEvent(
             "interjection",

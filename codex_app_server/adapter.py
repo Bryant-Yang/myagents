@@ -102,6 +102,9 @@ class CodexAppServerAdapter:
         self._closed = False
         self._active_inner: AsyncIterator[AgentEvent] | None = None
         self._stream_task: asyncio.Task | None = None
+        self._active_thread_id: str | None = None
+        self._active_turn_id: str | None = None
+        self._turn_commit_gate: asyncio.Event | None = None
         self._lock = asyncio.Lock()
 
     @property
@@ -135,12 +138,49 @@ class CodexAppServerAdapter:
         """限制可作为 app-server localImage 发送的本地附件目录。"""
         self._attachment_root = None if root is None else Path(root).absolute()
 
+    async def interject(self, instruction: str) -> None:
+        """Use official ``turn/steer`` after the active turn commit is durable."""
+        client = self._client
+        thread_id = self._active_thread_id
+        turn_id = self._active_turn_id
+        gate = self._turn_commit_gate
+        if (
+            thread_id is None
+            or turn_id is None
+            or gate is None
+            or not gate.is_set()
+            or not client.running
+        ):
+            raise CodexAppServerError(
+                "Codex 当前没有已提交且可插话的活动 turn")
+        try:
+            await client.turn_steer(
+                thread_id,
+                turn_id,
+                instruction,
+                images=prompt_images(instruction, self._attachment_root),
+            )
+        except (
+            CodexAppServerRequestCancelled,
+            CodexAppServerRequestUncertain,
+        ) as exc:
+            # turn/steer may already have reached the active turn. Reclaim the
+            # process and surface a no-replay failure instead of letting the
+            # queued source command execute again as a normal prompt.
+            await client.close()
+            raise AgentDeliveryUncertainError(
+                "Codex turn/steer 结果不确定；连接已作废，禁止自动重投"
+            ) from exc
+
     async def _reset(self) -> None:
         with contextlib.suppress(Exception):
             await self._client.close()
         self._started = False
         self._active_sandbox = None
         self.session_id = None
+        self._active_thread_id = None
+        self._active_turn_id = None
+        self._turn_commit_gate = None
         if not self._closed:
             self._client = self._new_client()
 
@@ -288,6 +328,12 @@ class CodexAppServerAdapter:
                 try:
                     async for event in inner:
                         yield event
+                        if event.kind == "delivery_committed":
+                            gate = self._turn_commit_gate
+                            if gate is not None:
+                                # The consumer resumes this generator only
+                                # after it has durably handled the event.
+                                gate.set()
                 finally:
                     with contextlib.suppress(RuntimeError):
                         await inner.aclose()
@@ -353,6 +399,10 @@ class CodexAppServerAdapter:
                 raise
             # turn/start 已明确接受。在任何正文、工具或权限事件到达外部 sink
             # 前，让 Orchestrator 先持久化 no-replay cursor。
+            commit_gate = asyncio.Event()
+            self._active_thread_id = thread_id
+            self._active_turn_id = turn_id
+            self._turn_commit_gate = commit_gate
             yield AgentEvent("delivery_committed", meta={
                 "threadId": thread_id,
                 "turnId": turn_id,
@@ -459,6 +509,10 @@ class CodexAppServerAdapter:
             self._client.set_permission_handler(self._permission_handler)
             if turn_id is not None and not terminal:
                 await self._interrupt_and_confirm(thread_id, turn_id)
+            if self._active_turn_id == turn_id:
+                self._active_thread_id = None
+                self._active_turn_id = None
+                self._turn_commit_gate = None
 
     def _sandbox_for(self, execution_mode: ExecutionMode) -> str | None:
         if execution_mode is ExecutionMode.READ_ONLY:
@@ -617,3 +671,6 @@ class CodexAppServerAdapter:
         self._started = False
         self._active_sandbox = None
         self.session_id = None
+        self._active_thread_id = None
+        self._active_turn_id = None
+        self._turn_commit_gate = None

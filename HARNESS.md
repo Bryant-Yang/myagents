@@ -355,10 +355,12 @@ transport。
 - TUI `Esc` / `Ctrl+X`、control `command.cancel`、MCP
   `myagents_cancel_command` 共用一个取消原语；外部可通过
   `myagents_read_events` 读取持久进度。
-- TUI `Alt+↑` 只向唯一活动 delivery 提交能力受限插话。workflow 继续走
-  ADR-0009 阶段边界；普通轮只有 adapter 明确提供已验收 `interject()` 才允许，
-  当前为 Pi 官方 RPC `steer`。意图必须先落 execution event，再写 transport；
-  多目标、ACP/Codex/native model 等未获证路径保留草稿并 fail-closed。
+- TUI `Alt+↑` 只提升同 room FIFO 中最早的 queued command，composer 草稿不参与；
+  其余排队项保持原顺序。workflow 继续走 ADR-0009 阶段边界；普通轮只有 adapter
+  明确提供已验收 `interject()` 才允许，当前为 Pi 官方 RPC `steer` 与 Codex
+  app-server `turn/steer`。意图必须先落 execution event，再写 transport；结果
+  不确定时原 queued command 必须 terminal 且不得重放。多目标、ACP/native model
+  等未获证路径保留原队列并 fail-closed。
 - 重启后最后事件非 terminal 的命令必须显示为“已中断”，不得伪装完成。
 - model Host 的 provider/model 只来自 ADR-0017 的 XDG 私有配置文件与显式环境
   临时覆盖；凭据不进入 readiness、事件或错误。agent Host 只来自
@@ -385,6 +387,10 @@ transport。
   自动 bootstrap 已投递过的 Codex transcript。
 - `turn/start` 明确接受后，no-replay cursor 必须早于正文、工具、权限等任何
   外部 event sink 回调落盘，避免执行事件写失败重新打开重投窗口。
+- 普通 worker 的运行中插话仅在上述 cursor 已落盘后开放；使用同一 client 发送
+  `turn/steer(threadId, expectedTurnId, input)`，必须命中原活动 turn，不创建第二
+  turn/thread/writer。明确拒绝保留队首；写后取消、断线或响应不可信按 uncertain
+  作废连接，源 queued command 终止且不得作为普通 turn 重投。
 - app-server 是 Codex 专用实验协议；最小 wire contract 由 fake tests 固定，
   CLI 升级后必须重跑 contract 与真实探针。
 

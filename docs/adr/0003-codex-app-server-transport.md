@@ -74,7 +74,19 @@ M4.3 允许 `turn/start.input` 在 text 后追加官方 schema 的
 `turn/completed` 是本轮结束的唯一权威信号；`turn/start` response 只表示本轮
 已经建立，不能提前视为完成。
 
-### 2.5 取消与断线
+### 2.5 运行中插话
+
+- 仅在 `turn/start` 的 `delivery_committed` 已被外层持久化后开放 adapter
+  `interject()`；持久化完成前拒绝，避免协议侧接受了插话但执行事件不存在。
+- 使用同一 app-server client 调用官方
+  `turn/steer(threadId, expectedTurnId, input)`；`expectedTurnId` 必须是当前活动
+  turn，响应也必须返回该 turn id。不得创建第二 turn/thread/process/writer。
+- app-server 明确拒绝（例如 review 或 manual compact 阶段）属于未接受，队首输入
+  保持 queued。写后取消、断线、超时、缺失或错误 turn id 属于 uncertain：立即
+  作废连接，源 queued command terminal failed，禁止再作为普通 turn 重投。
+- 图片仍只允许来自当前房间已验证的附件信任根，沿用 `localImage` TOCTOU 校验。
+
+### 2.6 取消与断线
 
 - 取消活跃流时发送 `turn/interrupt(threadId, turnId)`，继续等待匹配的
   `turn/completed`。
@@ -83,7 +95,7 @@ M4.3 允许 `turn/start.input` 在 text 后追加官方 schema 的
 - stdout EOF、非法协议帧或进程退出必须使 pending request 和活跃 turn 立即
   失败，不得留下“处理中”假状态。
 
-### 2.6 fallback 语义
+### 2.7 fallback 语义
 
 - initialize 或 thread prepare 阶段失败可以回退到 `codex exec --json`；
   此时尚未提交用户 turn，即使空 thread 已在服务端建立也没有工具副作用。
@@ -103,7 +115,7 @@ M4.3 允许 `turn/start.input` 在 text 后追加官方 schema 的
   潜在工具副作用。
 - fallback 是可观测事件，不能静默伪装成 app-server 成功。
 
-### 2.7 实验协议防漂移
+### 2.8 实验协议防漂移
 
 - fake server contract tests 固定当前使用的最小 method/field 集。
 - 生产实现只依赖生成 schema 中的稳定核心方法，不开启 experimental API。
@@ -121,6 +133,8 @@ M4.3 允许 `turn/start.input` 在 text 后追加官方 schema 的
    残留；真实模型测试不进入默认快速 gate。
 6. JSONL fallback 单独保留回归证据，且禁止对已发送 `turn/start` 自动重放。
 7. fake app-server 抓包证明图片轮包含 `localImage`，且不新增配置覆盖字段。
+8. fake app-server 证明 `turn/steer` 只命中原活动 turn、不产生第二
+   `turn/start`；pre-commit 拒绝，写后断线按 uncertain/no-replay 收尾。
 
 ## 4. 后果
 

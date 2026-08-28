@@ -16,6 +16,8 @@
   同步等客户端应答并记 "approval:<result|error>"，然后正常完成本轮
 - 含 "slow"：发一个 delta 后挂起不完成；收到 turn/interrupt 后回空
   result 并发 turn/completed(status=interrupted)，记 "interrupt:<turnId>"
+- 活跃 slow turn 收到 turn/steer：校验 threadId/expectedTurnId，回同一 turnId，
+  发追加 delta 后完成；不会创建第二 turn
 - 含 "tools"：发 reasoning item + item/reasoning/textDelta（正文含标记
   REASONING-SECRET-MARKER）、commandExecution / fileChange / mcpToolCall
   item（command 含 API_TOKEN=secret-value，配合脱敏断言），再发
@@ -44,8 +46,14 @@ SECRET_COMMAND = "API_TOKEN=secret-value rm -rf build"
 
 PID = os.getpid()
 _turn_seq = 0
-# 当前活跃 turn：{"rid": turn/start 请求 id, "turn_id": str, "slow": bool}
-_active: dict = {"rid": None, "turn_id": None, "slow": False}
+# 当前活跃 turn：{"rid": turn/start 请求 id, "thread_id": str,
+# "turn_id": str, "slow": bool}
+_active: dict = {
+    "rid": None,
+    "thread_id": None,
+    "turn_id": None,
+    "slow": False,
+}
 
 
 def log(event: str) -> None:
@@ -238,7 +246,8 @@ def main() -> None:
             if "die" in text:
                 # 模拟崩溃：pending 的 turn/start 永远等不到响应
                 os._exit(1)
-            _active.update({"rid": rid, "turn_id": turn_id,
+            _active.update({"rid": rid, "thread_id": thread_id,
+                            "turn_id": turn_id,
                             "slow": "slow" in text})
             send({"id": rid, "result": {
                 "turn": turn_obj(turn_id, "inProgress")}})
@@ -255,7 +264,8 @@ def main() -> None:
                 notify("turn/completed", {
                     "threadId": thread_id,
                     "turn": turn_obj(turn_id, "interrupted")})
-                _active.update({"rid": None, "turn_id": None, "slow": False})
+                _active.update({"rid": None, "thread_id": None,
+                                "turn_id": None, "slow": False})
                 continue
             if "approval" in text:
                 send({"id": "srv-approval-1",
@@ -307,12 +317,54 @@ def main() -> None:
                 notify("turn/completed", {
                     "threadId": thread_id,
                     "turn": turn_obj(turn_id, "inProgress")})
-                _active.update({"rid": None, "turn_id": None, "slow": False})
+                _active.update({"rid": None, "thread_id": None,
+                                "turn_id": None, "slow": False})
                 continue
             if "tools" in text:
                 emit_tool_items(thread_id, turn_id)
             emit_text_and_complete(thread_id, turn_id, rid)
-            _active.update({"rid": None, "turn_id": None, "slow": False})
+            _active.update({"rid": None, "thread_id": None,
+                            "turn_id": None, "slow": False})
+        elif method == "turn/steer":
+            log("steer-params:" + json.dumps(params, sort_keys=True))
+            if (
+                _active["rid"] is None
+                or params.get("threadId") != _active["thread_id"]
+                or params.get("expectedTurnId") != _active["turn_id"]
+            ):
+                send({"id": rid, "error": {
+                    "code": -32602,
+                    "message": "active turn does not match expected turn",
+                }})
+                continue
+            text = "".join(
+                part.get("text", "")
+                for part in params.get("input") or []
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+            if "reject-steer" in text:
+                send({"id": rid, "error": {
+                    "code": -32602,
+                    "message": "turn cannot accept steering now",
+                }})
+                continue
+            if "die-steer" in text:
+                os._exit(1)
+            thread_id = _active["thread_id"]
+            turn_id = _active["turn_id"]
+            send({"id": rid, "result": {"turnId": turn_id}})
+            notify("item/agentMessage/delta", {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": turn_id + "_msg",
+                "delta": "已收到插话",
+            })
+            notify("turn/completed", {
+                "threadId": thread_id,
+                "turn": turn_obj(turn_id, "completed"),
+            })
+            _active.update({"rid": None, "thread_id": None,
+                            "turn_id": None, "slow": False})
         elif method == "turn/interrupt":
             log("interrupt:%s" % params.get("turnId", ""))
             send({"id": rid, "result": {}})
@@ -331,7 +383,8 @@ def main() -> None:
                     "threadId": thread_id,
                     "turn": turn_obj(_active["turn_id"], "interrupted")})
                 log("interrupt-complete:%s" % _active["turn_id"])
-                _active.update({"rid": None, "turn_id": None, "slow": False})
+                _active.update({"rid": None, "thread_id": None,
+                                "turn_id": None, "slow": False})
         elif rid is not None:
             send({"id": rid,
                   "error": {"code": -32601, "message": "method not found"}})

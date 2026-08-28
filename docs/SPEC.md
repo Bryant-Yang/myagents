@@ -93,7 +93,9 @@
   之一。计划固定 2–4 步、至少两个不同且 ready 的 worker；每步只有固定 agent
   与非空 assignment。同一 worker 可在后续步骤再次出现，但 host 不得增员、漏掉
   显式 mention、改变权限或添加重试。模型输出未知 agent、空任务、单 agent 循环、
-  缺步、超限或畸形 JSON 一律 fail-closed。
+  缺步、超限或畸形 JSON 一律 fail-closed。fenced Markdown 或说明文字允许包裹
+  唯一合法路由 object；解析器必须逐对象解码，多个路由/计划 object 因歧义拒绝，
+  不得用贪婪正则把相邻花括号拼成伪 JSON。
 - **主流程**：整个计划只占一个 CommandBus command 和一条 user timeline。
   Orchestrator 用普通代码严格串行推进；每步回复按同一 command id 写回共享
   timeline，下一步从最新 timeline 读取前序真实结果。assignment 不伪装成 user
@@ -110,7 +112,8 @@
   ready；无 mention 时 host 只能从 ready worker 候选中选人。
 - **验收**：`tests/test_collaboration.py` 使用纯内存 fake host/adapter 覆盖计划
   边界、host 三路解析、显式 mention 闭集、普通 fan-out 兼容、严格顺序、前序
-  结果可见、唯一 user、统一 command id、同轮角色、失败和 CommandBus 取消。
+  结果可见、唯一 user、统一 command id、同轮角色、唯一路由 JSON 提取、歧义
+  多对象拒绝、失败和 CommandBus 取消。
   默认门禁不启动任何真实 agent。
 - **人工验收边界**：真实模型能否稳定把开放式自然语言拆成高质量步骤、成本与
   最终内容质量由用户验收；自动化只证明计划边界、执行时序和安全终态。
@@ -1005,22 +1008,30 @@
 
 ### UC-INTERJECT-001 能力受限的运行中插话
 
-- **角色 / 触发**：当前 room 有 running command，用户在 composer 输入非空草稿
-  后按 `Alt+↑`。
-- **主流程**：workflow 复用当前阶段允许的 boundary steering；非 workflow
+- **角色 / 触发**：当前 room 有 running command 和至少一条 queued command，
+  用户按 `Alt+↑`。composer 中尚未按 Enter 的草稿不是候选。
+- **主流程**：CommandBus 原子选择同 room FIFO 中最早 queued command；有多条时
+  其余保持原顺序。workflow 复用当前阶段允许的 boundary steering；非 workflow
   必须恰有一个活动 delivery 且 adapter 显式实现 `interject()`。当前 Pi 使用同一
-  已 attested RPC session 的官方 `steer`，不创建第二 prompt/process/session。
+  已 attested RPC session 的官方 `steer`；Codex 使用同一 app-server client 向原
+  `threadId` / `expectedTurnId` 发送官方 `turn/steer`。两者都不创建第二
+  prompt/turn/process/session。
 - **持久与 no-replay**：native intent 先以 `interjection_requested` 写入
   `events.jsonl`，协议明确接受后写 `interjection_accepted`；失败或不确定分别写
-  对应终态。插话不进入 timeline、不推进普通 cursor，写后响应丢失不得重投。
-- **异常分支**：无活动 delivery、多目标并发、超过 1000 字符、目标结束或没有
-  已验收能力时拒绝且保留草稿。ACP、Codex app-server 与 native model 当前不得
-  伪装支持；workflow verify/final 等禁止阶段不得降级为 native steer。
+  对应终态。明确接受后源 queued command terminal；写入前失败时仍在原 FIFO
+  位置；结果不确定时源 command terminal failed，既不重投 steer，也不再作为普通
+  command 执行。插话不进入 timeline、不推进普通 cursor。
+- **异常分支**：无 queued command、无活动 delivery、多目标并发、队首超过 1000
+  字符、目标结束或没有已验收能力时拒绝，队列和 composer 草稿均不改变。ACP 与
+  native model 当前不得伪装支持；Codex 明确拒绝 `turn/steer` 时队首仍保留，写后
+  结果不确定时源 command terminal failed。workflow verify/final 等禁止阶段不得
+  降级为 native steer。
 - **验收 / 证据**：`tests/test_tui_completion.py`、`tests/test_m3_bus.py`、
   `tests/test_pi_rpc_client.py`、`tests/fake_pi_rpc_server.py`、
-  `tests/test_pi_adapter.py`。
-- **人工边界**：真实终端验证 Alt+↑ 键序列；真实 Pi 可在授权的无副作用临时任务
-  中验证一次，不进入普通 gate。
+  `tests/test_pi_adapter.py`、`tests/fake_codex_app_server.py`、
+  `tests/test_codex_app_server.py`。
+- **人工边界**：真实终端用连续 Enter 形成至少两条队列后验证 Alt+↑ 键序列与
+  队首选择；真实 Pi 可在授权的无副作用临时任务中验证一次，不进入普通 gate。
 
 ### UC-CANCEL-001 精确取消
 
@@ -1088,9 +1099,13 @@
   确认未发送的失败保持可重试；即使旧 thread 无法恢复，新 thread 也不
   bootstrap 已投递的旧输入。明确接受的 turn 在任何正文/工具/权限 event
   sink 回调前先持久化该边界。
+- **运行中插话**：原 turn 的 `delivery_committed` 已被 Orchestrator 持久化后，
+  adapter 才开放 `interject()`；它使用同一 app-server client 调用官方
+  `turn/steer(threadId, expectedTurnId, input)`。响应必须确认原 turn id；明确拒绝
+  不消费队首，写后取消/断线/响应不可信按 uncertain 作废连接并禁止源输入重投。
 - **验收**：fake server 证明 worker 两轮同 PID/thread、无 `jsonrpc` header、
-  默认配置字段未被覆盖、取消不
-  重叠、断线失败、close 无残留。
+  默认配置字段未被覆盖、取消不重叠、`turn/steer` 命中同一 turn 且不创建第二
+  turn、写后断线 no-replay、close 无残留。
 - **独立证据来源**：`tests/fake_codex_app_server.py` +
   `tests/test_codex_app_server.py`。
 - **真实验收证据**：2026-07-27 在临时目录执行两组真实 Codex 探针，均未

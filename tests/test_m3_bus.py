@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from control import (CommandBus, CommandBusClosedError, CommandBusError,
                      CommandCapacityError, CommandNotFoundError,
                      CommandStatus, CommandValidationError)
-from adapters.base import AgentEvent
+from adapters.base import AgentDeliveryUncertainError, AgentEvent
 from host import HostDecision
 from storage.store import RoomStore
 
@@ -394,9 +394,11 @@ def test_workflow_steering_uses_active_owner_and_persists_event() -> None:
             await orch.started.wait()
             receipt = bus.steer(snap.command_id, "补充空输入回归测试")
             assert receipt["accepted"] == 1
-            interjected = await bus.interject(
-                snap.command_id, "Alt+Up 补充验收约束")
+            queued = await bus.submit("Alt+Up 补充验收约束")
+            interjected = await bus.interject_next(snap.command_id)
             assert interjected["mode"] == "boundary"
+            assert interjected["source_command_id"] == queued.command_id
+            assert bus.get(queued.command_id).status is CommandStatus.COMPLETED
             persisted = [
                 event for event in store.read_events(0, 50)["items"]
                 if event.command_id == snap.command_id
@@ -476,7 +478,7 @@ def test_workflow_steering_persistence_failure_does_not_commit() -> None:
     print("ok  steering 持久化失败时不修改 workflow 内存")
 
 
-def test_runtime_interjection_is_durable_before_transport_acceptance() -> None:
+def test_runtime_interjection_promotes_earliest_queued_command() -> None:
     class RuntimeProposal:
         def __init__(self, command_id, instruction, accepted):
             self.event = AgentEvent(
@@ -521,30 +523,36 @@ def test_runtime_interjection_is_durable_before_transport_acceptance() -> None:
             bus = make_bus(orch)
             snap = await bus.submit("@pi 长任务")
             await orch.started.wait()
-            receipt = await bus.interject(snap.command_id, "先给结论")
+            first = await bus.submit("最早排队输入")
+            second = await bus.submit("后来排队输入")
+            receipt = await bus.interject_next(snap.command_id)
             assert receipt == {
                 "command_id": snap.command_id,
                 "accepted": 1,
                 "agent": "pi",
                 "mode": "in_flight",
                 "applies_after": "current_turn",
+                "source_command_id": first.command_id,
             }
-            assert orch.accepted == ["先给结论"]
+            assert orch.accepted == ["最早排队输入"]
+            assert bus.get(first.command_id).status is CommandStatus.COMPLETED
+            assert bus.get(second.command_id).status is CommandStatus.QUEUED
             events = [
                 item for item in store.read_events(0, 100)["items"]
                 if item.command_id == snap.command_id
                 and item.kind.startswith("interjection")
             ]
             assert [(item.agent, item.kind, item.text) for item in events] == [
-                ("user", "interjection_requested", "先给结论"),
+                ("user", "interjection_requested", "最早排队输入"),
                 ("system", "interjection_accepted", "pi 已接受运行中插话"),
             ]
+            await bus.cancel(second.command_id)
             orch.release.set()
             await bus.wait(snap.command_id, timeout=5)
             await bus.aclose()
 
     asyncio.run(run())
-    print("ok  runtime interjection persists intent before transport acceptance")
+    print("ok  runtime interjection promotes the earliest queued command")
 
 
 def test_runtime_interjection_persistence_failure_never_calls_transport() -> None:
@@ -599,19 +607,223 @@ def test_runtime_interjection_persistence_failure_never_calls_transport() -> Non
             bus = make_bus(orch)
             snap = await bus.submit("@pi 长任务")
             await orch.started.wait()
+            queued = await bus.submit("不能越过落盘边界")
             try:
-                await bus.interject(snap.command_id, "不能越过落盘边界")
+                await bus.interject_next(snap.command_id)
             except Exception as exc:
                 assert "执行事件持久化失败" in str(exc)
             else:
                 raise AssertionError("persistence failure was not propagated")
             assert orch.accepted == []
+            assert bus.get(queued.command_id).status is CommandStatus.QUEUED
+            await bus.cancel(queued.command_id)
             orch.release.set()
             await bus.wait(snap.command_id, timeout=5)
             await bus.aclose()
 
     asyncio.run(run())
     print("ok  runtime interjection persistence failure blocks transport")
+
+
+def test_uncertain_queued_interjection_is_never_replayed() -> None:
+    class RuntimeProposal:
+        def __init__(self, instruction, attempts):
+            self.event = AgentEvent(
+                "interjection", instruction,
+                {"agent": "pi", "mode": "in_flight"},
+            )
+            self.attempts = attempts
+
+        async def commit(self):
+            self.attempts.append(self.event.text)
+            raise AgentDeliveryUncertainError("steer response was lost")
+
+    class InterjectionOrch(FakeOrch):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.attempts: list[str] = []
+
+        async def dispatch(self, message, on_event, command_id=None):
+            self.started.set()
+            await self.release.wait()
+
+        def prepare_interjection(self, command_id, instruction):
+            return RuntimeProposal(instruction, self.attempts)
+
+    async def run() -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workdir = root / "work"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            orch = InterjectionOrch()
+            orch.store = store
+            def broken_sink(_agent, _event):
+                raise RuntimeError("UI sink is closed")
+
+            bus = make_bus(orch, event_sink=broken_sink)
+            active = await bus.submit("@pi 长任务")
+            await orch.started.wait()
+            first = await bus.submit("可能已发送的最早输入")
+            second = await bus.submit("仍应保留的第二条")
+            original_append = bus._append_execution_event
+
+            def fail_uncertain(command_id, agent, kind, text):
+                if kind == "interjection_uncertain":
+                    raise OSError("audit disk full")
+                return original_append(command_id, agent, kind, text)
+
+            bus._append_execution_event = fail_uncertain
+            try:
+                await bus.interject_next(active.command_id)
+            except Exception as exc:
+                assert "结果不确定" in str(exc) or "response was lost" in str(exc)
+            else:
+                raise AssertionError("uncertain interjection was reported as success")
+            assert orch.attempts == ["可能已发送的最早输入"]
+            assert bus.get(first.command_id).status is CommandStatus.FAILED
+            assert bus.get(second.command_id).status is CommandStatus.QUEUED
+            bus._append_execution_event = original_append
+            await bus.cancel(second.command_id)
+            orch.release.set()
+            await bus.wait(active.command_id, timeout=5)
+            await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  uncertain promoted input is terminal and never replayed")
+
+
+def test_explicitly_rejected_interjection_stays_at_queue_head() -> None:
+    class RuntimeProposal:
+        def __init__(self, instruction):
+            self.event = AgentEvent(
+                "interjection", instruction,
+                {"agent": "codex", "mode": "in_flight"},
+            )
+
+        async def commit(self):
+            raise RuntimeError("turn cannot accept steering now")
+
+    class InterjectionOrch(FakeOrch):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def dispatch(self, message, on_event, command_id=None):
+            self.started.set()
+            await self.release.wait()
+
+        def prepare_interjection(self, command_id, instruction):
+            return RuntimeProposal(instruction)
+
+    async def run() -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workdir = root / "work"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            orch = InterjectionOrch()
+            orch.store = store
+            bus = make_bus(orch)
+            active = await bus.submit("@codex 长任务")
+            await orch.started.wait()
+            first = await bus.submit("仍应留在队首")
+            second = await bus.submit("第二条仍保持顺序")
+            try:
+                await bus.interject_next(active.command_id)
+            except CommandBusError as exc:
+                assert "cannot accept steering" in str(exc)
+            else:
+                raise AssertionError("明确拒绝被报告为已接受")
+            assert bus.get(first.command_id).status is CommandStatus.QUEUED
+            assert bus.get(second.command_id).status is CommandStatus.QUEUED
+            events = [
+                item for item in store.read_events(0, 100)["items"]
+                if item.command_id == active.command_id
+                and item.kind.startswith("interjection")
+            ]
+            assert [item.kind for item in events] == [
+                "interjection_requested", "interjection_failed"]
+            await bus.cancel(first.command_id)
+            await bus.cancel(second.command_id)
+            orch.release.set()
+            await bus.wait(active.command_id, timeout=5)
+            await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  explicitly rejected interjection remains queued")
+
+
+def test_accepted_interjection_is_not_replayed_when_result_audit_fails() -> None:
+    class RuntimeProposal:
+        def __init__(self, instruction, accepted):
+            self.event = AgentEvent(
+                "interjection", instruction,
+                {"agent": "codex", "mode": "in_flight"},
+            )
+            self.accepted = accepted
+
+        async def commit(self):
+            self.accepted.append(self.event.text)
+            return {"agent": "codex", "accepted": 1}
+
+    class InterjectionOrch(FakeOrch):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.accepted: list[str] = []
+            self.dispatched: list[str] = []
+
+        async def dispatch(self, message, on_event, command_id=None):
+            self.dispatched.append(message)
+            self.started.set()
+            await self.release.wait()
+
+        def prepare_interjection(self, command_id, instruction):
+            return RuntimeProposal(instruction, self.accepted)
+
+    async def run() -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workdir = root / "work"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            orch = InterjectionOrch()
+            orch.store = store
+            bus = make_bus(orch)
+            active = await bus.submit("@codex 长任务")
+            await orch.started.wait()
+            promoted = await bus.submit("已被接受但审计失败")
+            original_append = bus._append_execution_event
+
+            def fail_accepted(command_id, agent, kind, text):
+                if kind == "interjection_accepted":
+                    raise OSError("audit disk full")
+                return original_append(command_id, agent, kind, text)
+
+            bus._append_execution_event = fail_accepted
+            try:
+                await bus.interject_next(active.command_id)
+            except CommandBusError as exc:
+                assert "已被 transport 接受" in str(exc)
+            else:
+                raise AssertionError("accepted audit failure was hidden")
+            assert orch.accepted == ["已被接受但审计失败"]
+            assert bus.get(promoted.command_id).status in {
+                CommandStatus.COMPLETED, CommandStatus.FAILED}
+            bus._append_execution_event = original_append
+            orch.release.set()
+            await bus.wait(active.command_id, timeout=5)
+            await asyncio.sleep(0)
+            assert orch.dispatched == ["@codex 长任务"]
+            await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  accepted interjection audit failure cannot replay source input")
 
 
 def test_duplicate_tool_updates_are_forwarded_and_persisted_once() -> None:
@@ -1170,8 +1382,11 @@ if __name__ == "__main__":
     test_fanout_partial_events_keep_agent_identity()
     test_workflow_steering_uses_active_owner_and_persists_event()
     test_workflow_steering_persistence_failure_does_not_commit()
-    test_runtime_interjection_is_durable_before_transport_acceptance()
+    test_runtime_interjection_promotes_earliest_queued_command()
     test_runtime_interjection_persistence_failure_never_calls_transport()
+    test_uncertain_queued_interjection_is_never_replayed()
+    test_explicitly_rejected_interjection_stays_at_queue_head()
+    test_accepted_interjection_is_not_replayed_when_result_audit_fails()
     test_duplicate_tool_updates_are_forwarded_and_persisted_once()
     test_activity_only_events_refresh_silence_without_becoming_visible()
     test_status_dedup_keeps_visible_phase_changes()

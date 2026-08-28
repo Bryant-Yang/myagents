@@ -11,6 +11,7 @@
     await client.start(workdir)                    # spawn + initialize + initialized
     await client.thread_start(workdir) -> str      # thread/start，返回 thread id
     await client.turn_start(thread_id, text) -> str  # turn/start，返回 turn id
+    await client.turn_steer(thread_id, turn_id, text) -> str  # 同轮 turn/steer
     await client.turn_interrupt(thread_id, turn_id)  # turn/interrupt
     await client.next_event() -> dict              # 下一条 server 通知
     await client.aclose()                          # 回收子进程，无残留
@@ -46,12 +47,17 @@ from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from adapters.base import AgentEvent, ExecutionMode  # noqa: E402
+from adapters.base import (  # noqa: E402
+    AgentDeliveryUncertainError,
+    AgentEvent,
+    ExecutionMode,
+)
 from adapters import codex_adapter as codex_jsonl  # noqa: E402
 from clipboard_image import TrustedImage  # noqa: E402
 from codex_app_server.adapter import CodexAppServerAdapter  # noqa: E402
 from codex_app_server.client import (  # noqa: E402
     CodexAppServerClient,
+    CodexAppServerError,
     CodexAppServerRequestUncertain,
 )
 from control import CommandBus  # noqa: E402
@@ -196,6 +202,41 @@ def test_handshake_two_turns_same_thread_and_pid() -> None:
         assert_no_violation()  # 含 VIOLATION:jsonrpc（线上必须无 jsonrpc 头）
     run(body())
     print("ok  握手 + 两轮复用同一 thread 与 pid（无 jsonrpc 头）")
+
+
+def test_client_turn_steer_targets_the_active_turn_without_restart() -> None:
+    """官方 turn/steer 必须命中同一 thread/turn，不能创建第二轮。"""
+    async def body() -> None:
+        reset_state()
+        client = await make_client()
+        try:
+            thread_id = await client.thread_start("/tmp")
+            turn_id = await client.turn_start(thread_id, "slow 原任务")
+            await wait_state("turn:")
+            returned = await client.turn_steer(
+                thread_id, turn_id, "先拉其他伙伴一起协作")
+            assert returned == turn_id
+            await wait_state("steer-params:")
+        finally:
+            await client.aclose()
+
+        lines = state_events()
+        params = json.loads(next(
+            line.split(":", 1)[1]
+            for line in lines if line.startswith("steer-params:")
+        ))
+        assert params == {
+            "expectedTurnId": turn_id,
+            "input": [{
+                "text": "先拉其他伙伴一起协作",
+                "type": "text",
+            }],
+            "threadId": thread_id,
+        }
+        assert len([line for line in lines if line.startswith("turn:")]) == 1
+        assert_no_violation()
+    run(body())
+    print("ok  turn/steer 命中活动 turn 且不创建第二 turn")
 
 
 def test_local_image_uses_fake_wire_contract() -> None:
@@ -1164,6 +1205,69 @@ def test_adapter_cancel_interrupts_then_allows_next_turn() -> None:
     print("ok  取消走 turn/interrupt 且等 terminal 后才放行下一轮")
 
 
+def test_adapter_interject_uses_turn_steer_after_durable_commit() -> None:
+    """adapter 仅在 delivery commit 已被消费者持久化后开放同轮插话。"""
+    async def body() -> None:
+        reset_state()
+        adapter = CodexAppServerAdapter(CMD)
+        stream = adapter.stream("slow 原任务", "/tmp")
+        try:
+            try:
+                await adapter.interject("too early")
+            except CodexAppServerError:
+                pass
+            else:
+                raise AssertionError("pre-commit Codex interjection was accepted")
+
+            assert (await anext(stream)).kind == "info"
+            assert (await anext(stream)).kind == "delivery_committed"
+            # 恢复 generator 让 delivery_committed 的外层 yield 返回，表示
+            # Orchestrator 已有机会持久化 cursor；同时等到原 turn 的首个 delta。
+            assert (await anext(stream)).kind == "text"
+            await adapter.interject("先拉其他伙伴一起协作")
+            remaining = [event async for event in stream]
+            assert remaining[-1].kind == "done"
+            assert any(
+                event.kind == "text" and event.text == "已收到插话"
+                for event in remaining
+            )
+        finally:
+            await stream.aclose()
+            await adapter.aclose()
+
+        lines = state_events()
+        assert len([line for line in lines if line.startswith("turn:")]) == 1
+        assert len([
+            line for line in lines if line.startswith("steer-params:")
+        ]) == 1
+        assert_no_violation()
+    run(body())
+    print("ok  adapter durable commit 后用 turn/steer 同轮插话")
+
+
+def test_adapter_uncertain_interjection_is_no_replay_failure() -> None:
+    """turn/steer 写后断线必须暴露 uncertain，不能退回普通排队重放。"""
+    async def body() -> None:
+        reset_state()
+        adapter = CodexAppServerAdapter(CMD)
+        stream = adapter.stream("slow 原任务", "/tmp")
+        try:
+            assert (await anext(stream)).kind == "info"
+            assert (await anext(stream)).kind == "delivery_committed"
+            assert (await anext(stream)).kind == "text"
+            try:
+                await adapter.interject("die-steer")
+            except AgentDeliveryUncertainError:
+                pass
+            else:
+                raise AssertionError("断线后的 turn/steer 未标为 uncertain")
+        finally:
+            await stream.aclose()
+            await adapter.aclose()
+    run(body())
+    print("ok  turn/steer 写后断线不重放")
+
+
 def test_aclose_interrupts_active_stream_and_reaps_process() -> None:
     """直接 aclose 也必须唤醒活跃 turn，而不是无限等 writer lock。"""
     async def body() -> None:
@@ -1247,6 +1351,7 @@ def test_aclose_is_bounded_when_owner_swallows_cancellation() -> None:
 
 if __name__ == "__main__":
     test_handshake_two_turns_same_thread_and_pid()
+    test_client_turn_steer_targets_the_active_turn_without_restart()
     test_local_image_uses_fake_wire_contract()
     test_agent_host_routes_image_to_worker_without_host_local_image()
     test_command_approval_default_deny()
@@ -1275,6 +1380,8 @@ if __name__ == "__main__":
     test_ephemeral_thread_rejects_reuse_configuration()
     test_adapter_resumes_thread_after_process_restart()
     test_adapter_cancel_interrupts_then_allows_next_turn()
+    test_adapter_interject_uses_turn_steer_after_durable_commit()
+    test_adapter_uncertain_interjection_is_no_replay_failure()
     test_aclose_interrupts_active_stream_and_reaps_process()
     test_aclose_after_consumer_break_is_bounded()
     test_aclose_is_bounded_when_owner_swallows_cancellation()

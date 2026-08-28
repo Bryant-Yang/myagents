@@ -269,6 +269,32 @@ class CodexAppServerClient:
                 "turn/start 已发送但响应缺少 turn.id")
         return turn_id
 
+    async def turn_steer(
+        self,
+        thread_id: str,
+        turn_id: str,
+        instruction: str,
+        *,
+        images: tuple[TrustedImage, ...] = (),
+    ) -> str:
+        """Steer the currently active turn through the official same-turn seam."""
+        if not instruction.strip():
+            raise ValueError("turn/steer instruction 不能为空")
+        result = await self.request("turn/steer", {
+            "threadId": thread_id,
+            "expectedTurnId": turn_id,
+            "input": [
+                {"type": "text", "text": instruction},
+                *({"type": "localImage", "path": str(
+                    verify_unchanged_image(image))} for image in images),
+            ],
+        })
+        returned_id = result.get("turnId")
+        if returned_id != turn_id:
+            raise CodexAppServerRequestUncertain(
+                "turn/steer 已发送但响应未确认原活动 turn")
+        return returned_id
+
     async def turn_interrupt(self, thread_id: str, turn_id: str) -> None:
         await self.request("turn/interrupt", {
             "threadId": thread_id,

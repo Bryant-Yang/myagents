@@ -90,6 +90,61 @@ def test_host_decide_returns_ordered_plan() -> None:
         "[user] 做任务", ["kimi", "opencode"])
 
 
+def test_host_route_extracts_one_bounded_json_after_braced_preamble() -> None:
+    """Local models may emit a braced note before one valid route object."""
+    host = HostAgent(workers=["kimi", "opencode"])
+    raw = (
+        '说明：候选数量 {"ready": 2}\n```json\n'
+        '{"collaboration":{"steps":['
+        '{"agent":"kimi","assignment":"先检查现状并列出证据"},'
+        '{"agent":"opencode","assignment":"基于证据完成最终交付"}'
+        ']},"reason":"需要有界接力"}\n```'
+    )
+
+    decision = host.parse_decision(raw, ["kimi", "opencode"])
+
+    assert decision.collaboration is not None
+    assert decision.collaboration.participants == ("kimi", "opencode")
+
+
+def test_host_route_rejects_multiple_authoritative_json_objects() -> None:
+    host = HostAgent(workers=["kimi", "opencode"])
+    raw = (
+        '{"targets":["kimi"],"reason":"first"}\n'
+        '{"collaboration":{"steps":['
+        '{"agent":"kimi","assignment":"one"},'
+        '{"agent":"opencode","assignment":"two"}'
+        ']}}'
+    )
+
+    try:
+        host.parse_decision(raw, ["kimi", "opencode"])
+    except CollaborationValidationError as exc:
+        assert "多个" in str(exc) and "无法唯一判定" in str(exc)
+    else:
+        raise AssertionError("multiple route objects were accepted")
+
+
+def test_host_route_rejects_nested_truncated_and_mixed_contracts() -> None:
+    host = HostAgent(workers=["kimi", "opencode"])
+    malformed = (
+        '{"wrapper":{"targets":["kimi"]}}',
+        '{"targets":["kimi"]}\n{"collaboration":{"steps":[',
+        '{"discussion":{"participants":["kimi","opencode"]},'
+        '"collaboration":{"steps":[]}}',
+        '{"targets":42}',
+        '{"targets":["ghost"]}',
+        '{"targets":["kimi"],"tar\\u0067ets":["opencode"]}',
+        '{"tar\\u0067ets":["kimi"],"targ\\u0065ts":["opencode"]}',
+    )
+    for raw in malformed:
+        try:
+            host.parse_decision(raw, ["kimi", "opencode"])
+        except CollaborationValidationError:
+            continue
+        raise AssertionError(f"invalid route was accepted: {raw!r}")
+
+
 def test_explicit_plan_extraction_keeps_mention_closure() -> None:
     class ExtractionAdapter:
         session_id = None
@@ -492,6 +547,9 @@ if __name__ == "__main__":
     test_plan_parser_preserves_bounded_order()
     test_explicit_mentions_only_trigger_on_clear_order_cue()
     test_host_decide_returns_ordered_plan()
+    test_host_route_extracts_one_bounded_json_after_braced_preamble()
+    test_host_route_rejects_multiple_authoritative_json_objects()
+    test_host_route_rejects_nested_truncated_and_mixed_contracts()
     test_explicit_plan_extraction_keeps_mention_closure()
     test_plan_parser_rejects_untrusted_shapes()
     test_natural_language_plan_runs_strictly_in_order_with_shared_results()

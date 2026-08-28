@@ -730,7 +730,6 @@ def test_escape_cancels_active_task_and_alt_up_interjects() -> None:
 
         async def interject(self, instruction: str) -> None:
             self.interjections.append(instruction)
-            self.release.set()
 
     async def interjection_case() -> None:
         orch = make_orch()
@@ -743,17 +742,33 @@ def test_escape_cancels_active_task_and_alt_up_interjects() -> None:
             await pilot.press("enter")
             await asyncio.wait_for(adapter.started.wait(), timeout=2)
 
-            box.value = "先给结论"
+            box.value = "最早排队输入"
+            await pilot.press("enter")
+            await pilot.pause()
+            box.value = "后来排队输入"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            box.value = "仍在输入框的草稿"
             box.cursor_position = len(box.value)
             await pilot.press("alt+up")
-            await app.workers.wait_for_complete()
+            deadline = asyncio.get_running_loop().time() + 2
+            while not adapter.interjections:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise AssertionError("queued interjection was not delivered")
+                await pilot.pause()
 
-            assert adapter.interjections == ["先给结论"]
-            assert box.value == ""
-            assert [message.text for message in orch.history].count("先给结论") == 0
+            assert adapter.interjections == ["最早排队输入"]
+            assert box.value == "仍在输入框的草稿"
+            assert "最早排队输入" not in [
+                message.text for message in orch.history]
             rendered = "\n".join(
                 str(line.text) for line in app.query_one(RichLog).lines)
             assert "插话已接受：qwen" in rendered
+            adapter.release.set()
+            await app.workers.wait_for_complete()
+            assert "后来排队输入" in [
+                message.text for message in orch.history]
 
     async def cancel_case() -> None:
         orch = make_orch()
@@ -781,6 +796,27 @@ def test_escape_cancels_active_task_and_alt_up_interjects() -> None:
             await app.workers.wait_for_complete()
             assert app.bus.get(active.command_id).status.value == "cancelled"
 
+    async def no_queue_case() -> None:
+        orch = make_orch()
+        adapter = Adapter()
+        orch.adapters["qwen"] = adapter
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test() as pilot:
+            box = app.query_one("#composer", ComposerInput)
+            box.value = "@qwen 执行长任务"
+            await pilot.press("enter")
+            await asyncio.wait_for(adapter.started.wait(), timeout=2)
+            box.value = "还没有按 Enter 的草稿"
+            await pilot.press("alt+up")
+            await pilot.pause()
+            assert adapter.interjections == []
+            assert box.value == "还没有按 Enter 的草稿"
+            rendered = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines)
+            assert "当前没有排队输入；请先按 Enter 入队" in rendered
+            adapter.release.set()
+            await app.workers.wait_for_complete()
+
     async def unsupported_case() -> None:
         class UnsupportedAdapter:
             session_id = None
@@ -803,21 +839,27 @@ def test_escape_cancels_active_task_and_alt_up_interjects() -> None:
             box.value = "@qwen 执行长任务"
             await pilot.press("enter")
             await asyncio.wait_for(adapter.started.wait(), timeout=2)
-            box.value = "不要继续写文件"
+            box.value = "排队但当前 transport 不支持"
+            await pilot.press("enter")
+            await pilot.pause()
+            box.value = "仍在输入框的草稿"
             box.cursor_position = len(box.value)
             await pilot.press("alt+up")
             await pilot.pause()
-            assert box.value == "不要继续写文件"
+            assert box.value == "仍在输入框的草稿"
             rendered = "\n".join(
                 str(line.text) for line in app.query_one(RichLog).lines)
-            assert "transport 不支持安全的运行中插话" in rendered
+            assert "不支持安全的运行中插话" in rendered, rendered
+            assert "该输入仍在队首" in rendered
+            assert "按 Enter 排队" not in rendered
             adapter.release.set()
             await app.workers.wait_for_complete()
 
     asyncio.run(interjection_case())
     asyncio.run(cancel_case())
+    asyncio.run(no_queue_case())
     asyncio.run(unsupported_case())
-    print("ok  Alt+Up 插话；正常输入态 Esc 取消当前任务")
+    print("ok  Alt+Up 提升最早排队输入；正常输入态 Esc 取消当前任务")
 
 
 def test_host_command_switches_locally_without_timeline_write() -> None:

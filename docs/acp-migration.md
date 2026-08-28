@@ -374,11 +374,13 @@ Pi 必须看到最终 assistant `message_end`，且 stop reason 属于
 `tool_execution_end.result.terminate=true` 也属于已提交失败，而不是成功的空回复。
 自动重试后的最后一条 assistant 成功可覆盖中间 error。
 
-普通 ACP、Codex app-server 和 native model runtime 当前没有已验收的运行中
-插话原语，不能为 `Alt+↑` 建立第二 prompt/writer。Pi 是明确例外：仅在原 prompt
-的 durable `delivery_committed` 之后，由同一 client 发送官方 `steer`；用户意图
-先写 `interjection_requested`，响应丢失记 uncertain 且不重投。workflow 即使使用
-Pi stage 也继续受 ADR-0009 阶段边界约束。完整设计见
+普通 ACP 和 native model runtime 当前没有已验收的运行中插话原语，不能为
+`Alt+↑` 建立第二 prompt/writer。Alt+↑ 只提升同 room FIFO 最早 queued command，
+composer 草稿不参与。Pi 仅在原 prompt 的 durable `delivery_committed` 之后，由
+同一 client 发送官方 `steer`；Codex app-server 同样只在 durable commit 之后，由
+同一 client 向原 `threadId` / `expectedTurnId` 发送官方 `turn/steer`。两者都先写
+`interjection_requested`；响应丢失记 uncertain，源 queued command 不得作为普通
+命令重投。workflow 即使使用支持 native steer 的 stage 也继续受 ADR-0009 阶段边界约束。完整设计见
 [ADR-0018](adr/0018-capability-bounded-runtime-interjection.md)。
 
 不在等待人工权限且没有活跃工具时，prompt 连续 300 秒无 transport 事件或终止响应
