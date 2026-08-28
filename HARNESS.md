@@ -368,7 +368,8 @@ transport。
 - TUI `Alt+↑` 只提升同 room FIFO 中最早的 queued command，composer 草稿不参与；
   其余排队项保持原顺序。workflow 继续走 ADR-0009 阶段边界；普通轮只有 adapter
   明确提供已验收 `interject()` 才允许，当前为 Pi 官方 RPC `steer` 与 Codex
-  app-server `turn/steer`。意图必须先落 execution event，再写 transport；结果
+  app-server `turn/steer`；Codex Agent Host 只投影其独立 Host adapter 的同一能力，
+  model Host 与无 capability 的 agent Host 仍 fail-closed。意图必须先落 execution event，再写 transport；结果
   不确定时原 queued command 必须 terminal 且不得重放。多目标、ACP/native model
   等未获证路径保留原队列并 fail-closed。
 - 重启后最后事件非 terminal 的命令必须显示为“已中断”，不得伪装完成。

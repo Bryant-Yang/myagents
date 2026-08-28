@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Callable
+from typing import AsyncIterator, Awaitable, Callable
 
 from adapters.base import AgentAdapter, AgentEvent, ExecutionMode
 from collaboration import (
@@ -298,6 +298,22 @@ class HostAgent:
     def replay_history_on_fresh_session(self) -> bool:
         return bool(getattr(
             self.adapter, "replay_history_on_fresh_session", True))
+
+    @property
+    def interject(self) -> Callable[[str], Awaitable[None]]:
+        """Project only a verified agent backend's native steer capability.
+
+        Model Host remains capability-absent: OpenAI-compatible streaming has
+        no accepted same-turn input seam. Raising ``AttributeError`` makes the
+        generic Orchestrator's ``getattr(..., None)`` capability check keep
+        that path fail-closed without branching on backend names.
+        """
+        if self.backend_kind != "agent":
+            raise AttributeError("model Host 不支持运行中插话")
+        submit = getattr(self.adapter, "interject", None)
+        if not callable(submit):
+            raise AttributeError("agent Host 底层 adapter 未声明插话能力")
+        return submit
 
     async def decide(
             self, transcript: str, workdir: str,

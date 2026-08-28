@@ -23,11 +23,13 @@ from agent_readiness import (
     AgentUnavailableError,
     ReadinessState,
 )
+from control import CommandBus
 from host_backend import (
     HostBackendSelection,
     HostBackendValidationError,
     parse_host_command,
 )
+from host import HostAgent
 from native_agent import (
     ModelProviderError,
     OpenAICompatibleProvider,
@@ -127,6 +129,38 @@ class UncertainPreparedAdapter(PreparedRecordingAdapter):
         raise AgentDeliveryUncertainError("fake uncertain host turn")
 
 
+class InterjectingPreparedAdapter(PreparedRecordingAdapter):
+    def __init__(self, label: str) -> None:
+        super().__init__(label)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.interjections: list[str] = []
+
+    async def stream_prepared(
+        self,
+        make_prompt,
+        _workdir,
+        resume_session_id=None,
+        *,
+        execution_mode=ExecutionMode.DEFAULT,
+    ):
+        self.modes.append(execution_mode)
+        self.prompts.append(make_prompt(SimpleNamespace(
+            session_id=self.session_id,
+            restored=False,
+            load_failed=False,
+            fresh=True,
+        )))
+        yield AgentEvent("delivery_committed")
+        self.started.set()
+        await self.release.wait()
+        yield AgentEvent("text", f"{self.label}-reply")
+        yield AgentEvent("done")
+
+    async def interject(self, instruction: str) -> None:
+        self.interjections.append(instruction)
+
+
 def ready(name: str):
     return lambda: AgentReadiness(
         name, ReadinessState.READY, "fake ready", "none")
@@ -152,6 +186,59 @@ def test_selection_and_command_validation() -> None:
         pass
     else:
         raise AssertionError("incomplete /host command must be local error")
+
+
+def test_agent_host_projects_native_interjection_capability() -> None:
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp) / "work"
+            workdir.mkdir()
+            store = RoomStore(workdir, Path(tmp) / "state")
+            store.set_host_backend(
+                HostBackendSelection.agent("codex"), cursor=0)
+            host_adapter = InterjectingPreparedAdapter("agent-host")
+            spec = AgentSpec(
+                "codex",
+                "app-server",
+                lambda: RecordingAdapter("worker"),
+                ready("codex"),
+                lambda: host_adapter,
+                ready("codex"),
+            )
+            orch = Orchestrator(
+                str(workdir),
+                specs=(spec,),
+                store=store,
+                discover_agents=True,
+            )
+            bus = CommandBus(orch)
+            bus.start()
+            active = await bus.submit("@host 执行长任务")
+            await asyncio.wait_for(host_adapter.started.wait(), timeout=2)
+            queued = await bus.submit("先回答最关键的结论")
+            try:
+                receipt = await bus.interject_next(active.command_id)
+                assert receipt["source_command_id"] == queued.command_id
+                assert receipt["agent"] == "host"
+                assert host_adapter.interjections == ["先回答最关键的结论"]
+            finally:
+                host_adapter.release.set()
+                await bus.wait(active.command_id, timeout=5)
+                await bus.aclose()
+                await orch.aclose()
+
+    asyncio.run(run())
+
+
+def test_host_interjection_capability_remains_fail_closed() -> None:
+    model_host = HostAgent(
+        InterjectingPreparedAdapter("model"), backend_kind="model")
+    unsupported_agent_host = HostAgent(
+        PreparedRecordingAdapter("unsupported"), backend_kind="agent")
+    assert getattr(model_host, "interject", None) is None
+    assert getattr(unsupported_agent_host, "interject", None) is None
+    asyncio.run(model_host.aclose())
+    asyncio.run(unsupported_agent_host.aclose())
 
 
 def test_room_persistence_isolated_and_sets_cross_backend_boundary() -> None:
@@ -802,6 +889,8 @@ def test_persisted_unready_agent_host_does_not_fallback_to_model() -> None:
 
 if __name__ == "__main__":
     test_selection_and_command_validation()
+    test_agent_host_projects_native_interjection_capability()
+    test_host_interjection_capability_remains_fail_closed()
     test_room_persistence_isolated_and_sets_cross_backend_boundary()
     test_named_glm_profile_without_model_discovery()
     test_unselected_profile_does_not_require_its_secret()

@@ -1044,7 +1044,9 @@
   必须恰有一个活动 delivery 且 adapter 显式实现 `interject()`。当前 Pi 使用同一
   已 attested RPC session 的官方 `steer`；Codex 使用同一 app-server client 向原
   `threadId` / `expectedTurnId` 发送官方 `turn/steer`。两者都不创建第二
-  prompt/turn/process/session。
+  prompt/turn/process/session。agent Host 只投影其独立底层 adapter 的已验收
+  capability：Codex Agent Host 可插话，model Host 与无 capability 的 agent Host
+  继续 fail-closed，且绝不复用同名 worker。
 - **持久与 no-replay**：native intent 先以 `interjection_requested` 写入
   `events.jsonl`，协议明确接受后写 `interjection_accepted`；失败或不确定分别写
   对应终态。明确接受后源 queued command terminal；写入前失败时仍在原 FIFO
@@ -1058,7 +1060,7 @@
 - **验收 / 证据**：`tests/test_tui_completion.py`、`tests/test_m3_bus.py`、
   `tests/test_pi_rpc_client.py`、`tests/fake_pi_rpc_server.py`、
   `tests/test_pi_adapter.py`、`tests/fake_codex_app_server.py`、
-  `tests/test_codex_app_server.py`。
+  `tests/test_codex_app_server.py`、`tests/test_host_backend.py`。
 - **人工边界**：真实终端用连续 Enter 形成至少两条队列后验证 Alt+↑ 键序列与
   队首选择；真实 Pi 可在授权的无副作用临时任务中验证一次，不进入普通 gate。
 

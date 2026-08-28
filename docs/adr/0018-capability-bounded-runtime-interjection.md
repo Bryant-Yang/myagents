@@ -40,7 +40,9 @@ no-replay，也会误导用户。
   `expectedTurnId`。两者都不创建第二 prompt/turn/session/process/writer。
 - 没有 queued command、零个活动 delivery、多个并发 delivery、目标已结束，或
   adapter 没有已验证 seam 时 fail-closed；被选输入仍留在原 FIFO 位置。ACP、
-  原生 Host 和普通 JSONL 当前均明确拒绝；用户可选择 `Esc` 取消当前任务，或等待
+  原生 model Host 和普通 JSONL 当前均明确拒绝；agent Host 只投影其独立底层
+  adapter 已声明的同轮 capability，因此 Codex Agent Host 可使用自己的
+  `turn/steer`，不会借用 `@codex` worker。用户可选择 `Esc` 取消当前任务，或等待
   队列正常出队。Codex 若处于 review/manual compact 等不能接受 steer 的阶段，
   app-server 明确拒绝并同样保留队首。
 - 通用层只检查 adapter capability，不按 agent 名或 transport 字符串分支。
@@ -82,4 +84,7 @@ no-replay，也会误导用户。
    app-server 证明 `turn/steer` 命中原 thread/turn、没有第二个 `turn/start`，并
    覆盖写后断线 uncertain；两类 adapter 都只在 durable delivery commit 之后开放
    interject。
-5. 相关测试、`git diff --check` 与 `bash scripts/check-harness.sh` 全部通过。
+5. HostBackend 回归证明 Codex-like agent Host 将底层 `interject()` 投影给同一
+   活动 Host delivery；model Host 与没有该能力的 agent Host 仍保持 capability
+   absent、队首不出队。
+6. 相关测试、`git diff --check` 与 `bash scripts/check-harness.sh` 全部通过。

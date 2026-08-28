@@ -127,9 +127,9 @@ Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 co
   command，房间继续工作；补全、会话弹窗和活动导航先关闭自身。
 - 运行中插话：先按 Enter 把输入加入 FIFO，再按 `Alt+↑` 提升最早的排队输入。
   workflow 在下一阶段边界采纳；普通任务只有唯一活动且 adapter 有已验收能力时
-  接受（当前 Pi 走官方 native `steer`，Codex 走 app-server `turn/steer`）。输入框
-  里尚未提交的草稿不参与；ACP/native host、多目标或无活动目标明确拒绝，原队列
-  顺序保持不变。
+  接受（当前 Pi 走官方 native `steer`，Codex worker 与 Codex Agent Host 走各自
+  独立 app-server 的 `turn/steer`）。输入框里尚未提交的草稿不参与；ACP、model
+  Host、多目标或无活动目标明确拒绝，原队列顺序保持不变。
 - 权限 fail-closed：无处理器、异常或非法 option 一律拒绝。
 - 流式回复合并：ACP token/chunk 持续更新同一条 TUI 记录，不再一词一行。
 - 有状态 agent 卡死回收：普通分析连续 300 秒无协议事件才取消；ACP 与 Pi RPC
