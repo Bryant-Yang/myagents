@@ -65,6 +65,14 @@ class SessionSnapshot:
     history: tuple[Message, ...]
 
 
+@dataclass(frozen=True)
+class WorkspaceActivitySummary:
+    """当前工作区除活动会话外的轻量状态，不触发目录扫描。"""
+
+    background_running: int
+    unread: int
+
+
 @dataclass
 class _Runtime:
     summary: SessionSummary
@@ -211,6 +219,35 @@ class SessionManager:
     @property
     def active_runtime(self) -> _Runtime:
         return self._runtime(self.active_session_id)
+
+    def workspace_activity_summary(self) -> WorkspaceActivitySummary:
+        """汇总已加载后台运行态与所有已知未读态。"""
+        self._require_started()
+        active_states = {
+            "queued", "waiting_resource", "running", "waiting_permission",
+        }
+        background_running = sum(
+            1
+            for room_id, runtime in self._runtimes.items()
+            if room_id != self._active_id
+            and (
+                runtime.status in active_states
+                or runtime.bus.has_pending()
+                or runtime.permission_waits > 0
+            )
+        )
+        unread = sum(
+            1
+            for room_id, runtime in self._runtimes.items()
+            if room_id != self._active_id and runtime.unread
+        ) + sum(
+            1
+            for room_id, (_status, is_unread) in self._detached_states.items()
+            if room_id != self._active_id
+            and room_id not in self._runtimes
+            and is_unread
+        )
+        return WorkspaceActivitySummary(background_running, unread)
 
     def refresh_agent_readiness(self) -> tuple[AgentReadiness, ...]:
         """重扫所有已加载 room；本机 CLI 就绪事实不随会话分叉。"""

@@ -1330,8 +1330,8 @@ def test_worker_failure_marks_command_failed_after_fanout() -> None:
 def test_tui_bus_integration() -> None:
     """Textual pilot 快速提交两条：都经 app.bus 串行执行并显示；
     退出后 bus 与 orch 都关闭。"""
-    from textual.widgets import Input, RichLog
-    from main import ChatApp
+    from textual.widgets import RichLog
+    from main import ChatApp, ComposerInput
 
     async def run() -> None:
         orch = make_fake_orch()
@@ -1339,7 +1339,7 @@ def test_tui_bus_integration() -> None:
         assert isinstance(app.bus, CommandBus)
         async with app.run_test() as pilot:
             await pilot.pause()
-            box = app.query_one(Input)
+            box = app.query_one(ComposerInput)
             box.value = "@kimi 甲"
             await pilot.press("enter")
             box.value = "@kimi 乙"

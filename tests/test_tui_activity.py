@@ -17,8 +17,12 @@ from main import ChatApp
 from orchestrator import AgentSpec, Orchestrator
 from storage.store import RoomStore
 from test_basic import make_orch
-from textual.widgets import RichLog
+from textual.widgets import RichLog, Static
 from tui_activity import ActivityDetailEvent, ActivityFeed
+
+
+def _activity_text(app: ChatApp) -> str:
+    return str(app.query_one("#activity-panel", Static).render())
 
 
 def test_activity_feed_coalesces_progress_and_tool_updates() -> None:
@@ -182,6 +186,47 @@ def test_activity_feed_tracks_latest_agent_and_bounds_terminal_details() -> None
         hard_bound.set_command_state(command_id, "completed")
     assert len(hard_bound.command_ids()) == 2
     assert len(hard_bound.take_evicted()) <= 2
+
+
+def test_activity_panel_keeps_process_out_of_chat_timeline() -> None:
+    """活动是独立工作区，不再伪装成聊天 speaker。"""
+
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=make_orch())
+        async with app.run_test(size=(100, 30)) as pilot:
+            command_id = "cmd-separated"
+            app._on_agent_event(
+                "user",
+                AgentEvent(
+                    "committed", "@kimi 检查项目",
+                    {"command_id": command_id},
+                ),
+            )
+            app._on_agent_event(
+                "kimi",
+                AgentEvent(
+                    "tool", "运行测试",
+                    {
+                        "command_id": command_id,
+                        "tool_call_id": "tool-separated",
+                        "status": "completed",
+                        "command": "python -m unittest",
+                    },
+                ),
+            )
+            await pilot.pause()
+
+            chat = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines
+            )
+            activity = str(app.query_one("#activity-panel", Static).render())
+            assert "[user] @kimi 检查项目" in chat
+            assert "[activity]" not in chat
+            assert "任务 cmd-sepa" in activity
+            assert "1 个工具" in activity
+
+    asyncio.run(run())
+    print("ok  活动面板与聊天主线分层")
 
 
 def test_persisted_details_project_process_without_repeating_answer() -> None:
@@ -426,9 +471,7 @@ def test_tui_keeps_one_activity_card_and_primary_messages() -> None:
             await pilot.pause()
 
             lines = [str(line.text) for line in app.query_one(RichLog).lines]
-            activity = [line for line in lines if line.startswith("[activity] ")]
-            assert len(activity) == 1, activity
-            collapsed = "\n".join(lines)
+            collapsed = _activity_text(app)
             assert "1 个工具" in collapsed.replace("\n", "")
             assert "python -m unittest" not in collapsed
             assert "[user] @kimi 检查项目" in lines
@@ -439,17 +482,12 @@ def test_tui_keeps_one_activity_card_and_primary_messages() -> None:
 
             app.action_toggle_details()
             await pilot.pause()
-            expanded = "\n".join(
-                str(line.text) for line in app.query_one(RichLog).lines
-            )
+            expanded = _activity_text(app)
             assert "python -m unittest" in expanded
             assert "API_KEY=[已隐藏]" in expanded
             assert "supersecret" not in expanded
             assert "kimi 仍在运行（已等待 30 秒）" in expanded
-            assert len([
-                line for line in app.query_one(RichLog).lines
-                if str(line.text).startswith("[activity] ")
-            ]) == 1
+            assert expanded.count("任务 cmd-visi") == 1
 
     asyncio.run(run())
 
@@ -459,6 +497,7 @@ def test_tui_failure_stays_visible_outside_activity_details() -> None:
         app = ChatApp(workdir=".", orchestrator=make_orch())
         async with app.run_test() as pilot:
             command_id = "cmd-failed"
+            error = "权限被拒绝 API_KEY=supersecret"
             app._on_agent_event(
                 "user",
                 AgentEvent(
@@ -468,16 +507,21 @@ def test_tui_failure_stays_visible_outside_activity_details() -> None:
             )
             app._on_agent_event(
                 "kimi",
-                AgentEvent("error", "权限被拒绝", {"command_id": command_id}),
+                AgentEvent("error", error, {"command_id": command_id}),
             )
-            app._set_command_status(command_id, "failed", "权限被拒绝")
+            app._set_command_status(command_id, "failed", error)
             await pilot.pause()
 
             lines = [str(line.text) for line in app.query_one(RichLog).lines]
-            assert "[kimi] 出错：权限被拒绝" in lines
-            activity = [line for line in lines if line.startswith("[activity] ")]
-            assert len(activity) == 1
-            assert "失败" in "".join(lines)
+            visible = "\n".join(lines)
+            assert "[kimi] 出错：权限被拒绝 API_KEY=[已隐藏]" in visible
+            activity = _activity_text(app)
+            assert activity.count("任务 cmd-fail") == 1
+            assert "失败" in activity
+            status = str(app.query_one("#task-status", Static).render())
+            notice = str(app.query_one("#notice-strip", Static).render())
+            assert "supersecret" not in "\n".join(
+                (visible, activity, status, notice))
 
     asyncio.run(run())
 
@@ -518,17 +562,13 @@ def test_details_toggles_only_the_latest_activity_card() -> None:
 
             app.action_toggle_details()
             await pilot.pause()
-            expanded = "\n".join(
-                str(line.text) for line in app.query_one(RichLog).lines
-            )
+            expanded = _activity_text(app)
             assert "python second.py" in expanded
             assert "python first.py" not in expanded
 
             app.action_toggle_details()
             await pilot.pause()
-            collapsed = "\n".join(
-                str(line.text) for line in app.query_one(RichLog).lines
-            )
+            collapsed = _activity_text(app)
             assert "python second.py" not in collapsed
             assert "python first.py" not in collapsed
 
@@ -571,42 +611,62 @@ def test_keyboard_navigates_and_toggles_one_activity_card() -> None:
 
             await pilot.press("ctrl+g")
             await pilot.pause()
-            log = app.query_one(RichLog)
-            assert log.has_focus
-            selected = "\n".join(str(line.text) for line in log.lines)
+            panel = app.query_one("#activity-panel", Static)
+            assert panel.has_focus
+            selected = _activity_text(app)
             assert "▶ 任务 cmd-seco" in selected
 
             await pilot.press("up")
             await pilot.pause()
-            selected = "\n".join(str(line.text) for line in log.lines)
+            selected = _activity_text(app)
             assert "▶ 任务 cmd-firs" in selected
             assert "▶ 任务 cmd-seco" not in selected
 
             await pilot.press("enter")
             await pilot.pause()
-            expanded = "\n".join(str(line.text) for line in log.lines)
+            expanded = _activity_text(app)
             assert "python first.py" in expanded
             assert "python second.py" not in expanded
 
             await pilot.press("down", "enter")
             await pilot.pause()
-            both_expanded = "\n".join(str(line.text) for line in log.lines)
+            both_expanded = _activity_text(app)
             assert "python first.py" in both_expanded
             assert "python second.py" in both_expanded
 
             await pilot.press("up", "enter")
             await pilot.pause()
-            first_collapsed = "\n".join(
-                str(line.text) for line in log.lines
-            )
+            first_collapsed = _activity_text(app)
             assert "python first.py" not in first_collapsed
             assert "python second.py" in first_collapsed
 
             await pilot.press("escape")
             await pilot.pause()
             assert app.query_one("#composer").has_focus
-            closed = "\n".join(str(line.text) for line in log.lines)
+            closed = _activity_text(app)
             assert "▶ 任务" not in closed
+
+    asyncio.run(run())
+
+
+def test_activity_keyboard_reaches_latest_card_in_long_panel() -> None:
+    """长活动列表必须形成真实滚动区域，选中末卡后自动进入视口。"""
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=make_orch())
+        async with app.run_test(size=(60, 40)) as pilot:
+            for index in range(20):
+                command_id = f"cmd-{index:02d}"
+                app._activity_feed.begin(command_id, "completed")
+                app._activity_feed.record_status(
+                    command_id, "kimi", "完成", state="completed")
+            app._refresh_activity_cards()
+            await pilot.press("ctrl+g")
+            await pilot.pause()
+
+            panel = app.query_one("#activity-panel", Static)
+            assert app._selected_activity_id == "cmd-19"
+            assert panel.max_scroll_y > 0
+            assert panel.scroll_y > 0
 
     asyncio.run(run())
 
@@ -667,8 +727,7 @@ def test_consecutive_tui_inputs_show_and_consume_pending_queue() -> None:
                         break
                     await asyncio.sleep(0.01)
                 await pilot.pause()
-                queued = "\n".join(
-                    str(line.text) for line in app.query_one(RichLog).lines)
+                queued = _activity_text(app)
                 assert "排队 1" in queued
                 assert "待发送：@worker 第二条排队消息" in queued
                 assert "[user] @worker 第二条排队消息" not in queued
@@ -679,11 +738,13 @@ def test_consecutive_tui_inputs_show_and_consume_pending_queue() -> None:
                         break
                     await asyncio.sleep(0.01)
                 await pilot.pause()
-                completed = "\n".join(
+                completed_chat = "\n".join(
                     str(line.text) for line in app.query_one(RichLog).lines)
-                assert completed.count("@worker 第二条排队消息") == 1
-                assert "[user] @worker 第二条排队消息" in completed
-                assert "待发送：@worker 第二条排队消息" not in completed
+                completed_activity = _activity_text(app)
+                assert completed_chat.count(
+                    "[user] @worker 第二条排队消息") == 1
+                assert "待发送：@worker 第二条排队消息" \
+                    not in completed_activity
 
     asyncio.run(run())
 
@@ -749,14 +810,15 @@ def test_activity_card_survives_background_session_switch() -> None:
                 first_id = app.session_manager.active_session_id
                 app.action_toggle_details()
                 await pilot.pause()
-                before_switch = "\n".join(
-                    str(line.text) for line in app.query_one(RichLog).lines
-                )
+                before_switch = _activity_text(app)
                 assert "python -m unittest" in before_switch
 
                 await app.session_manager.create_session()
                 app._bind_active_runtime()
                 app._render_active_session()
+                background_status = str(
+                    app.query_one("#task-status", Static).render())
+                assert "后台 1 运行" in background_status
                 _BackgroundActivityAdapter.release.set()
                 for _ in range(100):
                     if app.session_manager.snapshot(first_id).status \
@@ -765,6 +827,10 @@ def test_activity_card_survives_background_session_switch() -> None:
                     await asyncio.sleep(0.01)
                 assert app.session_manager.snapshot(first_id).status \
                     == "completed"
+                app._render_task_status()
+                unread_status = str(
+                    app.query_one("#task-status", Static).render())
+                assert "1 未读" in unread_status
 
                 await app.session_manager.activate(first_id)
                 app._bind_active_runtime()
@@ -774,13 +840,7 @@ def test_activity_card_survives_background_session_switch() -> None:
                     str(line.text) for line in app.query_one(RichLog).lines
                 ]
                 assert "[worker] 后台回复已完成" in rendered
-                assert len([
-                    line for line in rendered
-                    if line.startswith("[activity] ")
-                ]) == 1
-                expanded = "\n".join(
-                    str(line.text) for line in app.query_one(RichLog).lines
-                )
+                expanded = _activity_text(app)
                 assert "后台测试 · 已完成" in expanded
                 assert "python -m unittest" in expanded
                 assert "过程概览" in expanded
@@ -840,17 +900,15 @@ def test_external_background_command_freezes_authoritative_duration() -> None:
                 app._bind_active_runtime()
                 app._render_active_session()
                 await pilot.pause()
-                rendered = "\n".join(
+                chat = "\n".join(
                     str(line.text) for line in app.query_one(RichLog).lines
                 )
-                assert "[worker] 后台回复已完成" in rendered
+                rendered = _activity_text(app)
+                assert "[worker] 后台回复已完成" in chat
                 assert "响应耗时" in rendered
                 assert "响应耗时 未知" not in rendered
                 assert "已取消" in rendered
-                assert len([
-                    line for line in rendered.splitlines()
-                    if line.startswith("[activity] ")
-                ]) == 2, rendered
+                assert rendered.count("· /details 展开") == 2, rendered
 
     asyncio.run(run())
 
@@ -907,9 +965,7 @@ def test_background_churn_does_not_reuse_stale_expansion_state() -> None:
                 )
                 app._upsert_activity_card("cmd-reused")
                 await pilot.pause()
-                rendered = "\n".join(
-                    str(line.text) for line in app.query_one(RichLog).lines
-                )
+                rendered = _activity_text(app)
                 assert "python new.py" not in rendered
 
     asyncio.run(run())
@@ -944,9 +1000,7 @@ def test_details_restores_latest_persisted_task_after_restart() -> None:
                 assert not app._activity_feed.command_ids()
                 app.action_toggle_details()
                 await app.workers.wait_for_complete()
-                rendered = "\n".join(
-                    str(line.text) for line in app.query_one(RichLog).lines
-                )
+                rendered = _activity_text(app)
                 assert "任务 cmd-rest" in rendered
                 assert "过程概览 · 4 条事件 · codex" in rendered
                 assert "阶段 · 正在检查项目" in rendered
@@ -978,9 +1032,7 @@ def test_interrupted_partial_is_summarized_without_repeating_body() -> None:
             async with app.run_test():
                 app.action_toggle_details()
                 await app.workers.wait_for_complete()
-                rendered = "\n".join(
-                    str(line.text) for line in app.query_one(RichLog).lines
-                )
+                rendered = _activity_text(app)
                 assert "上次响应在输出过程中中断" in rendered
                 assert "输出 · 1 个片段" in rendered
                 assert "不应在详情重复的正文" not in rendered
@@ -992,6 +1044,7 @@ if __name__ == "__main__":
     test_activity_feed_coalesces_progress_and_tool_updates()
     test_activity_feed_shows_pending_requests_without_duplicate_text()
     test_activity_feed_tracks_latest_agent_and_bounds_terminal_details()
+    test_activity_panel_keeps_process_out_of_chat_timeline()
     test_persisted_details_project_process_without_repeating_answer()
     test_persisted_details_redact_and_compact_noisy_process_events()
     test_persisted_detail_loading_error_is_visible_and_redacted()
@@ -1001,6 +1054,7 @@ if __name__ == "__main__":
     test_tui_failure_stays_visible_outside_activity_details()
     test_details_toggles_only_the_latest_activity_card()
     test_keyboard_navigates_and_toggles_one_activity_card()
+    test_activity_keyboard_reaches_latest_card_in_long_panel()
     test_consecutive_tui_inputs_show_and_consume_pending_queue()
     test_background_commit_clears_room_pending_preview()
     test_activity_card_survives_background_session_switch()

@@ -405,6 +405,9 @@ def test_background_terminal_sets_unread_notice_until_activation() -> None:
             command = await manager.submit("@worker 后台任务")
             await BlockingAdapter.started[resolved].wait()
             await manager.activate(first_id)
+            workspace = manager.workspace_activity_summary()
+            assert workspace.background_running == 1
+            assert workspace.unread == 0
             BlockingAdapter.release[resolved].set()
             await manager.wait(command)
             for _ in range(20):
@@ -413,6 +416,9 @@ def test_background_terminal_sets_unread_notice_until_activation() -> None:
                 await asyncio.sleep(0)
 
             assert manager.snapshot(second_id).unread is True
+            workspace = manager.workspace_activity_summary()
+            assert workspace.background_running == 0
+            assert workspace.unread == 1
             assert injected_timeout is True
             assert [(item.session_id, item.status) for item in notices] == [
                 (second_id, "completed")
@@ -426,8 +432,10 @@ def test_background_terminal_sets_unread_notice_until_activation() -> None:
             assert detached.loaded is False
             assert detached.status == "completed"
             assert detached.unread is True
+            assert manager.workspace_activity_summary().unread == 1
             await manager.activate(second_id)
             assert manager.snapshot(second_id).unread is False
+            assert manager.workspace_activity_summary().unread == 0
             await manager.aclose()
 
     asyncio.run(run())

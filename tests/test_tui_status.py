@@ -7,6 +7,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -14,7 +15,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from adapters.base import AgentEvent
 from main import ChatApp
-from textual.widgets import RichLog
+from textual.widgets import Static
 from test_basic import make_orch
 from tui_status import (
     TaskProgress,
@@ -84,6 +85,9 @@ def test_tui_status_panel_tracks_agent_lifecycle() -> None:
     async def run() -> None:
         app = ChatApp(workdir=".", orchestrator=make_orch())
         async with app.run_test() as pilot:
+            idle_panel = str(app.query_one("#task-status", Static).render())
+            assert "主持 模型" in idle_panel
+            assert "Agent 7/7" in idle_panel
             command_id = "cmd-panel"
             app._on_agent_event("user", AgentEvent(
                 "committed",
@@ -117,8 +121,8 @@ def test_tui_status_panel_tracks_agent_lifecycle() -> None:
             assert "codex 完成" in panel, panel
             assert "响应耗时 5.4秒" in panel, panel
             assert "Ctrl+X" not in panel, panel
-            activity = "\n".join(
-                str(line.text) for line in app.query_one(RichLog).lines)
+            activity = str(
+                app.query_one("#activity-panel", Static).render())
             assert "响应耗时 5.4秒" in activity, activity
 
             app._render_task_status()
@@ -126,8 +130,6 @@ def test_tui_status_panel_tracks_agent_lifecycle() -> None:
             assert "响应耗时 5.4秒" in frozen, frozen
 
             workflow_id = "cmd-workflow"
-            log = app.query_one(RichLog)
-            workflow_line_start = len(log.lines)
             app._on_agent_event("user", AgentEvent(
                 "committed",
                 "/workflow ...",
@@ -151,13 +153,13 @@ def test_tui_status_panel_tracks_agent_lifecycle() -> None:
             assert "codex 进行中 · 审查中" in workflow_panel
             assert "kimi 排队 · 等待实现" in workflow_panel
             assert "opencode 排队 · 等待复核" in workflow_panel
-            collapsed = "".join(
-                str(line.text) for line in log.lines[workflow_line_start:])
+            collapsed = str(
+                app.query_one("#activity-panel", Static).render())
             assert "codex：审查中" in collapsed
             app.action_toggle_details()
             await pilot.pause()
-            rendered = "\n".join(
-                str(line.text) for line in log.lines[workflow_line_start:])
+            rendered = str(
+                app.query_one("#activity-panel", Static).render())
             assert "workflow 已创建" in rendered
             assert "kimi 思考中" not in rendered
 
@@ -176,6 +178,24 @@ def test_tui_status_panel_tracks_agent_lifecycle() -> None:
 
     asyncio.run(run())
     print("ok  TUI 固定状态栏跟踪 agent 生命周期")
+
+
+def test_periodic_status_render_uses_cached_host_identity() -> None:
+    """每秒状态刷新只读内存，不重新解析模型配置。"""
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=make_orch())
+        with patch(
+            "orchestrator.resolve_native_model_config",
+            side_effect=AssertionError("周期刷新不应读取模型配置"),
+        ):
+            async with app.run_test() as pilot:
+                app._render_task_status()
+                app._workspace_status_line()
+                app._completion_agents()
+                await pilot.pause()
+
+    asyncio.run(run())
+    print("ok  周期状态刷新复用 Host 内存身份")
 
 
 def test_interrupted_execution_restores_into_status_panel() -> None:
@@ -327,6 +347,7 @@ def test_future_duplicate_skipped_does_not_overwrite_executed_truth() -> None:
 if __name__ == "__main__":
     test_partial_completion_keeps_per_agent_truth()
     test_tui_status_panel_tracks_agent_lifecycle()
+    test_periodic_status_render_uses_cached_host_identity()
     test_interrupted_execution_restores_into_status_panel()
     test_collaboration_status_queues_future_steps_and_allows_reentry()
     test_future_duplicate_skipped_does_not_overwrite_executed_truth()

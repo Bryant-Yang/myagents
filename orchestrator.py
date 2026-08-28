@@ -140,6 +140,8 @@ class AgentSpec:
     probe: ReadinessProbe | None = None
     host_factory: Callable[[], AgentAdapter] | None = None
     host_probe: ReadinessProbe | None = None
+    display_name: str = ""
+    purpose: str = ""
 
 
 @dataclass(frozen=True)
@@ -199,26 +201,32 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
     AgentSpec(
         "kimi", "acp+jsonl", AcpKimiAdapter,
         executable_probe("kimi", ("kimi",), "安装 Kimi Code CLI"),
+        display_name="Kimi Code", purpose="代码分析与实现",
     ),
     AgentSpec(
         "opencode", "acp+jsonl", AcpOpenCodeAdapter,
         executable_probe("opencode", ("opencode",), "安装 OpenCode CLI"),
+        display_name="OpenCode", purpose="代码实现与审查",
     ),
     AgentSpec(
         "qwen", "acp", AcpQwenAdapter,
         executable_probe("qwen", ("qwen",), "安装 Qwen Code CLI"),
+        display_name="Qwen Code", purpose="软件工程协作",
     ),
     AgentSpec(
         "codebuddy", "acp", AcpCodeBuddyAdapter,
         codebuddy_readiness_probe,
+        display_name="CodeBuddy", purpose="代码分析与实现",
     ),
     AgentSpec(
         "dsh", "acp", AcpDshAdapter,
         dsh_readiness_probe,
+        display_name="DeepSeek Harness", purpose="工程任务执行",
     ),
     AgentSpec(
         "pi", "rpc", PiRpcAdapter,
         executable_probe("pi", ("pi",), "安装 Pi coding agent CLI"),
+        display_name="Pi", purpose="轻量工程协作",
     ),
     AgentSpec(
         "codex", "app-server", CodexAppServerAdapter,
@@ -229,6 +237,7 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             fallback_jsonl=False,
         ),
         executable_probe("codex", ("codex",), "安装 Codex CLI"),
+        display_name="Codex", purpose="代码实现、审查与工具执行",
     ),
 )
 AGENTS: dict[str, AgentSpec] = {spec.name: spec for spec in AGENT_SPECS}
@@ -503,6 +512,10 @@ class Orchestrator:
             fresh_replay_floor=self._host_fresh_replay_floor(),
         )
         self.adapters[HOST_NAME] = self.host
+        (
+            self._host_transport,
+            self._host_resolved_target,
+        ) = self._resolve_host_status_display(self._host_backend)
         self._session_roles: dict[str, SessionRole] = (
             self.store.get_session_roles()
             if self.store is not None else {}
@@ -673,10 +686,21 @@ class Orchestrator:
         return self._host_backend
 
     def host_backend_status(self) -> HostBackendStatus:
+        """返回内存快照；状态栏刷新不得重新读取模型配置文件。"""
         readiness = next(
             item for item in self._readiness.snapshot()
             if item.name == HOST_NAME)
-        selection = self._host_backend
+        return HostBackendStatus(
+            self._host_backend,
+            readiness,
+            self._host_transport,
+            self._host_resolved_target,
+        )
+
+    def _resolve_host_status_display(
+        self, selection: HostBackendSelection
+    ) -> tuple[str, str]:
+        """只在初始化、显式切换或 rescan 边界解析可见 Host 身份。"""
         resolved = selection.target
         transport = "NATIVE-MODEL"
         if selection.kind == "agent":
@@ -692,8 +716,7 @@ class Orchestrator:
                 resolved = config.model_id
             except NativeModelConfigurationError:
                 pass
-        return HostBackendStatus(
-            selection, readiness, transport, resolved)
+        return transport, resolved
 
     def _host_agent_spec(self, name: str) -> AgentSpec | None:
         return next((spec for spec in self.specs if spec.name == name), None)
@@ -869,6 +892,10 @@ class Orchestrator:
                 self.adapters[HOST_NAME] = replacement
                 raise
             self._host_backend = selection
+            (
+                self._host_transport,
+                self._host_resolved_target,
+            ) = self._resolve_host_status_display(selection)
             self.host = candidate
             self.adapters[HOST_NAME] = candidate
             self._cursors[HOST_NAME] = boundary
@@ -945,6 +972,10 @@ class Orchestrator:
                 "重启当前会话，确认旧 runtime 已回收后再试",
             )
         self._readiness.set_status(host_status)
+        (
+            self._host_transport,
+            self._host_resolved_target,
+        ) = self._resolve_host_status_display(self._host_backend)
         if host_status.ready and isinstance(
                 self.host.adapter, _UnavailableHostAdapter):
             try:

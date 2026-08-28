@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from adapters.base import redact_sensitive_text
+
 
 _COMMAND_LABELS = {
     "queued": "排队",
@@ -102,7 +104,7 @@ class TaskProgress:
     ) -> None:
         self.status = status
         if error:
-            self.error = error[:500]
+            self.error = redact_sensitive_text(str(error), limit=500)
         if elapsed_seconds is not None:
             self.elapsed_seconds = max(0.0, float(elapsed_seconds))
         elif status in _TERMINAL_COMMAND_STATES:
@@ -118,7 +120,9 @@ class TaskProgress:
         session_role: str | None = None,
         allow_reentry: bool = False,
     ) -> None:
-        current = self.agents.get(name)
+        clean_name = redact_sensitive_text(
+            " ".join(str(name).split()), limit=60) or "agent"
+        current = self.agents.get(clean_name)
         # 迟到的普通状态或 done 不得把已经记录的失败洗掉。
         if current is not None and current.state == "failed" \
                 and state != "failed":
@@ -128,10 +132,11 @@ class TaskProgress:
                 and current.state in _TERMINAL_AGENT_STATES \
                 and state in {"queued", "running", "waiting_permission"}:
             return
-        clean_phase = " ".join(str(phase).split())[:120]
+        clean_phase = redact_sensitive_text(
+            " ".join(str(phase).split()), limit=120)
         if not clean_phase and current is not None:
             clean_phase = current.phase
-        self.agents[name] = AgentProgress(
+        self.agents[clean_name] = AgentProgress(
             state=state,
             phase=clean_phase or _AGENT_LABELS.get(state, state),
             session_role=(
@@ -221,4 +226,5 @@ class TaskProgress:
 def _clean_session_role(value: object) -> str:
     if not isinstance(value, str):
         return ""
-    return " ".join(value.split())[:40]
+    return redact_sensitive_text(
+        " ".join(value.split()), limit=40)

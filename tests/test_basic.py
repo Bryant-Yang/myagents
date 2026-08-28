@@ -449,14 +449,14 @@ class _Raises:
 
 
 def test_tui() -> None:
-    from textual.widgets import Input, RichLog
-    from main import ChatApp
+    from textual.widgets import RichLog, Static
+    from main import ChatApp, ComposerInput
 
     async def run() -> None:
         app = ChatApp(workdir=".", orchestrator=make_orch())  # 假 agent，不发真实请求
         async with app.run_test() as pilot:
             await pilot.pause()
-            box = app.query_one(Input)
+            box = app.query_one(ComposerInput)
             box.value = "不点名的消息"
             await pilot.press("enter")
             await pilot.pause()
@@ -468,16 +468,12 @@ def test_tui() -> None:
             rendered = [
                 str(line.text) for line in app.query_one(RichLog).lines
             ]
-            assert len([
-                line for line in rendered
-                if line.startswith("[activity] ")
-            ]) == 2
+            activity = str(app.query_one("#activity-panel", Static).render())
+            assert activity.count("· /details 展开") == 2
             assert "[kimi] kimi 收到" in rendered
             await pilot.press("ctrl+g", "up", "enter")
             await pilot.pause()
-            expanded = "\n".join(
-                str(line.text) for line in app.query_one(RichLog).lines
-            )
+            expanded = str(app.query_one("#activity-panel", Static).render())
             assert "路由 → kimi" in expanded
 
     asyncio.run(run())
@@ -504,8 +500,8 @@ def test_pi_has_distinct_tui_color() -> None:
 
 def test_tui_coalesces_stream_chunks() -> None:
     """一条流式回复的 token/chunk 不应各占一行。"""
-    from textual.widgets import Input, RichLog
-    from main import ChatApp
+    from textual.widgets import RichLog, Static
+    from main import ChatApp, ComposerInput
 
     class ChunkAdapter(FakeAdapter):
         async def stream(self, prompt: str, workdir: str):
@@ -518,7 +514,7 @@ def test_tui_coalesces_stream_chunks() -> None:
         orch.adapters["kimi"] = ChunkAdapter("kimi")
         app = ChatApp(workdir=".", orchestrator=orch)
         async with app.run_test() as pilot:
-            box = app.query_one(Input)
+            box = app.query_one(ComposerInput)
             box.value = "@kimi 测试流式显示"
             await pilot.press("enter")
             await app.workers.wait_for_complete()
@@ -535,8 +531,8 @@ def test_tui_coalesces_stream_chunks() -> None:
 
 def test_tui_renders_agent_markdown_without_visible_delimiters() -> None:
     """Agent 的常用 Markdown 应转成终端样式，而不是泄露控制符。"""
-    from textual.widgets import Input, RichLog
-    from main import ChatApp
+    from textual.widgets import RichLog, Static
+    from main import ChatApp, ComposerInput
     from tui_markdown import render_chat_markdown
 
     class MarkdownAdapter(FakeAdapter):
@@ -550,7 +546,7 @@ def test_tui_renders_agent_markdown_without_visible_delimiters() -> None:
         orch.adapters["kimi"] = MarkdownAdapter("kimi")
         app = ChatApp(workdir=".", orchestrator=orch)
         async with app.run_test() as pilot:
-            box = app.query_one(Input)
+            box = app.query_one(ComposerInput)
             box.value = "@kimi 测试 Markdown 显示"
             await pilot.press("enter")
             await app.workers.wait_for_complete()
@@ -655,7 +651,7 @@ def test_tui_reuses_rendered_markdown_during_stream_redraw() -> None:
 
 def test_tui_coalesces_heartbeat_and_avoids_false_success_copy() -> None:
     """heartbeat 折叠进一张活动卡；done 不伪装任务验收。"""
-    from textual.widgets import RichLog
+    from textual.widgets import RichLog, Static
     from main import ChatApp
 
     async def run() -> None:
@@ -672,15 +668,13 @@ def test_tui_coalesces_heartbeat_and_avoids_false_success_copy() -> None:
             lines = [
                 str(line.text) for line in app.query_one(RichLog).lines
             ]
-            activity = [
-                line for line in lines if line.startswith("[activity] ")
-            ]
-            assert len(activity) == 1, activity
+            activity = str(
+                app.query_one("#activity-panel", Static).render())
+            assert activity.count("任务 cmd-1") == 1, activity
             assert not [line for line in lines if "已等待 20 秒" in line]
             app.action_toggle_details()
-            expanded = "\n".join(
-                str(line.text) for line in app.query_one(RichLog).lines
-            )
+            expanded = str(
+                app.query_one("#activity-panel", Static).render())
             assert "host 正在路由（已等待 20 秒）" in expanded
             assert "本轮响应结束" in expanded
             assert "kimi 完成" not in expanded
@@ -691,21 +685,21 @@ def test_tui_coalesces_heartbeat_and_avoids_false_success_copy() -> None:
 
 def test_tui_updates_one_activity_card_per_command() -> None:
     """工具状态原位更新，完成后仍可展开历史活动卡。"""
-    from textual.widgets import RichLog
+    from textual.widgets import RichLog, Static
     from main import ChatApp
 
     async def run() -> None:
         app = ChatApp(workdir=".", orchestrator=make_orch())
         async with app.run_test() as pilot:
-            render_count = 0
-            original_render = app._render_display_lines
+            refresh_count = 0
+            original_refresh = app._refresh_activity_cards
 
-            def counted_render() -> None:
-                nonlocal render_count
-                render_count += 1
-                original_render()
+            def counted_refresh() -> None:
+                nonlocal refresh_count
+                refresh_count += 1
+                original_refresh()
 
-            app._render_display_lines = counted_render
+            app._refresh_activity_cards = counted_refresh
             base = {
                 "command_id": "cmd-tool",
                 "tool_call_id": "tool-1",
@@ -729,39 +723,25 @@ def test_tui_updates_one_activity_card_per_command() -> None:
                 ),
             )
             await pilot.pause()
-            logical = [
-                text for _speaker, text, _style in app._display_lines
-                if _speaker == "activity"
-            ]
-            assert len(logical) == 1, logical
-            assert "node --check demo.js" not in logical[0], logical
-            assert "/details" in logical[0], logical
-            assert render_count == 3, render_count
+            collapsed = str(
+                app.query_one("#activity-panel", Static).render())
+            assert collapsed.count("任务 cmd-tool") == 1, collapsed
+            assert "node --check demo.js" not in collapsed
+            assert "/details" in collapsed
+            assert refresh_count == 3, refresh_count
             app.action_toggle_details()
-            logical = [
-                text for _speaker, text, _style in app._display_lines
-                if _speaker == "activity"
-            ]
-            assert "node --check demo.js" in logical[0], logical
-            lines = [
-                str(line.text) for line in app.query_one(RichLog).lines
-                if "检查 JavaScript" in str(line.text)
-            ]
-            assert len([
-                line for line in app.query_one(RichLog).lines
-                if str(line.text).startswith("[activity] ")
-            ]) == 1
-            assert "已完成" in "\n".join(lines), lines
-            assert render_count == 4, render_count
+            expanded = str(
+                app.query_one("#activity-panel", Static).render())
+            assert "node --check demo.js" in expanded
+            assert "检查 JavaScript · 已完成" in expanded
+            assert refresh_count == 4, refresh_count
             app._on_agent_event(
                 "kimi", AgentEvent(
                     "done", meta={"command_id": "cmd-tool"}))
-            after_done = [
-                text for speaker, text, _style in app._display_lines
-                if speaker == "activity"
-            ]
-            assert len(after_done) == 1
-            assert "本轮响应结束" in after_done[0]
+            after_done = str(
+                app.query_one("#activity-panel", Static).render())
+            assert after_done.count("任务 cmd-tool") == 1
+            assert "本轮响应结束" in after_done
 
     asyncio.run(run())
     print("ok  TUI 工具状态原位更新")

@@ -23,7 +23,7 @@ from orchestrator import AgentSpec, Orchestrator
 from session_roles import SessionRole, SessionRoleChanges
 from test_basic import make_orch
 from textual.geometry import Region
-from textual.widgets import OptionList
+from textual.widgets import OptionList, Static
 from tui_completion import (
     completion_context,
     local_command_for,
@@ -356,6 +356,9 @@ def test_slash_commands_unknown_agent_and_submit_behaviour() -> None:
             assert box.value == "@ghost 请处理"
             assert orch.history == []
             assert box.has_focus
+            notice = app.query_one("#notice-strip", Static)
+            assert "未知 agent：@ghost" in str(notice.render())
+            assert notice.styles.display == "block"
 
             # 带参数的 slash 文本不是本地命令，仍进入正常派发路径。
             box.value = "/new task"
@@ -365,9 +368,54 @@ def test_slash_commands_unknown_agent_and_submit_behaviour() -> None:
             await pilot.pause()
             assert orch.history[0].speaker == "user"
             assert orch.history[0].text == "/new task"
+            assert notice.styles.display == "none"
 
     asyncio.run(run())
     print("ok  /command 补全/本地执行/未知 agent/命令误判")
+
+
+def test_composer_supports_multiline_prompts_with_contextual_shortcuts() -> None:
+    """多行、中文软换行和取消快捷键不破坏草稿。"""
+
+    async def run() -> None:
+        from textual.widgets import Static
+
+        orch = make_orch()
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test(size=(40, 30)) as pilot:
+            box = app.query_one("#composer", ComposerInput)
+            box.value = "中" * 40
+            box.cursor_position = len(box.value)
+            await pilot.pause()
+            assert box.outer_size.height >= 5
+
+            await pilot.press("ctrl+x")
+            await pilot.pause()
+            assert box.value == "中" * 40
+
+            box.value = "@kimi 第一行"
+            box.cursor_position = len(box.value)
+
+            await pilot.press("shift+enter")
+            await pilot.pause()
+            assert box.value == "@kimi 第一行\n"
+            assert box.has_focus
+
+            box.value += "第二行"
+            box.cursor_position = len(box.value)
+            assert box.outer_size.height >= 4
+            hint = str(app.query_one("#composer-hint", Static).render())
+            assert "Enter 发送" in hint
+            assert "Shift+Enter 换行" in hint
+
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert box.value == ""
+            assert orch.history[0].text == "@kimi 第一行\n第二行"
+
+    asyncio.run(run())
+    print("ok  多行 composer + 动态快捷提示")
 
 
 def test_yolo_is_session_scoped_visible_and_not_dispatched() -> None:
@@ -433,7 +481,10 @@ def test_agent_readiness_status_rescan_and_draft_preservation() -> None:
 
     specs = (
         AgentSpec("missing", "acp", Adapter, probe("missing")),
-        AgentSpec("ready", "jsonl", Adapter, probe("ready")),
+        AgentSpec(
+            "ready", "jsonl", Adapter, probe("ready"),
+            display_name="Ready Agent", purpose="代码审查",
+        ),
     )
     orch = Orchestrator(
         ".",
@@ -451,6 +502,7 @@ def test_agent_readiness_status_rescan_and_draft_preservation() -> None:
             completion = app._completion_agents()
             assert [name for name, _ in completion] == [
                 "ready", "host", "missing"]
+            assert "Ready Agent · 代码审查" in completion[0][1]
             assert "可用" in completion[0][1]
             assert "未检测到 CLI" in completion[-1][1]
 
@@ -912,6 +964,7 @@ if __name__ == "__main__":
     test_agent_completion_scrolls_selected_item_into_view()
     test_unready_dsh_remains_visible_after_ready_candidates()
     test_slash_commands_unknown_agent_and_submit_behaviour()
+    test_composer_supports_multiline_prompts_with_contextual_shortcuts()
     test_yolo_is_session_scoped_visible_and_not_dispatched()
     test_agent_readiness_status_rescan_and_draft_preservation()
     test_agent_global_switch_command_updates_tui_without_dispatch()

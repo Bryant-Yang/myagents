@@ -22,26 +22,28 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import json
 import re
 import shlex
 from pathlib import Path
 from typing import Callable, Iterable
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.events import Resize
+from textual.message import Message as TextualMessage
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
-    Footer,
     Input,
     Label,
     OptionList,
     RichLog,
     Static,
+    TextArea,
 )
 from textual.widgets.option_list import Option
 
@@ -161,30 +163,58 @@ def _safe_activity_agent(agent: str) -> str:
 
 
 def _tool_detail(tool: object) -> str:
-    """提取适合给用户看的工具上下文；隐藏常见凭据字段并限制长度。"""
+    """把协议工具参数投影为可扫读字段；不直接展示原始 JSON。"""
     if not isinstance(tool, dict):
         return ""
 
-    def scrub(value: object, key: str = "") -> object:
+    field_labels = {
+        "path": "路径",
+        "filepath": "文件",
+        "file_path": "文件",
+        "command": "命令",
+        "cwd": "工作目录",
+        "workdir": "工作目录",
+        "url": "地址",
+        "query": "查询",
+        "pattern": "匹配",
+        "content": "内容",
+    }
+    rows: list[str] = []
+
+    def visit(value: object, key: str = "") -> None:
+        if len(rows) >= 12:
+            return
         lowered = key.lower()
         if any(marker in lowered for marker in _SENSITIVE_DETAIL_KEYS):
-            return "[已隐藏]"
+            rows.append(f"{key}=[已隐藏]")
+            return
         if isinstance(value, dict):
-            return {str(k): scrub(v, str(k)) for k, v in value.items()
-                    if str(k) not in {"title", "toolCallId"}}
+            for nested_key, nested_value in value.items():
+                name = str(nested_key)
+                if name not in {"title", "toolCallId"}:
+                    visit(nested_value, name)
+            return
         if isinstance(value, list):
-            return [scrub(item) for item in value[:20]]
-        if isinstance(value, str):
-            return redact_sensitive_text(value)
-        if isinstance(value, (int, float, bool)) or value is None:
-            return value
-        return str(value)[:2000]
+            for item in value[:20]:
+                visit(item, key)
+            return
+        rendered = redact_sensitive_text(str(value), limit=1200)
+        if not rendered or rendered == "None":
+            return
+        label = field_labels.get(lowered, key or "参数")
+        separator = "=" if label == key and key else "："
+        rows.append(f"{label}{separator}{rendered}")
 
-    cleaned = scrub(tool)
-    if not isinstance(cleaned, dict) or not cleaned:
-        return ""
-    rendered = json.dumps(cleaned, ensure_ascii=False, indent=2)
-    return rendered[:4000]
+    visit(tool)
+    return "\n".join(rows)[:4000]
+
+
+_PERMISSION_OPTION_LABELS = {
+    "allow_once": "允许一次",
+    "allow_always": "始终允许（高风险）",
+    "reject_once": "拒绝这次",
+    "reject_always": "始终拒绝",
+}
 
 
 class PermissionScreen(ModalScreen):
@@ -205,9 +235,11 @@ class PermissionScreen(ModalScreen):
         session_label: str = "",
     ) -> None:
         super().__init__()
-        self._agent_name = agent_name
+        self._agent_name = redact_sensitive_text(
+            " ".join(agent_name.split()), limit=60) or "agent"
         self._session_id = session_id
-        self._session_label = session_label
+        self._session_label = redact_sensitive_text(
+            " ".join(session_label.split()), limit=200)
         tool = params.get("toolCall", {})
         if not isinstance(tool, dict):
             tool = {}
@@ -217,24 +249,45 @@ class PermissionScreen(ModalScreen):
         )
         self._detail = _tool_detail(tool)
         # optionId 不一定是合法 DOM id，用序号映射
-        self._options = {f"perm-opt-{i}": opt
-                         for i, opt in enumerate(params.get("options", []))}
+        options = params.get("options", [])
+        if not isinstance(options, list):
+            options = []
+        self._options = {
+            f"perm-opt-{i}": opt
+            for i, opt in enumerate(options)
+            if isinstance(opt, dict)
+        }
 
     def compose(self) -> ComposeResult:
         with Vertical(id="perm-dialog"):
-            prefix = f"{self._session_label} · " if self._session_label else ""
-            text = f"{prefix}{self._agent_name} 请求权限：{self._title}"
+            context = f"{self._session_label} · " if self._session_label else ""
+            text = f"{context}@{self._agent_name} 请求执行\n{self._title}"
             if self._detail:
                 text += f"\n{self._detail}"
-            yield Label(text)
+            yield Label(text, id="permission-summary")
             for bid, opt in self._options.items():
-                yield Button(opt.get("name") or opt.get("optionId", "?"), id=bid)
-            yield Button("取消", id="perm-cancel", variant="error")
+                kind = str(opt.get("kind") or "")
+                label = _PERMISSION_OPTION_LABELS.get(kind)
+                if label is None:
+                    label = redact_sensitive_text(
+                        str(opt.get("name") or "使用此选项"), limit=120)
+                variant = (
+                    "success" if kind == "allow_once"
+                    else "warning" if kind == "allow_always"
+                    else "error" if kind.startswith("reject")
+                    else "default"
+                )
+                yield Button(label, id=bid, variant=variant)
+            yield Button("取消整个任务", id="perm-cancel", variant="error")
+            yield Label(
+                "Enter 选择 · Esc 取消整个任务",
+                id="permission-help",
+            )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         opt = self._options.get(event.button.id or "")
         if opt is None:  # 取消按钮
-            self.dismiss(dict(_CANCELLED))
+            self.action_cancel_task()
         else:
             self.dismiss({"outcome": "selected",
                           "optionId": opt.get("optionId", "")})
@@ -244,6 +297,8 @@ class PermissionScreen(ModalScreen):
 
     def action_cancel_task(self) -> None:
         self.app.action_cancel_session(self._session_id)
+        with contextlib.suppress(Exception):
+            self.dismiss(dict(_CANCELLED))
 
 
 class SessionPickerScreen(ModalScreen[str | None]):
@@ -601,23 +656,81 @@ class DeleteSessionScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class ComposerInput(Input):
-    """输入框保持焦点时处理候选导航，不让 Enter 提前提交消息。"""
+class ComposerInput(TextArea):
+    """可增长的多行 composer：Enter 提交，Shift+Enter 换行。"""
+
+    class Submitted(TextualMessage):
+        def __init__(self, composer: "ComposerInput") -> None:
+            super().__init__()
+            self.input = composer
+            self.value = composer.value
+
+        @property
+        def control(self) -> "ComposerInput":
+            return self.input
 
     BINDINGS = [
-        Binding("up", "completion_previous", show=False),
-        Binding("down", "completion_next", show=False),
-        Binding("tab", "completion_accept", show=False),
+        Binding("enter", "submit", "发送", show=False, priority=True),
+        Binding(
+            "shift+enter", "insert_newline", "换行",
+            show=False, priority=True,
+        ),
+        Binding("up", "completion_previous", show=False, priority=True),
+        Binding("down", "completion_next", show=False, priority=True),
+        Binding("tab", "completion_accept", show=False, priority=True),
         Binding("alt+up", "interject", "提升排队", priority=True),
-        Binding("escape", "completion_close", show=False),
-        *Input.BINDINGS,
+        Binding("ctrl+x", "cancel_active", "取消当前任务", priority=True),
+        Binding("escape", "completion_close", show=False, priority=True),
+        *TextArea.BINDINGS,
     ]
 
+    def __init__(self, text: str = "", **kwargs) -> None:
+        super().__init__(
+            text,
+            soft_wrap=True,
+            show_line_numbers=False,
+            highlight_cursor_line=False,
+            tab_behavior="focus",
+            **kwargs,
+        )
+
+    @property
+    def value(self) -> str:
+        """保留原 composer 的字符串接口，避免会话草稿层感知 TextArea。"""
+        return self.text
+
+    @value.setter
+    def value(self, value: str) -> None:
+        self.load_text(value)
+
+    @property
+    def cursor_position(self) -> int:
+        return self.document.get_index_from_location(self.cursor_location)
+
+    @cursor_position.setter
+    def cursor_position(self, value: int) -> None:
+        index = max(0, min(int(value), len(self.text)))
+        self.cursor_location = self.document.get_location_from_index(index)
+
+    @property
+    def selection_offsets(self) -> tuple[int, int]:
+        return (
+            self.document.get_index_from_location(self.selection.start),
+            self.document.get_index_from_location(self.selection.end),
+        )
+
+    def replace_offsets(self, text: str, start: int, end: int) -> None:
+        start_location = self.document.get_location_from_index(start)
+        end_location = self.document.get_location_from_index(end)
+        self.replace(text, start_location, end_location)
+
     def action_completion_previous(self) -> None:
-        self.app.move_completion(-1)
+        if not self.app.move_completion(-1):
+            self.action_cursor_up()
 
     def action_completion_next(self) -> None:
-        self.app.move_completion(1)
+        if not self.app.move_completion(1):
+            self.action_cursor_down()
 
     def action_completion_accept(self) -> None:
         if not self.app.accept_completion():
@@ -630,9 +743,15 @@ class ComposerInput(Input):
     def action_interject(self) -> None:
         self.app.action_interject()
 
-    async def action_submit(self) -> None:
+    def action_cancel_active(self) -> None:
+        self.app.action_cancel_active()
+
+    def action_submit(self) -> None:
         if not self.app.accept_completion():
-            await super().action_submit()
+            self.post_message(self.Submitted(self))
+
+    def action_insert_newline(self) -> None:
+        self.insert("\n")
 
     def action_paste(self) -> None:
         """文本剪贴板沿用 Textual；空文本时尝试读取系统图片。"""
@@ -642,8 +761,10 @@ class ComposerInput(Input):
             self.app.action_paste_image()
 
 
-class ActivityLog(RichLog):
-    """活动卡获得焦点后，用方向键选择，避免复用聊天输入语义。"""
+class ActivityPanel(Static):
+    """独立任务过程区；聊天主线只保留用户、回复和错误。"""
+
+    can_focus = True
 
     BINDINGS = [
         Binding("up", "activity_previous", show=False, priority=True),
@@ -676,12 +797,46 @@ class ChatApp(App):
     CSS = """
     RichLog { border: round $primary; }
     Input { border: round $secondary; }
+    #composer {
+        height: 3;
+        min-height: 3;
+        max-height: 8;
+        border: round $secondary;
+        padding: 0 1;
+    }
+    #composer-hint {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+    }
     #task-status {
         height: auto;
         min-height: 3;
         padding: 0 1;
         border: round $secondary;
         color: $text-muted;
+    }
+    #notice-strip {
+        display: none;
+        height: auto;
+        max-height: 4;
+        padding: 0 1;
+        border-left: thick $error;
+        background: $error 12%;
+        color: $text;
+    }
+    #activity-panel {
+        display: none;
+        height: auto;
+        max-height: 14;
+        overflow-y: auto;
+        padding: 0 1;
+        border: round $primary-darken-1;
+        color: $text-muted;
+    }
+    #activity-panel:focus {
+        border: round $accent;
+        color: $text;
     }
     #task-status.auto-approve {
         border: round $error;
@@ -704,10 +859,16 @@ class ChatApp(App):
         background: $background 70%;
     }
     #perm-dialog {
-        width: 60; height: auto; padding: 1 2;
+        width: 72; max-width: 92%; height: auto; padding: 1 2;
         border: round $warning; background: $surface;
     }
     #perm-dialog Button { width: 100%; margin-top: 1; }
+    #permission-summary { margin-bottom: 1; }
+    #permission-help {
+        margin-top: 1;
+        color: $text-muted;
+        text-align: center;
+    }
     #session-dialog {
         width: 60; height: auto; padding: 1 2;
         border: round $primary; background: $surface;
@@ -840,13 +1001,12 @@ class ChatApp(App):
         self._activity_feeds = {activity_room_id: ActivityFeed()}
         self._activity_feed = self._activity_feeds[activity_room_id]
         self._activity_room_id = activity_room_id
+        self._error_notices: dict[str, str] = {}
         # /yolo 是当前进程内、按 room 隔离的显式授权。不得写入 room state，
         # 因此重启后一定恢复默认逐次询问。
         self._auto_approve_rooms: set[str] = set()
         self._expanded_activity_ids = {activity_room_id: set()}
         self._expanded_activity = self._expanded_activity_ids[activity_room_id]
-        self._activity_line_index: dict[str, int] = {}
-        self._activity_line_fingerprint: dict[str, tuple[str, str, str]] = {}
         self._selected_activity_id: str | None = None
         self._clipboard_image_capture = clipboard_image_capture
         self._image_paste_in_progress = False
@@ -857,17 +1017,18 @@ class ChatApp(App):
         self._suppress_completion_value: str | None = None
 
     def compose(self) -> ComposeResult:
-        yield ActivityLog(wrap=True)
+        yield RichLog(wrap=True, id="chat-log")
+        yield Static(id="notice-strip")
+        yield ActivityPanel(id="activity-panel")
         yield Static(id="task-status")
         yield OptionList(id="completion-list", compact=True)
+        yield Static(id="composer-hint")
         yield ComposerInput(
             placeholder=(
-                "输入 @ 选择 agent；/new 或 Ctrl+N 新会话；"
-                "Alt+↑ 提升最早排队输入；Esc 取消任务；Ctrl+O 会话；Ctrl+G 活动；Ctrl+C 退出"
+                "输入消息，@ 选择 Agent，/ 查看命令"
             ),
             id="composer",
         )
-        yield Footer()
 
     async def on_mount(self) -> None:
         if self.session_manager is not None:
@@ -893,18 +1054,16 @@ class ChatApp(App):
         statuses = self.orch.agent_readiness_snapshot()
         ready = [item.name for item in statuses if item.ready]
         pending = [item.name for item in statuses if not item.ready]
-        rows = [f"聊天室已就绪：已就绪 {len(ready)}/{len(statuses)}"]
-        if ready:
-            rows.append("可用：" + "、".join(f"@{name}" for name in ready))
+        summary = f"聊天室已就绪：已就绪 {len(ready)}/{len(statuses)}"
         if pending:
-            rows.append(
-                "待处理：" + "、".join(f"@{name}" for name in pending))
-        rows.append("详情：/agents")
-        rows.append(
-            f"会话：{self.session_name}；工作目录：{self.orch.workdir}")
-        self._system("\n".join(rows))
+            summary += f" · {len(pending)} 个待处理"
+        summary += " · /agents 管理 · Ctrl+O 会话"
+        self._system(summary)
         self._update_permission_mode_ui()
-        self.query_one("#composer", ComposerInput).focus()
+        composer = self.query_one("#composer", ComposerInput)
+        self._resize_composer(composer)
+        self._render_composer_hint()
+        composer.focus()
 
     async def on_unmount(self) -> None:
         # 先放行等待中的权限请求（cancelled），再停 bus worker（取消进行
@@ -950,6 +1109,7 @@ class ChatApp(App):
             self._expanded_activity.discard(command_id)
         self._discard_stale_activity_selection()
         self._update_permission_mode_ui()
+        self._render_error_notice()
 
     def _on_session_event(
         self,
@@ -1010,6 +1170,9 @@ class ChatApp(App):
                 terminal.error,
                 elapsed_seconds=elapsed,
             )
+        if terminal.status == "failed" and terminal.error:
+            self._show_error_notice(
+                terminal.error, room_id=terminal.session_id)
 
     def _record_background_activity(
         self, room_id: str, name: str, ev: AgentEvent
@@ -1020,6 +1183,8 @@ class ChatApp(App):
             return
         command_id = str(command_value)
         feed = self._activity_feeds.setdefault(room_id, ActivityFeed())
+        if ev.kind == "error":
+            self._show_error_notice(ev.text, room_id=room_id)
         if ev.kind == "committed" and name == "user":
             feed.mark_request_committed(command_id)
             feed.begin(command_id)
@@ -1346,10 +1511,43 @@ class ChatApp(App):
         return Text.assemble(prefix, body)
 
     def _write(self, speaker: str, text: str, style: str = "") -> None:
+        if "red" in style:
+            text = redact_sensitive_text(text, limit=2000)
         self._display_lines.append((speaker, text, style))
         rendered = self._line(speaker, text, style)
         self._rendered_display_lines.append(rendered)
         self.query_one(RichLog).write(rendered)
+        if "red" in style:
+            self._show_error_notice(text)
+
+    def _show_error_notice(
+        self, text: str, *, room_id: str | None = None
+    ) -> None:
+        """按 room 保存最新可操作错误，避免切会话时串屏。"""
+        target_room = room_id or self._activity_room_id
+        compact = redact_sensitive_text(" ".join(text.split()), limit=500)
+        self._error_notices[target_room] = compact
+        if target_room == self._activity_room_id:
+            self._render_error_notice()
+
+    def _render_error_notice(self) -> None:
+        try:
+            notice = self.query_one("#notice-strip", Static)
+        except NoMatches:
+            return
+        compact = self._error_notices.get(self._activity_room_id, "")
+        if compact:
+            notice.update(f"错误 · {compact}")
+            notice.styles.display = "block"
+        else:
+            notice.update("")
+            notice.styles.display = "none"
+
+    def _clear_error_notice(self, room_id: str | None = None) -> None:
+        target_room = room_id or self._activity_room_id
+        self._error_notices.pop(target_room, None)
+        if target_room == self._activity_room_id:
+            self._render_error_notice()
 
     def _render_display_lines(self) -> None:
         """重绘逻辑时间线，让正在流式增长的回复仍只占一条记录。"""
@@ -1397,41 +1595,18 @@ class ChatApp(App):
         self._stream_line_index.pop(name, None)
 
     def _upsert_activity_card(self, command_id: str) -> None:
-        """同一 command 的过程事件始终只重绘一张逻辑活动卡。"""
-        changed = self._apply_activity_evictions()
-        if not self._activity_feed.has(command_id):
-            if changed:
-                self._render_display_lines()
-            return
-        rendered = self._render_activity_card(command_id)
-        if self._activity_line_fingerprint.get(command_id) == rendered:
-            if changed:
-                self._render_display_lines()
-            return
-        self._activity_line_fingerprint[command_id] = rendered
-        index = self._activity_line_index.get(command_id)
-        if index is None:
-            self._activity_line_index[command_id] = len(self._display_lines)
-            self._display_lines.append(rendered)
-            self._rendered_display_lines.append(None)
-        else:
-            self._display_lines[index] = rendered
-            self._rendered_display_lines[index] = None
-        self._render_display_lines()
+        """同一 command 的过程事件始终只重绘独立任务面板。"""
+        del command_id
+        self._refresh_activity_cards()
 
     def _apply_activity_evictions(self) -> bool:
-        """近期可展开窗口之外，只留下已折叠的有界归档行。"""
+        """近期可展开窗口之外从任务面板移除；持久事件仍是事实源。"""
         changed = False
-        for command_id, snapshot in self._activity_feed.take_evicted():
+        for command_id, _snapshot in self._activity_feed.take_evicted():
             self._expanded_activity.discard(command_id)
             if self._selected_activity_id == command_id:
                 self._selected_activity_id = None
-            index = self._activity_line_index.pop(command_id, None)
-            self._activity_line_fingerprint.pop(command_id, None)
-            if index is not None:
-                self._display_lines[index] = ("activity", snapshot, "dim")
-                self._rendered_display_lines[index] = None
-                changed = True
+            changed = True
         self._discard_stale_activity_selection()
         return changed
 
@@ -1442,7 +1617,7 @@ class ChatApp(App):
         if self._selected_activity_id not in command_ids:
             self._selected_activity_id = None
 
-    def _render_activity_card(self, command_id: str) -> tuple[str, str, str]:
+    def _render_activity_card(self, command_id: str) -> Text:
         expanded = command_id in self._expanded_activity
         text = self._activity_feed.render(command_id, expanded=expanded)
         style = "dim"
@@ -1453,28 +1628,31 @@ class ChatApp(App):
                 1,
             )
             style = "bold cyan"
-        return ("activity", text, style)
+        return Text(text, style=style)
 
     def _refresh_activity_cards(self) -> None:
-        """切换展开态时一次性重建全部活动卡，避免连续整屏闪烁。"""
-        changed = self._apply_activity_evictions()
-        for command_id in self._activity_feed.command_ids():
-            rendered = self._render_activity_card(command_id)
-            if self._activity_line_fingerprint.get(command_id) == rendered:
-                continue
-            self._activity_line_fingerprint[command_id] = rendered
-            index = self._activity_line_index.get(command_id)
-            if index is None:
-                self._activity_line_index[command_id] = len(
-                    self._display_lines)
-                self._display_lines.append(rendered)
-                self._rendered_display_lines.append(None)
-            else:
-                self._display_lines[index] = rendered
-                self._rendered_display_lines[index] = None
-            changed = True
-        if changed:
-            self._render_display_lines()
+        """切换展开态时只重建任务面板，不重绘聊天主线。"""
+        self._apply_activity_evictions()
+        try:
+            panel = self.query_one("#activity-panel", ActivityPanel)
+        except NoMatches:
+            # Session watcher 可能恰好在 Textual 已卸载子节点后完成收尾。
+            return
+        command_ids = self._activity_feed.command_ids()
+        if not command_ids:
+            panel.update("")
+            panel.styles.display = "none"
+            return
+        rendered = Text()
+        rendered.append("任务活动", "bold")
+        rendered.append("  ·  Ctrl+G 浏览  ·  /details 展开", "dim")
+        for command_id in command_ids:
+            rendered.append("\n")
+            rendered.append_text(self._render_activity_card(command_id))
+        panel.update(rendered)
+        visual_lines = rendered.plain.count("\n") + 1
+        panel.styles.height = min(14, max(3, visual_lines + 2))
+        panel.styles.display = "block"
 
     def _system(self, text: str) -> None:
         self._write("system", text, "dim")
@@ -1486,41 +1664,73 @@ class ChatApp(App):
             item.name: item
             for item in self.orch.agent_readiness_snapshot()
         }
-        agents = [
-            (
-                spec.name,
-                f"{spec.transport.upper()} · "
-                f"{status_by_name[spec.name].state.label}",
-            )
-            for spec in self.orch.specs
-        ]
+        agents = []
+        for spec in self.orch.specs:
+            if spec.display_name or spec.purpose:
+                identity = spec.display_name or spec.name
+                purpose = f" · {spec.purpose}" if spec.purpose else ""
+                description = (
+                    f"{identity}{purpose} · "
+                    f"{status_by_name[spec.name].state.label}"
+                )
+            else:
+                description = (
+                    f"{spec.transport.upper()} · "
+                    f"{status_by_name[spec.name].state.label}"
+                )
+            agents.append((spec.name, description))
         if all(name != HOST_NAME for name, _ in agents):
             host = status_by_name[HOST_NAME]
             backend = self.orch.host_backend_status()
+            target = (
+                f"@{backend.selection.target}"
+                if backend.selection.kind == "agent"
+                else backend.resolved_target
+            )
             agents.append((
                 HOST_NAME,
-                f"MODERATOR · {backend.transport} · {host.state.label}",
+                f"主持、路由与总结 · {target} · {host.state.label}",
             ))
         agents.sort(
             key=lambda item: not status_by_name[item[0]].ready)
         return tuple(agents)
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id != "composer":
-            return
-        if event.value == self._suppress_completion_value:
+    def _update_composer_completion(self, box: ComposerInput) -> None:
+        value = box.value
+        if value == self._suppress_completion_value:
             self._suppress_completion_value = None
             self.close_completion()
             return
         self._suppress_completion_value = None
         context = completion_context(
-            event.value,
-            event.input.cursor_position,
+            value,
+            box.cursor_position,
             self._completion_agents(),
         )
         self._completion = context
         self._completion_index = 0
         self._render_completion()
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if event.text_area.id != "composer":
+            return
+        box = event.text_area
+        if not isinstance(box, ComposerInput):
+            return
+        self._resize_composer(box)
+        if not self.is_mounted:
+            return
+        self._update_composer_completion(box)
+
+    def _resize_composer(self, box: ComposerInput) -> None:
+        """按显式换行和软换行近似增长，避免长任务只剩一条横向窗口。"""
+        content_width = max(20, box.content_size.width or self.size.width - 4)
+        visual_lines = 0
+        for line in box.value.split("\n"):
+            width = cell_len(line.expandtabs(4))
+            visual_lines += max(
+                1, (width + content_width - 1) // content_width)
+        box.styles.height = min(8, max(3, visual_lines + 2))
 
     def _render_completion(self) -> None:
         popup = self.query_one("#completion-list", OptionList)
@@ -1618,7 +1828,10 @@ class ChatApp(App):
             self._render_completion()
         return was_open
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
+    async def on_composer_input_submitted(
+        self,
+        event: ComposerInput.Submitted,
+    ) -> None:
         text = event.value.strip()
         if not text:
             return
@@ -2060,8 +2273,8 @@ class ChatApp(App):
         self.close_completion()
         self._selected_activity_id = command_ids[-1]
         self._refresh_activity_cards()
-        self.query_one(ActivityLog).focus()
-        self._scroll_selected_activity_into_view()
+        self.query_one(ActivityPanel).focus()
+        self.call_after_refresh(self._scroll_selected_activity_into_view)
 
     def move_activity_selection(self, delta: int) -> None:
         command_ids = self._activity_feed.command_ids()
@@ -2074,18 +2287,22 @@ class ChatApp(App):
             index = (index + delta) % len(command_ids)
         self._selected_activity_id = command_ids[index]
         self._refresh_activity_cards()
-        self._scroll_selected_activity_into_view()
+        self.call_after_refresh(self._scroll_selected_activity_into_view)
 
     def _scroll_selected_activity_into_view(self) -> None:
         command_id = self._selected_activity_id
         if command_id is None:
             return
-        log = self.query_one(ActivityLog)
-        needle = f"任务 {command_id[:8]}"
-        for index, line in enumerate(log.lines):
-            if needle in str(line.text):
-                log.scroll_to(y=index, immediate=True, force=True)
+        panel = self.query_one(ActivityPanel)
+        offset = 1
+        for item in self._activity_feed.command_ids():
+            if item == command_id:
+                panel.scroll_to(y=offset, immediate=True, force=True)
                 return
+            offset += self._activity_feed.render(
+                item,
+                expanded=item in self._expanded_activity,
+            ).count("\n") + 1
 
     def close_activity_navigation(self) -> None:
         """退出活动卡导航，清除选中标记并把焦点还给输入框。"""
@@ -2125,12 +2342,13 @@ class ChatApp(App):
             except ClipboardImageError as exc:
                 self._write("system", str(exc), "bold red")
                 return
-            start, end = box.selection
+            start, end = box.selection_offsets
             prefix = "" if start == 0 or box.value[start - 1].isspace() else " "
             suffix = "" if end == len(box.value) or (
                 end < len(box.value) and box.value[end].isspace()
             ) else " "
-            box.replace(f"{prefix}{reference}{suffix}", start, end)
+            box.replace_offsets(
+                f"{prefix}{reference}{suffix}", start, end)
             box.focus()
             self._system(f"已粘贴图片：{path.name}")
 
@@ -2170,6 +2388,7 @@ class ChatApp(App):
                 except Exception as exc:
                     self._write("system", f"派发失败：{exc}", "bold red")
                     return
+                self._clear_error_notice(managed.session_id)
                 if managed.session_id == self.session_manager.active_session_id:
                     self._set_queued_command(managed.command_id, text)
                 while True:
@@ -2200,6 +2419,7 @@ class ChatApp(App):
             except Exception as exc:
                 self._write("system", f"派发失败：{exc}", "bold red")
                 return
+            self._clear_error_notice()
             self._set_queued_command(snap.command_id, text)
             while True:  # agent 长任务可能超过单次 wait 上限，等到 terminal
                 result = await bus.wait(snap.command_id)
@@ -2317,15 +2537,17 @@ class ChatApp(App):
     def _render_task_status(self) -> None:
         if not self.is_mounted:
             return
+        self._render_composer_hint()
         panel = self.query_one("#task-status", Static)
         warning = (
             "YOLO：当前会话自动完全授权已开启（只读阶段仍硬拒绝）\n"
             if self.auto_approve else ""
         )
+        workspace = self._workspace_status_line()
         progress = self._selected_task()
         if progress is None:
             panel.update(
-                warning + "空闲 · 输入 @ 选择 agent，输入 / 查看命令")
+                warning + workspace + "\n空闲 · 输入 @ 选择 Agent，输入 / 查看命令")
             return
         with contextlib.suppress(Exception):
             snapshot = self.bus.get(progress.command_id)
@@ -2352,7 +2574,49 @@ class ChatApp(App):
                 ),
             ):
                 self._upsert_activity_card(progress.command_id)
-        panel.update(warning + progress.render())
+        panel.update(warning + workspace + "\n" + progress.render())
+
+    def _workspace_status_line(self) -> str:
+        """固定展示当前主持、Agent 可用度和后台提醒。"""
+        backend = self.orch.host_backend_status()
+        selection = backend.selection
+        if selection.kind == "agent":
+            host = f"主持 @{selection.target}（只读）"
+        else:
+            target = backend.resolved_target or selection.target
+            safe_target = redact_sensitive_text(
+                " ".join(target.split()), limit=80)
+            host = f"主持 模型 {safe_target}"
+        statuses = tuple(
+            item for item in self.orch.agent_readiness_snapshot()
+            if item.name != HOST_NAME
+        )
+        ready = sum(1 for item in statuses if item.ready)
+        parts = [host, f"Agent {ready}/{len(statuses)}"]
+        if self.session_manager is not None:
+            with contextlib.suppress(RuntimeError):
+                summary = self.session_manager.workspace_activity_summary()
+                if summary.background_running:
+                    parts.append(f"后台 {summary.background_running} 运行")
+                if summary.unread:
+                    parts.append(f"{summary.unread} 未读")
+        return " · ".join(parts)
+
+    def _render_composer_hint(self) -> None:
+        if not self.is_mounted:
+            return
+        active = self.bus.active()
+        if active is None and not self.bus.has_pending():
+            text = (
+                "Enter 发送 · Shift+Enter 换行 · @ 选择 Agent · "
+                "/ 查看命令 · Ctrl+O 会话"
+            )
+        else:
+            text = (
+                "Enter 排队 · Shift+Enter 换行 · Alt+↑ 插入最早排队 · "
+                "Esc 取消当前任务"
+            )
+        self.query_one("#composer-hint", Static).update(text)
 
     def action_cancel_active(self) -> None:
         if self.session_manager is not None:
@@ -2572,6 +2836,7 @@ class ChatApp(App):
                 return
             self._activity_feeds.pop(room_id, None)
             self._expanded_activity_ids.pop(room_id, None)
+            self._error_notices.pop(room_id, None)
             self._auto_approve_rooms.discard(room_id)
             self._system("会话已永久删除")
 
@@ -2588,8 +2853,6 @@ class ChatApp(App):
         self._rendered_display_lines.clear()
         self._stream_text.clear()
         self._stream_line_index.clear()
-        self._activity_line_index.clear()
-        self._activity_line_fingerprint.clear()
         self._selected_activity_id = None
         self._task_progresses.clear()
         self._latest_task_id = None
@@ -2600,6 +2863,7 @@ class ChatApp(App):
         for command_id in tuple(self._expanded_activity):
             self._refresh_expanded_persisted_detail(command_id)
         self._refresh_activity_cards()
+        self._render_error_notice()
         self._restore_interrupted_executions()
         self._system(
             f"已切换：{snapshot.summary.project_name} / "

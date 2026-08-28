@@ -957,12 +957,20 @@
   无标签的 `MM:SS`。同一 room 连续提交时，已入 FIFO 的后续输入立即显示有序
   “待发送”摘要；出队 committed 后由唯一正式 user 消息接替，queued 取消则显示
   “未发送”。临时摘要不进入对话 history。
+- **交互层级**：聊天主线只承载 user、agent/host 回复和必须独立可见的失败；
+  活动卡在独立可聚焦面板原位更新，不再伪装成 `[activity]` 聊天 speaker。
+  composer 使用 `Shift+Enter` 换行并在 3–8 行内随内容增长，Enter 保持发送/排队
+  语义。固定任务区首行展示 Host 类型/目标、ready worker 比例以及后台运行和
+  未读会话计数。最新错误按 room 隔离投影到输入区上方的固定提示，并在该 room
+  下一次 command 被成功接受后清除；错误事实仍留在聊天主线与执行日志。
 - **正文呈现**：agent/host 回复中的常用 Markdown（强调、行内代码、标题、
   列表、引用和 fenced code block）转换成安全的终端 `Text` 样式；不解释 Rich
   markup。用户原文、system 状态与活动卡保持字面值，持久历史和流式重绘使用
   同一呈现路径，未闭合的 Markdown 在流式阶段保留为普通文本。
 - **安全分支**：thought 正文不显示；常见凭据字段隐藏；执行事件不进入
-  agent 对话 history。
+  agent 对话 history。权限 UI 不直接渲染 raw JSON，而是展示会话、agent、工具
+  和脱敏字段；按钮按一次允许、长期允许、拒绝及取消整个任务明确区分，返回的
+  `optionId` 仍必须来自当次 options。
 - **高频分支**：adapter 继承初始 tool title/command 并压缩重复 update；
   CommandBus 再做 producer-independent 防御性去重。重复 update 仍刷新
   activity 时钟，但 activity-only 事件不进入 UI/events，不会误触发
@@ -980,7 +988,7 @@
   误迁移。窗口裁掉旧工具后仍保留历史失败/拒绝/取消事实。每个 room 独立保留
   近期终态的可展开安全摘要及逐卡展开态，切走期间的后台
   更新继续进入该 room 的活动模型。每卡只保留最近 50 个工具明细、每 room
-  只保留最近 100 张可展开终态卡，更早内容在当前视图冻结成折叠归档；完整事实仍从
+  只保留最近 100 张可展开终态卡，更早内容移出当前任务面板；完整事实仍从
   `events.jsonl` 读取；后台 runtime 经过 10 分钟 idle reap 后同步释放该 room
   的 UI 活动模型。ACP 与 Pi RPC 的活跃工具使用 15 分钟独立 watchdog；所有
   带 inactivity watchdog 的有状态 adapter 普通静默统一使用 300 秒阈值，
@@ -1001,7 +1009,9 @@
   完成再切回后卡片仍在；工具/终态窗口超限后有界归档；旧房间安全补建；损坏
   日志 fail loudly；重启后没有内存卡也能按需恢复最近任务详情，运行中旧快照
   不会覆盖 terminal 记录；连续输入在前一任务运行时可见排队序号和有界摘要，出队后
-  正文只出现一次，queued 取消可辨认原输入。
+  正文只出现一次，queued 取消可辨认原输入；多行输入保持换行，权限弹窗不泄露
+  raw JSON/嵌套凭据，固定区可见主持后端和后台提醒，错误提示不会跨 room 串屏或
+  被后续流式输出顶走，长活动列表可从键盘导航到全部卡片。
 - **证据**：`tests/test_storage.py`、`tests/test_acp.py`、
   `tests/test_phase2.py`、`tests/test_basic.py`、`tests/test_tui_activity.py`、
   `tests/test_tui_status.py`、

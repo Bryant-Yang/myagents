@@ -1047,8 +1047,7 @@ def test_tui_ctrl_n_requests_fresh_named_session() -> None:
 
 def test_tui_slash_new_is_local_command() -> None:
     """`/new` 与 Ctrl+N 同义，绝不写 timeline 或交给 host。"""
-    from textual.widgets import Input
-    from main import ChatApp
+    from main import ChatApp, ComposerInput
 
     room = _Room()
 
@@ -1067,7 +1066,7 @@ def test_tui_slash_new_is_local_command() -> None:
 
         async with app.run_test() as pilot:
             old_id = app.session_manager.active_session_id
-            box = app.query_one(Input)
+            box = app.query_one(ComposerInput)
             box.value = "/new"
             await pilot.press("enter")
             await app.workers.wait_for_complete()
@@ -1086,8 +1085,8 @@ def test_tui_slash_new_is_local_command() -> None:
 
 def test_tui_user_append_failure_shows_error() -> None:
     """用户消息落盘失败：RichLog 不出现该用户文本，出现红色持久化错误。"""
-    from textual.widgets import Input, RichLog
-    from main import ChatApp
+    from textual.widgets import RichLog
+    from main import ChatApp, ComposerInput
 
     room = _Room()
 
@@ -1103,7 +1102,7 @@ def test_tui_user_append_failure_shows_error() -> None:
         app = ChatApp(workdir=room.workdir, orchestrator=orch)
         async with app.run_test() as pilot:
             await pilot.pause()
-            box = app.query_one(Input)
+            box = app.query_one(ComposerInput)
             box.value = "这条不该出现"
             await pilot.press("enter")
             await app.workers.wait_for_complete()

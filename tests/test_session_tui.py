@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 
 from main import (
     ChatApp,
+    ComposerInput,
     DeleteSessionScreen,
     PermissionScreen,
     RenameSessionScreen,
@@ -164,7 +165,7 @@ def test_picker_switches_history_and_restores_per_session_drafts() -> None:
             )
 
             async with app.run_test() as pilot:
-                composer = app.query_one("#composer", Input)
+                composer = app.query_one("#composer", ComposerInput)
                 composer.value = "默认草稿"
                 composer.cursor_position = 2
                 await pilot.press("ctrl+o")
@@ -181,7 +182,7 @@ def test_picker_switches_history_and_restores_per_session_drafts() -> None:
                 assert "Talk 历史" in rendered
                 assert "默认历史" not in rendered
 
-                composer = app.query_one("#composer", Input)
+                composer = app.query_one("#composer", ComposerInput)
                 composer.value = "Talk 草稿"
                 await pilot.press("ctrl+o")
                 app.screen.query_one("#session-search", Input).value = "default"
@@ -190,8 +191,8 @@ def test_picker_switches_history_and_restores_per_session_drafts() -> None:
                 await app.workers.wait_for_complete()
                 await pilot.pause()
                 assert app.session_name == "default"
-                assert app.query_one("#composer", Input).value == "默认草稿"
-                assert app.query_one("#composer", Input).cursor_position == 2
+                assert app.query_one("#composer", ComposerInput).value == "默认草稿"
+                assert app.query_one("#composer", ComposerInput).cursor_position == 2
 
     asyncio.run(run())
 
@@ -209,7 +210,7 @@ def test_ctrl_n_creates_untitled_session_without_name_dialog() -> None:
             )
 
             async with app.run_test() as pilot:
-                app.query_one("#composer", Input).value = "原会话草稿"
+                app.query_one("#composer", ComposerInput).value = "原会话草稿"
                 old_id = app.session_manager.active_session_id
                 await pilot.press("ctrl+n")
                 await app.workers.wait_for_complete()
@@ -217,7 +218,7 @@ def test_ctrl_n_creates_untitled_session_without_name_dialog() -> None:
 
                 assert app.session_manager.active_session_id != old_id
                 assert app.session_manager.snapshot().summary.title == "新会话"
-                assert app.query_one("#composer", Input).value == ""
+                assert app.query_one("#composer", ComposerInput).value == ""
                 assert len(app.session_manager.list_sessions()) == 2
 
     asyncio.run(run())
@@ -280,6 +281,57 @@ def test_yolo_mode_is_isolated_by_room_and_not_persisted() -> None:
                 await pilot.pause()
                 assert reopened.auto_approve is False
                 assert "YOLO" not in reopened.title
+
+    asyncio.run(run())
+
+
+def test_error_notice_is_isolated_by_room() -> None:
+    """固定错误条跟随 room，切换会话不得串屏或清掉别处错误。"""
+    async def run() -> None:
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "project"
+            workdir.mkdir()
+            state_root = root / "state"
+            first = RoomStore(workdir, state_root=state_root)
+            second = RoomStore(
+                workdir, state_root=state_root, session_name="second")
+            app = ChatApp(
+                workdir=str(workdir),
+                orchestrator=Orchestrator(str(workdir), store=first),
+            )
+
+            async with app.run_test() as pilot:
+                first_id = app.session_manager.active_session_id
+                app._show_error_notice("第一会话失败")
+                assert "第一会话失败" in str(
+                    app.query_one("#notice-strip", Static).render())
+
+                await app.session_manager.activate(second.room_id)
+                app._bind_active_runtime()
+                app._render_active_session()
+                await pilot.pause()
+                notice = app.query_one("#notice-strip", Static)
+                assert notice.styles.display == "none"
+
+                second_id = app.session_manager.active_session_id
+                app._show_error_notice("第二会话失败")
+                assert "第二会话失败" in str(notice.render())
+
+                await app.session_manager.activate(first_id)
+                app._bind_active_runtime()
+                app._render_active_session()
+                await pilot.pause()
+                assert "第一会话失败" in str(notice.render())
+                assert "第二会话失败" not in str(notice.render())
+                app._clear_error_notice()
+                assert notice.styles.display == "none"
+
+                await app.session_manager.activate(second_id)
+                app._bind_active_runtime()
+                app._render_active_session()
+                await pilot.pause()
+                assert "第二会话失败" in str(notice.render())
 
     asyncio.run(run())
 
@@ -433,7 +485,7 @@ def test_ui_switch_does_not_make_runner_wait_on_the_new_session_bus() -> None:
             app = ChatApp(workdir=str(workdir), orchestrator=orch)
 
             async with app.run_test() as pilot:
-                composer = app.query_one("#composer", Input)
+                composer = app.query_one("#composer", ComposerInput)
                 composer.value = "@worker 后台任务"
                 await pilot.press("enter")
                 await asyncio.wait_for(_BlockingAdapter.started.wait(), 1)
@@ -539,6 +591,7 @@ if __name__ == "__main__":
     test_picker_switches_history_and_restores_per_session_drafts()
     test_ctrl_n_creates_untitled_session_without_name_dialog()
     test_yolo_mode_is_isolated_by_room_and_not_persisted()
+    test_error_notice_is_isolated_by_room()
     test_picker_renames_and_exact_title_deletes_inactive_session()
     test_picker_can_search_all_projects_grouped_by_workdir()
     test_ui_switch_does_not_make_runner_wait_on_the_new_session_bus()

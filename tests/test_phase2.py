@@ -423,6 +423,11 @@ def _richlog_text(app) -> str:
     return "\n".join(str(line.text) for line in app.query_one(RichLog).lines)
 
 
+def _activity_text(app) -> str:
+    from textual.widgets import Static
+    return str(app.query_one("#activity-panel", Static).render())
+
+
 async def _wait_for(pilot, cond, timeout: float = 10) -> None:
     start = time.monotonic()
     while time.monotonic() - start < timeout:
@@ -441,26 +446,29 @@ def _make_tui_app(kimi_adapter) -> "object":
 def test_tui_permission_select() -> None:
     """TUI 权限弹窗：显示工具标题和 options，用户点 allow → agent 收到 selected。"""
     async def run() -> None:
-        from textual.widgets import Button, Input, Label
-        from main import PermissionScreen
+        from textual.widgets import Button, Label
+        from main import ComposerInput, PermissionScreen
 
         reset_state()
         app = _make_tui_app(AcpAdapter("kimi", [sys.executable, SERVER]))
         async with app.run_test() as pilot:
             await pilot.pause()
-            box = app.query_one(Input)
+            box = app.query_one(ComposerInput)
             box.value = "@kimi 需要 perm secret-title 一下"
             await pilot.press("enter")
             await _wait_for(pilot, lambda: isinstance(app.screen, PermissionScreen))
 
             # 弹窗内容：来源 agent + 工具标题 + agent 提供的 options + 取消
-            label = str(app.screen.query_one(Label).render())
-            assert "kimi 请求权限" in label and "写文件" in label
+            label = str(app.screen.query_one("#permission-summary", Label).render())
+            assert "@kimi 请求执行" in label and "写文件" in label
             assert "API_TOKEN=[已隐藏]" in label
             assert "secret-value" not in label
             assert "examples/demo.txt" in label and "printf demo" in label
+            assert "{" not in label and "\"rawInput\"" not in label
             labels = [str(b.label) for b in app.screen.query(Button)]
-            assert "允许一次" in labels and "拒绝" in labels and "取消" in labels
+            assert "允许一次" in labels
+            assert "拒绝这次" in labels
+            assert "取消整个任务" in labels
 
             await pilot.click("#perm-opt-0")  # 允许一次
             await app.workers.wait_for_complete()
@@ -471,11 +479,46 @@ def test_tui_permission_select() -> None:
     print("ok  TUI 权限弹窗（标题/options 可见，选择 → selected）")
 
 
+def test_permission_screen_redacts_context_and_unknown_option_copy() -> None:
+    """会话标题和 provider 自定义选项也属于不可信 UI 输入。"""
+    async def run() -> None:
+        from main import PermissionScreen
+        from textual.widgets import Button, Label
+
+        app = _make_tui_app(ClosableFake("kimi"))
+        async with app.run_test() as pilot:
+            app.push_screen(PermissionScreen(
+                "kimi",
+                {
+                    "toolCall": {"title": "读取配置"},
+                    "options": [{
+                        "optionId": "opaque-secret-id",
+                        "kind": "provider_custom",
+                        "name": "API_KEY=provider-secret 自定义处理",
+                    }],
+                },
+                session_label="排障 API_KEY=session-secret",
+            ))
+            await pilot.pause()
+            summary = str(
+                app.screen.query_one("#permission-summary", Label).render())
+            buttons = "\n".join(
+                str(button.label) for button in app.screen.query(Button))
+            visible = summary + "\n" + buttons
+            assert "session-secret" not in visible
+            assert "provider-secret" not in visible
+            assert "opaque-secret-id" not in visible
+            assert "API_KEY=[已隐藏]" in visible
+
+    asyncio.run(run())
+    print("ok  权限上下文与未知选项文案统一脱敏")
+
+
 def test_tui_yolo_auto_approve_mode() -> None:
     """显式 /yolo 不弹窗，只选择 agent 本次提供的 allow_once。"""
     async def run() -> None:
-        from main import ChatApp, PermissionScreen
-        from textual.widgets import Input, Static
+        from main import ChatApp, ComposerInput, PermissionScreen
+        from textual.widgets import Static
 
         reset_state()
         app = ChatApp(
@@ -491,7 +534,7 @@ def test_tui_yolo_auto_approve_mode() -> None:
             assert "当前会话自动完全授权已开启" in status
             assert "只读阶段仍硬拒绝" in status
 
-            box = app.query_one(Input)
+            box = app.query_one(ComposerInput)
             box.value = "@kimi 需要 perm 一下"
             await pilot.press("enter")
             await app.workers.wait_for_complete()
@@ -514,14 +557,13 @@ def test_tui_yolo_auto_approve_mode() -> None:
 def test_tui_permission_cancel_on_exit() -> None:
     """权限等待中退出：按 cancelled 收尾，不留挂起 Future。"""
     async def run() -> None:
-        from textual.widgets import Input
-        from main import PermissionScreen
+        from main import ComposerInput, PermissionScreen
 
         reset_state()
         app = _make_tui_app(AcpAdapter("kimi", [sys.executable, SERVER]))
         async with app.run_test() as pilot:
             await pilot.pause()
-            box = app.query_one(Input)
+            box = app.query_one(ComposerInput)
             box.value = "@kimi 需要 perm 一下"
             await pilot.press("enter")
             await _wait_for(pilot, lambda: isinstance(app.screen, PermissionScreen))
@@ -539,14 +581,13 @@ def test_tui_permission_cancel_on_exit() -> None:
 def test_tui_permission_cancel_with_ctrl_x() -> None:
     """权限弹窗期间 Ctrl+X 必须同时结束权限等待和当前 command。"""
     async def run() -> None:
-        from main import PermissionScreen
-        from textual.widgets import Input
+        from main import ComposerInput, PermissionScreen
 
         reset_state()
         app = _make_tui_app(AcpAdapter("kimi", [sys.executable, SERVER]))
         async with app.run_test() as pilot:
             await pilot.pause()
-            box = app.query_one(Input)
+            box = app.query_one(ComposerInput)
             box.value = "@kimi 需要 perm 一下"
             await pilot.press("enter")
             await _wait_for(
@@ -569,14 +610,13 @@ def test_tui_permission_cancel_with_ctrl_x() -> None:
 def test_tui_permission_cancel_with_escape() -> None:
     """权限弹窗中的 Esc 也必须取消整个 command，而非只拒绝一次工具。"""
     async def run() -> None:
-        from main import PermissionScreen
-        from textual.widgets import Input
+        from main import ComposerInput, PermissionScreen
 
         reset_state()
         app = _make_tui_app(AcpAdapter("kimi", [sys.executable, SERVER]))
         async with app.run_test() as pilot:
             await pilot.pause()
-            box = app.query_one(Input)
+            box = app.query_one(ComposerInput)
             box.value = "@kimi 需要 perm 一下"
             await pilot.press("enter")
             await _wait_for(
@@ -598,7 +638,7 @@ def test_tui_permission_cancel_with_escape() -> None:
 def test_tui_status_and_shutdown() -> None:
     """启动摘要与 /agents 可见传输协议；退出统一回收 fake ACP。"""
     async def run() -> None:
-        from textual.widgets import Input
+        from main import ComposerInput
 
         reset_state()
         kimi_acp = AcpAdapter("kimi", [sys.executable, SERVER])
@@ -621,14 +661,14 @@ def test_tui_status_and_shutdown() -> None:
             assert "@dsh · 可用 · ACP" in lines
             assert "@pi · 可用 · RPC" in lines
             # 跑一轮，让 kimi acp 进程真的起来；session id 应展示一次
-            box = app.query_one(Input)
+            box = app.query_one(ComposerInput)
             box.value = "@kimi fast round"
             await pilot.press("enter")
             await app.workers.wait_for_complete()
             assert "ACP session 已建立：fake-session-1" not in _richlog_text(app)
             app.action_toggle_details()
             await pilot.pause()
-            assert "ACP session 已建立：fake-session-1" in _richlog_text(app)
+            assert "ACP session 已建立：fake-session-1" in _activity_text(app)
         # 退出后：所有 closable adapter 被 aclose
         assert codex.closed and opencode.closed
         assert kimi_acp._started is False
@@ -844,6 +884,7 @@ if __name__ == "__main__":
     test_permission_outcome_failclosed()
     test_permission_task_exception_consumed()
     test_tui_permission_select()
+    test_permission_screen_redacts_context_and_unknown_option_copy()
     test_tui_yolo_auto_approve_mode()
     test_tui_permission_cancel_on_exit()
     test_tui_permission_cancel_with_ctrl_x()

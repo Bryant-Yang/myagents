@@ -25,7 +25,7 @@ from clipboard_image import (
     prompt_images,
 )
 from codex_app_server.client import CodexAppServerClient
-from main import ChatApp
+from main import ChatApp, ComposerInput
 from orchestrator import Orchestrator
 from storage.store import RoomStore
 from textual.widgets import Input
@@ -317,7 +317,7 @@ def test_tui_paste_image_inserts_reference_without_submitting() -> None:
                 clipboard_image_capture=fake_capture,
             )
             async with app.run_test() as pilot:
-                box = app.query_one("#composer", Input)
+                box = app.query_one("#composer", ComposerInput)
                 box.value = "@kimi 看一下 "
                 box.cursor_position = len(box.value)
                 box.value = "/paste-image"

@@ -348,6 +348,10 @@ class ActivityFeed:
         session_role: str | None = None,
     ) -> bool:
         card = self._ensure_card(command_id)
+        agent = redact_sensitive_text(
+            " ".join(str(agent).split()), limit=60) or "agent"
+        phase = redact_sensitive_text(
+            " ".join(str(phase).split()), limit=500)
         changed = False
         current = card.agents.get(agent)
         # heartbeat 只刷新等待证据，不覆盖更有意义的实际阶段。
@@ -381,6 +385,11 @@ class ActivityFeed:
         state: str | None = None,
     ) -> bool:
         card = self._ensure_card(command_id)
+        agent = redact_sensitive_text(
+            " ".join(str(agent).split()), limit=60) or "agent"
+        category = redact_sensitive_text(
+            " ".join(str(category).split()), limit=60) or "info"
+        text = redact_sensitive_text(str(text), limit=1200)
         changed = False
         key = (category, agent)
         if card.notes.get(key) != text:
@@ -414,6 +423,11 @@ class ActivityFeed:
         identity_is_fallback: bool = False,
     ) -> bool:
         card = self._ensure_card(command_id)
+        agent = redact_sensitive_text(
+            " ".join(str(agent).split()), limit=60) or "agent"
+        identity = redact_sensitive_text(str(identity), limit=120)
+        title = redact_sensitive_text(str(title), limit=300)
+        detail = redact_sensitive_text(str(detail), limit=2000)
         key = (agent, identity)
         inherited: _ToolActivity | None = None
         # 有些协议先只给 title，后续 update 才补 toolCallId；迁移 identity，
@@ -490,7 +504,9 @@ class ActivityFeed:
             # 运行中读取的快照不能在任务结束后伪装成完整过程。先回到最新
             # 内存摘要；用户再次展开或切回会话时会重新读取 terminal 快照。
             card.detail_state = "idle"
-        normalized_error = error or ""
+        normalized_error = (
+            redact_sensitive_text(str(error), limit=500) if error else ""
+        )
         changed = (
             card.command_state != state
             or card.error != normalized_error
@@ -753,7 +769,8 @@ class ActivityFeed:
 def _clean_session_role(value: object) -> str:
     if not isinstance(value, str):
         return ""
-    return " ".join(value.split())[:40]
+    return redact_sensitive_text(
+        " ".join(value.split()), limit=40)
 
 
 def _agent_label(card: _ActivityCard, agent: str) -> str:
