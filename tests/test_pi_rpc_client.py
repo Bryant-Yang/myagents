@@ -202,6 +202,36 @@ def test_cancel_accepted_prompt_aborts_and_waits_for_settled() -> None:
     print("ok  accepted prompt cancellation aborts and settles")
 
 
+def test_steer_is_accepted_during_active_prompt() -> None:
+    async def body() -> None:
+        reset_state()
+        client = PiRpcClient(command(), "/tmp")
+        await client.start()
+        try:
+            stream = client.prompt("slow")
+            assert (await anext(stream))["type"] == "delivery_committed"
+            assert (await anext(stream))["type"] == "agent_start"
+            assert (await anext(stream))["type"] == "message_update"
+
+            await client.steer("先给结论")
+            remaining = await collect(stream)
+            assert any(
+                event.get("type") == "queue_update"
+                and event.get("steering") == ["先给结论"]
+                for event in remaining
+            )
+            assert remaining[-1]["type"] == "agent_settled"
+        finally:
+            await client.close()
+
+        frame = await wait_for_frame("steer")
+        assert frame["message"] == "先给结论"
+        assert isinstance(frame.get("id"), str)
+
+    run(body())
+    print("ok  active Pi prompt accepts native steer without a second prompt")
+
+
 def test_unconfirmed_abort_closes_without_orphan_task_warning() -> None:
     async def body() -> None:
         reset_state()

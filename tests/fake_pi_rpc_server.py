@@ -241,6 +241,26 @@ def main() -> None:
                 send({"type": "agent_settled"})
             continue
 
+        if command == "steer":
+            if not active_slow:
+                response(request, success=False, error="no active prompt")
+                continue
+            response(request)
+            send({
+                "type": "queue_update",
+                "steering": [request.get("message", "")],
+                "followUp": [],
+            })
+            text_events("STEERED")
+            send({
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": "stop"},
+            })
+            send({"type": "agent_end", "willRetry": False})
+            active_slow = False
+            send({"type": "agent_settled"})
+            continue
+
         if command == "extension_ui_response":
             if request.get("id") == pending_extension_id:
                 if (

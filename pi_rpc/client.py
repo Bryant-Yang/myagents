@@ -308,6 +308,35 @@ class PiRpcClient:
     async def abort(self) -> None:
         await self._request("abort")
 
+    async def steer(self, message: str) -> None:
+        """Queue one native Pi steering message with strict no-replay semantics."""
+        if not isinstance(message, str) or not message.strip():
+            raise TypeError("Pi RPC steer message must be a non-empty string")
+        request_id: str | None = None
+        response_future: asyncio.Future[dict] | None = None
+        try:
+            try:
+                request_id, response_future = await self._begin_request(
+                    "steer", {"message": message.strip()})
+            except _PiRpcWriteError as exc:
+                if exc.may_have_written:
+                    raise AgentDeliveryUncertainError(
+                        f"Pi RPC steer may have been written: {exc}"
+                    ) from exc
+                raise PiRpcError(str(exc)) from exc
+            try:
+                await self._await_response(
+                    request_id, response_future, "steer")
+            except PiRpcRemoteError:
+                raise
+            except BaseException as exc:
+                raise AgentDeliveryUncertainError(
+                    f"Pi RPC steer was sent but acceptance is uncertain: {exc}"
+                ) from exc
+        finally:
+            if request_id is not None:
+                self._discard_pending(request_id, response_future)
+
     async def extension_ui_response(self, response: dict) -> None:
         """Send one validated extension UI response, never an arbitrary RPC command."""
         normalized = self._validated_extension_response(response)
@@ -695,9 +724,11 @@ class PiRpcClient:
         self,
         event_queue: asyncio.Queue[tuple[dict | BaseException, int]],
     ) -> None:
+        abort_task = asyncio.create_task(
+            self.abort(), name="pi-rpc-abort-after-cancel")
         try:
             await asyncio.wait_for(
-                asyncio.shield(self.abort()), timeout=self._abort_timeout)
+                asyncio.shield(abort_task), timeout=self._abort_timeout)
             deadline = asyncio.get_running_loop().time() + self._abort_timeout
             while True:
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -713,6 +744,16 @@ class PiRpcClient:
             # Cancellation recovery is fail-closed: an unconfirmed abort makes
             # this connection unusable, so reclaim the full process group.
             await self.close()
+        finally:
+            # wait_for shields the request so a timeout cannot interrupt a
+            # partially written abort frame. Once the process is reclaimed,
+            # explicitly consume that task as well; otherwise close() may set
+            # its pending response to an exception that is reported later as
+            # an orphan task failure.
+            if not abort_task.done():
+                abort_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await abort_task
 
     async def _drain_stderr(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None

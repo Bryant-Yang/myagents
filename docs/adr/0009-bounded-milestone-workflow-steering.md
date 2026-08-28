@@ -142,7 +142,8 @@ post-submit no-replay 契约。
   不写入共享 timeline、不推进 ACP cursor；workflow 将累计 steering 明确注入
   所有尚未开始的阶段 assignment。
 - steering 只在阶段边界生效，不修改已经提交的 prompt、不打断当前 agent、
-  不跨 session 并发写入。需要立即停止时仍使用 `Ctrl+X` / command cancel。
+  不跨 session 并发写入。需要立即停止时仍使用 `Esc` / `Ctrl+X` / command
+  cancel；Alt+↑ 的能力路由与 Pi native 例外见 ADR-0018。
 - steering 只能补充目标、验收标准或实现约束；不能更换角色、增加修复次数、
   跳过 verify、扩大 sandbox/权限、授权外部副作用或覆盖 no-replay。
 - queued、verify/reverify/final、terminal、非 workflow 或超过限制的 steering

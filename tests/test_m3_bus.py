@@ -378,6 +378,9 @@ def test_workflow_steering_uses_active_owner_and_persists_event() -> None:
                     self.accepted.append(instruction) or receipt),
             )
 
+        def prepare_interjection(self, command_id, instruction):
+            return self.prepare_workflow_steering(command_id, instruction)
+
     async def run() -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -391,13 +394,19 @@ def test_workflow_steering_uses_active_owner_and_persists_event() -> None:
             await orch.started.wait()
             receipt = bus.steer(snap.command_id, "补充空输入回归测试")
             assert receipt["accepted"] == 1
+            interjected = await bus.interject(
+                snap.command_id, "Alt+Up 补充验收约束")
+            assert interjected["mode"] == "boundary"
             persisted = [
                 event for event in store.read_events(0, 50)["items"]
                 if event.command_id == snap.command_id
                 and event.kind == "steering"]
             assert [(item.agent, item.text) for item in persisted] == [
-                ("user", "补充空输入回归测试")]
-            assert orch.accepted == ["补充空输入回归测试"]
+                ("user", "补充空输入回归测试"),
+                ("user", "Alt+Up 补充验收约束"),
+            ]
+            assert orch.accepted == [
+                "补充空输入回归测试", "Alt+Up 补充验收约束"]
             orch.release.set()
             assert (await bus.wait(
                 snap.command_id, timeout=5))["status"] == "completed"
@@ -465,6 +474,144 @@ def test_workflow_steering_persistence_failure_does_not_commit() -> None:
 
     asyncio.run(run())
     print("ok  steering 持久化失败时不修改 workflow 内存")
+
+
+def test_runtime_interjection_is_durable_before_transport_acceptance() -> None:
+    class RuntimeProposal:
+        def __init__(self, command_id, instruction, accepted):
+            self.event = AgentEvent(
+                "interjection", instruction,
+                {"agent": "pi", "mode": "in_flight"},
+            )
+            self.accepted = accepted
+            self.command_id = command_id
+
+        async def commit(self):
+            self.accepted.append(self.event.text)
+            return {
+                "command_id": self.command_id,
+                "accepted": 1,
+                "agent": "pi",
+                "mode": "in_flight",
+                "applies_after": "current_turn",
+            }
+
+    class InterjectionOrch(FakeOrch):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.accepted: list[str] = []
+
+        async def dispatch(self, message, on_event, command_id=None):
+            self.started.set()
+            await self.release.wait()
+
+        def prepare_interjection(self, command_id, instruction):
+            return RuntimeProposal(command_id, instruction, self.accepted)
+
+    async def run() -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workdir = root / "work"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            orch = InterjectionOrch()
+            orch.store = store
+            bus = make_bus(orch)
+            snap = await bus.submit("@pi 长任务")
+            await orch.started.wait()
+            receipt = await bus.interject(snap.command_id, "先给结论")
+            assert receipt == {
+                "command_id": snap.command_id,
+                "accepted": 1,
+                "agent": "pi",
+                "mode": "in_flight",
+                "applies_after": "current_turn",
+            }
+            assert orch.accepted == ["先给结论"]
+            events = [
+                item for item in store.read_events(0, 100)["items"]
+                if item.command_id == snap.command_id
+                and item.kind.startswith("interjection")
+            ]
+            assert [(item.agent, item.kind, item.text) for item in events] == [
+                ("user", "interjection_requested", "先给结论"),
+                ("system", "interjection_accepted", "pi 已接受运行中插话"),
+            ]
+            orch.release.set()
+            await bus.wait(snap.command_id, timeout=5)
+            await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  runtime interjection persists intent before transport acceptance")
+
+
+def test_runtime_interjection_persistence_failure_never_calls_transport() -> None:
+    class RuntimeProposal:
+        def __init__(self, command_id, instruction, accepted):
+            self.event = AgentEvent(
+                "interjection", instruction,
+                {"agent": "pi", "mode": "in_flight"},
+            )
+            self.accepted = accepted
+            self.command_id = command_id
+
+        async def commit(self):
+            self.accepted.append(self.event.text)
+            return {
+                "command_id": self.command_id,
+                "accepted": 1,
+                "agent": "pi",
+                "mode": "in_flight",
+            }
+
+    class FailingInterjectionStore(RoomStore):
+        def append_event(self, *, command_id, agent, kind, text):
+            if kind == "interjection_requested":
+                raise OSError("simulated persistence failure")
+            return super().append_event(
+                command_id=command_id, agent=agent, kind=kind, text=text)
+
+    class InterjectionOrch(FakeOrch):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.accepted: list[str] = []
+
+        async def dispatch(self, message, on_event, command_id=None):
+            self.started.set()
+            await self.release.wait()
+
+        def prepare_interjection(self, command_id, instruction):
+            return RuntimeProposal(command_id, instruction, self.accepted)
+
+    async def run() -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workdir = root / "work"
+            workdir.mkdir()
+            store = FailingInterjectionStore(
+                workdir, state_root=root / "state")
+            orch = InterjectionOrch()
+            orch.store = store
+            bus = make_bus(orch)
+            snap = await bus.submit("@pi 长任务")
+            await orch.started.wait()
+            try:
+                await bus.interject(snap.command_id, "不能越过落盘边界")
+            except Exception as exc:
+                assert "执行事件持久化失败" in str(exc)
+            else:
+                raise AssertionError("persistence failure was not propagated")
+            assert orch.accepted == []
+            orch.release.set()
+            await bus.wait(snap.command_id, timeout=5)
+            await bus.aclose()
+
+    asyncio.run(run())
+    print("ok  runtime interjection persistence failure blocks transport")
 
 
 def test_duplicate_tool_updates_are_forwarded_and_persisted_once() -> None:
@@ -1023,6 +1170,8 @@ if __name__ == "__main__":
     test_fanout_partial_events_keep_agent_identity()
     test_workflow_steering_uses_active_owner_and_persists_event()
     test_workflow_steering_persistence_failure_does_not_commit()
+    test_runtime_interjection_is_durable_before_transport_acceptance()
+    test_runtime_interjection_persistence_failure_never_calls_transport()
     test_duplicate_tool_updates_are_forwarded_and_persisted_once()
     test_activity_only_events_refresh_silence_without_becoming_visible()
     test_status_dedup_keeps_visible_phase_changes()

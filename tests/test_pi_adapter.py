@@ -229,6 +229,29 @@ class UncertainPiClient(FakePiClient):
             "prompt drained but acceptance response was lost")
 
 
+class SteeringPiClient(FakePiClient):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.release = asyncio.Event()
+        self.steers: list[str] = []
+
+    async def prompt(self, message: str, images=()):
+        self.prompts.append((message, tuple(images)))
+        yield {"type": "delivery_committed"}
+        yield {"type": "agent_start"}
+        await self.release.wait()
+        yield {
+            "type": "message_end",
+            "message": {"role": "assistant", "stopReason": "stop"},
+        }
+        yield {"type": "agent_end", "willRetry": False}
+        yield {"type": "agent_settled"}
+
+    async def steer(self, message: str) -> None:
+        self.steers.append(message)
+        self.release.set()
+
+
 class BurstPiClient(FakePiClient):
     """Expose whether the adapter drains a producer ahead of its consumer."""
 
@@ -632,6 +655,44 @@ def test_stream_prepared_attests_maps_events_and_checkpoints() -> None:
             assert "--no-approve" in cmd
             assert "--offline" in cmd
             assert FakePiClient.instances[0].env["PI_OFFLINE"] == "1"
+
+    asyncio.run(run())
+
+
+def test_interject_uses_native_steer_only_after_delivery_commit() -> None:
+    from pi_rpc.adapter import PiRpcAdapter, PiRpcError
+
+    async def run() -> None:
+        FakePiClient.instances.clear()
+        with tempfile.TemporaryDirectory(prefix="myagents-pi-steer-") as raw:
+            adapter = PiRpcAdapter(
+                client_factory=SteeringPiClient,
+                state_root=Path(raw) / "state",
+            )
+            stream = adapter.stream("hello", raw)
+            try:
+                try:
+                    await adapter.interject("too early")
+                except PiRpcError:
+                    pass
+                else:
+                    raise AssertionError("pre-commit Pi interjection was accepted")
+
+                assert (await anext(stream)).kind == "delivery_committed"
+                assert (await anext(stream)).kind == "info"
+                assert (await anext(stream)).kind == "activity"
+                pending = asyncio.create_task(anext(stream))
+                await asyncio.sleep(0)
+
+                await adapter.interject("先给结论")
+                client = SteeringPiClient.instances[-1]
+                assert client.steers == ["先给结论"]
+                await pending
+                remaining = [event async for event in stream]
+                assert remaining[-1].kind == "done"
+            finally:
+                await stream.aclose()
+                await adapter.aclose()
 
     asyncio.run(run())
 
@@ -1502,6 +1563,7 @@ def test_uncertain_delivery_rebuilds_process_before_any_next_turn() -> None:
 if __name__ == "__main__":
     test_pi_is_registered_as_stateful_rpc()
     test_stream_prepared_attests_maps_events_and_checkpoints()
+    test_interject_uses_native_steer_only_after_delivery_commit()
     test_profiles_rebuild_process_and_never_restore_across_modes()
     test_new_pi_session_path_may_materialize_on_first_prompt()
     test_fresh_session_info_is_not_exposed_before_prompt_acceptance()

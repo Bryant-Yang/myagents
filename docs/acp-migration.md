@@ -262,8 +262,9 @@ client 声明 `fs/terminal` 能力为 false（不代理文件/终端）。
    adapter（`Orchestrator.set_permission_handler`），回调签名
    `async (agent_name, params) -> outcome`——通用多 agent runtime 里
    弹窗必须显示来源 agent（名字在 adapter 注入时绑定，client 层保持
-   params-only）。弹窗显示工具标题和 agent 提供的 options，用户选
-   allow / reject / cancel（Esc）。
+   params-only）。弹窗显示工具标题和 agent 提供的 options，用户可选
+   allow / reject / cancel；生产 TUI 的 `Esc` 直接取消当前 command，单次权限
+   取消仍可使用弹窗按钮或 reject option。
 2. **无权限处理器**（非 TUI / 测试 / 脚本调用）：一律 cancelled——
    安全拒绝是默认，不是配置缺失的意外。
 3. **auto 放行**：只能显式 opt-in（`AcpClient(..., permission="auto")`），
@@ -372,6 +373,13 @@ Pi 必须看到最终 assistant `message_end`，且 stop reason 属于
 以及权限拒绝造成的
 `tool_execution_end.result.terminate=true` 也属于已提交失败，而不是成功的空回复。
 自动重试后的最后一条 assistant 成功可覆盖中间 error。
+
+普通 ACP、Codex app-server 和 native model runtime 当前没有已验收的运行中
+插话原语，不能为 `Alt+↑` 建立第二 prompt/writer。Pi 是明确例外：仅在原 prompt
+的 durable `delivery_committed` 之后，由同一 client 发送官方 `steer`；用户意图
+先写 `interjection_requested`，响应丢失记 uncertain 且不重投。workflow 即使使用
+Pi stage 也继续受 ADR-0009 阶段边界约束。完整设计见
+[ADR-0018](adr/0018-capability-bounded-runtime-interjection.md)。
 
 不在等待人工权限且没有活跃工具时，prompt 连续 300 秒无 transport 事件或终止响应
 会触发 inactivity cancel；

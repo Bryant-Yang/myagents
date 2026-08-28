@@ -21,6 +21,7 @@ request_id 的重复提交永远幂等返回原记录，不受容量限制。
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 import uuid
 from dataclasses import dataclass
@@ -28,12 +29,17 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable
 
-from adapters.base import AgentEvent, tool_status_label
+from adapters.base import (
+    AgentDeliveryUncertainError,
+    AgentEvent,
+    tool_status_label,
+)
 
 MAX_MESSAGE_BYTES = 64 * 1024      # message 的 UTF-8 字节上限
 MAX_REQUEST_ID_CHARS = 128         # request_id 的字符上限
 MAX_WAIT_TIMEOUT = 30.0            # wait() 的 timeout 上限（秒）
 _MAX_ERROR_CHARS = 200             # failed 记录里保存的错误摘要上限
+_MAX_INTERJECTION_CHARS = 1000      # 与 workflow 单条 steering 上限一致
 
 
 class CommandStatus(str, Enum):
@@ -301,6 +307,98 @@ class CommandBus:
             )
             self._event_sink("user", event)
         return receipt.to_dict()
+
+    async def interject(
+        self,
+        command_id: str,
+        instruction: str,
+    ) -> dict[str, Any]:
+        """向当前 command 的安全边界插话；不支持的 transport 明确拒绝。"""
+        cmd = self._lookup(command_id)
+        if cmd.status is not CommandStatus.RUNNING or self._active is not cmd:
+            raise CommandValidationError("插话只接受当前 running command")
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise CommandValidationError("插话内容必须是非空字符串")
+        clean = instruction.strip()
+        if len(clean) > _MAX_INTERJECTION_CHARS:
+            raise CommandValidationError(
+                f"插话单条超过 {_MAX_INTERJECTION_CHARS} 字符上限")
+        try:
+            proposal = self._orch.prepare_interjection(command_id, clean)
+        except (ValueError, RuntimeError) as exc:
+            raise CommandValidationError(str(exc)) from exc
+        event = getattr(proposal, "event", None)
+        if not isinstance(event, AgentEvent):
+            raise CommandValidationError("插话 proposal 缺少有效事件")
+
+        # Workflow 仍沿用已验收的“先落盘再修改状态机”语义。
+        if event.kind == "steering":
+            self._append_execution_event(
+                command_id, "user", "steering", event.text)
+            receipt = proposal.commit()
+            if inspect.isawaitable(receipt):
+                receipt = await receipt
+            result = (
+                receipt.to_dict()
+                if hasattr(receipt, "to_dict") else dict(receipt)
+            )
+            self._last_activity = asyncio.get_running_loop().time()
+            if self._event_sink is not None:
+                self._event_sink("user", AgentEvent(
+                    event.kind,
+                    event.text,
+                    {**event.meta, "command_id": command_id},
+                ))
+            return {**result, "mode": "boundary"}
+
+        # Native in-flight transport 先把用户意图作为 no-replay 边界持久化；
+        # 随后才写协议。失败/不确定都只记结果，绝不重投同一条插话。
+        self._append_execution_event(
+            command_id, "user", "interjection_requested", clean)
+        try:
+            receipt = proposal.commit()
+            if inspect.isawaitable(receipt):
+                receipt = await receipt
+        except asyncio.CancelledError:
+            # commit coroutine may have been cancelled after the transport
+            # write. Record uncertainty before propagating cancellation; the
+            # persisted request must never be replayed on recovery.
+            self._append_execution_event(
+                command_id,
+                "system",
+                "interjection_uncertain",
+                "CancelledError: 插话提交被取消，发送结果未知",
+            )
+            raise
+        except Exception as exc:
+            kind = (
+                "interjection_uncertain"
+                if isinstance(exc, AgentDeliveryUncertainError)
+                else "interjection_failed"
+            )
+            detail = f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_CHARS]
+            self._append_execution_event(
+                command_id, "system", kind, detail)
+            raise CommandBusError(f"运行中插话失败：{exc}") from exc
+        result = (
+            receipt.to_dict()
+            if hasattr(receipt, "to_dict") else dict(receipt)
+        )
+        agent = str(result.get("agent") or event.meta.get("agent") or "agent")
+        self._append_execution_event(
+            command_id,
+            "system",
+            "interjection_accepted",
+            f"{agent} 已接受运行中插话",
+        )
+        self._last_activity = asyncio.get_running_loop().time()
+        if self._event_sink is not None:
+            self._event_sink("user", AgentEvent(
+                "interjection",
+                clean,
+                {**event.meta, **result, "command_id": command_id},
+            ))
+        return result
 
     async def cancel(self, command_id: str) -> CommandSnapshot:
         """精确取消 queued/running 命令；terminal 命令幂等返回。"""

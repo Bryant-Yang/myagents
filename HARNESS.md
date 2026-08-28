@@ -74,8 +74,8 @@ transport。
   readiness、stock `myagents` profile 命令、绝对状态目录和 load/close hard gate 只存在于
   `AcpDshAdapter`，不进入通用 Orchestrator。
 - `pi_rpc/client.py` 独占 `pi --mode rpc` 进程，负责 LF framing、request/event、
-  permission bridge UI、attestation、abort、session 与进程组回收；公开 API 不
-  接受任意 raw RPC dict。
+  permission bridge UI、attestation、官方 steer/abort、session 与进程组回收；
+  公开 API 不接受任意 raw RPC dict。
 - `pi_rpc/adapter.py` 把 Pi session/stream 映射成 stateful `AgentEvent`；不得把
   Pi RPC 冒充 ACP，也不得提供 JSON/JSONL fallback。
 - `pi_rpc/extensions/myagents_permission_bridge.ts` 是 Pi 唯一显式加载的权限组件，
@@ -352,9 +352,13 @@ transport。
   整个 `RichLog`。时长以 CommandBus 的 `created_at` / `finished_at` 为权威，
   终态计时不得继续增长；缺少历史边界时显示“未知”，不得伪造为 0 秒。秒、分、
   小时按紧凑中文单位呈现，不得再使用无标签、易被误认作时钟的 `MM:SS`。
-- TUI `Ctrl+X`、control `command.cancel`、MCP
+- TUI `Esc` / `Ctrl+X`、control `command.cancel`、MCP
   `myagents_cancel_command` 共用一个取消原语；外部可通过
   `myagents_read_events` 读取持久进度。
+- TUI `Alt+↑` 只向唯一活动 delivery 提交能力受限插话。workflow 继续走
+  ADR-0009 阶段边界；普通轮只有 adapter 明确提供已验收 `interject()` 才允许，
+  当前为 Pi 官方 RPC `steer`。意图必须先落 execution event，再写 transport；
+  多目标、ACP/Codex/native model 等未获证路径保留草稿并 fail-closed。
 - 重启后最后事件非 terminal 的命令必须显示为“已中断”，不得伪装完成。
 - model Host 的 provider/model 只来自 ADR-0017 的 XDG 私有配置文件与显式环境
   临时覆盖；凭据不进入 readiness、事件或错误。agent Host 只来自

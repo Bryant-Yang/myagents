@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
-from typing import Callable
+from typing import Awaitable, Callable
 
 from acp.adapter import (
     AcpKimiAdapter,
@@ -168,6 +168,23 @@ class _PreparedStreamResult:
     done_meta: dict
     failed: str | None
     delivered_upto: int
+
+
+@dataclass
+class _RuntimeInterjectionProposal:
+    """One validated native in-flight write, committed only by CommandBus."""
+
+    event: AgentEvent
+    receipt: dict[str, object]
+    _commit: Callable[[], Awaitable[None]]
+    _committed: bool = False
+
+    async def commit(self) -> dict[str, object]:
+        if self._committed:
+            raise RuntimeError("插话 proposal 已提交")
+        await self._commit()
+        self._committed = True
+        return dict(self.receipt)
 
 
 # 工人 agent 注册表：长连接协议优先，JSONL 只作受约束降级。
@@ -550,6 +567,9 @@ class Orchestrator:
         # dispatch 会都按旧 cursor 构造 prompt，重复/乱序投递。
         self._delivery_locks: dict[str, asyncio.Lock] = {}
         self._active_workflows: dict[str, MilestoneWorkflow] = {}
+        self._active_deliveries: dict[
+            str, dict[object, tuple[str, AgentAdapter]]
+        ] = {}
         self._active_dispatches = 0
         # A timed-out/failed Host close may leave the old runtime alive. Keep
         # the room fail-closed until restart; a passive rescan cannot prove the
@@ -1724,6 +1744,55 @@ class Orchestrator:
                 f"命令 {command_id} 不是活动 workflow")
         return workflow.prepare_steering(instruction)
 
+    def prepare_interjection(self, command_id: str, instruction: str):
+        """Resolve one bounded interjection without protocol/name branching."""
+        workflow = self._active_workflows.get(command_id)
+        if workflow is not None:
+            # Workflow owns stricter phase/role/permission bounds. A Pi stage
+            # must not bypass those bounds by falling through to native RPC.
+            return workflow.prepare_steering(instruction)
+
+        active = self._active_deliveries.get(command_id, {})
+        if not active:
+            raise RuntimeError("当前任务尚未进入可插话的 agent 运行段")
+        if len(active) != 1:
+            raise RuntimeError(
+                "当前任务有多个 agent 同时运行，无法确定唯一插话目标")
+        token, (name, adapter) = next(iter(active.items()))
+        submit = getattr(adapter, "interject", None)
+        if not callable(submit):
+            raise RuntimeError(
+                f"当前 {name} transport 不支持安全的运行中插话；"
+                "可按 Esc 取消，或按 Enter 排队")
+        clean = instruction.strip()
+        event = AgentEvent(
+            "interjection",
+            clean,
+            {
+                "agent": name,
+                "mode": "in_flight",
+                "applies_after": "current_turn",
+            },
+        )
+
+        async def commit() -> None:
+            current = self._active_deliveries.get(command_id, {})
+            if current.get(token) != (name, adapter):
+                raise RuntimeError("插话目标已结束或切换，未发送")
+            await submit(clean)
+
+        return _RuntimeInterjectionProposal(
+            event,
+            {
+                "command_id": command_id,
+                "accepted": 1,
+                "agent": name,
+                "mode": "in_flight",
+                "applies_after": "current_turn",
+            },
+            commit,
+        )
+
     def steer_workflow(self, command_id: str, instruction: str):
         """无持久层调用方的兼容入口；CommandBus 使用两阶段 prepare/commit。"""
         workflow = self._active_workflows.get(command_id)
@@ -1731,6 +1800,33 @@ class Orchestrator:
             raise WorkflowValidationError(
                 f"命令 {command_id} 不是活动 workflow")
         return workflow.steer(instruction)
+
+    def _activate_delivery(
+        self,
+        command_id: str | None,
+        name: str,
+        adapter: AgentAdapter,
+    ) -> object | None:
+        if command_id is None:
+            return None
+        token = object()
+        self._active_deliveries.setdefault(command_id, {})[token] = (
+            name, adapter)
+        return token
+
+    def _deactivate_delivery(
+        self,
+        command_id: str | None,
+        token: object | None,
+    ) -> None:
+        if command_id is None or token is None:
+            return
+        active = self._active_deliveries.get(command_id)
+        if active is None:
+            return
+        active.pop(token, None)
+        if not active:
+            self._active_deliveries.pop(command_id, None)
 
     async def _dispatch_discussion(
             self,
@@ -1905,18 +2001,23 @@ class Orchestrator:
                     # 绝不 start/load/prompt agent
                     raise OrchestratorClosedError(
                         f"Orchestrator 已关闭，放弃对 {name!r} 的排队派发")
-                if getattr(adapter, "stream_prepared", None) is not None:
-                    # ACP restore 原语：prepare 与 prompt 同一锁生命周期，
-                    # checkpoint（cursor/session_id）在 prompt 前原子提交。
-                    failed, delivered_upto = await self._deliver_prepared(
-                        name, adapter, on_event, command_id, assignment,
-                        execution_mode)
-                else:
-                    # 无 stream_prepared 的 stateful fake：纯内存 seq 路径
-                    messages, delivered_upto = self._messages_for(name)
-                    failed = await self._deliver(name, adapter, messages,
-                                                 on_event, command_id,
-                                                 assignment, execution_mode)
+                delivery_token = self._activate_delivery(
+                    command_id, name, adapter)
+                try:
+                    if getattr(adapter, "stream_prepared", None) is not None:
+                        # ACP restore 原语：prepare 与 prompt 同一锁生命周期，
+                        # checkpoint（cursor/session_id）在 prompt 前原子提交。
+                        failed, delivered_upto = await self._deliver_prepared(
+                            name, adapter, on_event, command_id, assignment,
+                            execution_mode)
+                    else:
+                        # 无 stream_prepared 的 stateful fake：纯内存 seq 路径
+                        messages, delivered_upto = self._messages_for(name)
+                        failed = await self._deliver(
+                            name, adapter, messages, on_event, command_id,
+                            assignment, execution_mode)
+                finally:
+                    self._deactivate_delivery(command_id, delivery_token)
                 if failed is None:
                     # 成功交付后才推进 cursor，且只推进到本轮构造时的快照
                     # 末尾 seq：1) 明确未提交的失败不推进——下轮从旧 cursor
@@ -1931,9 +2032,14 @@ class Orchestrator:
                 return failed
         else:
             # 无状态（JSONL）agent：dispatch 瞬间的 transcript 快照
-            return await self._deliver(
-                name, adapter, snapshot[-self.history_limit:], on_event,
-                command_id, assignment, execution_mode)
+            delivery_token = self._activate_delivery(
+                command_id, name, adapter)
+            try:
+                return await self._deliver(
+                    name, adapter, snapshot[-self.history_limit:], on_event,
+                    command_id, assignment, execution_mode)
+            finally:
+                self._deactivate_delivery(command_id, delivery_token)
 
     async def _deliver_prepared(self, name: str, adapter: AgentAdapter,
                                 on_event: EventCallback,
@@ -2112,16 +2218,21 @@ class Orchestrator:
             if self._closed:
                 raise OrchestratorClosedError(
                     "Orchestrator 已关闭，放弃 host 语义调用")
-            result = await self._consume_prepared(
-                HOST_NAME,
-                adapter,
-                on_event,
-                command_id,
-                lambda messages: prompt_builder(self._format(messages)),
-                ExecutionMode.READ_ONLY,
-                emit_text=False,
-                max_seq=max_seq,
-            )
+            delivery_token = self._activate_delivery(
+                command_id, HOST_NAME, adapter)
+            try:
+                result = await self._consume_prepared(
+                    HOST_NAME,
+                    adapter,
+                    on_event,
+                    command_id,
+                    lambda messages: prompt_builder(self._format(messages)),
+                    ExecutionMode.READ_ONLY,
+                    emit_text=False,
+                    max_seq=max_seq,
+                )
+            finally:
+                self._deactivate_delivery(command_id, delivery_token)
             if result.failed is not None:
                 raise RuntimeError(result.failed)
             self._commit_cursor(HOST_NAME, result.delivered_upto)

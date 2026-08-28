@@ -158,7 +158,7 @@ class PermissionScreen(ModalScreen):
     用户选 allow / reject / cancel，结果作为 ACP outcome 回给 agent。"""
 
     BINDINGS = [
-        ("escape", "cancel", "取消权限"),
+        ("escape", "cancel_task", "取消任务"),
         ("ctrl+x", "cancel_task", "取消任务"),
     ]
 
@@ -574,6 +574,7 @@ class ComposerInput(Input):
         Binding("up", "completion_previous", show=False),
         Binding("down", "completion_next", show=False),
         Binding("tab", "completion_accept", show=False),
+        Binding("alt+up", "interject", "插话", priority=True),
         Binding("escape", "completion_close", show=False),
         *Input.BINDINGS,
     ]
@@ -589,7 +590,11 @@ class ComposerInput(Input):
             self.app.action_focus_next()
 
     def action_completion_close(self) -> None:
-        self.app.close_completion()
+        if not self.app.close_completion():
+            self.app.action_cancel_active()
+
+    def action_interject(self) -> None:
+        self.app.action_interject()
 
     async def action_submit(self) -> None:
         if not self.app.accept_completion():
@@ -632,6 +637,7 @@ class ChatApp(App):
         ("ctrl+o", "show_sessions", "会话"),
         ("ctrl+g", "focus_activities", "活动"),
         ("ctrl+x", "cancel_active", "取消当前任务"),
+        ("escape", "cancel_active", "取消当前任务"),
     ]
     CSS = """
     RichLog { border: round $primary; }
@@ -822,7 +828,7 @@ class ChatApp(App):
         yield ComposerInput(
             placeholder=(
                 "输入 @ 选择 agent；/new 或 Ctrl+N 新会话；"
-                "Ctrl+O 会话；Ctrl+G 活动；Ctrl+X 取消当前任务；Ctrl+C 退出"
+                "Alt+↑ 插话；Esc 取消任务；Ctrl+O 会话；Ctrl+G 活动；Ctrl+C 退出"
             ),
             id="composer",
         )
@@ -1093,6 +1099,8 @@ class ChatApp(App):
                 command_id, "system", "cancel", ev.text)
         elif ev.kind == "steering":
             feed.record_note(command_id, name, "steering", ev.text)
+        elif ev.kind == "interjection":
+            feed.record_note(command_id, name, "interjection", ev.text)
         elif ev.kind == "error":
             feed.record_status(command_id, name, ev.text, state="failed")
         elif ev.kind == "done":
@@ -2137,6 +2145,49 @@ class ChatApp(App):
                         f"{result.status.value}，无需取消")
         self.run_worker(runner())
 
+    def action_interject(self) -> None:
+        """把当前草稿提交给唯一可安全插话的活动 delivery。"""
+        box = self.query_one("#composer", ComposerInput)
+        instruction = box.value.strip()
+        if not instruction:
+            self._write("system", "请输入插话内容后再按 Alt+↑", "bold red")
+            return
+        active = self.bus.active()
+        if active is None:
+            self._write(
+                "system", "当前没有运行中的任务；可按 Enter 正常发送", "bold red")
+            return
+        original = box.value
+        target_bus = self.bus
+        target_room_id = self._activity_room_id
+
+        async def runner() -> None:
+            try:
+                await target_bus.interject(active.command_id, instruction)
+            except Exception as exc:
+                if self._activity_room_id == target_room_id:
+                    self._write("system", f"插话失败：{exc}", "bold red")
+                    box.focus()
+                else:
+                    self.notify(
+                        f"后台会话插话失败：{exc}",
+                        severity="error",
+                        timeout=5,
+                    )
+                return
+            if self._activity_room_id == target_room_id:
+                if box.value == original:
+                    box.value = ""
+                self.close_completion()
+                box.focus()
+            elif self.session_manager is not None:
+                snapshot = self.session_manager.snapshot(target_room_id)
+                if snapshot.draft == original:
+                    self.session_manager.save_draft(
+                        "", cursor_position=0, session_id=target_room_id)
+
+        self.run_worker(runner())
+
     def action_cancel_session(self, session_id: str | None) -> None:
         """取消指定会话任务；权限弹窗只影响其所属会话。"""
         if self.session_manager is None:
@@ -2606,6 +2657,13 @@ class ChatApp(App):
                     command_id, name, "steering", ev.text)
                 self._upsert_activity_card(command_id)
             self._system(f"steering 已记录：{ev.text}")
+        elif ev.kind == "interjection":
+            if command_id is not None:
+                self._activity_feed.record_note(
+                    command_id, name, "interjection", ev.text)
+                self._upsert_activity_card(command_id)
+            target = str(ev.meta.get("agent") or "agent")
+            self._system(f"插话已接受：{target} · {ev.text}")
         elif ev.kind == "error":
             self._finish_stream_text(name)
             if command_id is not None:

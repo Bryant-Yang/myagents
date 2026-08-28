@@ -994,9 +994,30 @@
   分层回归通过。历史事件保持 append-only，不回写清理。
 - **里程碑**：M3.1。
 
+### UC-INTERJECT-001 能力受限的运行中插话
+
+- **角色 / 触发**：当前 room 有 running command，用户在 composer 输入非空草稿
+  后按 `Alt+↑`。
+- **主流程**：workflow 复用当前阶段允许的 boundary steering；非 workflow
+  必须恰有一个活动 delivery 且 adapter 显式实现 `interject()`。当前 Pi 使用同一
+  已 attested RPC session 的官方 `steer`，不创建第二 prompt/process/session。
+- **持久与 no-replay**：native intent 先以 `interjection_requested` 写入
+  `events.jsonl`，协议明确接受后写 `interjection_accepted`；失败或不确定分别写
+  对应终态。插话不进入 timeline、不推进普通 cursor，写后响应丢失不得重投。
+- **异常分支**：无活动 delivery、多目标并发、超过 1000 字符、目标结束或没有
+  已验收能力时拒绝且保留草稿。ACP、Codex app-server 与 native model 当前不得
+  伪装支持；workflow verify/final 等禁止阶段不得降级为 native steer。
+- **验收 / 证据**：`tests/test_tui_completion.py`、`tests/test_m3_bus.py`、
+  `tests/test_pi_rpc_client.py`、`tests/fake_pi_rpc_server.py`、
+  `tests/test_pi_adapter.py`。
+- **人工边界**：真实终端验证 Alt+↑ 键序列；真实 Pi 可在授权的无副作用临时任务
+  中验证一次，不进入普通 gate。
+
 ### UC-CANCEL-001 精确取消
 
-- **角色 / 触发**：用户按 `Ctrl+X`，或外部 host 调用 cancel。
+- **角色 / 触发**：用户在正常输入态按 `Esc` / `Ctrl+X`，或外部 host 调用
+  cancel。补全、活动导航和非权限 modal 的 Esc 先关闭自身；权限 modal 的 Esc
+  取消整条 command。
 - **主流程**：queued 直接取消；running 仅取消该 dispatch；terminal 幂等。
 - **可见状态**：`cancel_requested` 仅显示“正在取消”，在 CommandBus 确认
   terminal 前保持运行态与工具状态。

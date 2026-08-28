@@ -643,6 +643,115 @@ def test_roles_clear_waits_for_current_command_boundary() -> None:
     print("ok  /roles clear 不跨越运行中 command 边界")
 
 
+def test_escape_cancels_active_task_and_alt_up_interjects() -> None:
+    from textual.widgets import RichLog
+
+    class Adapter:
+        session_id = None
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.interjections: list[str] = []
+
+        async def stream(self, _prompt, _workdir, **_kwargs):
+            self.started.set()
+            await self.release.wait()
+            yield AgentEvent("text", "完成")
+            yield AgentEvent("done")
+
+        async def interject(self, instruction: str) -> None:
+            self.interjections.append(instruction)
+            self.release.set()
+
+    async def interjection_case() -> None:
+        orch = make_orch()
+        adapter = Adapter()
+        orch.adapters["qwen"] = adapter
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test() as pilot:
+            box = app.query_one("#composer", ComposerInput)
+            box.value = "@qwen 执行长任务"
+            await pilot.press("enter")
+            await asyncio.wait_for(adapter.started.wait(), timeout=2)
+
+            box.value = "先给结论"
+            box.cursor_position = len(box.value)
+            await pilot.press("alt+up")
+            await app.workers.wait_for_complete()
+
+            assert adapter.interjections == ["先给结论"]
+            assert box.value == ""
+            assert [message.text for message in orch.history].count("先给结论") == 0
+            rendered = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines)
+            assert "插话已接受：qwen" in rendered
+
+    async def cancel_case() -> None:
+        orch = make_orch()
+        adapter = Adapter()
+        orch.adapters["qwen"] = adapter
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test() as pilot:
+            box = app.query_one("#composer", ComposerInput)
+            box.value = "@qwen 执行长任务"
+            await pilot.press("enter")
+            await asyncio.wait_for(adapter.started.wait(), timeout=2)
+            active = app.bus.active()
+            assert active is not None
+
+            box.value = "@"
+            box.cursor_position = 1
+            await pilot.pause()
+            assert app._completion is not None
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app._completion is None
+            assert app.bus.get(active.command_id).status.value == "running"
+
+            await pilot.press("escape")
+            await app.workers.wait_for_complete()
+            assert app.bus.get(active.command_id).status.value == "cancelled"
+
+    async def unsupported_case() -> None:
+        class UnsupportedAdapter:
+            session_id = None
+
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def stream(self, _prompt, _workdir, **_kwargs):
+                self.started.set()
+                await self.release.wait()
+                yield AgentEvent("done")
+
+        orch = make_orch()
+        adapter = UnsupportedAdapter()
+        orch.adapters["qwen"] = adapter
+        app = ChatApp(workdir=".", orchestrator=orch)
+        async with app.run_test() as pilot:
+            box = app.query_one("#composer", ComposerInput)
+            box.value = "@qwen 执行长任务"
+            await pilot.press("enter")
+            await asyncio.wait_for(adapter.started.wait(), timeout=2)
+            box.value = "不要继续写文件"
+            box.cursor_position = len(box.value)
+            await pilot.press("alt+up")
+            await pilot.pause()
+            assert box.value == "不要继续写文件"
+            rendered = "\n".join(
+                str(line.text) for line in app.query_one(RichLog).lines)
+            assert "transport 不支持安全的运行中插话" in rendered
+            adapter.release.set()
+            await app.workers.wait_for_complete()
+
+    asyncio.run(interjection_case())
+    asyncio.run(cancel_case())
+    asyncio.run(unsupported_case())
+    print("ok  Alt+Up 插话；正常输入态 Esc 取消当前任务")
+
+
 def test_host_command_switches_locally_without_timeline_write() -> None:
     from textual.widgets import RichLog
 
@@ -698,5 +807,6 @@ if __name__ == "__main__":
     test_tui_starts_with_zero_or_all_fake_clis()
     test_roles_commands_view_and_clear_without_dispatch()
     test_roles_clear_waits_for_current_command_boundary()
+    test_escape_cancels_active_task_and_alt_up_interjects()
     test_host_command_switches_locally_without_timeline_write()
     print("\nTUI completion 全部通过")

@@ -99,7 +99,8 @@ CommandBus 为每个 active command 持有独立 dispatch task：
 - cancel_requested 只表示取消已发出，TUI 在 CommandBus 确认 terminal 前保持
   运行态和工具状态；
 - terminal command 的 cancel 幂等返回原状态；
-- TUI `Ctrl+X` 与 control `command.cancel` 复用同一原语。
+- TUI `Esc` / `Ctrl+X` 与 control `command.cancel` 复用同一原语；Esc 的
+  widget/modal 优先级与运行中插话由 ADR-0018 补充。
 
 取消后 worker 必须继续处理下一条命令。TUI 重启时，若某 command 的最后持久
 事件不是 terminal，显示“上次任务已中断”及最后状态，不伪装为完成。
@@ -125,7 +126,7 @@ MCP bridge 对应新增 `myagents_read_events` 与
    事件经重启仍可读取。
 3. 权限请求前 TUI 显示工具上下文，请求与结果均写入事件日志。
 4. active/queued 可精确取消，bus worker 继续服务下一条命令。
-5. TUI `Ctrl+X`、control 与 MCP 使用同一取消语义。
+5. TUI `Esc` / `Ctrl+X`、control 与 MCP 使用同一取消语义。
 6. M3 旧房间可无损补建事件日志；损坏事件日志拒绝打开。
 7. 历史 Codex host 不添加模型、reasoning、plugin、MCP 或自然语言关键词覆盖；
    当前 host 改由 ADR-0017 约束。

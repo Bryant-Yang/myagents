@@ -566,6 +566,35 @@ def test_tui_permission_cancel_with_ctrl_x() -> None:
     print("ok  权限等待中 Ctrl+X → permission/command 同时取消")
 
 
+def test_tui_permission_cancel_with_escape() -> None:
+    """权限弹窗中的 Esc 也必须取消整个 command，而非只拒绝一次工具。"""
+    async def run() -> None:
+        from main import PermissionScreen
+        from textual.widgets import Input
+
+        reset_state()
+        app = _make_tui_app(AcpAdapter("kimi", [sys.executable, SERVER]))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            box = app.query_one(Input)
+            box.value = "@kimi 需要 perm 一下"
+            await pilot.press("enter")
+            await _wait_for(
+                pilot, lambda: isinstance(app.screen, PermissionScreen))
+            active = app.bus.active()
+            assert active is not None
+            await pilot.press("escape")
+            await _wait_for(
+                pilot,
+                lambda: (not isinstance(app.screen, PermissionScreen)
+                         and app.bus.get(active.command_id).status.value
+                         == "cancelled"))
+            assert not app._permission_futures
+
+    asyncio.run(run())
+    print("ok  权限等待中 Esc → permission/command 同时取消")
+
+
 def test_tui_status_and_shutdown() -> None:
     """启动摘要与 /agents 可见传输协议；退出统一回收 fake ACP。"""
     async def run() -> None:
@@ -818,5 +847,6 @@ if __name__ == "__main__":
     test_tui_yolo_auto_approve_mode()
     test_tui_permission_cancel_on_exit()
     test_tui_permission_cancel_with_ctrl_x()
+    test_tui_permission_cancel_with_escape()
     test_tui_status_and_shutdown()
     print("\nPhase 2 全部通过")

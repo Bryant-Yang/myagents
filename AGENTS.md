@@ -90,6 +90,10 @@ app-server），同时仅为已获证路径保留 JSONL 兼容回退。
   no-replay cursor 已持久化后运行；只有明确成功闭集内的 assistant terminal 才能
   完成本轮，缺失/未知 terminal、error/abort 与权限终止工具必须记为失败。生产 client 不得暴露任意 RPC passthrough 或
   发送 raw RPC `type: "bash"`；Pi 没有跨协议 fallback，提交后严格 no-replay。
+  运行中插话只允许在原 prompt 的 `delivery_committed` cursor 已持久化后，通过
+  同一 Pi client 发送官方 `steer`；意图必须先落 execution event，写后结果不确定
+  不得重投。其他 adapter 没有已验收 capability 时必须 fail-closed，workflow 不得
+  借 Pi native steer 绕过阶段边界。
 - **R5 多智能体协作必须有界**：自然语言讨论与 `/discuss` 只允许 2–3 个
   已注册 worker、1–3 轮和一个终局 moderator，并复用同一确定性状态机。
   自然语言有序协作只允许 2–4 个串行步骤、至少
@@ -132,6 +136,10 @@ app-server），同时仅为已获证路径保留 JSONL 兼容回退。
   [`ADR-0014`](docs/adr/0014-pi-rpc-permission-bridge.md)：唯一显式权限 bridge、
   wrapper tool 闭集、启动 attestation、三 profile 隔离和 raw RPC bash 禁令必须
   同时成立；应用层权限桥不宣称提供 OS sandbox。
+- 运行中插话遵守
+  [`ADR-0018`](docs/adr/0018-capability-bounded-runtime-interjection.md)：
+  唯一活动 delivery、显式 adapter capability、持久化先于协议写入和 no-replay
+  必须同时成立；`Esc` 取消不得破坏补全/modal/活动导航的优先关闭语义。
 - DSH ACP-only 接入遵守
   [`ADR-0015`](docs/adr/0015-dsh-acp-only-transport.md)：官方 profile 入口、标准
   myagents bundle、被动 readiness、两 execution safety profile、load/close hard gate、

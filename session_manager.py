@@ -115,8 +115,11 @@ class _GatedOrchestrator:
         finally:
             self._gate.release()
 
-    def steer(self, command_id, instruction):
-        return self._orch.steer(command_id, instruction)
+    def prepare_workflow_steering(self, command_id, instruction):
+        return self._orch.prepare_workflow_steering(command_id, instruction)
+
+    def prepare_interjection(self, command_id, instruction):
+        return self._orch.prepare_interjection(command_id, instruction)
 
 
 class SessionManager:

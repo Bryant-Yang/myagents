@@ -1208,7 +1208,7 @@ if pi_client.is_file():
     }
     expected_pi_client_public = {
         "pid", "running", "start", "get_state", "get_commands", "prompt",
-        "abort", "extension_ui_response", "close",
+        "steer", "abort", "extension_ui_response", "close",
     }
     if public_methods != expected_pi_client_public:
         errors.append(

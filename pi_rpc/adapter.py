@@ -234,6 +234,19 @@ class PiRpcAdapter:
     def set_attachment_root(self, root: Path | None) -> None:
         self._attachment_root = None if root is None else Path(root).absolute()
 
+    async def interject(self, instruction: str) -> None:
+        """Use Pi's official steer command only after prompt commit is durable."""
+        client = self._client
+        gate = self._prompt_permission_gate
+        if (
+            client is None
+            or gate is None
+            or not gate.is_set()
+            or self._active_event_queue is None
+        ):
+            raise PiRpcError("Pi 当前没有已提交且可插话的活动 prompt")
+        await client.steer(instruction)
+
     @staticmethod
     def _tools_for(mode: ExecutionMode) -> tuple[str, ...]:
         if mode is ExecutionMode.READ_ONLY:

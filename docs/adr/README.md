@@ -23,3 +23,4 @@
 | [0015](0015-dsh-acp-only-transport.md) | Accepted | M4.12 标准 myagents bundle + stock `dsh --profile myagents`、不可变 DSH、两 execution safety profile、stateful lifecycle gate 与零 fallback |
 | [0016](0016-explicit-auto-approve-mode.md) | Accepted | M4.13 `/yolo` 会话级自动批准、只选 allow-once、持续危险提示与 read-only 硬边界 |
 | [0017](0017-native-model-backed-host.md) | Accepted | M4.14 会话级 HostBackend、原生模型 runtime 与独立只读 agent Host |
+| [0018](0018-capability-bounded-runtime-interjection.md) | Accepted | Esc 精确取消、Alt+↑ 能力受限插话、Pi native steer 与 no-replay |
