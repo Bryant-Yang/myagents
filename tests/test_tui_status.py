@@ -14,6 +14,11 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 from adapters.base import AgentEvent
+from collaboration import (
+    CollaborationPlan,
+    CollaborationPlanEvent,
+    CollaborationStep,
+)
 from main import ChatApp
 from textual.widgets import Static
 from test_basic import make_orch
@@ -235,6 +240,11 @@ def test_collaboration_status_queues_future_steps_and_allows_reentry() -> None:
         app = ChatApp(workdir=".", orchestrator=make_orch())
         async with app.run_test() as pilot:
             command_id = "cmd-collaboration"
+            plan = CollaborationPlan((
+                CollaborationStep("kimi", "调查现状并列出证据"),
+                CollaborationStep("opencode", "基于证据完成审查"),
+                CollaborationStep("kimi", "修订并完成最终交付"),
+            ))
             app._on_agent_event("user", AgentEvent(
                 "committed",
                 "先调查，再审查，最后修订",
@@ -251,6 +261,16 @@ def test_collaboration_status_queues_future_steps_and_allows_reentry() -> None:
                     "collaboration_total": 3,
                 },
             ))
+            app._on_agent_event("host", AgentEvent(
+                "plan", CollaborationPlanEvent.created(plan).encode(),
+                {"command_id": command_id},
+            ))
+            app._on_agent_event("kimi", AgentEvent(
+                "plan",
+                CollaborationPlanEvent.transition(
+                    plan, 1, "running").encode(),
+                {"command_id": command_id},
+            ))
             progress = app._task_progresses[command_id]
             assert progress.agents["kimi"].state == "running"
             assert progress.agents["opencode"].state == "queued"
@@ -264,7 +284,33 @@ def test_collaboration_status_queues_future_steps_and_allows_reentry() -> None:
                     "collaboration_total": 3,
                 },
             ))
+            app._on_agent_event("kimi", AgentEvent(
+                "plan",
+                CollaborationPlanEvent.transition(
+                    plan, 1, "completed").encode(),
+                {"command_id": command_id},
+            ))
             assert progress.agents["kimi"].state == "completed"
+            app._on_agent_event("opencode", AgentEvent(
+                "plan",
+                CollaborationPlanEvent.transition(
+                    plan, 2, "running").encode(),
+                {"command_id": command_id},
+            ))
+            app._on_agent_event("opencode", AgentEvent(
+                "done", meta={
+                    "command_id": command_id,
+                    "collaboration": True,
+                    "collaboration_step": 2,
+                    "collaboration_total": 3,
+                },
+            ))
+            app._on_agent_event("opencode", AgentEvent(
+                "plan",
+                CollaborationPlanEvent.transition(
+                    plan, 2, "completed").encode(),
+                {"command_id": command_id},
+            ))
             app._on_agent_event("kimi", AgentEvent(
                 "status",
                 "协作第 3/3 步：已接收任务，准备执行",
@@ -279,23 +325,18 @@ def test_collaboration_status_queues_future_steps_and_allows_reentry() -> None:
             ))
             assert progress.agents["kimi"].state == "running"
             assert progress.agents["kimi"].phase == "协作 3/3"
-            app._on_agent_event("opencode", AgentEvent(
-                "status",
-                "协作第 2/3 步未执行：前序步骤失败",
-                {
-                    "command_id": command_id,
-                    "agent_state": "skipped",
-                    "phase": "因前序失败未执行",
-                    "collaboration": True,
-                    "collaboration_step": 2,
-                    "collaboration_total": 3,
-                },
+            app._on_agent_event("kimi", AgentEvent(
+                "plan",
+                CollaborationPlanEvent.transition(
+                    plan, 3, "running").encode(),
+                {"command_id": command_id},
             ))
-            assert progress.agents["opencode"].state == "skipped"
             await pilot.pause()
             panel = str(app.query_one("#task-status").render())
-            assert "kimi 进行中 · 协作 3/3" in panel
-            assert "opencode 未执行 · 因前序失败未执行" in panel, panel
+            assert "协作计划 3/3 · kimi → opencode → kimi" in panel, panel
+            assert "✓ 1 kimi 已结束 · 调查现状并列出证据" in panel, panel
+            assert "✓ 2 opencode 已结束 · 基于证据完成审查" in panel, panel
+            assert "› 3 kimi 进行中 · 修订并完成最终交付" in panel, panel
 
     asyncio.run(run())
     print("ok  有序协作 TUI 排队与重复 agent 再进入")

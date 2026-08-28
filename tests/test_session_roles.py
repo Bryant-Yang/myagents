@@ -20,6 +20,11 @@ from session_roles import (  # noqa: E402
     SessionRoleChanges,
     has_session_role_cue,
 )
+from collaboration import (  # noqa: E402
+    CollaborationPlan,
+    CollaborationPlanEvent,
+    CollaborationStep,
+)
 from storage.store import CorruptedStorageError, RoomStore  # noqa: E402
 from test_basic import FakeAdapter, FakeHost, make_orch  # noqa: E402
 from tui_activity import ActivityFeed  # noqa: E402
@@ -383,6 +388,23 @@ def test_session_role_remains_visible_through_activity_updates() -> None:
     progress.set_agent("qwen", "completed", "本轮响应结束")
     rendered_progress = progress.render(2)
     assert "qwen · 产品研究员（本会话） 完成" in rendered_progress
+
+    plan = CollaborationPlan((
+        CollaborationStep("qwen", "调查产品现状"),
+        CollaborationStep("opencode", "复核并完成交付"),
+    ))
+    feed.record_plan_event("command-role", CollaborationPlanEvent.created(plan))
+    feed.record_plan_event(
+        "command-role",
+        CollaborationPlanEvent.transition(plan, 1, "running"),
+    )
+    assert "qwen · 产品研究员（本会话）" in feed.render(
+        "command-role", expanded=True)
+
+    progress.record_collaboration_plan(CollaborationPlanEvent.created(plan))
+    progress.record_collaboration_plan(
+        CollaborationPlanEvent.transition(plan, 1, "running"))
+    assert "qwen · 产品研究员（本会话） 进行中" in progress.render(2)
     print("ok  活动卡与任务状态持续显示会话级角色")
 
 

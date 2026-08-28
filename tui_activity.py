@@ -12,6 +12,11 @@ from datetime import datetime
 from typing import Mapping
 
 from adapters.base import redact_sensitive_text
+from collaboration import (
+    CollaborationPlanEvent,
+    CollaborationPlanEventError,
+    CollaborationPlanProgress,
+)
 from tui_status import format_response_duration
 
 
@@ -72,9 +77,10 @@ _DETAIL_KIND_LABELS = {
     "completed": "完成",
     "failed": "失败",
     "cancelled": "取消",
+    "plan": "协作计划",
 }
 _DETAIL_IMPORTANT_KINDS = frozenset({
-    "tool", "permission", "steering",
+    "plan", "tool", "permission", "steering",
     "interjection_requested", "interjection_accepted",
     "interjection_failed", "interjection_uncertain",
 })
@@ -133,6 +139,8 @@ class _ActivityCard:
     notes: OrderedDict[tuple[str, str], str] = field(
         default_factory=OrderedDict
     )
+    plan: CollaborationPlanProgress = field(
+        default_factory=CollaborationPlanProgress)
     detail_state: str = "idle"
     detail_events: tuple[ActivityDetailEvent, ...] = ()
     detail_total_count: int = 0
@@ -318,6 +326,7 @@ class ActivityFeed:
             if partial_char_count is None
             else max(0, int(partial_char_count))
         )
+        plan_changed = self._restore_plan_from_details(card, normalized)
         changed = (
             card.detail_state != "ready"
             or card.detail_events != normalized
@@ -326,6 +335,7 @@ class ActivityFeed:
             or card.detail_kind_counts != normalized_counts
             or card.detail_agents != normalized_agents
             or card.detail_partial_char_count != resolved_partial_chars
+            or plan_changed
         )
         card.detail_state = "ready"
         card.detail_events = normalized
@@ -336,6 +346,78 @@ class ActivityFeed:
         card.detail_partial_char_count = resolved_partial_chars
         card.detail_error = ""
         return changed
+
+    def record_plan_event(
+        self,
+        command_id: str,
+        event: CollaborationPlanEvent | str,
+    ) -> bool:
+        """Project one validated collaboration event into a card.
+
+        Scheduling never reads this state.  Malformed persisted input is
+        ignored here because RoomStore already preserves the raw evidence and
+        the UI must remain usable while showing other command details.
+        """
+        card = self._ensure_card(command_id)
+        try:
+            decoded = (
+                CollaborationPlanEvent.decode(event)
+                if isinstance(event, str) else event
+            )
+        except CollaborationPlanEventError:
+            return False
+        return self._apply_plan_event(card, decoded)
+
+    @staticmethod
+    def _apply_plan_event(
+        card: _ActivityCard,
+        event: CollaborationPlanEvent,
+    ) -> bool:
+        updated = card.plan.apply(event)
+        if updated == card.plan:
+            return False
+        card.plan = updated
+        return True
+
+    def _restore_plan_from_details(
+        self,
+        card: _ActivityCard,
+        events: tuple[ActivityDetailEvent, ...],
+    ) -> bool:
+        plan_events: list[CollaborationPlanEvent] = []
+        for detail in events:
+            if detail.kind != "plan":
+                continue
+            try:
+                plan_events.append(CollaborationPlanEvent.decode(detail.text))
+            except CollaborationPlanEventError:
+                continue
+        created_index = next(
+            (
+                index for index, event in enumerate(plan_events)
+                if event.event == "created"
+            ),
+            None,
+        )
+        if created_index is None:
+            return False
+        previous = card.plan
+        created = plan_events[created_index]
+        restored = CollaborationPlanProgress().apply(created)
+        if previous.steps:
+            # 详情读取与实时事件并发：持久快照可能早于屏幕上已收到的状态。
+            # 只在计划身份一致时把后续迁移单调合入，绝不先 reset 造成倒退。
+            if tuple(
+                (step.agent, step.assignment) for step in restored.steps
+            ) != tuple(
+                (step.agent, step.assignment) for step in previous.steps
+            ):
+                return False
+            restored = previous
+        for event in plan_events[created_index + 1:]:
+            restored = restored.apply(event)
+        card.plan = restored
+        return restored != previous
 
     def record_status(
         self,
@@ -556,6 +638,15 @@ class ActivityFeed:
                 "待发送" if card.command_state == "queued" else "未发送"
             )
             focus = f"{prefix}：{card.pending_request}"
+        elif card.plan.current is not None:
+            step_index, step = card.plan.current
+            assignment = step.assignment.replace("\n", " ")
+            if len(assignment) > 40:
+                assignment = f"{assignment[:39]}…"
+            focus = (
+                f"步骤 {step_index}/{len(card.plan.steps)} · "
+                f"{_agent_label(card, step.agent)}：{assignment}"
+            )
         elif card.agents:
             latest_name = next(reversed(card.agents))
             latest = card.agents[latest_name]
@@ -615,6 +706,7 @@ class ActivityFeed:
             return header
 
         rows: list[str] = [header]
+        rows.extend(self._render_plan(card))
         if card.detail_state == "ready":
             rows.extend(self._render_persisted_details(card))
             if card.error:
@@ -650,9 +742,35 @@ class ActivityFeed:
             rows.append("  过程 · 正在读取持久记录…")
         elif card.detail_state == "error":
             rows.append(f"  详情加载失败 · {card.detail_error}")
-        elif not card.notes and not card.tools and not card.error:
+        elif (
+            not card.notes
+            and not card.tools
+            and not card.error
+            and not card.plan.steps
+        ):
             rows.append("  过程 · 暂无可显示的阶段、工具或权限事件")
         return "\n".join(rows)
+
+    @staticmethod
+    def _render_plan(card: _ActivityCard) -> list[str]:
+        if not card.plan.steps or card.plan.current is None:
+            return []
+        current_index, _current = card.plan.current
+        rows = [
+            f"  协作计划 · {current_index}/{len(card.plan.steps)}"
+        ]
+        for index, step in enumerate(card.plan.steps, start=1):
+            assignment = step.assignment.replace("\n", " ")
+            rows.append(
+                f"  {step.mark} {index}  {_agent_label(card, step.agent)}"
+                f" · {step.state_label}"
+                f" · {assignment}"
+            )
+        if current_index > 1:
+            previous = card.plan.steps[current_index - 2]
+            current = card.plan.steps[current_index - 1]
+            rows.append(f"  交接 · {previous.agent} → {current.agent}")
+        return rows
 
     def _render_persisted_details(self, card: _ActivityCard) -> list[str]:
         events = card.detail_events
@@ -669,17 +787,19 @@ class ActivityFeed:
         status_count = kind_counts.get("status", 0)
         control_count = sum(
             kind_counts.get(kind, 0) for kind in _CONTROL_KINDS)
+        plan_count = kind_counts.get("plan", 0)
         rows = [
             f"  过程概览 · {card.detail_total_count} 条事件 · {agent_summary}"
             f" · 已读取 {len(events)} 条代表记录",
             f"  完整统计 · 生命周期 {lifecycle_count} · 阶段 {status_count}"
             f" · 工具 {tool_count} · 权限 {permission_count}"
-            f" · 控制 {control_count}",
+            f" · 控制 {control_count} · 计划 {plan_count}",
         ]
 
         partial_count = kind_counts.get("partial", 0)
         raw_process_events = tuple(
-            event for event in events if event.kind != "partial"
+            event for event in events
+            if event.kind not in {"partial", "plan"}
         )
         process_events = self._compact_heartbeats(raw_process_events)
         compacted_heartbeats = len(raw_process_events) - len(process_events)

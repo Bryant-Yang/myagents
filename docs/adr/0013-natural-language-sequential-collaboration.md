@@ -2,6 +2,7 @@
 
 - 状态：Accepted
 - 日期：2026-08-12
+- 补充：2026-08-28（一等计划与步骤交接投影，详见 ADR-0019）
 - Owner：Bryant Yang
 - 里程碑：M7
 
@@ -44,6 +45,9 @@
   能看到此前步骤的真实回复；内部 assignment 不伪装成 user 消息。
 - 每步回复照常进入 timeline，并共享原 command id。事件携带计划阶段、总步骤和
   当前 agent，现有活动卡和固定任务区据此展示进度。
+- 计划冻结后另发版本化 plan projection event，逐步记录 running 与确定性终态；
+  projection 只供实时/重启 UI 使用，不能反向驱动状态机。assignment preview
+  必须脱敏且有界，重复 agent 的不同步骤按 step index 独立显示。
 - 权限、adapter execution mode、session/cursor、no-replay 与进程生命周期沿用
   现有契约；协作计划不扩权，也不创建 agent 之间的直接调用。
 

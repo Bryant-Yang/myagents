@@ -12,6 +12,11 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 from adapters.base import AgentEvent
+from collaboration import (
+    CollaborationPlan,
+    CollaborationPlanEvent,
+    CollaborationStep,
+)
 from control import ControlClient
 from main import ChatApp
 from orchestrator import AgentSpec, Orchestrator
@@ -130,6 +135,172 @@ def test_activity_feed_shows_pending_requests_without_duplicate_text() -> None:
     feed.set_command_state("cmd-failed", "failed")
     assert "不能在失败卡残留的原文" not in feed.render(
         "cmd-failed", expanded=False)
+
+
+def test_activity_feed_renders_first_class_collaboration_handoff() -> None:
+    long_assignment = (
+        "基于前序证据制定方案，并逐项核对约束、风险、回滚和验收证据，"
+        "再检查权限、会话隔离、失败终态与重启恢复，并核对实时与持久"
+        "投影在竞态下仍然一致，最后给出完整尾部"
+    )
+    plan = CollaborationPlan((
+        CollaborationStep("kimi", "调查现状并列出证据"),
+        CollaborationStep("opencode", long_assignment),
+        CollaborationStep("kimi", "复核并向用户完成最终交付"),
+    ))
+    feed = ActivityFeed()
+    command_id = "cmd-plan-view"
+    feed.begin(command_id)
+    assert feed.record_plan_event(
+        command_id, CollaborationPlanEvent.created(plan))
+    assert feed.record_plan_event(
+        command_id, CollaborationPlanEvent.transition(plan, 1, "running"))
+    collapsed = feed.render(command_id, expanded=False)
+    assert "步骤 1/3 · kimi：调查现状并列出证据" in collapsed
+
+    expanded = feed.render(command_id, expanded=True)
+    assert "协作计划 · 1/3" in expanded
+    assert "› 1  kimi · 进行中 · 调查现状并列出证据" in expanded
+    assert f"○ 2  opencode · 等待 · {long_assignment}" in expanded
+    assert "完整尾部" in expanded
+    assert "暂无可显示" not in expanded
+
+    feed.record_plan_event(
+        command_id, CollaborationPlanEvent.transition(plan, 1, "completed"))
+    feed.record_plan_event(
+        command_id, CollaborationPlanEvent.transition(plan, 2, "running"))
+    expanded = feed.render(command_id, expanded=True)
+    assert "协作计划 · 2/3" in expanded
+    assert "✓ 1  kimi · 已结束" in expanded
+    assert "交接 · kimi → opencode" in expanded
+    assert not feed.record_plan_event(command_id, "not-json")
+
+    restored = ActivityFeed()
+    restored.begin(command_id)
+    plan_events = (
+        CollaborationPlanEvent.created(plan),
+        CollaborationPlanEvent.transition(plan, 1, "running"),
+        CollaborationPlanEvent.transition(plan, 1, "completed"),
+        CollaborationPlanEvent.transition(plan, 2, "running"),
+    )
+    details = tuple(
+        ActivityDetailEvent(
+            index,
+            "host" if index == 1 else "opencode",
+            "plan",
+            event.encode(),
+            f"2026-08-28T01:00:0{index}Z",
+        )
+        for index, event in enumerate(plan_events, start=1)
+    )
+    restored.set_persisted_details(
+        command_id,
+        details,
+        total_count=len(details),
+        omitted_count=0,
+    )
+    restored_text = restored.render(command_id, expanded=True)
+    assert "协作计划 · 2/3" in restored_text
+    assert "交接 · kimi → opencode" in restored_text
+    assert '"event":"created"' not in restored_text
+
+
+def test_older_detail_snapshot_cannot_roll_back_live_plan() -> None:
+    plan = CollaborationPlan((
+        CollaborationStep("kimi", "调查现状"),
+        CollaborationStep("opencode", "复核结论"),
+    ))
+    feed = ActivityFeed()
+    command_id = "cmd-plan-race"
+    feed.begin(command_id)
+    live = (
+        CollaborationPlanEvent.created(plan),
+        CollaborationPlanEvent.transition(plan, 1, "running"),
+        CollaborationPlanEvent.transition(plan, 1, "completed"),
+        CollaborationPlanEvent.transition(plan, 2, "running"),
+    )
+    for event in live:
+        feed.record_plan_event(command_id, event)
+
+    stale = tuple(
+        ActivityDetailEvent(
+            index, "host", "plan", event.encode(),
+            f"2026-08-28T01:00:0{index}Z",
+        )
+        for index, event in enumerate(live[:2], start=1)
+    )
+    feed.set_persisted_details(
+        command_id, stale,
+        total_count=len(stale), omitted_count=0,
+    )
+    rendered = feed.render(command_id, expanded=True)
+    assert "协作计划 · 2/2" in rendered
+    assert "✓ 1  kimi · 已结束" in rendered
+    assert "› 2  opencode · 进行中" in rendered
+
+
+def test_details_restores_collaboration_plan_after_restart() -> None:
+    async def run() -> None:
+        plan = CollaborationPlan((
+            CollaborationStep("kimi", "调查并列出证据"),
+            CollaborationStep("qwen", "复核并完成最终交付"),
+        ))
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "project"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            command_id = "cmd-plan-restart"
+            store.append_event(
+                command_id=command_id, agent="system",
+                kind="running", text="开始执行")
+            for agent, event in (
+                ("host", CollaborationPlanEvent.created(plan)),
+                ("kimi", CollaborationPlanEvent.transition(
+                    plan, 1, "running")),
+                ("kimi", CollaborationPlanEvent.transition(
+                    plan, 1, "completed")),
+                ("qwen", CollaborationPlanEvent.transition(
+                    plan, 2, "running")),
+                ("qwen", CollaborationPlanEvent.transition(
+                    plan, 2, "completed")),
+            ):
+                store.append_event(
+                    command_id=command_id,
+                    agent=agent,
+                    kind="plan",
+                    text=event.encode(),
+                )
+            store.append_event(
+                command_id=command_id, agent="system",
+                kind="completed", text="本轮响应结束")
+            app = ChatApp(
+                workdir=str(workdir),
+                orchestrator=Orchestrator(str(workdir), store=store),
+            )
+            async with app.run_test():
+                restored_status = str(
+                    app.query_one("#task-status").render())
+                assert "协作计划 2/2 · kimi → qwen" in restored_status
+                # 会话切换会清空瞬时 TaskProgress；切回时必须能从同一
+                # execution event 重新构建固定任务区，而不只恢复活动卡。
+                app._task_progresses.clear()
+                app._latest_task_id = None
+                app._restore_latest_collaboration_task()
+                switched_status = str(
+                    app.query_one("#task-status").render())
+                assert "协作计划 2/2 · kimi → qwen" in switched_status
+                app.action_toggle_details()
+                await app.workers.wait_for_complete()
+                rendered = _activity_text(app)
+                assert "协作计划 · 2/2" in rendered, rendered
+                assert "✓ 1  kimi · 已结束 · 调查并列出证据" in rendered
+                assert "✓ 2  qwen · 已结束 · 复核并完成最终交付" in rendered
+                assert '"event":"created"' not in rendered
+                task_status = str(app.query_one("#task-status").render())
+                assert "协作计划 2/2 · kimi → qwen" in task_status
+
+    asyncio.run(run())
 
 
 def test_activity_feed_tracks_latest_agent_and_bounds_terminal_details() -> None:
@@ -1043,6 +1214,9 @@ def test_interrupted_partial_is_summarized_without_repeating_body() -> None:
 if __name__ == "__main__":
     test_activity_feed_coalesces_progress_and_tool_updates()
     test_activity_feed_shows_pending_requests_without_duplicate_text()
+    test_activity_feed_renders_first_class_collaboration_handoff()
+    test_older_detail_snapshot_cannot_roll_back_live_plan()
+    test_details_restores_collaboration_plan_after_restart()
     test_activity_feed_tracks_latest_agent_and_bounds_terminal_details()
     test_activity_panel_keeps_process_out_of_chat_timeline()
     test_persisted_details_project_process_without_repeating_answer()

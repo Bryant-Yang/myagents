@@ -100,6 +100,9 @@
   Orchestrator 用普通代码严格串行推进；每步回复按同一 command id 写回共享
   timeline，下一步从最新 timeline 读取前序真实结果。assignment 不伪装成 user
   消息。最后一步必须直接产生面向用户的最终交付，不自动追加 host 总结。
+  计划冻结后写入 `kind=plan` 的版本化 execution event；created 只含脱敏有界的
+  assignment preview，step 只含步骤序号、agent 与确定性状态迁移。该投影不能
+  驱动调度，也不进入 agent history。
 - **角色组合**：若同一句显式消息还明确设置/取消会话角色，host 在同一次提取中
   返回受 mention 闭集约束的 `role_changes`；Orchestrator 仍按既有先持久化、后
   更新内存和派发的原子入口处理，角色不能改变计划成员、步骤或权限。
@@ -110,15 +113,22 @@
   session/cursor、no-replay 与进程回收契约；协作不扩权、不跨协议重放，也不让
   agent 递归调用 Orchestrator。显式计划在 timeline 前原子要求全部参与者和 host
   ready；无 mention 时 host 只能从 ready worker 候选中选人。
+- **可见性**：固定任务区和活动卡按 step index 显示完整计划、当前步骤和前后
+  交接，同一 agent 重复出现时不得合并。折叠卡显示当前 `步骤 x/n`；展开与
+  `/details` 显示每步 assignment preview 和等待/进行中/结束/失败/取消/未执行。
+  重启后从 plan execution event 恢复相同视图，原始 JSON 不直接展示。
 - **验收**：`tests/test_collaboration.py` 使用纯内存 fake host/adapter 覆盖计划
   边界、host 三路解析、显式 mention 闭集、普通 fan-out 兼容、严格顺序、前序
   结果可见、唯一 user、统一 command id、同轮角色、唯一路由 JSON 提取、歧义
-  多对象拒绝、失败和 CommandBus 取消。
+  多对象拒绝、失败、CommandBus 取消及 plan event 持久顺序；
+  `tests/test_tui_status.py`、`tests/test_tui_activity.py` 和 `tests/test_storage.py`
+  覆盖逐步骤 UI、重复 agent、交接、采样保留和重启恢复。
   默认门禁不启动任何真实 agent。
 - **人工验收边界**：真实模型能否稳定把开放式自然语言拆成高质量步骤、成本与
   最终内容质量由用户验收；自动化只证明计划边界、执行时序和安全终态。
-- **事实源**：ADR-0013、`collaboration.py`、`host.py`、`orchestrator.py`。
-- **里程碑**：M7。
+- **事实源**：ADR-0013、ADR-0019、`collaboration.py`、`host.py`、
+  `orchestrator.py`、`tui_status.py`、`tui_activity.py`。
+- **里程碑**：M7.1。
 
 ### UC-ROLE-001 会话级自然语言角色
 
@@ -945,7 +955,7 @@
 ### UC-OBS-001 执行进度、权限上下文与重启证据
 
 - **角色 / 触发**：TUI 或外部 MCP host 提交一个长任务。
-- **主流程**：queued/running、ACP 阶段、工具、权限、partial、heartbeat
+- **主流程**：queued/running、ACP 阶段、工具、权限、partial、plan、heartbeat
   与 terminal 事件写入独立 `events.jsonl`；heartbeat 显示当前阶段和累计
   静默时长，TUI 对同一 command 原位更新；工具事件按
   `(command_id, agent, tool_call_id)` 聚合，缺 ID 时使用脱敏标题作为可见
@@ -959,6 +969,8 @@
   “未发送”。临时摘要不进入对话 history。
 - **交互层级**：聊天主线只承载 user、agent/host 回复和必须独立可见的失败；
   活动卡在独立可聚焦面板原位更新，不再伪装成 `[activity]` 聊天 speaker。
+  有序协作卡折叠时直接显示当前步骤，展开时按序号显示冻结 assignment、状态与
+  当前交接；固定任务区使用相同纯投影，不能把重复 agent 的多个步骤合并。
   composer 使用 `Shift+Enter` 换行并在 3–8 行内随内容增长，Enter 保持发送/排队
   语义。固定任务区首行展示 Host 类型/目标、ready worker 比例以及后台运行和
   未读会话计数。最新错误按 room 隔离投影到输入区上方的固定提示，并在该 room

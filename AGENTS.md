@@ -153,6 +153,10 @@ app-server），同时仅为已获证路径保留 JSONL 兼容回退。
   [`ADR-0008`](docs/adr/0008-bounded-multi-agent-discussion.md)：同轮并发、
   跨轮串行，一条 command 只有一条 user 记录；参与者失败不自动重试，最终
   moderator 不能掩盖失败终态；自然语言识别不得改变这些边界。
+- 有序协作的可见计划遵守
+  [`ADR-0019`](docs/adr/0019-first-class-collaboration-plan-projection.md)：
+  `CollaborationPlan` 仍是唯一调度权威；版本化 plan event 只做有界、脱敏的
+  步骤投影，不得反向驱动执行、解析状态文案或进入 agent history。
 - 自然语言有序协作遵守
   [`ADR-0013`](docs/adr/0013-natural-language-sequential-collaboration.md)：
   不新增 `/task`，固定计划严格串行，后一步读取前序真实回复，失败/取消即停。

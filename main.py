@@ -1051,6 +1051,7 @@ class ChatApp(App):
         if restored:
             self._system(f"已恢复 {len(restored)} 条历史消息")
         self._restore_interrupted_executions()
+        self._restore_latest_collaboration_task()
         statuses = self.orch.agent_readiness_snapshot()
         ready = [item.name for item in statuses if item.ready]
         pending = [item.name for item in statuses if not item.ready]
@@ -1222,6 +1223,8 @@ class ChatApp(App):
             return
         if ev.kind == "text":
             feed.record_status(command_id, name, "回复中", state="running")
+        elif ev.kind == "plan":
+            feed.record_plan_event(command_id, ev.text)
         elif ev.kind == "info":
             targets = ev.meta.get("route_targets")
             if (ev.meta.get("collaboration") is True
@@ -1484,10 +1487,20 @@ class ChatApp(App):
                     "queued" if state == "queued" else "running",
                     summary,
                 )
+                if hasattr(store, "read_command_events"):
+                    self._restore_task_plan(
+                        progress,
+                        store.read_command_events(item.command_id)["items"],
+                    )
                 continue
             progress = self._update_command_progress(
                 item.command_id, "interrupted", summary)
             progress.set_agent(safe_agent, "interrupted", summary)
+            if hasattr(store, "read_command_events"):
+                self._restore_task_plan(
+                    progress,
+                    store.read_command_events(item.command_id)["items"],
+                )
             if self._activity_feed.set_command_state(
                 item.command_id, "interrupted", summary
             ):
@@ -1496,6 +1509,71 @@ class ChatApp(App):
                 f"上次任务 {item.command_id[:8]} 已中断；"
                 f"最后状态：{safe_agent} {summary}")
         self._render_task_status()
+
+    def _restore_latest_collaboration_task(self) -> None:
+        """恢复当前房间最后一个协作任务的固定状态投影。"""
+        store = self.orch.store
+        if store is None or not hasattr(store, "read_latest_command_events"):
+            return
+        page = store.read_latest_command_events()
+        if page is None:
+            return
+        items = page["items"]
+        if not items or not any(item.kind == "plan" for item in items):
+            return
+        last = items[-1]
+        try:
+            live = self.bus.get(last.command_id)
+        except CommandNotFoundError:
+            live = None
+        state = (
+            live.status.value
+            if live is not None
+            else last.kind
+            if last.kind in {"completed", "failed", "cancelled"}
+            else "interrupted"
+        )
+        error = (
+            live.error
+            if live is not None
+            else _interrupted_event_summary(last.kind, last.text)
+            if state in {"failed", "interrupted"}
+            else None
+        )
+        elapsed = (
+            command_elapsed_seconds(
+                live.created_at,
+                live.finished_at,
+                allow_open_interval=state in {"queued", "running"},
+            )
+            if live is not None
+            else command_elapsed_seconds(
+                items[0].created_at,
+                items[-1].created_at,
+                allow_open_interval=False,
+            )
+        )
+        progress = self._update_command_progress(
+            last.command_id,
+            state,
+            error,
+            elapsed_seconds=elapsed,
+        )
+        self._restore_task_plan(progress, items)
+        self._render_task_status()
+
+    @staticmethod
+    def _restore_task_plan(
+        progress: TaskProgress,
+        records: Iterable[ExecutionEventRecord],
+    ) -> bool:
+        """把持久计划单调投影到固定任务区，不参与任何执行决策。"""
+        changed = False
+        for record in records:
+            if record.kind == "plan":
+                changed = progress.record_collaboration_plan(
+                    record.text) or changed
+        return changed
 
     # ---- 时间线输出 ----
 
@@ -2196,6 +2274,16 @@ class ChatApp(App):
                 agents=page["agents"],
                 partial_char_count=page["partial_char_count"],
             )
+            if self._activity_room_id == target_room_id:
+                progress = self._update_command_progress(
+                    last.command_id,
+                    state,
+                    safe_last_text
+                    if state in {"failed", "interrupted"} else None,
+                    elapsed_seconds=elapsed,
+                )
+                self._restore_task_plan(progress, items)
+                self._render_task_status()
             self._expanded_activity_ids.setdefault(
                 target_room_id, set()).add(last.command_id)
             if self._activity_room_id == target_room_id:
@@ -2865,6 +2953,7 @@ class ChatApp(App):
         self._refresh_activity_cards()
         self._render_error_notice()
         self._restore_interrupted_executions()
+        self._restore_latest_collaboration_task()
         self._system(
             f"已切换：{snapshot.summary.project_name} / "
             f"{snapshot.summary.title}；工作目录：{snapshot.summary.workdir}"
@@ -2975,6 +3064,19 @@ class ChatApp(App):
                         self._system("host 处理中…")
             if command_id is not None:
                 self._upsert_activity_card(command_id)
+        elif ev.kind == "plan":
+            self._finish_stream_text(name)
+            if command_id is not None:
+                progress_changed = self._ensure_task(
+                    command_id).record_collaboration_plan(ev.text)
+                activity_changed = self._activity_feed.record_plan_event(
+                    command_id, ev.text)
+                if progress_changed:
+                    self._render_task_status()
+                if activity_changed:
+                    self._upsert_activity_card(command_id)
+            else:
+                self._system("收到缺少任务标识的协作计划事件")
         elif ev.kind == "text":
             if command_id is not None:
                 self._set_agent_status(

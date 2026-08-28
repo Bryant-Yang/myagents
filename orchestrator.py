@@ -62,6 +62,7 @@ from dsh_acp import AcpDshAdapter, dsh_readiness_probe
 from pi_rpc.adapter import PiRpcAdapter
 from collaboration import (
     CollaborationPlan,
+    CollaborationPlanEvent,
     CollaborationValidationError,
     MAX_COLLABORATION_STEPS,
     has_ordered_collaboration_cue,
@@ -1560,6 +1561,14 @@ class Orchestrator:
                 )
         self._apply_session_role_changes(role_changes)
         if collaboration is not None:
+            on_event(HOST_NAME, AgentEvent(
+                "plan",
+                CollaborationPlanEvent.created(collaboration).encode(),
+                meta={
+                    "collaboration": True,
+                    "phase": "协作计划已冻结",
+                },
+            ))
             return await self._dispatch_collaboration(
                 collaboration,
                 on_event,
@@ -1597,6 +1606,12 @@ class Orchestrator:
         """Run a validated plan serially; later steps see earlier replies."""
         total = len(plan.steps)
         for index, step in enumerate(plan.steps, start=1):
+            on_event(step.agent, AgentEvent(
+                "plan",
+                CollaborationPlanEvent.transition(
+                    plan, index, "running").encode(),
+                meta={"collaboration": True},
+            ))
             meta = {
                 "agent_state": "running",
                 "phase": f"协作 {index}/{total}",
@@ -1634,6 +1649,12 @@ class Orchestrator:
                 )
             except asyncio.CancelledError:
                 on_event(step.agent, AgentEvent(
+                    "plan",
+                    CollaborationPlanEvent.transition(
+                        plan, index, "cancelled").encode(),
+                    meta={"collaboration": True},
+                ))
+                on_event(step.agent, AgentEvent(
                     "status",
                     f"协作第 {index}/{total} 步已取消",
                     meta={
@@ -1652,6 +1673,12 @@ class Orchestrator:
                 raise
             if error is not None:
                 on_event(step.agent, AgentEvent(
+                    "plan",
+                    CollaborationPlanEvent.transition(
+                        plan, index, "failed").encode(),
+                    meta={"collaboration": True},
+                ))
+                on_event(step.agent, AgentEvent(
                     "status",
                     f"协作在第 {index}/{total} 步停止，后续步骤未执行",
                     meta={
@@ -1668,6 +1695,12 @@ class Orchestrator:
                     reason="前序步骤失败",
                 )
                 return DispatchOutcome((AgentFailure(step.agent, error),))
+            on_event(step.agent, AgentEvent(
+                "plan",
+                CollaborationPlanEvent.transition(
+                    plan, index, "completed").encode(),
+                meta={"collaboration": True},
+            ))
         return DispatchOutcome()
 
     def _emit_skipped_collaboration_steps(
@@ -1688,6 +1721,12 @@ class Orchestrator:
             plan.steps[completed_count:],
             start=completed_count + 1,
         ):
+            on_event(step.agent, AgentEvent(
+                "plan",
+                CollaborationPlanEvent.transition(
+                    plan, step_index, "skipped").encode(),
+                meta={"collaboration": True},
+            ))
             on_event(step.agent, AgentEvent(
                 "status",
                 f"协作第 {step_index}/{total} 步未执行：{reason}",

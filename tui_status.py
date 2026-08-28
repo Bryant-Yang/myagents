@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from adapters.base import redact_sensitive_text
+from collaboration import (
+    CollaborationPlanEvent,
+    CollaborationPlanEventError,
+    CollaborationPlanProgress,
+)
 
 
 _COMMAND_LABELS = {
@@ -94,6 +99,8 @@ class TaskProgress:
     workflow_roles: dict[str, str] = field(default_factory=dict)
     steering_available: bool | None = None
     elapsed_seconds: float | None = None
+    collaboration_plan: CollaborationPlanProgress = field(
+        default_factory=CollaborationPlanProgress)
 
     def set_command(
         self,
@@ -165,6 +172,23 @@ class TaskProgress:
         if isinstance(steering_available, bool):
             self.steering_available = steering_available
 
+    def record_collaboration_plan(
+        self,
+        event: CollaborationPlanEvent | str,
+    ) -> bool:
+        try:
+            decoded = (
+                CollaborationPlanEvent.decode(event)
+                if isinstance(event, str) else event
+            )
+        except CollaborationPlanEventError:
+            return False
+        updated = self.collaboration_plan.apply(decoded)
+        if updated == self.collaboration_plan:
+            return False
+        self.collaboration_plan = updated
+        return True
+
     @property
     def overall_label(self) -> str:
         worker_states = {
@@ -213,7 +237,40 @@ class TaskProgress:
             suffix = f" · {role_line}" if role_line else ""
             details.append(
                 f"workflow {self.workflow_stage}{suffix} · {steering}")
+        planned_agents: set[str] = set()
+        if (
+            self.collaboration_plan.steps
+            and self.collaboration_plan.current is not None
+        ):
+            planned_agents.add("host")
+            current_index, _current = self.collaboration_plan.current
+            chain = " → ".join(
+                step.agent for step in self.collaboration_plan.steps)
+            details.append(
+                f"协作计划 {current_index}/{len(self.collaboration_plan.steps)}"
+                f" · {chain}"
+            )
+            for index, step in enumerate(
+                self.collaboration_plan.steps, start=1,
+            ):
+                planned_agents.add(step.agent)
+                agent_progress = self.agents.get(step.agent)
+                agent_label = (
+                    f"{step.agent} · {agent_progress.session_role}（本会话）"
+                    if agent_progress is not None
+                    and agent_progress.session_role
+                    else step.agent
+                )
+                assignment = step.assignment.replace("\n", " ")
+                if len(assignment) > 56:
+                    assignment = f"{assignment[:55]}…"
+                details.append(
+                    f"{step.mark} {index} {agent_label}"
+                    f" {step.state_label} · {assignment}"
+                )
         for name, item in self.agents.items():
+            if name in planned_agents:
+                continue
             label = _AGENT_LABELS.get(item.state, item.state)
             agent_label = (
                 f"{name} · {item.session_role}（本会话）"

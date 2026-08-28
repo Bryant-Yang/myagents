@@ -8,12 +8,16 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from collaboration import (
     CollaborationPlan,
+    CollaborationPlanEvent,
+    CollaborationPlanEventError,
+    CollaborationPlanProgress,
     CollaborationStep,
     CollaborationValidationError,
     has_ordered_collaboration_cue,
@@ -24,6 +28,7 @@ from control import CommandBus, CommandStatus
 from host import HostAgent, HostCollaboration, HostDecision
 from orchestrator import Orchestrator
 from session_roles import SessionRole, SessionRoleChanges
+from storage.store import RoomStore
 
 
 WORKERS = ("kimi", "opencode", "qwen")
@@ -44,6 +49,57 @@ def test_plan_parser_preserves_bounded_order() -> None:
     assert [step.agent for step in plan.steps] == [
         "kimi", "opencode", "qwen"]
     assert plan.steps[-1].assignment == "复核方案并给出最终交付"
+
+
+def test_plan_events_are_versioned_bounded_and_redacted() -> None:
+    plan = CollaborationPlan((
+        CollaborationStep(
+            "kimi",
+            '调查 API_KEY=supersecret、password: hunter2 与 '
+            '"token":"json-secret" 并给出证据',
+        ),
+        CollaborationStep(
+            "opencode",
+            "用 Authorization: Basic Zm9vOmJhcg== 复核最终方案",
+        ),
+    ))
+    created = CollaborationPlanEvent.created(plan)
+    encoded = created.encode()
+    for secret in (
+        "supersecret", "hunter2", "json-secret", "Zm9vOmJhcg==",
+    ):
+        assert secret not in encoded
+    decoded = CollaborationPlanEvent.decode(encoded)
+    assert decoded.event == "created"
+    assert decoded.steps[0].assignment.count("[已隐藏]") == 3
+    assert decoded.steps[1].assignment.count("[已隐藏]") == 1
+
+    progress = CollaborationPlanProgress().apply(decoded)
+    progress = progress.apply(CollaborationPlanEvent.transition(
+        plan, 1, "running"))
+    assert progress.current is not None
+    assert progress.current[0] == 1
+    assert progress.apply(CollaborationPlanEvent.transition(
+        plan, 2, "running")) == progress
+    assert progress.apply(CollaborationPlanEvent.transition(
+        plan, 2, "skipped")) == progress
+    progress = progress.apply(CollaborationPlanEvent.transition(
+        plan, 1, "completed"))
+    assert progress.current is not None
+    assert progress.current[0] == 2
+
+    malformed = (
+        "not-json",
+        '{"version":2,"event":"created","steps":[]}',
+        '{"version":1,"event":"step","step":1,"total":2,'
+        '"agent":"kimi","state":"retrying"}',
+    )
+    for payload in malformed:
+        try:
+            CollaborationPlanEvent.decode(payload)
+        except CollaborationPlanEventError:
+            continue
+        raise AssertionError(f"malformed plan event accepted: {payload}")
 
 
 def test_explicit_mentions_only_trigger_on_clear_order_cue() -> None:
@@ -312,6 +368,49 @@ def test_natural_language_plan_runs_strictly_in_order_with_shared_results() -> N
     ]
     assert {event.meta["collaboration_step"] for event in step_events} == {
         1, 2, 3}
+    plan_events = [
+        CollaborationPlanEvent.decode(event.text)
+        for _name, event in events if event.kind == "plan"
+    ]
+    assert [event.event for event in plan_events] == [
+        "created", "step", "step", "step", "step", "step", "step",
+    ]
+    assert [event.state for event in plan_events[1:]] == [
+        "running", "completed", "running", "completed", "running",
+        "completed",
+    ]
+
+
+def test_command_bus_persists_versioned_plan_events() -> None:
+    async def run() -> None:
+        plan = CollaborationPlan((
+            CollaborationStep("kimi", "调查现状"),
+            CollaborationStep("opencode", "复核并交付"),
+        ))
+        orch, _adapters, _host, _calls = make_plan_orchestrator(plan)
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            store = RoomStore(Path.cwd(), state_root=Path(tmp) / "state")
+            orch.store = store
+            bus = CommandBus(orch)
+            bus.start()
+            submitted = await bus.submit("请先调查，再复核交付")
+            result = await bus.wait(submitted.command_id, timeout=2)
+            assert result["status"] == "completed"
+            page = store.read_command_events(submitted.command_id)
+            persisted = [
+                CollaborationPlanEvent.decode(item.text)
+                for item in page["items"] if item.kind == "plan"
+            ]
+            assert [event.event for event in persisted] == [
+                "created", "step", "step", "step", "step",
+            ]
+            assert [event.state for event in persisted[1:]] == [
+                "running", "completed", "running", "completed",
+            ]
+            await bus.aclose()
+            await orch.aclose()
+
+    asyncio.run(run())
 
 
 def test_explicit_order_uses_fixed_mentions_but_together_stays_fanout() -> None:
@@ -384,6 +483,17 @@ def test_collaboration_failure_stops_before_later_steps() -> None:
     assert skipped[0][1].meta.get("phase") == "因前序失败未执行"
     assert skipped[0][1].meta.get(
         "collaboration_preserve_agent_state") is True
+    plan_events = [
+        CollaborationPlanEvent.decode(event.text)
+        for _name, event in events if event.kind == "plan"
+    ]
+    assert [(event.step, event.state) for event in plan_events[1:]] == [
+        (1, "running"),
+        (1, "completed"),
+        (2, "running"),
+        (2, "failed"),
+        (3, "skipped"),
+    ]
 
 
 def test_ordered_collaboration_applies_explicit_session_roles_in_same_call() -> None:
@@ -464,6 +574,16 @@ def test_command_cancel_stops_current_and_future_collaboration_steps() -> None:
         )
         assert skipped[1][1].meta.get(
             "collaboration_preserve_agent_state") is True
+        plan_events = [
+            CollaborationPlanEvent.decode(event.text)
+            for _name, event in events if event.kind == "plan"
+        ]
+        assert [(event.step, event.state) for event in plan_events[1:]] == [
+            (1, "running"),
+            (1, "cancelled"),
+            (2, "skipped"),
+            (3, "skipped"),
+        ]
         await bus.aclose()
         await orch.aclose()
 
@@ -545,6 +665,7 @@ def test_malformed_collaboration_json_is_not_presented_as_host_answer() -> None:
 
 if __name__ == "__main__":
     test_plan_parser_preserves_bounded_order()
+    test_plan_events_are_versioned_bounded_and_redacted()
     test_explicit_mentions_only_trigger_on_clear_order_cue()
     test_host_decide_returns_ordered_plan()
     test_host_route_extracts_one_bounded_json_after_braced_preamble()
@@ -553,6 +674,7 @@ if __name__ == "__main__":
     test_explicit_plan_extraction_keeps_mention_closure()
     test_plan_parser_rejects_untrusted_shapes()
     test_natural_language_plan_runs_strictly_in_order_with_shared_results()
+    test_command_bus_persists_versioned_plan_events()
     test_explicit_order_uses_fixed_mentions_but_together_stays_fanout()
     test_collaboration_failure_stops_before_later_steps()
     test_ordered_collaboration_applies_explicit_session_roles_in_same_call()

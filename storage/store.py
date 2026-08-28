@@ -48,8 +48,9 @@ DEFAULT_READ_LIMIT = 50
 MAX_READ_LIMIT = 200
 MAX_TEXT_BYTES = 64 * 1024      # 单条消息文本上限（UTF-8 字节）
 MAX_RECORD_BYTES = 128 * 1024   # 单条 JSONL 记录上限（UTF-8 字节）
+MAX_PINNED_PLAN_EVENTS = 16
 EXECUTION_EVENT_KINDS = frozenset({
-    "queued", "running", "status", "tool", "permission", "partial",
+    "queued", "running", "status", "tool", "permission", "partial", "plan",
     "steering", "interjection_requested", "interjection_accepted",
     "interjection_failed", "interjection_uncertain",
     "completed", "failed", "cancelled",
@@ -958,6 +959,9 @@ class RoomStore:
         tail_count = bounded_limit - head_count
         head: list[ExecutionEventRecord] = []
         tail: deque[ExecutionEventRecord] = deque(maxlen=tail_count)
+        first_plan: ExecutionEventRecord | None = None
+        recent_plan: deque[ExecutionEventRecord] = deque(
+            maxlen=MAX_PINNED_PLAN_EVENTS - 1)
         total_count = 0
         kind_counts: dict[str, int] = {}
         agents: dict[str, None] = {}
@@ -970,11 +974,46 @@ class RoomStore:
             agents.setdefault(record.agent, None)
             if record.kind == "partial":
                 partial_char_count += len(record.text)
+            if record.kind == "plan":
+                if first_plan is None:
+                    first_plan = record
+                else:
+                    recent_plan.append(record)
             if len(head) < head_count:
                 head.append(record)
             else:
                 tail.append(record)
-        items = head + list(tail)
+        candidates = {
+            record.seq: record
+            for record in (
+                head
+                + ([first_plan] if first_plan is not None else [])
+                + list(recent_plan)
+                + list(tail)
+            )
+        }
+        if len(candidates) <= bounded_limit:
+            items = sorted(candidates.values(), key=lambda record: record.seq)
+        else:
+            # 详情优先保留首尾事实和版本化计划；极小 limit 下仍严格有界。
+            ordered = sorted(candidates.values(), key=lambda record: record.seq)
+            selected: dict[int, ExecutionEventRecord] = {}
+            if bounded_limit == 1:
+                selected[ordered[-1].seq] = ordered[-1]
+            else:
+                selected[ordered[0].seq] = ordered[0]
+                selected[ordered[-1].seq] = ordered[-1]
+                for record in ordered:
+                    if len(selected) >= bounded_limit:
+                        break
+                    if record.kind == "plan":
+                        selected[record.seq] = record
+                if len(selected) < bounded_limit:
+                    for record in reversed(ordered):
+                        selected[record.seq] = record
+                        if len(selected) >= bounded_limit:
+                            break
+            items = sorted(selected.values(), key=lambda record: record.seq)
         return {
             "command_id": command_id,
             "items": items,

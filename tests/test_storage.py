@@ -693,23 +693,30 @@ def test_read_command_events_is_bounded_and_command_scoped():
             store.append_event(
                 command_id="cmd-detail", agent="kimi", kind="status",
                 text=f"阶段 {index}")
+            if index == 2:
+                store.append_event(
+                    command_id="cmd-detail", agent="host", kind="plan",
+                    text='{"version":1,"event":"created","steps":['
+                    '{"agent":"kimi","assignment":"调查"},'
+                    '{"agent":"qwen","assignment":"复核"}]}')
         store.append_event(
             command_id="cmd-detail", agent="kimi", kind="completed",
             text="本轮响应结束")
 
         page = store.read_command_events("cmd-detail", limit=4)
-        assert page["total_count"] == 7
-        assert page["omitted_count"] == 3
+        assert page["total_count"] == 8
+        assert page["omitted_count"] == 4
         assert len(page["items"]) == 4
         assert all(
             item.command_id == "cmd-detail" for item in page["items"])
         assert page["items"][0].kind == "queued"
         assert page["items"][-1].kind == "completed"
+        assert any(item.kind == "plan" for item in page["items"])
         assert [item.seq for item in page["items"]] == sorted(
             item.seq for item in page["items"])
         assert page["kind_counts"] == {
-            "queued": 1, "status": 5, "completed": 1}
-        assert page["agents"] == ("system", "kimi")
+            "queued": 1, "status": 5, "plan": 1, "completed": 1}
+        assert page["agents"] == ("system", "kimi", "host")
         assert page["partial_char_count"] == 0
 
         latest_page = store.read_latest_command_events(limit=4)

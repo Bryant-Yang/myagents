@@ -790,6 +790,7 @@ class CommandBus:
             "permission": "permission",
             "info": "status",
             "error": "status",
+            "plan": "plan",
             "steering": "steering",
         }
         kind = kind_map.get(event.kind)

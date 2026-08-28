@@ -30,6 +30,8 @@ required=(
   docs/adr/0015-dsh-acp-only-transport.md
   docs/adr/0016-explicit-auto-approve-mode.md
   docs/adr/0017-native-model-backed-host.md
+  docs/adr/0018-capability-bounded-runtime-interjection.md
+  docs/adr/0019-first-class-collaboration-plan-projection.md
   scripts/check-redlines.sh
   scripts/check-dsh-runtime-contract.py
   scripts/package-dsh-plugin.sh
@@ -81,6 +83,8 @@ docs = [
     root / "docs/adr/0015-dsh-acp-only-transport.md",
     root / "docs/adr/0016-explicit-auto-approve-mode.md",
     root / "docs/adr/0017-native-model-backed-host.md",
+    root / "docs/adr/0018-capability-bounded-runtime-interjection.md",
+    root / "docs/adr/0019-first-class-collaboration-plan-projection.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")

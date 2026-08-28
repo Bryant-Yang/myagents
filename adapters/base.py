@@ -56,9 +56,15 @@ class ExecutionMode(str, Enum):
     WORKSPACE_WRITE = "workspace_write"
 
 
-_SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|APIKEY|"
-    r"AUTHORIZATION|CREDENTIAL|PRIVATE_KEY)[A-Z0-9_]*)=([^\s]+)")
+_SENSITIVE_KEY_VALUE = re.compile(
+    r"(?i)(?<![A-Z0-9_])"
+    r"([\"']?[A-Z0-9_]{0,32}(?:TOKEN|SECRET|PASSWORD|API_KEY|APIKEY|"
+    r"AUTHORIZATION|CREDENTIAL|PRIVATE_KEY)[A-Z0-9_]{0,32}"
+    r"[\"']?\s*[:=]\s*)"
+    r"(?!\[已隐藏\])(?:\"[^\"]*\"|'[^']*'|[^\s,}\]、，；;]+)")
+_AUTHORIZATION_HEADER = re.compile(
+    r"(?i)(\bAuthorization\s*[:=]\s*)(?:Bearer|Basic)\s+"
+    r"[^\s,}\]\"']+")
 _BEARER_VALUE = re.compile(r"(?i)\bBearer\s+[^\s'\"]+")
 _OPENAI_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
 _TOOL_STATUS_LABELS = {
@@ -79,9 +85,21 @@ _TOOL_STATUS_LABELS = {
 
 def redact_sensitive_text(value: str, *, limit: int = 2000) -> str:
     """隐藏命令/工具文本中的常见凭据形态并做长度限制。"""
-    text = _SENSITIVE_ASSIGNMENT.sub(r"\1=[已隐藏]", value)
-    text = _BEARER_VALUE.sub("Bearer [已隐藏]", text)
-    text = _OPENAI_KEY.sub("[已隐藏]", text)
+    # 先截取 UI/事件实际会保留的前缀，既满足输出上限，也避免针对模型返回的
+    # 多 MiB 文本做无意义的全量正则扫描。
+    text = value[:limit]
+    folded = text.casefold()
+    if "authorization" in folded:
+        text = _AUTHORIZATION_HEADER.sub(r"\1[已隐藏]", text)
+    if any(marker in folded for marker in (
+        "token", "secret", "password", "api_key", "apikey",
+        "authorization", "credential", "private_key",
+    )):
+        text = _SENSITIVE_KEY_VALUE.sub(r"\1[已隐藏]", text)
+    if "bearer " in folded:
+        text = _BEARER_VALUE.sub("Bearer [已隐藏]", text)
+    if "sk-" in text:
+        text = _OPENAI_KEY.sub("[已隐藏]", text)
     return text[:limit]
 
 
@@ -107,6 +125,8 @@ class AgentEvent:
       - "tool"  : 工具标题与已脱敏、有界的 meta 上下文；同一
         tool_call_id 的生命周期通过 meta.status 原位更新
       - "permission": 权限请求/结果摘要
+      - "plan"  : 编排器冻结的有界协作计划或步骤迁移；JSON 正文只进入
+        执行事件与 TUI，不进入聊天或 agent history
       - "activity": 无可见增量的协议活动；只刷新 CommandBus 静默时钟，
         不进入 UI 或持久事件
       - "cancel_requested": 控制层请求取消，UI 应先结束权限等待

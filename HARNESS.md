@@ -145,6 +145,9 @@ transport。
   `一起/分别/各自` 继续 fan-out。后一步读取前序真实回复，中间失败/取消后不得
   启动后续步骤；禁止递归 dispatch、动态扩员、自动重试、换人、跳步或追加
   host 伪造成功总结。计划不改变 adapter 权限、execution mode 或 no-replay。
+  Orchestrator 同时发出版本化、脱敏且有界的 plan projection event，供固定任务区、
+  活动卡与重启详情共享；projection 绝不反向驱动调度，同一 agent 的不同步骤按
+  step index 独立保存。完整合同见 ADR-0019。
 
 ### 4.2 权限
 
@@ -314,8 +317,9 @@ transport。
 
 ### 4.6 执行可观测性与精确取消（M3.1）
 
-- `events.jsonl` 与对话 timeline 分离，记录生命周期、status、tool、
-  permission、partial 与 terminal 事件；绝不进入 agent history。
+- `events.jsonl` 与对话 timeline 分离，记录生命周期、status、tool、permission、
+  partial、plan 与 terminal 事件；绝不进入 agent history。plan payload 是
+  versioned strict JSON，只保存有界 assignment preview 与确定性步骤迁移。
 - ACP thought 正文不可见，只映射安全阶段；工具与权限上下文有界展示，
   常见凭据字段隐藏。
 - 工具生命周期按 `(command_id, agent, tool_call_id)` 合并；协议缺少 ID 时
@@ -455,7 +459,7 @@ transport。
 | 源码级全局命令打包 | `tests/test_packaging.py` + 临时目录 `uv build` 人工验收 |
 | 会话级自然语言角色 | `tests/test_session_roles.py` + `tests/test_discussion.py` + `tests/test_tui_completion.py` + TUI 纯状态模型 |
 | 自然语言有界讨论 | `tests/test_discussion.py`（显式 mention、host 路由、边界与同一状态机） |
-| 自然语言有序协作 | `tests/test_collaboration.py`（纯内存 fake host/adapter + CommandBus 取消） |
+| 自然语言有序协作与步骤投影 | `tests/test_collaboration.py` + `tests/test_tui_status.py` + `tests/test_tui_activity.py` + `tests/test_storage.py`（fake host/adapter、持久 plan event 与重启详情） |
 | TUI/增量/权限/回收 | `tests/test_phase2.py` |
 | 多会话目录/生命周期/TUI | `tests/test_session_catalog.py` + `tests/test_session_manager.py` + `tests/test_session_tui.py` |
 | RoomStore 持久化 | `tests/test_storage.py` |
@@ -587,7 +591,9 @@ branch protection / required checks 需要单独配置后才能宣称生效。
 - M4.10 Agent 就绪与 setup UX 事实源：
   [`docs/adr/0012-agent-readiness-and-setup-ux.md`](docs/adr/0012-agent-readiness-and-setup-ux.md)。
 - M7 自然语言有序协作事实源：
-  [`docs/adr/0013-natural-language-sequential-collaboration.md`](docs/adr/0013-natural-language-sequential-collaboration.md)。
+  [`docs/adr/0013-natural-language-sequential-collaboration.md`](docs/adr/0013-natural-language-sequential-collaboration.md)；
+  M7.1 可见计划投影见
+  [`docs/adr/0019-first-class-collaboration-plan-projection.md`](docs/adr/0019-first-class-collaboration-plan-projection.md)。
 - 当前路线图：[`README.md`](README.md)“路线图”。
 - 重大协议/安全边界改变先形成可评审设计记录，再修改本契约。
 - Steering 只在同类失败至少两次或已有趋势证据时建立；单次失败只修当前问题。
