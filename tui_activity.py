@@ -8,7 +8,10 @@ from __future__ import annotations
 
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Mapping
 
+from adapters.base import redact_sensitive_text
 from tui_status import format_response_duration
 
 
@@ -51,8 +54,49 @@ _MAX_NOTES = 12
 _MAX_REQUEST_PREVIEW_CHARS = 120
 _DEFAULT_MAX_TERMINAL_CARDS = 100
 _DEFAULT_MAX_TOOLS_PER_CARD = 50
+_DEFAULT_MAX_DETAIL_ROWS = 80
 _TERMINAL_STATES = {
     "completed", "failed", "cancelled", "interrupted", "skipped"}
+
+_DETAIL_KIND_LABELS = {
+    "queued": "排队",
+    "running": "开始",
+    "status": "阶段",
+    "tool": "工具",
+    "permission": "权限",
+    "steering": "阶段补充",
+    "interjection_requested": "插话",
+    "interjection_accepted": "插话",
+    "interjection_failed": "插话失败",
+    "interjection_uncertain": "插话状态不确定",
+    "completed": "完成",
+    "failed": "失败",
+    "cancelled": "取消",
+}
+_DETAIL_IMPORTANT_KINDS = frozenset({
+    "tool", "permission", "steering",
+    "interjection_requested", "interjection_accepted",
+    "interjection_failed", "interjection_uncertain",
+})
+_PERSISTED_TERMINAL_KINDS = frozenset({
+    "completed", "failed", "cancelled"})
+_LIFECYCLE_KINDS = frozenset({
+    "queued", "running", "completed", "failed", "cancelled"})
+_CONTROL_KINDS = frozenset({
+    "steering", "interjection_requested", "interjection_accepted",
+    "interjection_failed", "interjection_uncertain", "cancelled",
+})
+
+
+@dataclass(frozen=True)
+class ActivityDetailEvent:
+    """持久过程事件的 UI-safe 中立投影输入。"""
+
+    seq: int
+    agent: str
+    kind: str
+    text: str
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -89,6 +133,15 @@ class _ActivityCard:
     notes: OrderedDict[tuple[str, str], str] = field(
         default_factory=OrderedDict
     )
+    detail_state: str = "idle"
+    detail_events: tuple[ActivityDetailEvent, ...] = ()
+    detail_total_count: int = 0
+    detail_omitted_count: int = 0
+    detail_kind_counts: tuple[tuple[str, int], ...] = ()
+    detail_agents: tuple[str, ...] = ()
+    detail_partial_char_count: int = 0
+    detail_error: str = ""
+    detail_generation: int = 0
 
     def status_label(self) -> str:
         label = _COMMAND_LABELS.get(self.command_state, self.command_state)
@@ -109,12 +162,15 @@ class ActivityFeed:
         *,
         max_terminal_cards: int = _DEFAULT_MAX_TERMINAL_CARDS,
         max_tools_per_card: int = _DEFAULT_MAX_TOOLS_PER_CARD,
+        max_detail_rows: int = _DEFAULT_MAX_DETAIL_ROWS,
     ) -> None:
-        if max_terminal_cards < 1 or max_tools_per_card < 1:
-            raise ValueError("活动卡与工具上限必须为正数")
+        if (max_terminal_cards < 1 or max_tools_per_card < 1
+                or max_detail_rows < 1):
+            raise ValueError("活动卡、工具与详情行上限必须为正数")
         self._cards: OrderedDict[str, _ActivityCard] = OrderedDict()
         self._max_terminal_cards = max_terminal_cards
         self._max_tools_per_card = max_tools_per_card
+        self._max_detail_rows = max_detail_rows
         self._evicted: deque[tuple[str, str]] = deque(
             maxlen=max_terminal_cards)
 
@@ -171,6 +227,115 @@ class ActivityFeed:
 
     def command_ids(self) -> tuple[str, ...]:
         return tuple(self._cards)
+
+    def has_terminal_persisted_details(self, command_id: str) -> bool:
+        card = self._cards.get(command_id)
+        return bool(
+            card is not None
+            and card.detail_state == "ready"
+            and card.detail_events
+            and card.detail_events[-1].kind in _PERSISTED_TERMINAL_KINDS
+        )
+
+    def start_details_loading(self, command_id: str) -> int:
+        card = self._ensure_card(command_id)
+        card.detail_generation += 1
+        card.detail_state = "loading"
+        card.detail_error = ""
+        return card.detail_generation
+
+    def set_details_error(
+        self,
+        command_id: str,
+        error: str,
+        *,
+        generation: int | None = None,
+    ) -> bool:
+        card = self._ensure_card(command_id)
+        if (
+            generation is not None
+            and generation != card.detail_generation
+        ) or card.detail_state == "ready":
+            return False
+        safe_error = redact_sensitive_text(" ".join(error.split()), limit=400)
+        changed = (
+            card.detail_state != "error"
+            or card.detail_error != safe_error
+        )
+        card.detail_state = "error"
+        card.detail_error = safe_error
+        return changed
+
+    def set_persisted_details(
+        self,
+        command_id: str,
+        events: tuple[ActivityDetailEvent, ...],
+        *,
+        total_count: int,
+        omitted_count: int,
+        kind_counts: Mapping[str, int] | None = None,
+        agents: tuple[str, ...] | None = None,
+        partial_char_count: int | None = None,
+        generation: int | None = None,
+    ) -> bool:
+        """提交一次持久详情快照；正文只计数，不进入详情文本。"""
+        card = self._ensure_card(command_id)
+        normalized = tuple(events)
+        if generation is not None and generation != card.detail_generation:
+            return False
+        incoming_last_kind = normalized[-1].kind if normalized else ""
+        if (
+            card.command_state in {"completed", "failed", "cancelled"}
+            and incoming_last_kind not in _PERSISTED_TERMINAL_KINDS
+        ):
+            return False
+        if (
+            card.detail_state == "ready"
+            and card.detail_events
+            and normalized
+            and normalized[-1].seq < card.detail_events[-1].seq
+        ):
+            return False
+        resolved_counts: dict[str, int] = {}
+        if kind_counts is None:
+            for event in normalized:
+                resolved_counts[event.kind] = (
+                    resolved_counts.get(event.kind, 0) + 1)
+        else:
+            resolved_counts = {
+                str(kind): max(0, int(count))
+                for kind, count in kind_counts.items()
+            }
+        normalized_counts = tuple(sorted(resolved_counts.items()))
+        normalized_agents = (
+            tuple(dict.fromkeys(str(agent) for agent in agents))
+            if agents is not None
+            else tuple(dict.fromkeys(event.agent for event in normalized))
+        )
+        resolved_partial_chars = (
+            sum(len(event.text) for event in normalized
+                if event.kind == "partial")
+            if partial_char_count is None
+            else max(0, int(partial_char_count))
+        )
+        changed = (
+            card.detail_state != "ready"
+            or card.detail_events != normalized
+            or card.detail_total_count != total_count
+            or card.detail_omitted_count != omitted_count
+            or card.detail_kind_counts != normalized_counts
+            or card.detail_agents != normalized_agents
+            or card.detail_partial_char_count != resolved_partial_chars
+        )
+        card.detail_state = "ready"
+        card.detail_events = normalized
+        card.detail_total_count = max(0, int(total_count))
+        card.detail_omitted_count = max(0, int(omitted_count))
+        card.detail_kind_counts = normalized_counts
+        card.detail_agents = normalized_agents
+        card.detail_partial_char_count = resolved_partial_chars
+        card.detail_error = ""
+        return changed
 
     def record_status(
         self,
@@ -312,11 +477,25 @@ class ActivityFeed:
         cleared_pending = state == "failed" and bool(card.pending_request)
         if cleared_pending:
             card.pending_request = ""
+        details_became_stale = (
+            state in _TERMINAL_STATES
+            and card.detail_state == "ready"
+            and (
+                not card.detail_events
+                or card.detail_events[-1].kind
+                not in _PERSISTED_TERMINAL_KINDS
+            )
+        )
+        if details_became_stale:
+            # 运行中读取的快照不能在任务结束后伪装成完整过程。先回到最新
+            # 内存摘要；用户再次展开或切回会话时会重新读取 terminal 快照。
+            card.detail_state = "idle"
         normalized_error = error or ""
         changed = (
             card.command_state != state
             or card.error != normalized_error
             or cleared_pending
+            or details_became_stale
         )
         if elapsed_seconds is not None and card.elapsed_seconds is None:
             normalized_elapsed = max(0.0, float(elapsed_seconds))
@@ -352,6 +531,10 @@ class ActivityFeed:
     def render(self, command_id: str, *, expanded: bool) -> str:
         card = self._cards[command_id]
         tool_count = len(card.tools)
+        persisted_tool_events = (
+            dict(card.detail_kind_counts).get("tool", 0)
+            if card.detail_state == "ready" else 0
+        )
         if card.pending_request:
             prefix = (
                 "待发送" if card.command_state == "queued" else "未发送"
@@ -388,7 +571,10 @@ class ActivityFeed:
             count = f"≥{tool_count}" if card.tools_truncated else str(tool_count)
             tool_summary = f"{count} 个工具（{tool_state}）"
         else:
-            tool_summary = "0 个工具"
+            tool_summary = (
+                f"{persisted_tool_events} 条工具事件"
+                if persisted_tool_events else "0 个工具"
+            )
         timing = ""
         if card.command_state in _TERMINAL_STATES:
             duration = (
@@ -413,6 +599,12 @@ class ActivityFeed:
             return header
 
         rows: list[str] = [header]
+        if card.detail_state == "ready":
+            rows.extend(self._render_persisted_details(card))
+            if card.error:
+                rows.append(f"  失败原因 · {card.error}")
+            return "\n".join(rows)
+
         for (category, agent), note in card.notes.items():
             marker = _NOTE_LABELS.get(category, "阶段")
             rows.append(
@@ -438,7 +630,124 @@ class ActivityFeed:
             )
         if card.error:
             rows.append(f"  失败原因 · {card.error}")
+        if card.detail_state == "loading":
+            rows.append("  过程 · 正在读取持久记录…")
+        elif card.detail_state == "error":
+            rows.append(f"  详情加载失败 · {card.detail_error}")
+        elif not card.notes and not card.tools and not card.error:
+            rows.append("  过程 · 暂无可显示的阶段、工具或权限事件")
         return "\n".join(rows)
+
+    def _render_persisted_details(self, card: _ActivityCard) -> list[str]:
+        events = card.detail_events
+        agents = tuple(
+            _detail_actor(agent) for agent in card.detail_agents
+            if agent not in {"system", "user"}
+        )
+        agent_summary = "、".join(agents) if agents else "system"
+        kind_counts = dict(card.detail_kind_counts)
+        tool_count = kind_counts.get("tool", 0)
+        permission_count = kind_counts.get("permission", 0)
+        lifecycle_count = sum(
+            kind_counts.get(kind, 0) for kind in _LIFECYCLE_KINDS)
+        status_count = kind_counts.get("status", 0)
+        control_count = sum(
+            kind_counts.get(kind, 0) for kind in _CONTROL_KINDS)
+        rows = [
+            f"  过程概览 · {card.detail_total_count} 条事件 · {agent_summary}"
+            f" · 已读取 {len(events)} 条代表记录",
+            f"  完整统计 · 生命周期 {lifecycle_count} · 阶段 {status_count}"
+            f" · 工具 {tool_count} · 权限 {permission_count}"
+            f" · 控制 {control_count}",
+        ]
+
+        partial_count = kind_counts.get("partial", 0)
+        raw_process_events = tuple(
+            event for event in events if event.kind != "partial"
+        )
+        process_events = self._compact_heartbeats(raw_process_events)
+        compacted_heartbeats = len(raw_process_events) - len(process_events)
+        visible_events, projected_omitted = self._bound_detail_events(
+            process_events)
+        for event in visible_events:
+            label = _DETAIL_KIND_LABELS.get(event.kind, "事件")
+            text = redact_sensitive_text(
+                " ↳ ".join(event.text.splitlines()), limit=500)
+            rows.append(
+                f"  {_detail_time(event.created_at)} · "
+                f"{_detail_actor(event.agent)}"
+                f" · {label} · {text or '已记录'}"
+            )
+
+        if partial_count:
+            rows.append(
+                f"  输出 · {partial_count} 个片段 / "
+                f"{card.detail_partial_char_count} 字"
+                "（正文见聊天主线）"
+            )
+        if tool_count == 0 and permission_count == 0:
+            rows.append("  过程 · 本轮未调用工具或请求权限")
+        if card.detail_omitted_count:
+            rows.append(
+                f"  … · 持久日志读取省略 {card.detail_omitted_count} 条；"
+                "已保留首尾证据"
+            )
+        if compacted_heartbeats:
+            rows.append(
+                f"  … · 已合并 {compacted_heartbeats} 条重复心跳"
+            )
+        if projected_omitted:
+            rows.append(
+                f"  … · 过程视图再省略 {projected_omitted} 条高频事件"
+            )
+        if not events:
+            rows.append("  过程 · 本轮没有持久过程事件")
+        return rows
+
+    @staticmethod
+    def _compact_heartbeats(
+        events: tuple[ActivityDetailEvent, ...],
+    ) -> tuple[ActivityDetailEvent, ...]:
+        compacted: list[ActivityDetailEvent] = []
+        pending_heartbeat: ActivityDetailEvent | None = None
+        for event in events:
+            is_heartbeat = (
+                event.kind == "status"
+                and "仍在运行（已等待" in event.text
+            )
+            if is_heartbeat:
+                pending_heartbeat = event
+                continue
+            if pending_heartbeat is not None:
+                compacted.append(pending_heartbeat)
+                pending_heartbeat = None
+            compacted.append(event)
+        if pending_heartbeat is not None:
+            compacted.append(pending_heartbeat)
+        return tuple(compacted)
+
+    def _bound_detail_events(
+        self,
+        events: tuple[ActivityDetailEvent, ...],
+    ) -> tuple[tuple[ActivityDetailEvent, ...], int]:
+        if len(events) <= self._max_detail_rows:
+            return events, 0
+
+        selected: dict[int, ActivityDetailEvent] = {}
+        selected[events[0].seq] = events[0]
+        selected[events[-1].seq] = events[-1]
+        for event in events:
+            if event.kind in _DETAIL_IMPORTANT_KINDS:
+                selected[event.seq] = event
+                if len(selected) >= self._max_detail_rows:
+                    break
+        if len(selected) < self._max_detail_rows:
+            for event in reversed(events):
+                selected[event.seq] = event
+                if len(selected) >= self._max_detail_rows:
+                    break
+        bounded = tuple(sorted(selected.values(), key=lambda event: event.seq))
+        return bounded, len(events) - len(bounded)
 
 
 def _clean_session_role(value: object) -> str:
@@ -452,3 +761,16 @@ def _agent_label(card: _ActivityCard, agent: str) -> str:
     if activity is None or not activity.session_role:
         return agent
     return f"{agent} · {activity.session_role}（本会话）"
+
+
+def _detail_time(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone().strftime("%H:%M:%S")
+    except (TypeError, ValueError):
+        return "--:--:--"
+
+
+def _detail_actor(value: str) -> str:
+    compact = " ".join(str(value).split())
+    return redact_sensitive_text(compact, limit=60) or "system"

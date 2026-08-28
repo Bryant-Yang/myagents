@@ -18,7 +18,7 @@ from orchestrator import AgentSpec, Orchestrator
 from storage.store import RoomStore
 from test_basic import make_orch
 from textual.widgets import RichLog
-from tui_activity import ActivityFeed
+from tui_activity import ActivityDetailEvent, ActivityFeed
 
 
 def test_activity_feed_coalesces_progress_and_tool_updates() -> None:
@@ -182,6 +182,202 @@ def test_activity_feed_tracks_latest_agent_and_bounds_terminal_details() -> None
         hard_bound.set_command_state(command_id, "completed")
     assert len(hard_bound.command_ids()) == 2
     assert len(hard_bound.take_evicted()) <= 2
+
+
+def test_persisted_details_project_process_without_repeating_answer() -> None:
+    feed = ActivityFeed()
+    command_id = "cmd-persisted-detail"
+    feed.begin(command_id)
+    answer_chunk = "这段回答正文只应出现在聊天主线"
+    events = (
+        ActivityDetailEvent(1, "system", "queued", "进入队列",
+                            "2026-08-28T01:00:00Z"),
+        ActivityDetailEvent(2, "host", "running", "开始执行",
+                            "2026-08-28T01:00:01Z"),
+        ActivityDetailEvent(3, "host", "status", "正在制定协作计划",
+                            "2026-08-28T01:00:02Z"),
+        ActivityDetailEvent(4, "host", "partial", answer_chunk,
+                            "2026-08-28T01:00:03Z"),
+        ActivityDetailEvent(5, "host", "partial", "第二段",
+                            "2026-08-28T01:00:04Z"),
+        ActivityDetailEvent(6, "host", "completed", "本轮响应结束",
+                            "2026-08-28T01:00:05Z"),
+    )
+
+    assert feed.set_persisted_details(
+        command_id, events, total_count=6, omitted_count=0)
+    rendered = feed.render(command_id, expanded=True)
+    assert "过程概览 · 6 条事件 · host" in rendered
+    assert "阶段 · 正在制定协作计划" in rendered
+    assert (
+        f"输出 · 2 个片段 / {len(answer_chunk) + len('第二段')} 字"
+        "（正文见聊天主线）"
+    ) in rendered
+    assert "本轮未调用工具或请求权限" in rendered
+    assert answer_chunk not in rendered
+
+
+def test_persisted_details_redact_and_compact_noisy_process_events() -> None:
+    feed = ActivityFeed(max_detail_rows=20)
+    command_id = "cmd-safe-detail"
+    feed.begin(command_id)
+    events = (
+        ActivityDetailEvent(1, "qwen", "running", "开始执行",
+                            "2026-08-28T01:00:00Z"),
+        ActivityDetailEvent(2, "qwen", "status", "仍在运行（已等待 10 秒）",
+                            "2026-08-28T01:00:10Z"),
+        ActivityDetailEvent(3, "qwen", "status", "仍在运行（已等待 20 秒）",
+                            "2026-08-28T01:00:20Z"),
+        ActivityDetailEvent(
+            4, "qwen", "tool",
+            "Shell · running\nAPI_KEY=supersecret python inspect.py",
+            "2026-08-28T01:00:21Z"),
+        ActivityDetailEvent(5, "qwen", "permission", "允许读取一次",
+                            "2026-08-28T01:00:22Z"),
+        ActivityDetailEvent(6, "system", "interjection_requested",
+                            "请求插入最早排队输入",
+                            "2026-08-28T01:00:23Z"),
+        ActivityDetailEvent(7, "qwen", "status", "正在整理结果",
+                            "2026-08-28T01:00:24Z"),
+        ActivityDetailEvent(8, "qwen", "completed", "本轮响应结束",
+                            "2026-08-28T01:00:25Z"),
+    )
+
+    feed.set_persisted_details(
+        command_id,
+        events,
+        total_count=12,
+        omitted_count=4,
+        agents=("qwen", "API_KEY=agentsecret"),
+    )
+    rendered = feed.render(command_id, expanded=True)
+    assert "API_KEY=[已隐藏]" in rendered
+    assert "supersecret" not in rendered
+    assert "agentsecret" not in rendered
+    assert "已等待 10 秒" not in rendered
+    assert "已等待 20 秒" in rendered
+    assert "已合并 1 条重复心跳" in rendered
+    assert "权限 · 允许读取一次" in rendered
+    assert "插话 · 请求插入最早排队输入" in rendered
+    assert "持久日志读取省略 4 条" in rendered
+
+    bounded = ActivityFeed(max_detail_rows=5)
+    bounded.begin("cmd-bounded")
+    noisy = tuple(
+        ActivityDetailEvent(
+            index, "qwen", "status", f"阶段 {index}",
+            f"2026-08-28T01:01:{index:02d}Z",
+        )
+        for index in range(1, 13)
+    )
+    bounded.set_persisted_details(
+        "cmd-bounded", noisy, total_count=12, omitted_count=0)
+    assert "过程视图再省略 7 条高频事件" in bounded.render(
+        "cmd-bounded", expanded=True)
+
+
+def test_persisted_detail_loading_error_is_visible_and_redacted() -> None:
+    feed = ActivityFeed()
+    feed.begin("cmd-load-error")
+    feed.start_details_loading("cmd-load-error")
+    assert "正在读取持久记录" in feed.render(
+        "cmd-load-error", expanded=True)
+
+    feed.set_details_error(
+        "cmd-load-error", "API_KEY=supersecret 无法读取事件")
+    rendered = feed.render("cmd-load-error", expanded=True)
+    assert "详情加载失败" in rendered
+    assert "API_KEY=[已隐藏]" in rendered
+    assert "supersecret" not in rendered
+
+
+def test_terminal_card_rejects_stale_running_detail_snapshot() -> None:
+    feed = ActivityFeed()
+    command_id = "cmd-detail-race"
+    feed.begin(command_id)
+    feed.set_command_state(command_id, "completed")
+    running_snapshot = (
+        ActivityDetailEvent(1, "codex", "running", "开始执行",
+                            "2026-08-28T01:00:00Z"),
+        ActivityDetailEvent(2, "codex", "status", "回复中",
+                            "2026-08-28T01:00:01Z"),
+    )
+    assert not feed.set_persisted_details(
+        command_id, running_snapshot, total_count=2, omitted_count=0)
+    assert "过程概览" not in feed.render(command_id, expanded=True)
+
+    terminal_snapshot = running_snapshot + (
+        ActivityDetailEvent(3, "codex", "completed", "本轮响应结束",
+                            "2026-08-28T01:00:02Z"),
+    )
+    assert feed.set_persisted_details(
+        command_id, terminal_snapshot, total_count=3, omitted_count=0)
+    assert not feed.set_persisted_details(
+        command_id, running_snapshot, total_count=2, omitted_count=0)
+    rendered = feed.render(command_id, expanded=True)
+    assert "完成 · 本轮响应结束" in rendered
+    assert "过程概览 · 3 条事件" in rendered
+
+    running = ActivityFeed()
+    running.begin("cmd-generation")
+    old_generation = running.start_details_loading("cmd-generation")
+    new_generation = running.start_details_loading("cmd-generation")
+    assert running.set_persisted_details(
+        "cmd-generation",
+        (ActivityDetailEvent(
+            3, "codex", "status", "新快照",
+            "2026-08-28T01:00:03Z"),),
+        total_count=3,
+        omitted_count=2,
+        generation=new_generation,
+    )
+    assert not running.set_persisted_details(
+        "cmd-generation",
+        (ActivityDetailEvent(
+            2, "codex", "status", "旧快照",
+            "2026-08-28T01:00:02Z"),),
+        total_count=2,
+        omitted_count=1,
+        generation=old_generation,
+    )
+    running_rendered = running.render("cmd-generation", expanded=True)
+    assert "新快照" in running_rendered
+    assert "旧快照" not in running_rendered
+
+
+def test_persisted_detail_overview_uses_complete_category_counts() -> None:
+    feed = ActivityFeed()
+    command_id = "cmd-complete-counts"
+    feed.begin(command_id, "completed")
+    sampled = (
+        ActivityDetailEvent(1, "codex", "running", "开始执行",
+                            "2026-08-28T01:00:00Z"),
+        ActivityDetailEvent(70, "codex", "completed", "本轮响应结束",
+                            "2026-08-28T01:01:00Z"),
+    )
+    feed.set_persisted_details(
+        command_id,
+        sampled,
+        total_count=71,
+        omitted_count=69,
+        kind_counts={
+            "running": 1,
+            "status": 40,
+            "tool": 10,
+            "permission": 4,
+            "steering": 2,
+            "interjection_requested": 3,
+            "partial": 9,
+            "completed": 1,
+            "cancelled": 1,
+        },
+        partial_char_count=321,
+    )
+    rendered = feed.render(command_id, expanded=True)
+    assert (
+        "完整统计 · 生命周期 3 · 阶段 40 · 工具 10 · 权限 4 · 控制 6"
+    ) in rendered
+    assert "输出 · 9 个片段 / 321 字" in rendered
 
 
 def test_tui_keeps_one_activity_card_and_primary_messages() -> None:
@@ -587,6 +783,7 @@ def test_activity_card_survives_background_session_switch() -> None:
                 )
                 assert "后台测试 · 已完成" in expanded
                 assert "python -m unittest" in expanded
+                assert "过程概览" in expanded
                 assert "响应耗时" in expanded
                 assert "响应耗时 未知" not in expanded
 
@@ -718,10 +915,88 @@ def test_background_churn_does_not_reuse_stale_expansion_state() -> None:
     asyncio.run(run())
 
 
+def test_details_restores_latest_persisted_task_after_restart() -> None:
+    async def run() -> None:
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "project"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            store.append_event(
+                command_id="cmd-restored-detail", agent="system",
+                kind="queued", text="进入队列")
+            store.append_event(
+                command_id="cmd-restored-detail", agent="codex",
+                kind="status", text="正在检查项目")
+            store.append_event(
+                command_id="cmd-restored-detail", agent="codex",
+                kind="partial", text="主线回答")
+            store.append_event(
+                command_id="cmd-restored-detail",
+                agent="API_KEY=agentsecret",
+                kind="completed", text="本轮响应结束")
+            app = ChatApp(
+                workdir=str(workdir),
+                orchestrator=Orchestrator(str(workdir), store=store),
+            )
+
+            async with app.run_test():
+                assert not app._activity_feed.command_ids()
+                app.action_toggle_details()
+                await app.workers.wait_for_complete()
+                rendered = "\n".join(
+                    str(line.text) for line in app.query_one(RichLog).lines
+                )
+                assert "任务 cmd-rest" in rendered
+                assert "过程概览 · 4 条事件 · codex" in rendered
+                assert "阶段 · 正在检查项目" in rendered
+                assert "输出 · 1 个片段 / 4 字（正文见聊天主线）" in rendered
+                assert "主线回答" not in rendered
+                assert "agentsecret" not in rendered
+
+    asyncio.run(run())
+
+
+def test_interrupted_partial_is_summarized_without_repeating_body() -> None:
+    async def run() -> None:
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "project"
+            workdir.mkdir()
+            store = RoomStore(workdir, state_root=root / "state")
+            store.append_event(
+                command_id="cmd-interrupted", agent="codex",
+                kind="running", text="开始执行")
+            store.append_event(
+                command_id="cmd-interrupted", agent="codex",
+                kind="partial", text="不应在详情重复的正文")
+            app = ChatApp(
+                workdir=str(workdir),
+                orchestrator=Orchestrator(str(workdir), store=store),
+            )
+
+            async with app.run_test():
+                app.action_toggle_details()
+                await app.workers.wait_for_complete()
+                rendered = "\n".join(
+                    str(line.text) for line in app.query_one(RichLog).lines
+                )
+                assert "上次响应在输出过程中中断" in rendered
+                assert "输出 · 1 个片段" in rendered
+                assert "不应在详情重复的正文" not in rendered
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     test_activity_feed_coalesces_progress_and_tool_updates()
     test_activity_feed_shows_pending_requests_without_duplicate_text()
     test_activity_feed_tracks_latest_agent_and_bounds_terminal_details()
+    test_persisted_details_project_process_without_repeating_answer()
+    test_persisted_details_redact_and_compact_noisy_process_events()
+    test_persisted_detail_loading_error_is_visible_and_redacted()
+    test_terminal_card_rejects_stale_running_detail_snapshot()
+    test_persisted_detail_overview_uses_complete_category_counts()
     test_tui_keeps_one_activity_card_and_primary_messages()
     test_tui_failure_stays_visible_outside_activity_details()
     test_details_toggles_only_the_latest_activity_card()
@@ -731,4 +1006,6 @@ if __name__ == "__main__":
     test_activity_card_survives_background_session_switch()
     test_external_background_command_freezes_authoritative_duration()
     test_background_churn_does_not_reuse_stale_expansion_state()
+    test_details_restores_latest_persisted_task_after_restart()
+    test_interrupted_partial_is_summarized_without_repeating_body()
     print("ok  TUI 执行活动折叠、展开与失败可见性")

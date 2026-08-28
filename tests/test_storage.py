@@ -677,6 +677,54 @@ def test_execution_event_journal_and_legacy_migration():
     print("ok  独立执行事件日志 + 旧房间兼容迁移 + 损坏拒绝")
 
 
+def test_read_command_events_is_bounded_and_command_scoped():
+    """详情读取只返回目标 command，并保留首尾证据而不是静默截尾。"""
+    tmp, workdir, state_root = make_env()
+    with tmp:
+        store = open_store(workdir, state_root)
+        assert store.read_latest_command_events(limit=4) is None
+        store.append_event(
+            command_id="cmd-detail", agent="system", kind="queued",
+            text="进入队列")
+        store.append_event(
+            command_id="cmd-other", agent="system", kind="running",
+            text="另一个任务")
+        for index in range(5):
+            store.append_event(
+                command_id="cmd-detail", agent="kimi", kind="status",
+                text=f"阶段 {index}")
+        store.append_event(
+            command_id="cmd-detail", agent="kimi", kind="completed",
+            text="本轮响应结束")
+
+        page = store.read_command_events("cmd-detail", limit=4)
+        assert page["total_count"] == 7
+        assert page["omitted_count"] == 3
+        assert len(page["items"]) == 4
+        assert all(
+            item.command_id == "cmd-detail" for item in page["items"])
+        assert page["items"][0].kind == "queued"
+        assert page["items"][-1].kind == "completed"
+        assert [item.seq for item in page["items"]] == sorted(
+            item.seq for item in page["items"])
+        assert page["kind_counts"] == {
+            "queued": 1, "status": 5, "completed": 1}
+        assert page["agents"] == ("system", "kimi")
+        assert page["partial_char_count"] == 0
+
+        latest_page = store.read_latest_command_events(limit=4)
+        assert latest_page is not None
+        assert latest_page["command_id"] == "cmd-detail"
+        assert latest_page["items"][-1].kind == "completed"
+
+        try:
+            store.read_command_events("", limit=4)
+            raise AssertionError("空 command_id 应拒绝")
+        except ValueError:
+            pass
+    print("ok  command 详情读取隔离、有界且保留首尾证据")
+
+
 if __name__ == "__main__":
     test_room_identity()
     test_named_session_identity_isolation_and_validation()
@@ -702,4 +750,5 @@ if __name__ == "__main__":
     test_lease_pid_write_failure_releases_lock()
     test_lease_non_busy_oserror_not_rewritten()
     test_execution_event_journal_and_legacy_migration()
+    test_read_command_events_is_bounded_and_command_scoped()
     print("\n全部通过")

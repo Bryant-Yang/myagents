@@ -26,7 +26,7 @@ import json
 import re
 import shlex
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -72,6 +72,7 @@ from workflow import (
 )
 from storage.store import (
     DEFAULT_SESSION_NAME,
+    ExecutionEventRecord,
     RoomBusyError,
     RoomStore,
     WorkdirMismatchError,
@@ -93,7 +94,7 @@ from tui_completion import (
 )
 from tui_status import TaskProgress, command_elapsed_seconds
 from tui_markdown import render_chat_markdown
-from tui_activity import ActivityFeed
+from tui_activity import ActivityDetailEvent, ActivityFeed
 
 # 每个发言者的显示颜色
 _COLORS = {"user": "yellow", "kimi": "cyan", "opencode": "green",
@@ -129,6 +130,34 @@ _SENSITIVE_DETAIL_KEYS = {
 _LEGACY_IMAGE_PREVIEW_RE = re.compile(
     r"\[图片附件：\s*[^\]\r\n]+\]"
 )
+
+
+def _activity_detail_events(
+    records: Iterable[ExecutionEventRecord],
+) -> tuple[ActivityDetailEvent, ...]:
+    """把 storage record 复制成 UI 快照，避免详情层持有可变存储对象。"""
+    return tuple(
+        ActivityDetailEvent(
+            seq=record.seq,
+            agent=record.agent,
+            kind=record.kind,
+            text=record.text,
+            created_at=record.created_at,
+        )
+        for record in records
+    )
+
+
+def _interrupted_event_summary(kind: str, text: str) -> str:
+    """中断恢复不把最后一个 partial 正文复制到状态区或活动详情。"""
+    if kind == "partial":
+        return "上次响应在输出过程中中断"
+    return redact_sensitive_text(" ".join(text.split()), limit=400)
+
+
+def _safe_activity_agent(agent: str) -> str:
+    return redact_sensitive_text(
+        " ".join(agent.split()), limit=60) or "system"
 
 
 def _tool_detail(tool: object) -> str:
@@ -1267,6 +1296,8 @@ class ChatApp(App):
         for item in store.latest_execution_events():
             if item.kind in terminal:
                 continue
+            summary = _interrupted_event_summary(item.kind, item.text)
+            safe_agent = _safe_activity_agent(item.agent)
             try:
                 live = self.bus.get(item.command_id)
             except CommandNotFoundError:
@@ -1284,21 +1315,21 @@ class ChatApp(App):
                     ),
                 )
                 progress.set_agent(
-                    item.agent,
+                    safe_agent,
                     "queued" if state == "queued" else "running",
-                    item.text,
+                    summary,
                 )
                 continue
             progress = self._update_command_progress(
-                item.command_id, "interrupted", item.text)
-            progress.set_agent(item.agent, "interrupted", item.text)
+                item.command_id, "interrupted", summary)
+            progress.set_agent(safe_agent, "interrupted", summary)
             if self._activity_feed.set_command_state(
-                item.command_id, "interrupted", item.text
+                item.command_id, "interrupted", summary
             ):
                 self._upsert_activity_card(item.command_id)
             self._system(
                 f"上次任务 {item.command_id[:8]} 已中断；"
-                f"最后状态：{item.agent} {item.text}")
+                f"最后状态：{safe_agent} {summary}")
         self._render_task_status()
 
     # ---- 时间线输出 ----
@@ -1854,7 +1885,15 @@ class ChatApp(App):
         """展开或收起当前选中、否则最近一张执行活动卡。"""
         command_ids = self._activity_feed.command_ids()
         if not command_ids:
-            self._system("当前没有可展开的执行活动")
+            store = self.orch.store
+            if (
+                store is None
+                or not hasattr(store, "read_latest_command_events")
+            ):
+                self._system("当前会话还没有可展开的执行活动")
+                return
+            self.notify("正在读取最近任务详情…", timeout=2)
+            self._load_latest_persisted_activity(store)
             return
         command_id = (
             self._selected_activity_id
@@ -1865,7 +1904,152 @@ class ChatApp(App):
             self._expanded_activity.remove(command_id)
         else:
             self._expanded_activity.add(command_id)
+            store = self.orch.store
+            if store is not None and hasattr(store, "read_command_events"):
+                generation = self._activity_feed.start_details_loading(
+                    command_id)
+                self._load_persisted_activity_details(
+                    store, command_id, self._activity_feed,
+                    self._activity_room_id,
+                    generation,
+                )
         self._upsert_activity_card(command_id)
+
+    def _load_latest_persisted_activity(self, store: RoomStore) -> None:
+        """没有内存卡时，按需恢复当前 room 最近一个持久任务。"""
+        target_room_id = self._activity_room_id
+        target_feed = self._activity_feed
+
+        async def runner() -> None:
+            try:
+                page = await asyncio.to_thread(
+                    store.read_latest_command_events)
+                if page is None:
+                    if self._activity_room_id == target_room_id:
+                        self._system("当前会话还没有可展开的执行活动")
+                    return
+                items = page["items"]
+                last = items[-1]
+            except Exception as exc:
+                if self._activity_room_id == target_room_id:
+                    self._write(
+                        "system",
+                        "详情加载失败："
+                        + redact_sensitive_text(str(exc), limit=400),
+                        "bold red",
+                    )
+                return
+            if self._activity_feeds.get(target_room_id) is not target_feed:
+                return
+            if target_feed.command_ids():
+                # 等待磁盘期间若已有新任务进入当前 room，不用旧历史抢占焦点。
+                return
+            state = (
+                last.kind
+                if last.kind in {"completed", "failed", "cancelled"}
+                else "interrupted"
+            )
+            safe_last_text = _interrupted_event_summary(
+                last.kind, last.text)
+            safe_agent = _safe_activity_agent(last.agent)
+            target_feed.begin(last.command_id, state)
+            target_feed.record_status(
+                last.command_id,
+                safe_agent,
+                safe_last_text,
+                state=state,
+            )
+            elapsed = (
+                command_elapsed_seconds(
+                    items[0].created_at,
+                    items[-1].created_at,
+                    allow_open_interval=False,
+                )
+                if items else None
+            )
+            target_feed.set_command_state(
+                last.command_id,
+                state,
+                safe_last_text
+                if state in {"failed", "interrupted"} else None,
+                elapsed_seconds=elapsed,
+            )
+            target_feed.set_persisted_details(
+                last.command_id,
+                _activity_detail_events(items),
+                total_count=page["total_count"],
+                omitted_count=page["omitted_count"],
+                kind_counts=page["kind_counts"],
+                agents=page["agents"],
+                partial_char_count=page["partial_char_count"],
+            )
+            self._expanded_activity_ids.setdefault(
+                target_room_id, set()).add(last.command_id)
+            if self._activity_room_id == target_room_id:
+                self._upsert_activity_card(last.command_id)
+
+        self.run_worker(runner())
+
+    def _load_persisted_activity_details(
+        self,
+        store: RoomStore,
+        command_id: str,
+        target_feed: ActivityFeed,
+        target_room_id: str,
+        generation: int,
+    ) -> None:
+        """异步读取一个任务的持久详情；切会话不会串写当前 RichLog。"""
+        async def runner() -> None:
+            try:
+                page = await asyncio.to_thread(
+                    store.read_command_events, command_id)
+            except Exception as exc:
+                if target_feed.has(command_id):
+                    target_feed.set_details_error(
+                        command_id, str(exc), generation=generation)
+            else:
+                if target_feed.has(command_id):
+                    target_feed.set_persisted_details(
+                        command_id,
+                        _activity_detail_events(page["items"]),
+                        total_count=page["total_count"],
+                        omitted_count=page["omitted_count"],
+                        kind_counts=page["kind_counts"],
+                        agents=page["agents"],
+                        partial_char_count=page["partial_char_count"],
+                        generation=generation,
+                    )
+            if (
+                self._activity_room_id == target_room_id
+                and self._activity_feed is target_feed
+                and target_feed.has(command_id)
+            ):
+                self._upsert_activity_card(command_id)
+
+        self.run_worker(runner())
+
+    def _refresh_expanded_persisted_detail(
+        self,
+        command_id: str,
+    ) -> None:
+        """终态或会话切回时，把运行中旧快照刷新为完整持久过程。"""
+        store = self.orch.store
+        if (
+            store is None
+            or not hasattr(store, "read_command_events")
+            or command_id not in self._expanded_activity
+            or not self._activity_feed.has(command_id)
+            or self._activity_feed.has_terminal_persisted_details(command_id)
+        ):
+            return
+        generation = self._activity_feed.start_details_loading(command_id)
+        self._load_persisted_activity_details(
+            store,
+            command_id,
+            self._activity_feed,
+            self._activity_room_id,
+            generation,
+        )
 
     def action_focus_activities(self) -> None:
         """进入活动卡键盘导航，并默认选中最近一张。"""
@@ -2079,6 +2263,8 @@ class ChatApp(App):
                 if progress.is_terminal else None
             ),
         )
+        if self.is_mounted and progress.is_terminal:
+            self._refresh_expanded_persisted_detail(command_id)
         if self.is_mounted and (
                 activity_changed or self._activity_feed.has(command_id)):
             # queued 序号取决于同 room 其余卡片的状态；任一 command 出队或
@@ -2411,6 +2597,8 @@ class ChatApp(App):
         snapshot = self.session_manager.snapshot()
         for message in sorted(snapshot.history, key=lambda item: item.seq):
             self._write(message.speaker, message.text)
+        for command_id in tuple(self._expanded_activity):
+            self._refresh_expanded_persisted_detail(command_id)
         self._refresh_activity_cards()
         self._restore_interrupted_executions()
         self._system(

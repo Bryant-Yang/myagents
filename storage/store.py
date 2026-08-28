@@ -20,11 +20,13 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import unicodedata
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Iterator, Mapping
 
 from session_roles import (
     SessionRole,
@@ -381,6 +383,7 @@ class RoomStore:
         self._state: dict = {}
         self._next_seq = 1
         self._next_event_seq = 1
+        self._events_lock = threading.RLock()
         self._open()
 
     @classmethod
@@ -564,27 +567,60 @@ class RoomStore:
         return last_seq + 1
 
     def _load_events(self) -> list[ExecutionEventRecord]:
-        if not self.events_path.is_file():
-            raise CorruptedStorageError(
-                f"缺少 events.jsonl：{self.events_path}")
-        records: list[ExecutionEventRecord] = []
-        with open(self.events_path, "r", encoding="utf-8") as f:
-            for line_no, line in enumerate(f, start=1):
-                if len(line.encode("utf-8")) > MAX_RECORD_BYTES:
-                    raise CorruptedStorageError(
-                        f"events 第 {line_no} 行超过单条记录上限 "
-                        f"{MAX_RECORD_BYTES} 字节")
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise CorruptedStorageError(
-                        f"events 第 {line_no} 行不是合法 JSON：{exc}") from exc
-                records.append(ExecutionEventRecord.from_dict(
-                    data, line_no=line_no))
-        return records
+        return list(self._iter_event_snapshot())
+
+    def _iter_event_snapshot(self) -> Iterator[ExecutionEventRecord]:
+        """流式读取一个完整前缀；只在取得 fd/size 时短暂阻塞 append。
+
+        events 文件只追加不回写。锁内取得的文件大小因此定义了稳定前缀，后续
+        解析无需继续持锁，也不会把 Textual event loop 的同步事件写入卡在长扫描
+        后面。每次最多读取一条记录大小，避免为详情全量载入文件。
+        """
+        with self._events_lock:
+            if not self.events_path.is_file():
+                raise CorruptedStorageError(
+                    f"缺少 events.jsonl：{self.events_path}")
+            fd = os.open(self.events_path, os.O_RDONLY)
+            try:
+                snapshot_size = os.fstat(fd).st_size
+            except BaseException:
+                os.close(fd)
+                raise
+        try:
+            with os.fdopen(fd, "rb") as stream:
+                remaining = snapshot_size
+                line_no = 0
+                while remaining:
+                    line_no += 1
+                    raw = stream.readline(
+                        min(remaining, MAX_RECORD_BYTES + 1))
+                    if not raw:
+                        raise CorruptedStorageError(
+                            "events.jsonl 在读取快照期间意外截断")
+                    remaining -= len(raw)
+                    if len(raw) > MAX_RECORD_BYTES:
+                        raise CorruptedStorageError(
+                            f"events 第 {line_no} 行超过单条记录上限 "
+                            f"{MAX_RECORD_BYTES} 字节")
+                    if not raw.endswith(b"\n"):
+                        raise CorruptedStorageError(
+                            f"events 第 {line_no} 行缺少换行终止符")
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise CorruptedStorageError(
+                            f"events 第 {line_no} 行不是合法 JSON：{exc}"
+                        ) from exc
+                    yield ExecutionEventRecord.from_dict(
+                        data, line_no=line_no)
+        except BaseException:
+            # fdopen 未取得所有权前出错时仍需关闭；正常 with 退出后 EBADF 忽略。
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
 
     # ---- 单写者 lease ----
 
@@ -847,23 +883,25 @@ class RoomStore:
         if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
             raise LimitExceededError(
                 f"执行事件文本超过上限 {MAX_TEXT_BYTES} 字节")
-        record = ExecutionEventRecord(
-            seq=self._next_event_seq, command_id=command_id,
-            agent=agent, kind=kind, text=text, created_at=_utc_now_iso())
-        line = json.dumps(record.to_dict(), ensure_ascii=False)
-        if len(line.encode("utf-8")) > MAX_RECORD_BYTES:
-            raise LimitExceededError(
-                f"执行事件记录超过上限 {MAX_RECORD_BYTES} 字节")
-        fd = os.open(self.events_path, os.O_APPEND | os.O_WRONLY)
-        try:
-            with os.fdopen(fd, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-        except BaseException:
-            raise
-        self._next_event_seq += 1
-        return record
+        with self._events_lock:
+            record = ExecutionEventRecord(
+                seq=self._next_event_seq, command_id=command_id,
+                agent=agent, kind=kind, text=text,
+                created_at=_utc_now_iso())
+            line = json.dumps(record.to_dict(), ensure_ascii=False)
+            if len(line.encode("utf-8")) > MAX_RECORD_BYTES:
+                raise LimitExceededError(
+                    f"执行事件记录超过上限 {MAX_RECORD_BYTES} 字节")
+            fd = os.open(self.events_path, os.O_APPEND | os.O_WRONLY)
+            try:
+                with os.fdopen(fd, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except BaseException:
+                raise
+            self._next_event_seq += 1
+            return record
 
     def read_events(self, after_seq: int = 0,
                     limit: int = DEFAULT_READ_LIMIT) -> dict:
@@ -879,9 +917,77 @@ class RoomStore:
             "next_after_seq": items[-1].seq if items else after_seq,
         }
 
+    def read_command_events(
+        self,
+        command_id: str,
+        limit: int = MAX_READ_LIMIT,
+    ) -> dict:
+        """有界读取一个 command 的过程事件，并保留首尾生命周期证据。
+
+        详情视图按需调用该接口。事件总量超过上限时返回代表性的头尾窗口，
+        不会因只取前 ``limit`` 条而把 terminal 结果藏掉。
+        """
+        if not isinstance(command_id, str) or not command_id:
+            raise ValueError("command_id 不能为空")
+        bounded_limit = max(1, min(int(limit), MAX_READ_LIMIT))
+        return self._command_events_page(
+            self._iter_event_snapshot(), command_id, bounded_limit)
+
+    def read_latest_command_events(
+        self,
+        limit: int = MAX_READ_LIMIT,
+    ) -> dict | None:
+        """单次扫描返回最近 command 的详情；空日志返回 ``None``。"""
+        bounded_limit = max(1, min(int(limit), MAX_READ_LIMIT))
+        command_id: str | None = None
+        for record in self._iter_event_snapshot():
+            command_id = record.command_id
+        if command_id is None:
+            return None
+        return self._command_events_page(
+            self._iter_event_snapshot(), command_id, bounded_limit)
+
+    @staticmethod
+    def _command_events_page(
+        all_records: Iterable[ExecutionEventRecord],
+        command_id: str,
+        bounded_limit: int,
+    ) -> dict:
+        head_count = 0 if bounded_limit == 1 else max(
+            1, bounded_limit // 3)
+        tail_count = bounded_limit - head_count
+        head: list[ExecutionEventRecord] = []
+        tail: deque[ExecutionEventRecord] = deque(maxlen=tail_count)
+        total_count = 0
+        kind_counts: dict[str, int] = {}
+        agents: dict[str, None] = {}
+        partial_char_count = 0
+        for record in all_records:
+            if record.command_id != command_id:
+                continue
+            total_count += 1
+            kind_counts[record.kind] = kind_counts.get(record.kind, 0) + 1
+            agents.setdefault(record.agent, None)
+            if record.kind == "partial":
+                partial_char_count += len(record.text)
+            if len(head) < head_count:
+                head.append(record)
+            else:
+                tail.append(record)
+        items = head + list(tail)
+        return {
+            "command_id": command_id,
+            "items": items,
+            "total_count": total_count,
+            "omitted_count": total_count - len(items),
+            "kind_counts": kind_counts,
+            "agents": tuple(agents),
+            "partial_char_count": partial_char_count,
+        }
+
     def latest_execution_events(self) -> list[ExecutionEventRecord]:
         """每个 command 的最后一条事件，按事件 seq 排序。"""
         latest: dict[str, ExecutionEventRecord] = {}
-        for record in self._load_events():
+        for record in self._iter_event_snapshot():
             latest[record.command_id] = record
         return sorted(latest.values(), key=lambda record: record.seq)
