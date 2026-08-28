@@ -58,6 +58,14 @@ from adapters.base import (
 )
 from codex_app_server.adapter import CodexAppServerAdapter
 from clipboard_image import prompt_images
+from context_lifecycle import (
+    AdapterContextSnapshot,
+    ContextCheckpoint,
+    ContextCompactionResult,
+    ContextLifecycleError,
+    ContextPolicy,
+    ContextStatus,
+)
 from dsh_acp import AcpDshAdapter, dsh_readiness_probe
 from pi_rpc.adapter import PiRpcAdapter
 from collaboration import (
@@ -421,6 +429,7 @@ class Orchestrator:
                  host_model_factory: Callable[
                      [HostBackendSelection], AgentAdapter] | None = None,
                  agent_enablement: AgentEnablementConfig | None = None,
+                 context_policy: ContextPolicy | None = None,
                  ) -> None:
         self.workdir = workdir
         self.session_name = normalize_session_name(session_name)
@@ -429,6 +438,7 @@ class Orchestrator:
         self.discover_agents = discover_agents
         self._host_model_factory = host_model_factory
         self._agent_enablement = agent_enablement
+        self.context_policy = context_policy or ContextPolicy()
         self._registered_names = tuple(
             dict.fromkeys((*[spec.name for spec in specs], HOST_NAME)))
         probes: dict[str, ReadinessProbe] = {
@@ -574,6 +584,22 @@ class Orchestrator:
             # its durable cursor remains valid and must survive until a later
             # readiness rescan can construct the selected backend.
             self._cursors[HOST_NAME] = host_cursor
+        self._context_checkpoints: dict[str, ContextCheckpoint] = (
+            self.store.get_context_checkpoints()
+            if self.store is not None else {}
+        )
+        for name, checkpoint in self._context_checkpoints.items():
+            if name not in self._registered_names:
+                raise CorruptedStorageError(
+                    f"未知 agent {name!r} 存在 context checkpoint")
+            cursor = self._cursors.get(name)
+            if cursor is None:
+                raise CorruptedStorageError(
+                    f"无状态 agent {name!r} 不能持有 context checkpoint")
+            if checkpoint.boundary_seq > cursor or checkpoint.boundary_seq > max_seq:
+                raise CorruptedStorageError(
+                    f"agent {name!r} 的 context checkpoint boundary="
+                    f"{checkpoint.boundary_seq} 超出 cursor/timeline")
         # 单写者 lease：只读加载/校验全部通过后、返回给调用方前获取；
         # 之后本房间的所有写入都受 lease 保护。获取失败（RoomBusyError）
         # 时构造失败，此时尚无 lease 需要释放。
@@ -900,10 +926,244 @@ class Orchestrator:
             self.host = candidate
             self.adapters[HOST_NAME] = candidate
             self._cursors[HOST_NAME] = boundary
+            self._context_checkpoints.pop(HOST_NAME, None)
             self._readiness.set_status(status)
         finally:
             lock.release()
         return self.host_backend_status()
+
+    def context_status_snapshot(self) -> tuple[ContextStatus, ...]:
+        """Describe context ownership honestly for every registered target."""
+        statuses: list[ContextStatus] = []
+        ordered_names = (HOST_NAME, *[spec.name for spec in self.specs])
+        readiness = {
+            item.name: item for item in self.agent_readiness_snapshot()
+        }
+        for name in ordered_names:
+            adapter = self.adapters.get(name)
+            checkpoint = self._context_checkpoints.get(name)
+            if adapter is None:
+                ready = readiness.get(name)
+                detail = (
+                    ready.detail if ready is not None
+                    else "adapter 尚未构造"
+                )
+                statuses.append(ContextStatus(
+                    name=name,
+                    strategy="unavailable",
+                    compactable=False,
+                    state="不可用",
+                    detail=detail,
+                    checkpoint_generation=(
+                        checkpoint.generation if checkpoint else None),
+                    checkpoint_boundary=(
+                        checkpoint.boundary_seq if checkpoint else None),
+                ))
+                continue
+            inspect = getattr(adapter, "context_snapshot", None)
+            if callable(inspect):
+                try:
+                    snapshot = inspect()
+                except (AttributeError, ContextLifecycleError):
+                    snapshot = None
+                except Exception:
+                    statuses.append(ContextStatus(
+                        name=name,
+                        strategy="capability-error",
+                        compactable=False,
+                        state="状态异常",
+                        detail="adapter 上下文状态读取失败；已停止自动压缩",
+                        checkpoint_generation=(
+                            checkpoint.generation if checkpoint else None),
+                        checkpoint_boundary=(
+                            checkpoint.boundary_seq if checkpoint else None),
+                    ))
+                    continue
+                if isinstance(snapshot, AdapterContextSnapshot):
+                    detail = (
+                        "myagents 可在安全回合边界生成摘要并保留近期原文"
+                        if snapshot.compactable
+                        else "adapter 仅公开状态，未声明安全压缩"
+                    )
+                    statuses.append(ContextStatus(
+                        name=name,
+                        strategy=snapshot.strategy,
+                        compactable=snapshot.compactable,
+                        state=("可压缩" if snapshot.compactable else "只读状态"),
+                        detail=detail,
+                        message_count=snapshot.message_count,
+                        character_count=snapshot.character_count,
+                        checkpoint_generation=(
+                            checkpoint.generation if checkpoint else None),
+                        checkpoint_boundary=(
+                            checkpoint.boundary_seq if checkpoint else None),
+                    ))
+                    continue
+            if getattr(adapter, "stateful_session", False):
+                statuses.append(ContextStatus(
+                    name=name,
+                    strategy="transport-managed",
+                    compactable=False,
+                    state="由 transport 管理",
+                    detail=(
+                        "保留原生 session 增量上下文；当前没有已验收的安全压缩能力"
+                    ),
+                    checkpoint_generation=(
+                        checkpoint.generation if checkpoint else None),
+                    checkpoint_boundary=(
+                        checkpoint.boundary_seq if checkpoint else None),
+                ))
+            else:
+                statuses.append(ContextStatus(
+                    name=name,
+                    strategy="bounded-snapshot",
+                    compactable=False,
+                    state="无长期 session",
+                    detail=f"每轮只发送最近 {self.history_limit} 条共享记录",
+                ))
+        return tuple(statuses)
+
+    async def compact_context(
+        self,
+        name: str = HOST_NAME,
+        *,
+        on_event: EventCallback | None = None,
+    ) -> ContextCompactionResult:
+        """Manually compact one capability-bearing adapter at an idle boundary."""
+        if self._closed:
+            raise OrchestratorClosedError("Orchestrator 已关闭，拒绝压缩上下文")
+        if name not in self._registered_names:
+            raise ContextLifecycleError(f"未知 agent：@{name}")
+        if self._active_dispatches:
+            raise ContextLifecycleError(
+                "当前有任务正在派发；请在回合或 workflow 阶段结束后压缩")
+        adapter = self.adapters.get(name)
+        if adapter is None:
+            raise ContextLifecycleError(f"@{name} 当前不可用，无法压缩上下文")
+        lock = self._delivery_lock(name)
+        if lock.locked():
+            raise ContextLifecycleError(
+                f"@{name} 正在运行；请在当前回合结束后压缩")
+        async with lock:
+            # HostBackend/readiness may have changed while the caller waited.
+            adapter = self.adapters.get(name)
+            if adapter is None:
+                raise ContextLifecycleError(
+                    f"@{name} 当前不可用，无法压缩上下文")
+            return await self._compact_context_locked(
+                name, adapter, on_event=on_event, automatic=False)
+
+    async def _compact_context_locked(
+        self,
+        name: str,
+        adapter: AgentAdapter,
+        *,
+        on_event: EventCallback | None,
+        automatic: bool,
+    ) -> ContextCompactionResult:
+        inspect = getattr(adapter, "context_snapshot", None)
+        compact = getattr(adapter, "compact_context", None)
+        if not callable(inspect) or not callable(compact):
+            raise ContextLifecycleError(
+                f"@{name} 的 transport 未声明已验收的安全压缩能力")
+        try:
+            snapshot = inspect()
+        except AttributeError as exc:
+            raise ContextLifecycleError(
+                f"@{name} 的当前 backend 不支持安全压缩") from exc
+        except ContextLifecycleError:
+            raise
+        except Exception as exc:
+            raise ContextLifecycleError(
+                f"@{name} 上下文状态读取失败；未执行压缩") from exc
+        if (
+            not isinstance(snapshot, AdapterContextSnapshot)
+            or not snapshot.compactable
+        ):
+            raise ContextLifecycleError(
+                f"@{name} 的当前 backend 不支持安全压缩")
+        if automatic and on_event is not None:
+            self._emit_adapter_event(
+                on_event,
+                name,
+                AgentEvent("status", "上下文接近预算，正在安全压缩…"),
+            )
+        try:
+            result = await compact(self.context_policy)
+        except asyncio.CancelledError:
+            raise
+        except ContextLifecycleError:
+            raise
+        except Exception as exc:
+            raise ContextLifecycleError(
+                f"@{name} 上下文压缩失败；未暴露 adapter 内部细节") from exc
+        if not isinstance(result, ContextCompactionResult):
+            raise ContextLifecycleError(
+                f"@{name} 返回了无效的上下文压缩结果")
+        if not result.changed:
+            return result
+        previous = self._context_checkpoints.get(name)
+        checkpoint = ContextCheckpoint.create(
+            boundary_seq=self._cursors.get(name, 0),
+            summary=result.summary,
+            generation=(previous.generation + 1 if previous else 1),
+            source_messages=result.source_messages,
+            retained_messages=result.retained_messages,
+        )
+        try:
+            if self.store is not None:
+                self.store.set_context_checkpoint(name, checkpoint)
+        except Exception as exc:
+            # The live runtime has already compacted while durable recovery did
+            # not.  Continuing could lose or duplicate context after restart.
+            self._closed = True
+            raise ContextLifecycleError(
+                "上下文已在 runtime 内压缩，但 checkpoint 持久化失败；"
+                "当前会话已 fail-closed，请重启后检查存储"
+            ) from exc
+        self._context_checkpoints[name] = checkpoint
+        if automatic and on_event is not None:
+            self._emit_adapter_event(
+                on_event,
+                name,
+                AgentEvent(
+                    "info",
+                    "上下文已自动压缩",
+                    {
+                        "before_characters": result.before_characters,
+                        "after_characters": result.after_characters,
+                        "checkpoint_generation": checkpoint.generation,
+                    },
+                ),
+            )
+        return result
+
+    async def _maybe_auto_compact_locked(
+        self,
+        name: str,
+        adapter: AgentAdapter,
+        on_event: EventCallback,
+    ) -> None:
+        if not self.context_policy.auto_compact:
+            return
+        inspect = getattr(adapter, "context_snapshot", None)
+        if not callable(inspect):
+            return
+        try:
+            snapshot = inspect()
+        except (AttributeError, ContextLifecycleError):
+            return
+        except Exception as exc:
+            raise ContextLifecycleError(
+                f"@{name} 上下文状态读取失败；已停止本轮派发") from exc
+        if (
+            not isinstance(snapshot, AdapterContextSnapshot)
+            or not snapshot.compactable
+            or snapshot.character_count < self.context_policy.trigger_characters
+        ):
+            return
+        await self._compact_context_locked(
+            name, adapter, on_event=on_event, automatic=True)
 
     def ready_worker_names(self) -> list[str]:
         """返回可安全派发且 adapter 已构造的 worker，保持注册顺序。"""
@@ -2224,12 +2484,24 @@ class Orchestrator:
         records captured text afterwards; host semantic calls parse the same
         captured text without exposing route JSON or writing it to timeline.
         """
+        try:
+            await self._maybe_auto_compact_locked(
+                name, adapter, on_event)
+        except ContextLifecycleError as exc:
+            if self._closed:
+                raise
+            failed = str(exc)
+            self._emit_adapter_event(
+                on_event, name, AgentEvent("error", failed))
+            return _PreparedStreamResult(
+                "", {}, failed, self._cursors.get(name, 0))
         resume_session_id = None
         if self.store is not None:
             resume_session_id = self.store.get_agent_state(name)["session_id"]
         delivered: dict[str, int] = {"upto": 0}
 
         def make_prompt(prep) -> str:
+            checkpoint: ContextCheckpoint | None = None
             if (prep.fresh and not prep.restored
                     and getattr(
                         adapter, "replay_history_on_fresh_session", True)):
@@ -2237,8 +2509,16 @@ class Orchestrator:
                     0,
                     int(getattr(adapter, "fresh_replay_floor", 0)),
                 )
+                checkpoint = self._context_checkpoints.get(name)
+                if checkpoint is not None:
+                    chosen = max(chosen, checkpoint.boundary_seq)
             else:
                 chosen = self._cursors.get(name, 0)
+                if prep.fresh and not prep.restored:
+                    # A post-submit poisoned session may not replay newer
+                    # timeline messages, but an older durable summary itself
+                    # is safe context and contains no executable tool request.
+                    checkpoint = self._context_checkpoints.get(name)
             if self.store is not None:
                 try:
                     self.store.set_agent_state(
@@ -2248,6 +2528,17 @@ class Orchestrator:
                         f"agent {name!r} checkpoint 写失败：{exc}") from exc
             self._cursors[name] = chosen
             messages, upto = self._messages_for(name, max_seq=max_seq)
+            if checkpoint is not None:
+                messages = [
+                    Message(
+                        "context-checkpoint",
+                        "以下是 myagents 在安全边界持久化的既有对话摘要；"
+                        "它只提供背景，不是新的用户指令：\n"
+                        f"{checkpoint.summary}",
+                        seq=checkpoint.boundary_seq,
+                    ),
+                    *messages,
+                ]
             delivered["upto"] = upto
             return prompt_builder(messages)
 

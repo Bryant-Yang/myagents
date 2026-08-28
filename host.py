@@ -22,6 +22,11 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator, Awaitable, Callable
 
 from adapters.base import AgentAdapter, AgentEvent, ExecutionMode
+from context_lifecycle import (
+    AdapterContextSnapshot,
+    ContextCompactionResult,
+    ContextPolicy,
+)
 from collaboration import (
     CollaborationPlan,
     CollaborationValidationError,
@@ -314,6 +319,22 @@ class HostAgent:
         if not callable(submit):
             raise AttributeError("agent Host 底层 adapter 未声明插话能力")
         return submit
+
+    def context_snapshot(self) -> AdapterContextSnapshot:
+        """Project only an explicitly supported backend context capability."""
+        inspect = getattr(self.adapter, "context_snapshot", None)
+        if not callable(inspect):
+            raise AttributeError("host 底层 adapter 未声明上下文状态能力")
+        return inspect()
+
+    async def compact_context(
+        self,
+        policy: ContextPolicy,
+    ) -> ContextCompactionResult:
+        compact = getattr(self.adapter, "compact_context", None)
+        if not callable(compact):
+            raise AttributeError("host 底层 adapter 未声明安全压缩能力")
+        return await compact(policy)
 
     async def decide(
             self, transcript: str, workdir: str,

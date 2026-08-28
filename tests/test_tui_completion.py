@@ -86,6 +86,11 @@ def test_completion_parser_and_command_boundary() -> None:
     assert local_command_for("/roles").description == "查看当前会话角色"
     assert local_command_for("/roles clear").description == "清空当前会话角色"
     assert local_command_for("/host").description == "查看当前会话主持后端"
+    assert local_command_for("/context").description == "查看当前会话上下文状态"
+    assert local_command_for("/compact").description == "压缩 Host 上下文"
+    assert completion_context(
+        "/compact @host", len("/compact @host"), AGENTS,
+    ) is None
     assert local_command_for("/agents rescan").description == "重新检测本机 agent"
     assert local_command_for("/details").description == "展开或收起当前活动卡"
     assert local_command_for("/discuss @kimi @opencode -- 主题") is None

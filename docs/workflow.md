@@ -1,6 +1,6 @@
 # myagents 工作流
 
-> 作者：Bryant Yang　最近更新：2026-08-27
+> 作者：Bryant Yang　最近更新：2026-08-28
 >
 > 每次任务先在本表定位场景，再按需加载文档。顶层契约是
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -22,6 +22,7 @@
 | 11 | 改自然语言有序协作或步骤接力 | [`adr/0013-natural-language-sequential-collaboration.md`](adr/0013-natural-language-sequential-collaboration.md)；[`adr/0019-first-class-collaboration-plan-projection.md`](adr/0019-first-class-collaboration-plan-projection.md)；[`SPEC.md`](SPEC.md) UC-COLLAB-001；`../HARNESS.md` §4.1 | R1–R5 | `collaboration.py`、host/Orchestrator、TUI 状态、fake tests | 2–4 步、至少两个 worker、严格串行、前序产物可见、逐步骤计划/交接可恢复、失败/取消即停、无递归/扩员 |
 | 12 | 改 HostBackend、原生模型 provider/runtime 或 agent Host | [`adr/0017-native-model-backed-host.md`](adr/0017-native-model-backed-host.md)；[`SPEC.md`](SPEC.md) UC-HOST-001；`../HARNESS.md` §4.9 | R1–R6、provider-neutral、model tool-less、agent Host 独立只读、no-replay、无 fallback | `host_backend.py`、`native_agent/`、`host.py`、`AgentSpec`、RoomStore、TUI、fake tests | room 级 model/agent 切换与恢复；provider discovery capability；fresh session；同名 worker 隔离；运行中拒绝；权限/no-fallback/显式 @ 反例通过 |
 | 13 | 改 Esc 取消、运行中插话或 transport steering capability | [`adr/0018-capability-bounded-runtime-interjection.md`](adr/0018-capability-bounded-runtime-interjection.md)；[`adr/0009-bounded-milestone-workflow-steering.md`](adr/0009-bounded-milestone-workflow-steering.md)；[`SPEC.md`](SPEC.md) UC-INTERJECT-001；`../HARNESS.md` §4.3、§4.6 | R2–R6、单 writer、能力显式、no-replay、workflow bounds | adapter capability、Orchestrator active delivery、CommandBus FIFO/execution events、TUI、fake transport tests | Esc 精确取消且 overlay 优先；Alt+↑ 只提升最早 queued command，草稿不参与；其余保持 FIFO；Pi 同 session native steer、Codex 同 turn native steer；ACP/多目标 fail-closed；requested 在协议写入前持久化，uncertain 源命令不得重放 |
+| 14 | 改长会话预算、压缩或摘要恢复 | [`adr/0020-capability-bounded-context-lifecycle.md`](adr/0020-capability-bounded-context-lifecycle.md)；[`adr/0001-persistent-room-command-bus-mcp.md`](adr/0001-persistent-room-command-bus-mcp.md)；[`SPEC.md`](SPEC.md) UC-CONTEXT-001；`../HARNESS.md` §4.10 | R1–R4、单 writer、capability-first、timeline append-only、no-replay | `context_lifecycle.py`、明确声明 capability 的 adapter/runtime、RoomStore、Orchestrator/TUI、fake tests | 自动/手动均只在安全边界；权威摘要后才替换；checkpoint 可恢复；未获证 transport 拒绝；跨 backend/profile 不复用；持久失败 fail-closed |
 
 不在表内且会改变协议、安全或外部接口的任务，先向用户确认范围。
 

@@ -32,6 +32,7 @@ required=(
   docs/adr/0017-native-model-backed-host.md
   docs/adr/0018-capability-bounded-runtime-interjection.md
   docs/adr/0019-first-class-collaboration-plan-projection.md
+  docs/adr/0020-capability-bounded-context-lifecycle.md
   scripts/check-redlines.sh
   scripts/check-dsh-runtime-contract.py
   scripts/package-dsh-plugin.sh
@@ -85,6 +86,7 @@ docs = [
     root / "docs/adr/0017-native-model-backed-host.md",
     root / "docs/adr/0018-capability-bounded-runtime-interjection.md",
     root / "docs/adr/0019-first-class-collaboration-plan-projection.md",
+    root / "docs/adr/0020-capability-bounded-context-lifecycle.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -116,7 +118,7 @@ if [ ! -x .venv/bin/python ]; then
 fi
 
 .venv/bin/python -m py_compile \
-  main.py myagents_mcp.py orchestrator.py host.py discussion.py collaboration.py workflow.py session_roles.py session_catalog.py session_manager.py tui_activity.py agent_readiness.py \
+  main.py myagents_mcp.py orchestrator.py host.py context_lifecycle.py discussion.py collaboration.py workflow.py session_roles.py session_catalog.py session_manager.py tui_activity.py agent_readiness.py \
   acp/*.py pi_rpc/*.py codex_app_server/*.py native_agent/*.py adapters/*.py control/*.py storage/*.py workspace/*.py tests/*.py \
   scripts/e2e-m3-real.py scripts/e2e-m5-real.py
 .venv/bin/python tests/test_agent_readiness.py
@@ -127,6 +129,7 @@ fi
 .venv/bin/python tests/test_tui_completion.py
 .venv/bin/python tests/test_native_agent.py
 .venv/bin/python tests/test_host_backend.py
+.venv/bin/python tests/test_context_lifecycle.py
 .venv/bin/python tests/test_discussion.py
 .venv/bin/python tests/test_collaboration.py
 .venv/bin/python tests/test_workflow.py

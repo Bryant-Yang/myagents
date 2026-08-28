@@ -192,6 +192,7 @@ class OpenAICompatibleProvider:
                                 "openai-compatible-chat-completions",
                                 "finish_reason+[DONE]",
                                 terminal_reason,
+                                terminal_reason == "stop",
                             ),
                         )
                         return

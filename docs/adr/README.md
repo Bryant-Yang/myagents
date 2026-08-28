@@ -25,3 +25,4 @@
 | [0017](0017-native-model-backed-host.md) | Accepted | M4.14 会话级 HostBackend、原生模型 runtime 与独立只读 agent Host |
 | [0018](0018-capability-bounded-runtime-interjection.md) | Accepted | Esc 精确取消、Alt+↑ 能力受限插话、Pi native steer 与 no-replay |
 | [0019](0019-first-class-collaboration-plan-projection.md) | Accepted | 版本化协作计划事件、逐步骤交接视图与重启详情恢复 |
+| [0020](0020-capability-bounded-context-lifecycle.md) | Accepted | capability-first 上下文预算、原生 Host 压缩与持久恢复 |

@@ -1,6 +1,6 @@
 # myagents 工程契约（HARNESS）
 
-> 作者：Bryant Yang　最近更新：2026-08-27
+> 作者：Bryant Yang　最近更新：2026-08-28
 > Harness Framework：2.1.0（来源 commit：
 > `b3b8fd47ebc49b57abdc365f327688b33970d54c`）
 
@@ -443,12 +443,31 @@ transport。
 - 缺配置、模型不存在或 provider 拒绝必须给出可操作错误；不存在到第三方 Agent
   CLI 的隐式 fallback。完整契约和验收见 ADR-0017。
 
+### 4.10 能力受限的上下文生命周期（M7.2）
+
+- `history_limit` 与 cursor 只负责首次限界和增量投递，不得宣称为 compaction。
+  完整 timeline 保持 append-only；摘要只能进入房间私有 checkpoint。
+- 通用层只消费 adapter 显式声明的 `context_snapshot` / `compact_context`
+  capability，不得按 agent/provider 名调用 reset、session/new 或私有压缩命令。
+  未获证有状态 transport 必须显示为 transport-managed 并拒绝压缩。
+- 默认字符预算只用于诚实的可见阈值，不伪装成精确 token。自动压缩只在 target
+  delivery lock 内、下一条用户 prompt 前执行；手动 `/compact` 只在 room 无运行或
+  排队 command 的边界接受。
+- 原生摘要调用永久无工具，`/yolo` 不扩权；只有权威 terminal + 非空且实际缩小的
+  摘要才能替换 runtime messages。失败不推进用户 cursor、不自动重试。
+- `ContextCheckpoint` 绑定 agent、单调 generation 与 timeline boundary；持久化
+  失败后房间 fail-closed。fresh runtime 只注入一次旧摘要，并从 boundary 后继续
+  增量；post-submit no-replay cursor 优先，不能为恢复摘要回放已提交消息。
+- HostBackend/profile 切换不得复用 checkpoint。`/context` 只展示策略、计数与代次，
+  不显示摘要正文、prompt、凭据或 chain-of-thought。完整契约见 ADR-0020。
+
 ## 5. 测试策略
 
 | 层级 | 证据 |
 | --- | --- |
 | 路由/编排 | `tests/test_basic.py` |
 | 原生模型 provider/runtime/host | `tests/test_native_agent.py` + `tests/fake_openai_compatible_server.py` |
+| 上下文预算/压缩/checkpoint/TUI | `tests/test_context_lifecycle.py` + `tests/fake_openai_compatible_server.py`（仅本地 fake provider） |
 | ACP 协议与取消 | `tests/test_acp.py` + `tests/fake_acp_server.py` |
 | Kimi hybrid transport | `tests/test_kimi_hybrid.py` + `tests/fake_acp_server.py` |
 | OpenCode hybrid transport | `tests/test_opencode_hybrid.py` + `tests/fake_acp_server.py` |
@@ -595,6 +614,8 @@ branch protection / required checks 需要单独配置后才能宣称生效。
   [`docs/adr/0013-natural-language-sequential-collaboration.md`](docs/adr/0013-natural-language-sequential-collaboration.md)；
   M7.1 可见计划投影见
   [`docs/adr/0019-first-class-collaboration-plan-projection.md`](docs/adr/0019-first-class-collaboration-plan-projection.md)。
+- M7.2 上下文生命周期事实源：
+  [`docs/adr/0020-capability-bounded-context-lifecycle.md`](docs/adr/0020-capability-bounded-context-lifecycle.md)。
 - 当前路线图：[`README.md`](README.md)“路线图”。
 - 重大协议/安全边界改变先形成可评审设计记录，再修改本契约。
 - Steering 只在同类失败至少两次或已有趋势证据时建立；单次失败只修当前问题。

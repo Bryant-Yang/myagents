@@ -4,7 +4,7 @@
 Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M4.11、M4.12、M4.13、M4.14、M5.1、M5、M6 与 M7 已完成。
+> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M4.11、M4.12、M4.13、M4.14、M5.1、M5、M6、M7、M7.1 与 M7.2 已完成。
 > 共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
 > stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
@@ -75,6 +75,10 @@ Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 co
   host 如实汇总。Git baseline/candidate、execution mode 和失败终态由普通代码
   锁定，运行中可用有界 `/steer` 补充尚未开始阶段的约束。
 - ACP 增量上下文：每个 stateful agent 独立维护 history cursor。
+- 上下文生命周期：`/context` 显示每个 target 的上下文所有权、字符预算与
+  checkpoint；myagents 原生直接模型 Host 默认在安全回合边界自动压缩旧上下文，
+  也可用 `/compact [@agent]` 手动触发。完整 timeline 永不因压缩删除；未声明
+  capability 的第三方 transport 明确显示由其管理并拒绝伪压缩。
 - 并发顺序保证：同一 ACP agent 严格串行，不同 agent 保持并行。
 - 持久时间线：房间 timeline/state 落盘（单调 seq、UTC 时间戳），TUI 重启
   后恢复显示历史。
@@ -546,6 +550,7 @@ implementer 可写。未指定 `--verifier` 时由 reviewer 复核。`/steer` �
 | CodeBuddy | ACP (`codebuddy --acp --acp-transport stdio`) | 持久 session + 增量 history；default/受限只读 fresh profile | ACP-only 已验证 |
 | DSH | ACP（stock `dsh --profile myagents` + `@myagents/dsh-acp-host` bundle） | 持久 session + 增量 history；workspace-write/read-only fresh execution profile；load/close hard gate | ACP-only fake/release contract 与临时 profile 核心真实验收已通过 |
 | Pi | RPC (`pi --mode rpc`) | 持久 session + 增量 history；唯一 permission bridge、三 profile fresh session | RPC-only；fake contract 已验收 |
+| Host（直接模型） | myagents native model runtime | 持久内部消息 + 字符预算 + 安全摘要 checkpoint；fresh runtime 从摘要后增量恢复 | 自动/手动 compaction fake contract 已验收 |
 | Claude | 未接入 | 预留 AgentSpec/adapter 扩展点 | 规划中 |
 
 有状态 agent 首次接入只收到最近 `history_limit` 条共享记录；后续只收到 cursor
@@ -556,6 +561,14 @@ cursor 是持久化 timeline 的单调 seq：重启后优先使用各 transport 
 恢复能力续接旧 session 并保留 cursor；恢复失败或 agent 不支持时只按对应
 adapter 已冻结的安全契约处理。新 session 的 cursor 归零并按 `history_limit`
 有界 bootstrap，不能把失败恢复伪装成命中。
+
+这仍不等于所有 transport 都支持压缩。只有显式声明 context capability 的 adapter
+可进入 `/compact`；首版是 myagents 自有的无工具直接模型 Host。默认达到 48,000
+字符后，在下一回合真正 prompt 之前生成摘要并保留最近 4 条内部消息。摘要只有在
+provider 给出权威终态后才替换旧上下文，并以当前 cursor 为 boundary 原子写入房间
+私有 state；fresh runtime 注入一次摘要后继续增量。checkpoint 写失败会使 room
+fail-closed，HostBackend/profile 切换不复用摘要。细节见
+[ADR-0020](docs/adr/0020-capability-bounded-context-lifecycle.md)。
 
 Kimi 的 JSONL 降级是明确的受限模式：内置 agent profile 只允许
 `Read` / `Grep` / `Glob`，禁止写入、命令、Skill、子 agent 和 MCP。
@@ -826,6 +839,8 @@ myagents/
   一次 repair/reverify、阶段边界 steering 与 TUI 阶段状态。
 - [x] M6：自然语言指定会话级角色、跨任务持续、房间隔离与状态可见。
 - [x] M7：自然语言 2–4 步有序协作、前序结果接力、失败/取消即停。
+- [x] M7.1：一等协作计划、逐步骤交接投影与重启详情恢复。
+- [x] M7.2：上下文字符预算、原生 Host 自动/手动压缩与 checkpoint 恢复。
 - [ ] Later：只有出现跨机器、跨组织 agent 协作需求时再评估 A2A。
 
 ## 当前限制
@@ -839,7 +854,9 @@ myagents/
   18.0s/4.6s，真实 Orchestrator 连续两次 `@codex` 也复用同一
   app-server PID/thread；退出后无残留。app-server 是实验接口，Codex CLI
   升级后仍需重跑 contract 与真实探针。
-- 真实 Kimi cancel 时延和长会话 token/内存增长（含 compaction 表现）尚未压测。
+- 真实 Kimi cancel 时延和第三方 agent 长会话 token/内存增长（含厂商原生
+  compaction 表现）尚未压测；M7.2 自动化只证明 myagents 原生 Host 的本地 fake
+  contract，真实摘要质量、极限窗口、token 与成本仍需单独验收。
 - Kimi JSONL fallback 只能读取/分析，无法代替 ACP 完成写入任务；
   真实 fallback 回复质量与 CLI 升级后 schema 漂移仍需受限探针。
 - OpenCode fallback 同样只能读取/分析；`OPENCODE_PERMISSION` 与配置合并

@@ -20,6 +20,7 @@ class ModelTerminal:
     protocol: str
     signal: str
     reason: str
+    successful: bool
 
 
 @dataclass(frozen=True)

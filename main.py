@@ -54,6 +54,11 @@ from agent_readiness import (
     parse_agent_control_command,
 )
 from host_backend import HostBackendValidationError, parse_host_command
+from context_lifecycle import (
+    ContextCommandValidationError,
+    ContextLifecycleError,
+    parse_context_command,
+)
 from orchestrator import HOST_NAME, Orchestrator
 from adapters.base import (
     AgentEvent,
@@ -1952,6 +1957,24 @@ class ChatApp(App):
                 )
             return
 
+        try:
+            context_command = parse_context_command(text)
+        except ContextCommandValidationError as exc:
+            self._write("system", str(exc), "bold red")
+            event.input.value = event.value
+            event.input.cursor_position = original_cursor
+            event.input.focus()
+            return
+        if context_command is not None:
+            event.input.value = ""
+            self.close_completion()
+            if context_command.action == "show":
+                self.action_show_context()
+            else:
+                await self._compact_context(
+                    context_command.target or HOST_NAME)
+            return
+
         command = local_command_for(text)
         try:
             host_command = parse_host_command(text)
@@ -2030,6 +2053,71 @@ class ChatApp(App):
             f"详情：{status.readiness.detail}\n"
             "切换：/host model <profile-or-exact-model-id> 或 "
             "/host agent <agent>"
+        )
+
+    def action_show_context(self) -> None:
+        rows = [
+            "当前会话上下文：",
+            (
+                "策略：达到 "
+                f"{self.orch.context_policy.trigger_characters:,} 字符后"
+                + ("自动压缩" if self.orch.context_policy.auto_compact
+                   else "仅手动压缩")
+            ),
+        ]
+        for status in self.orch.context_status_snapshot():
+            counters = ""
+            if (
+                status.message_count is not None
+                and status.character_count is not None
+            ):
+                counters = (
+                    f" · {status.message_count} 条内部消息"
+                    f" · {status.character_count:,} 字符"
+                )
+            checkpoint = ""
+            if status.checkpoint_generation is not None:
+                checkpoint = (
+                    f" · checkpoint #{status.checkpoint_generation}"
+                    f"（至 seq {status.checkpoint_boundary}）"
+                )
+            rows.append(
+                f"@{status.name} · {status.state}{counters}{checkpoint}")
+            rows.append(f"  {status.detail}")
+        rows.append("手动压缩：/compact [@agent]；省略目标时使用 @host")
+        self._system("\n".join(rows))
+
+    def action_compact_context(self) -> None:
+        """Local command handler used by exact /compact completion."""
+        self.run_worker(self._compact_context(HOST_NAME))
+
+    async def _compact_context(self, name: str) -> None:
+        if self.bus.has_pending():
+            self._write(
+                "system",
+                "当前会话有任务正在运行或排队；请在回合结束后压缩上下文",
+                "bold red",
+            )
+            return
+        self.notify(f"正在压缩 @{name} 上下文…", timeout=3)
+        try:
+            result = await self.orch.compact_context(name)
+        except ContextLifecycleError as exc:
+            self._write("system", f"压缩失败：{exc}", "bold red")
+            return
+        except Exception:
+            self._write(
+                "system", "压缩失败：发生未预期的内部错误", "bold red")
+            return
+        if not result.changed:
+            self._system(
+                f"@{name} 近期上下文还不足以压缩；现有内容保持不变")
+            return
+        self._system(
+            f"@{name} 上下文已压缩："
+            f"{result.before_characters:,} → "
+            f"{result.after_characters:,} 字符；"
+            "完整聊天时间线未删除"
         )
 
     async def _switch_host_backend(self, kind: str, target: str) -> None:

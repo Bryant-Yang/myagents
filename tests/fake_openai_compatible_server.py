@@ -137,6 +137,31 @@ class FakeOpenAICompatibleServer(AbstractContextManager):
                     })
                     return
                 self._start_sse()
+                if "MYAGENTS_CONTEXT_COMPACTION_V1" in latest_prompt:
+                    if "CONTEXT_SUMMARY_PARTIAL_EOF" in latest_prompt:
+                        self._send_data({
+                            "choices": [{
+                                "delta": {"content": "partial summary"},
+                                "finish_reason": None,
+                            }],
+                        })
+                        self.close_connection = True
+                        return
+                    if "CONTEXT_SUMMARY_FILTERED" in latest_prompt:
+                        self._send_completion((), "content_filter")
+                        return
+                    if "CONTEXT_SUMMARY_EMPTY" in latest_prompt:
+                        self._send_completion(())
+                        return
+                    if "RESTORE_OLD_B" in latest_prompt:
+                        self._send_completion((
+                            "已保留最近事实 RESTORE_OLD_B 和既有约束。",
+                        ))
+                        return
+                    self._send_completion((
+                        "已保留既有目标、约束、关键事实和未完成事项。",
+                    ))
+                    return
                 if "FAKE_DIRECT" in latest_prompt:
                     self._send_completion(("native direct answer",))
                     return
@@ -183,7 +208,11 @@ class FakeOpenAICompatibleServer(AbstractContextManager):
                 self.send_header("Connection", "close")
                 self.end_headers()
 
-            def _send_completion(self, chunks: tuple[str, ...]) -> None:
+            def _send_completion(
+                self,
+                chunks: tuple[str, ...],
+                finish_reason: str = "stop",
+            ) -> None:
                 for chunk in chunks:
                     self._send_data({
                         "choices": [{
@@ -192,7 +221,9 @@ class FakeOpenAICompatibleServer(AbstractContextManager):
                         }],
                     })
                 self._send_data({
-                    "choices": [{"delta": {}, "finish_reason": "stop"}],
+                    "choices": [{
+                        "delta": {}, "finish_reason": finish_reason,
+                    }],
                 })
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()

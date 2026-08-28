@@ -127,7 +127,10 @@ agent 每次调用能"看到"的文本总量有限，按 token 计费。transcri
 
 **Compaction（上下文压缩）**
 对话逼近窗口上限时，把旧历史总结成摘要替换原文，保住近期细节。
-各家 CLI 内部都在做；编排层转发 transcript 时同样需要（本项目二期）。
+各家 CLI 是否支持、能否由外部安全触发并不统一。myagents 只对显式声明
+capability 的 runtime 执行压缩：当前原生直接模型 Host 会在安全边界生成私有
+checkpoint，完整 timeline 不改写；第三方 transport 未获证前只显示所有权状态，
+不会用 reset/session-new 伪造压缩。见 ADR-0020。
 
 **Agentic loop（代理循环）**
 agent 的基本工作方式：模型输出 → 调工具 → 拿结果 → 再输出……直到

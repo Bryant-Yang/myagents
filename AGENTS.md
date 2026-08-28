@@ -2,7 +2,7 @@
 
 <!-- harness:controls-read-policy=on-demand -->
 
-> 作者：Bryant Yang　最近更新：2026-08-27
+> 作者：Bryant Yang　最近更新：2026-08-28
 >
 > 本文是所有编码 agent 的项目级入场入口，也是唯一的协作规则源。详细工程契约见
 > [`HARNESS.md`](HARNESS.md)，按任务选读规则见
@@ -144,6 +144,11 @@ app-server），同时仅为已获证路径保留 JSONL 兼容回退。
   最早 queued command、唯一活动 delivery、显式 adapter capability、持久化先于
   协议写入和 no-replay 必须同时成立；`Esc` 取消不得破坏补全/modal/活动导航的
   优先关闭语义。
+- 上下文治理遵守
+  [`ADR-0020`](docs/adr/0020-capability-bounded-context-lifecycle.md)：完整 timeline
+  永不因压缩改写；通用层只消费显式 capability，未获证 transport 必须拒绝；
+  自动压缩只在安全阶段边界与用户 prompt 前执行，checkpoint 写失败使房间
+  fail-closed，fresh 恢复不得跨 backend/profile 或越过 no-replay cursor。
 - DSH ACP-only 接入遵守
   [`ADR-0015`](docs/adr/0015-dsh-acp-only-transport.md)：官方 profile 入口、标准
   myagents bundle、被动 readiness、两 execution safety profile、load/close hard gate、

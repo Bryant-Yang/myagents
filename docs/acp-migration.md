@@ -208,6 +208,28 @@ stateful native session 是持久上下文，编排器**不再**每轮转发完�
 - 无状态 JSONL fallback 不受影响：仍用 dispatch 瞬间的完整 transcript 快照
   （最近 12 条，防并发串话）。
 
+## 上下文生命周期（M7.2）
+
+`history_limit` 与 cursor 是传输减量，不是 compaction。ADR-0020 在既有单写者与
+no-replay 契约上增加可选、provider-neutral capability：
+
+- adapter 只有显式实现 `context_snapshot` / `compact_context` 才可被压缩；通用层
+  不按 ACP/RPC/app-server 或 agent 名猜测私有命令。首版仅 myagents 原生直接模型
+  Host 获证，第三方 stateful adapter 保持 transport-managed；
+- 自动压缩在同一 target delivery lock 内、真正 `session/prompt` / `turn/start` /
+  model chat 之前执行；摘要请求不是用户 prompt，不得推进 cursor 或制造
+  `delivery_committed`。拒绝、空摘要、断流、未知终态与取消保持旧 context；
+- 成功摘要绑定当前 cursor 写入私有 `ContextCheckpoint`。timeline 不删除不改写；
+  checkpoint 写失败使 room fail-closed，避免 live runtime 与恢复事实分叉；
+- fresh runtime 可把旧摘要作为背景注入一次，并从 checkpoint boundary 后继续增量。
+  若前一用户 prompt 已进入不确定终态，当前 no-replay cursor 优先，不能为了补齐
+  checkpoint 后内容而重放；
+- execution profile 或 HostBackend 切换不复用 checkpoint，也不借压缩绕过各 adapter
+  的 fresh session、权限和回收契约。
+
+因此 `/context` 对 ACP/RPC/app-server 只展示已证明的所有权状态；`/compact` 对未
+声明 capability 的 transport 明确拒绝，不调用 `session/new` 或 reset 伪造压缩。
+
 ## 持久化与 session restore（Phase 2.5）
 
 RoomStore（`storage/store.py`）把房间状态落盘到
@@ -509,6 +531,9 @@ transport adapter 执行；Orchestrator/workflow 不直接启动子进程。外�
 - [x] **Phase 5**：里程碑 review → 单 writer 修改 → 独立复核、最多一次
   repair/reverify、阶段边界 steering、Git fixed point 与 TUI 阶段状态已完成；
   真实 Kimi review/verify + Codex implementer 临时仓库探针通过。见 ADR-0009。
+- [x] **Phase 7.2**：provider-neutral `ContextPolicy`、adapter capability、原生
+  Host 自动/手动摘要、私有 checkpoint 与 fresh 恢复已完成；第三方 transport
+  未获证前保持只读状态与明确拒绝。见 ADR-0020。
 
 A2A 不在当前阶段；Streamable HTTP、远程认证同样不在 M3（M3 是单机
 单用户 stdio 集成，见 ADR-0001 §3）。只有出现跨机器、跨组织 agent

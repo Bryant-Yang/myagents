@@ -48,6 +48,8 @@ LOCAL_COMMANDS: tuple[LocalCommand, ...] = (
     LocalCommand("host", "查看当前会话主持后端", "action_show_host"),
     LocalCommand("host model", "切换为模型主持后端", "action_show_host"),
     LocalCommand("host agent", "切换为完整 agent 主持后端", "action_show_host"),
+    LocalCommand("context", "查看当前会话上下文状态", "action_show_context"),
+    LocalCommand("compact", "压缩 Host 上下文", "action_compact_context"),
     LocalCommand("yolo", "切换当前会话自动完全授权", "action_toggle_yolo"),
     LocalCommand("help", "查看本地命令与快捷键", "action_show_help"),
 )
@@ -136,6 +138,22 @@ def completion_context(
         if items:
             return CompletionContext(
                 "command", len(slash.group(1)), end, items)
+        return None
+
+    # `/compact` is a complete local command once its sole target exactly
+    # matches a registered agent.  Do not leave an exact mention completion
+    # open here, otherwise Enter only accepts the completion and users must
+    # press Enter twice to run the command.
+    compact_parts = left.strip().split()
+    if (
+        len(compact_parts) == 2
+        and compact_parts[0] == "/compact"
+        and compact_parts[1].startswith("@")
+        and any(
+            compact_parts[1][1:].lower() == name.lower()
+            for name, _transport in agents
+        )
+    ):
         return None
 
     mention = _MENTION_AT_CURSOR_RE.search(left)

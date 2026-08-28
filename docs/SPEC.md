@@ -2,7 +2,7 @@
 
 <!-- harness:behaviour-evidence=canonical-source -->
 
-> 作者：Bryant Yang　最近更新：2026-08-27
+> 作者：Bryant Yang　最近更新：2026-08-28
 >
 > 本文是关键用户行为与独立证据的唯一事实源。工程边界见
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -35,6 +35,8 @@
 | M5 | 完成 | review → 单 writer 修改 → 独立复核、一次修复上限与阶段边界 steering |
 | M6 | 完成 | 自然语言指定会话级角色、跨任务持续、房间隔离与状态可见 |
 | M7 | 完成 | 自然语言有序协作、2–4 步串行接力与失败/取消收口 |
+| M7.1 | 完成 | 一等协作计划、步骤交接投影与重启详情恢复 |
+| M7.2 | 完成 | capability-first 上下文预算、原生 Host 压缩与 checkpoint 恢复 |
 
 ## 1. 角色
 
@@ -359,8 +361,38 @@
   `-32603: Internal error`，且敏感字段不进入可见错误。
 - **独立证据来源**：`tests/test_phase2.py` fake stateful adapter；Codex 在实现后
   独立构造过并发复现，确认修复前第二轮重复 first、修复后回归通过。
-- **人工验收边界**：长会话 token/内存增长和 compaction 策略尚未验收。
+- **人工验收边界**：第三方 agent 的原生长期 session 质量、真实 token/成本和
+  厂商 compaction 仍未统一验收；myagents 自有原生 Host 见 UC-CONTEXT-001。
 - **里程碑**：M2。
+
+### UC-CONTEXT-001 上下文预算、压缩与恢复
+
+- **角色 / 触发**：用户输入 `/context` 查看 room 内每个 target 的上下文所有权，
+  或在空闲边界输入 `/compact [@agent]`；直接模型 Host 达到默认字符阈值时也会在
+  下一次投递前自动触发。
+- **前置条件**：adapter 显式声明 `context_snapshot` 与 `compact_context`，且当前
+  room 没有跨越该 target delivery lock 的运行任务。首版只有 myagents 原生直接
+  模型 Host 满足；agent Host 与第三方 worker 不因 stateful 就自动获得资格。
+- **主流程**：原生无工具 provider 把旧内部消息总结为有界摘要并保留近期原文；
+  权威 terminal 后才替换 runtime context。Orchestrator 以当前 cursor 为 boundary
+  原子持久化私有 `ContextCheckpoint`；完整 timeline 不删除、不改写。fresh runtime
+  恢复时注入一次摘要，并只发送 boundary 后增量。
+- **异常分支**：运行/排队时手动请求、未知/未就绪/未获证 target、空摘要、超时、
+  断流或未知终态均明确拒绝且不推进用户 cursor；checkpoint 写失败使整个 room
+  fail-closed。post-submit no-replay cursor 优先于旧 checkpoint，HostBackend/profile
+  切换清除或隔离摘要，不跨协议重放。
+- **可见性**：`/context` 显示自动阈值、策略、内部消息/字符计数和 checkpoint
+  代次，不显示摘要正文、prompt、凭据或 chain-of-thought。成功 `/compact` 只显示
+  前后字符数，并明确 timeline 未删除。
+- **验收**：`tests/test_context_lifecycle.py` + 本地 fake OpenAI-compatible server
+  覆盖命令、权威摘要、无工具、自动边界、持久恢复、失败不变、未获证拒绝、
+  checkpoint 损坏/写失败、Host 切换清理和 TUI 不进 timeline；普通 gate 不调用
+  真实模型或第三方 agent。
+- **人工验收边界**：真实长会话摘要质量、不同模型 token/成本、极限窗口压力与
+  第三方 transport 原生 compaction 仍需分别验收，字符预算不能替代这些证据。
+- **事实源**：ADR-0020、`context_lifecycle.py`、`native_agent/runtime.py`、
+  `storage/store.py`、`orchestrator.py`、`main.py`。
+- **里程碑**：M7.2。
 
 ### UC-ACP-003 Qwen Code ACP-only 接入
 

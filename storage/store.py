@@ -37,6 +37,7 @@ from host_backend import (
     HostBackendSelection,
     HostBackendValidationError,
 )
+from context_lifecycle import ContextCheckpoint
 
 APP_NAME = "myagents"
 STATE_SCHEMA_VERSION = 1
@@ -440,6 +441,7 @@ class RoomStore:
             "session_roles": {},
             "host_backend": HostBackendSelection.default().to_state(),
             "host_replay_floor": 0,
+            "context_checkpoints": {},
         }
         self._write_state(state)
         self._state = state
@@ -502,6 +504,20 @@ class RoomStore:
                 or replay_floor < 0):
             raise CorruptedStorageError(
                 "state.json 的 host_replay_floor 必须是非负整数")
+        checkpoints = data.get("context_checkpoints", {})
+        if not isinstance(checkpoints, dict):
+            raise CorruptedStorageError(
+                "state.json 的 context_checkpoints 必须是 object")
+        for agent_name, checkpoint in checkpoints.items():
+            if not isinstance(agent_name, str) or not agent_name:
+                raise CorruptedStorageError(
+                    "state.json 的 context checkpoint agent 名非法")
+            try:
+                ContextCheckpoint.from_state(checkpoint)
+            except ValueError as exc:
+                raise CorruptedStorageError(
+                    f"agent {agent_name!r} 的 context checkpoint 非法：{exc}"
+                ) from exc
         if "session_title" in data:
             try:
                 normalize_session_title(data["session_title"])
@@ -781,6 +797,12 @@ class RoomStore:
             "host_backend": selected.to_state(),
             "host_replay_floor": cursor,
             "agents": {**self._state["agents"], "host": host_state},
+            "context_checkpoints": {
+                name: value
+                for name, value in self._state.get(
+                    "context_checkpoints", {}).items()
+                if name != "host"
+            },
         }
         self._write_state(new_state)
         self._state = new_state
@@ -820,6 +842,51 @@ class RoomStore:
             new_entry["session_id"] = session_id
         new_state = {**self._state,
                      "agents": {**self._state["agents"], name: new_entry}}
+        self._write_state(new_state)
+        self._state = new_state
+
+    # ---- context lifecycle checkpoints（ADR-0020） ----
+
+    def get_context_checkpoints(self) -> dict[str, ContextCheckpoint]:
+        """Return a validated copy; legacy rooms default to no checkpoints."""
+        raw = self._state.get("context_checkpoints", {})
+        if not isinstance(raw, dict):
+            raise CorruptedStorageError(
+                "state.json 的 context_checkpoints 必须是 object")
+        result: dict[str, ContextCheckpoint] = {}
+        for name, value in raw.items():
+            try:
+                result[name] = ContextCheckpoint.from_state(value)
+            except ValueError as exc:
+                raise CorruptedStorageError(
+                    f"agent {name!r} 的 context checkpoint 非法：{exc}"
+                ) from exc
+        return result
+
+    def set_context_checkpoint(
+        self,
+        name: str,
+        checkpoint: ContextCheckpoint,
+    ) -> None:
+        """Atomically persist one private summary checkpoint."""
+        if not isinstance(name, str) or not name:
+            raise ValueError("context checkpoint agent 名不能为空")
+        if not isinstance(checkpoint, ContextCheckpoint):
+            raise ValueError("checkpoint 必须是 ContextCheckpoint")
+        current = self.get_context_checkpoints()
+        previous = current.get(name)
+        if previous is not None:
+            if checkpoint.generation <= previous.generation:
+                raise ValueError("context checkpoint generation 必须单调递增")
+            if checkpoint.boundary_seq < previous.boundary_seq:
+                raise ValueError("context checkpoint boundary 不得倒退")
+        new_state = {
+            **self._state,
+            "context_checkpoints": {
+                **self._state.get("context_checkpoints", {}),
+                name: checkpoint.to_state(),
+            },
+        }
         self._write_state(new_state)
         self._state = new_state
 

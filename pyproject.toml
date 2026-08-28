@@ -27,6 +27,7 @@ py-modules = [
   "agent_readiness",
   "clipboard_image",
   "collaboration",
+  "context_lifecycle",
   "discussion",
   "host",
   "host_backend",
