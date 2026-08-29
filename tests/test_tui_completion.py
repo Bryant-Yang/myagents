@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
-from adapters.base import AgentEvent
+from adapters.base import AgentEvent, AgentHostCapability
 from agent_readiness import (
     AgentEnablementConfig,
     AgentReadiness,
@@ -923,7 +923,12 @@ def test_host_command_switches_locally_without_timeline_write() -> None:
     from textual.widgets import RichLog
 
     class Adapter:
+        name = "codex"
         session_id = None
+
+        @classmethod
+        def host_capability(cls):
+            return AgentHostCapability("app-server", cls)
 
         async def stream(self, _prompt, _workdir, **_kwargs):
             yield AgentEvent("done")
@@ -931,8 +936,7 @@ def test_host_command_switches_locally_without_timeline_write() -> None:
         async def aclose(self):
             return None
 
-    specs = (AgentSpec(
-        "codex", "app-server", Adapter, None, Adapter, None),)
+    specs = (AgentSpec("codex", "app-server", Adapter),)
     orch = Orchestrator(
         ".", specs=specs, persistent=False,
         host_model_factory=lambda _selection: Adapter())
@@ -951,11 +955,11 @@ def test_host_command_switches_locally_without_timeline_write() -> None:
             box.cursor_position = len(box.value)
             await pilot.press("enter")
             await pilot.pause()
-            assert orch.host_backend_selection.kind == "agent"
-            assert orch.host_backend_selection.target == "codex"
-            assert orch.history == []
             rendered = "\n".join(
                 str(line.text) for line in app.query_one(RichLog).lines)
+            assert orch.host_backend_selection.kind == "agent", rendered
+            assert orch.host_backend_selection.target == "codex"
+            assert orch.history == []
             assert "当前会话 Host" in rendered
             assert "Host 已切换：agent:codex" in rendered
 

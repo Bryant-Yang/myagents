@@ -9,6 +9,7 @@ import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -16,17 +17,31 @@ sys.path.insert(0, str(ROOT))
 from adapters.base import (
     AgentDeliveryUncertainError,
     AgentEvent,
+    AgentHostCapability,
     ExecutionMode,
 )
+from acp.adapter import (
+    AcpCodeBuddyAdapter,
+    AcpOpenCodeAdapter,
+    AcpQwenAdapter,
+    CODEBUDDY_ACP_READ_ONLY_ARGS,
+    OPENCODE_ACP_READ_ONLY_PERMISSION_POLICY,
+    QWEN_ACP_READ_ONLY_CMD,
+)
+from acp.client import AcpError
+from adapters.kimi_adapter import KIMI_READONLY_AGENT_FILE, KimiAdapter
 from agent_readiness import (
     AgentReadiness,
     AgentUnavailableError,
     ReadinessState,
 )
 from control import CommandBus
+from codex_app_server.adapter import CodexAppServerAdapter
+from dsh_acp.adapter import AcpDshAdapter, DSH_ACP_READ_ONLY_PROFILE
 from host_backend import (
     HostBackendSelection,
     HostBackendValidationError,
+    configured_default_host_backend,
     parse_host_command,
 )
 from host import HostAgent
@@ -37,7 +52,9 @@ from native_agent import (
     load_native_model_catalog,
     resolve_native_model_config,
 )
-from orchestrator import AgentSpec, Orchestrator
+from orchestrator import AGENT_SPECS, AgentSpec, Orchestrator
+from pi_rpc.adapter import PI_READ_ONLY_TOOLS, PiRpcAdapter
+from session_catalog import SessionCatalog
 from storage.store import RoomStore
 from tests.fake_openai_compatible_server import FakeOpenAICompatibleServer
 
@@ -171,6 +188,25 @@ def unavailable(name: str):
         name, ReadinessState.NOT_FOUND, "fake missing", "install fake")
 
 
+class HostCapableFactory:
+    def __init__(self, name, worker_factory, host_factory, transport="fake"):
+        self.name = name
+        self.worker_factory = worker_factory
+        self.host_factory = host_factory
+        self.transport = transport
+
+    def __call__(self):
+        return self.worker_factory()
+
+    def host_capability(self) -> AgentHostCapability:
+        def create():
+            adapter = self.host_factory()
+            adapter.name = self.name
+            return adapter
+
+        return AgentHostCapability(self.transport, create)
+
+
 def test_selection_and_command_validation() -> None:
     assert parse_host_command("/host").action == "show"
     command = parse_host_command("/host model glm")
@@ -188,6 +224,149 @@ def test_selection_and_command_validation() -> None:
         raise AssertionError("incomplete /host command must be local error")
 
 
+def test_configured_default_is_applied_only_to_fresh_rooms() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        config = root / "config.toml"
+        config.write_text(
+            "[host.backend]\n"
+            'kind = "agent"\n'
+            'target = "opencode"\n'
+            "[host.model]\n"
+            'model_id = "local-model"\n',
+            encoding="utf-8",
+        )
+        config.chmod(0o600)
+        selected = configured_default_host_backend({}, config_path=config)
+        assert selected == HostBackendSelection.agent("opencode")
+
+        workdir = root / "work"
+        workdir.mkdir()
+        catalog = SessionCatalog(
+            root / "state", default_host_backend=selected)
+        created = catalog.create_session(workdir)
+        store = RoomStore(
+            workdir,
+            root / "state",
+            session_name=created.session_name,
+        )
+        assert store.get_host_backend() == HostBackendSelection.agent(
+            "opencode")
+
+        # Reopening a room never lets a later global default replace its
+        # room-scoped persisted selection.
+        store.set_host_backend(HostBackendSelection.agent("codex"), cursor=0)
+        reopened = RoomStore(
+            workdir,
+            root / "state",
+            session_name=created.session_name,
+            default_host_backend=selected,
+        )
+        assert reopened.get_host_backend() == HostBackendSelection.agent(
+            "codex")
+
+
+def test_all_registered_agents_declare_adapter_owned_host_capability() -> None:
+    capabilities = {
+        spec.name: spec.agent_host_capability()
+        for spec in AGENT_SPECS
+    }
+    assert set(capabilities) == {
+        "kimi", "opencode", "qwen", "codebuddy", "dsh", "pi", "codex",
+    }
+    assert all(capability is not None for capability in capabilities.values())
+    assert {
+        name: capability.transport
+        for name, capability in capabilities.items()
+    } == {
+        "kimi": "jsonl",
+        "opencode": "acp",
+        "qwen": "acp",
+        "codebuddy": "acp",
+        "dsh": "acp",
+        "pi": "rpc",
+        "codex": "app-server",
+    }
+
+    created = []
+    with tempfile.TemporaryDirectory() as tmp:
+        codebuddy = Path(tmp) / "codebuddy"
+        codebuddy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        codebuddy.chmod(0o700)
+        with (
+            patch.dict(
+                os.environ,
+                {"MYAGENTS_CODEBUDDY_CLI": str(codebuddy)},
+                clear=False,
+            ),
+            patch(
+                "dsh_acp.adapter._resolve_dsh_launch",
+                side_effect=AcpError("fake unavailable"),
+            ),
+        ):
+            pairs = {
+                name: (capability.factory(), capability.factory())
+                for name, capability in capabilities.items()
+            }
+            created.extend(
+                adapter for pair in pairs.values() for adapter in pair)
+
+            for name, (left, right) in pairs.items():
+                assert left is not right
+                assert left.name == right.name == name
+
+            kimi = pairs["kimi"][0]
+            assert isinstance(kimi, KimiAdapter)
+            assert kimi.agent_file == KIMI_READONLY_AGENT_FILE
+
+            opencode = pairs["opencode"][0]
+            assert isinstance(opencode, AcpOpenCodeAdapter)
+            assert opencode._fallback is None
+            assert opencode._execution_env_overrides[
+                ExecutionMode.READ_ONLY
+            ]["OPENCODE_PERMISSION"] == json.dumps(
+                OPENCODE_ACP_READ_ONLY_PERMISSION_POLICY,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+
+            qwen = pairs["qwen"][0]
+            assert isinstance(qwen, AcpQwenAdapter)
+            assert qwen._execution_cmd_overrides[
+                ExecutionMode.READ_ONLY
+            ] == list(QWEN_ACP_READ_ONLY_CMD)
+
+            codebuddy_host = pairs["codebuddy"][0]
+            assert isinstance(codebuddy_host, AcpCodeBuddyAdapter)
+            assert codebuddy_host._execution_cmd_overrides[
+                ExecutionMode.READ_ONLY
+            ] == [str(codebuddy.resolve()), *CODEBUDDY_ACP_READ_ONLY_ARGS]
+
+            dsh = pairs["dsh"][0]
+            assert isinstance(dsh, AcpDshAdapter)
+            assert dsh._execution_env_overrides[
+                ExecutionMode.READ_ONLY
+            ]["DSH_ACP_PROFILE"] == DSH_ACP_READ_ONLY_PROFILE
+
+            pi = pairs["pi"][0]
+            assert isinstance(pi, PiRpcAdapter)
+            assert pi._tools_for(ExecutionMode.READ_ONLY) == PI_READ_ONLY_TOOLS
+
+            codex = pairs["codex"][0]
+            assert isinstance(codex, CodexAppServerAdapter)
+            assert codex.sandbox == "read-only"
+            assert codex.approval_policy == "never"
+            assert codex._fallback_jsonl is False
+
+            async def close_all() -> None:
+                for adapter in created:
+                    close = getattr(adapter, "aclose", None)
+                    if close is not None:
+                        await close()
+
+            asyncio.run(close_all())
+
+
 def test_agent_host_projects_native_interjection_capability() -> None:
     async def run() -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -200,9 +379,11 @@ def test_agent_host_projects_native_interjection_capability() -> None:
             spec = AgentSpec(
                 "codex",
                 "app-server",
-                lambda: RecordingAdapter("worker"),
-                ready("codex"),
-                lambda: host_adapter,
+                HostCapableFactory(
+                    "codex",
+                    lambda: RecordingAdapter("worker"),
+                    lambda: host_adapter,
+                ),
                 ready("codex"),
             )
             orch = Orchestrator(
@@ -369,8 +550,9 @@ def test_agent_host_switch_is_independent_read_only_and_fresh() -> None:
             return item
 
         specs = (AgentSpec(
-            "codex", "app-server", worker_factory, ready("codex"),
-            host_factory, ready("codex")),)
+            "codex", "app-server",
+            HostCapableFactory("codex", worker_factory, host_factory),
+            ready("codex")),)
         orch = Orchestrator(
             str(ROOT), specs=specs, persistent=False,
             host_model_factory=model_factory)
@@ -424,9 +606,11 @@ def test_switch_boundary_survives_restart_without_cross_backend_replay() -> None
             specs = (AgentSpec(
                 "codex",
                 "app-server",
-                lambda: RecordingAdapter("worker"),
-                ready("codex"),
-                host_factory,
+                HostCapableFactory(
+                    "codex",
+                    lambda: RecordingAdapter("worker"),
+                    host_factory,
+                ),
                 ready("codex"),
             ),)
             first = Orchestrator(
@@ -547,8 +731,13 @@ def test_running_unknown_and_unready_switches_are_blocked_without_fallback() -> 
 
         specs = (
             AgentSpec(
-                "codex", "app-server", lambda: RecordingAdapter("worker"),
-                ready("codex"), candidate_factory, unavailable("codex")),
+                "codex", "app-server",
+                HostCapableFactory(
+                    "codex",
+                    lambda: RecordingAdapter("worker"),
+                    candidate_factory,
+                ),
+                unavailable("codex")),
         )
         orch = Orchestrator(
             str(ROOT), specs=specs, persistent=False,
@@ -859,8 +1048,12 @@ def test_persisted_unready_agent_host_does_not_fallback_to_model() -> None:
                 HostBackendSelection.agent("codex"), cursor=2)
             model_created: list[str] = []
             specs = (AgentSpec(
-                "codex", "app-server", lambda: RecordingAdapter("worker"),
-                ready("codex"), lambda: RecordingAdapter("agent-host"),
+                "codex", "app-server",
+                HostCapableFactory(
+                    "codex",
+                    lambda: RecordingAdapter("worker"),
+                    lambda: RecordingAdapter("agent-host"),
+                ),
                 unavailable("codex")),)
             orch = Orchestrator(
                 str(workdir), specs=specs, store=store,
@@ -889,6 +1082,8 @@ def test_persisted_unready_agent_host_does_not_fallback_to_model() -> None:
 
 if __name__ == "__main__":
     test_selection_and_command_validation()
+    test_configured_default_is_applied_only_to_fresh_rooms()
+    test_all_registered_agents_declare_adapter_owned_host_capability()
     test_agent_host_projects_native_interjection_capability()
     test_host_interjection_capability_remains_fail_closed()
     test_room_persistence_isolated_and_sets_cross_backend_boundary()

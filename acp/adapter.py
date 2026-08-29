@@ -48,6 +48,7 @@ from adapters.base import (
     AgentDeliveryCancelledError,
     AgentDeliveryUncertainError,
     AgentEvent,
+    AgentHostCapability,
     ExecutionMode,
     ReadOnlyFallbackError,
     redact_sensitive_text,
@@ -1467,6 +1468,17 @@ class AcpAdapter:
 
 
 class AcpKimiAdapter(AcpAdapter):
+    @classmethod
+    def host_capability(cls) -> AgentHostCapability:
+        # Kimi ACP currently has no independently proven runtime hard-deny
+        # profile.  Its checked-in JSONL agent is an actual Read/Grep/Glob
+        # tool closure, so Host uses that safe transport rather than pretending
+        # that an upper-layer READ_ONLY enum constrains ACP tools.
+        from adapters.kimi_adapter import KimiAdapter
+
+        return AgentHostCapability(
+            "jsonl", KimiAdapter.readonly_fallback)
+
     def __init__(
         self,
         permission: str = "deny",
@@ -1487,6 +1499,11 @@ class AcpKimiAdapter(AcpAdapter):
 
 
 class AcpOpenCodeAdapter(AcpAdapter):
+    @classmethod
+    def host_capability(cls) -> AgentHostCapability:
+        return AgentHostCapability(
+            "acp", lambda: cls(fallback_jsonl=False))
+
     @staticmethod
     def _load_rejection_allows_fresh(exc: AcpRemoteError) -> bool:
         if AcpAdapter._load_rejection_allows_fresh(exc):
@@ -1542,6 +1559,10 @@ class AcpOpenCodeAdapter(AcpAdapter):
 class AcpQwenAdapter(AcpAdapter):
     """Qwen Code 的 ACP-only 生产 adapter。"""
 
+    @classmethod
+    def host_capability(cls) -> AgentHostCapability:
+        return AgentHostCapability("acp", cls)
+
     def __init__(self, permission: str = "deny") -> None:
         super().__init__(
             "qwen",
@@ -1555,6 +1576,10 @@ class AcpQwenAdapter(AcpAdapter):
 
 class AcpCodeBuddyAdapter(AcpAdapter):
     """CodeBuddy 的 ACP-only 生产 adapter。"""
+
+    @classmethod
+    def host_capability(cls) -> AgentHostCapability:
+        return AgentHostCapability("acp", cls)
 
     def __init__(
         self,

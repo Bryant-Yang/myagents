@@ -16,6 +16,7 @@ from typing import Awaitable, Callable
 from adapters.base import AgentEvent, redact_sensitive_text
 from control import CommandBus, ControlServer
 from agent_readiness import AgentReadiness
+from host_backend import HostBackendSelection
 from orchestrator import AGENT_SPECS, AgentSpec, Message, Orchestrator
 from session_catalog import (
     SessionCatalog,
@@ -166,7 +167,15 @@ class SessionManager:
             and initial_orchestrator.store is not None
             else state_root
         )
-        self.catalog = SessionCatalog(inferred_root)
+        self._default_host_backend = (
+            initial_orchestrator.default_host_backend
+            if initial_orchestrator is not None
+            else HostBackendSelection.default()
+        )
+        self.catalog = SessionCatalog(
+            inferred_root,
+            default_host_backend=self._default_host_backend,
+        )
         self._specs = specs
         self._event_sink = event_sink
         self._permission_handler = permission_handler
@@ -306,6 +315,7 @@ class SessionManager:
                 self.initial_workdir,
                 state_root=self.catalog.state_root,
                 session_name=self.initial_session_name,
+                default_host_backend=self._default_host_backend,
             )
             summary = self.catalog.get_session(store.room_id)
             orch = Orchestrator(
@@ -317,6 +327,7 @@ class SessionManager:
                 host_probe=self._host_probe,
                 host_model_factory=self._host_model_factory,
                 agent_enablement=self._agent_enablement,
+                default_host_backend=self._default_host_backend,
             )
             self._build_runtime(summary, orch)
             self._active_id = summary.room_id
@@ -362,6 +373,7 @@ class SessionManager:
                 summary.workdir,
                 state_root=self.catalog.state_root,
                 session_name=summary.session_name,
+                default_host_backend=self._default_host_backend,
             )
             orch = Orchestrator(
                 summary.workdir,
@@ -372,6 +384,7 @@ class SessionManager:
                 host_probe=self._host_probe,
                 host_model_factory=self._host_model_factory,
                 agent_enablement=self._agent_enablement,
+                default_host_backend=self._default_host_backend,
             )
             runtime = self._build_runtime(summary, orch)
             try:

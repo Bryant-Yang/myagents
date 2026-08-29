@@ -54,6 +54,7 @@ from adapters.base import (
     AgentDeliveryCancelledError,
     AgentDeliveryUncertainError,
     AgentEvent,
+    AgentHostCapability,
     ExecutionMode,
 )
 from codex_app_server.adapter import CodexAppServerAdapter
@@ -147,10 +148,18 @@ class AgentSpec:
     transport: str  # "acp" | "acp+jsonl" | "app-server" | "rpc" | "jsonl"
     factory: Callable[[], AgentAdapter]
     probe: ReadinessProbe | None = None
-    host_factory: Callable[[], AgentAdapter] | None = None
-    host_probe: ReadinessProbe | None = None
     display_name: str = ""
     purpose: str = ""
+
+    def agent_host_capability(self) -> AgentHostCapability | None:
+        """Resolve an adapter-owned Host declaration without name branching."""
+        declaration = getattr(self.factory, "host_capability", None)
+        if not callable(declaration):
+            return None
+        capability = declaration()
+        if not isinstance(capability, AgentHostCapability):
+            raise TypeError("adapter host_capability 返回了未知契约")
+        return capability
 
 
 @dataclass(frozen=True)
@@ -239,12 +248,6 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
     ),
     AgentSpec(
         "codex", "app-server", CodexAppServerAdapter,
-        executable_probe("codex", ("codex",), "安装 Codex CLI"),
-        lambda: CodexAppServerAdapter(
-            sandbox="read-only",
-            approval_policy="never",
-            fallback_jsonl=False,
-        ),
         executable_probe("codex", ("codex",), "安装 Codex CLI"),
         display_name="Codex", purpose="代码实现、审查与工具执行",
     ),
@@ -430,6 +433,7 @@ class Orchestrator:
                      [HostBackendSelection], AgentAdapter] | None = None,
                  agent_enablement: AgentEnablementConfig | None = None,
                  context_policy: ContextPolicy | None = None,
+                 default_host_backend: HostBackendSelection | None = None,
                  ) -> None:
         self.workdir = workdir
         self.session_name = normalize_session_name(session_name)
@@ -439,6 +443,13 @@ class Orchestrator:
         self._host_model_factory = host_model_factory
         self._agent_enablement = agent_enablement
         self.context_policy = context_policy or ContextPolicy()
+        self.default_host_backend = (
+            default_host_backend
+            or (
+                store.default_host_backend
+                if store is not None else HostBackendSelection.default()
+            )
+        ).validated()
         self._registered_names = tuple(
             dict.fromkeys((*[spec.name for spec in specs], HOST_NAME)))
         probes: dict[str, ReadinessProbe] = {
@@ -483,7 +494,10 @@ class Orchestrator:
         if persistent:
             if store is None:
                 store = RoomStore(
-                    workdir, session_name=self.session_name)
+                    workdir,
+                    session_name=self.session_name,
+                    default_host_backend=self.default_host_backend,
+                )
             elif store.workdir != normalize_workdir(workdir):
                 raise WorkdirMismatchError(
                     f"store 属于 {store.workdir!r}，与 workdir {workdir!r} 不一致")
@@ -729,12 +743,18 @@ class Orchestrator:
     ) -> tuple[str, str]:
         """只在初始化、显式切换或 rescan 边界解析可见 Host 身份。"""
         resolved = selection.target
-        transport = "NATIVE-MODEL"
         if selection.kind == "agent":
+            transport = "HOST-AGENT/UNAVAILABLE"
             spec = self._host_agent_spec(selection.target)
             if spec is not None:
-                transport = f"HOST-AGENT/{spec.transport.upper()}"
+                try:
+                    capability = spec.agent_host_capability()
+                except Exception:
+                    capability = None
+                if capability is not None:
+                    transport = f"HOST-AGENT/{capability.transport.upper()}"
         else:
+            transport = "NATIVE-MODEL"
             try:
                 config = resolve_native_model_config(
                     selection.target,
@@ -763,11 +783,22 @@ class Orchestrator:
                 return self._host_readiness_probe()
             return native_host_readiness_probe(profile=selection.target)
         spec = self._host_agent_spec(selection.target)
-        if spec is None or spec.host_factory is None:
+        try:
+            capability = (
+                spec.agent_host_capability() if spec is not None else None
+            )
+        except Exception as exc:
             return AgentReadiness(
                 HOST_NAME,
                 ReadinessState.INVALID,
-                f"agent {selection.target!r} 未声明 host-safe read-only factory",
+                f"agent host {selection.target} capability 无效：{exc}",
+                "修复该 adapter 的 host_capability 声明后执行 /agents rescan",
+            )
+        if spec is None or capability is None:
+            return AgentReadiness(
+                HOST_NAME,
+                ReadinessState.INVALID,
+                f"agent {selection.target!r} 未声明 host-safe read-only capability",
                 "使用 /host agent <支持的 agent> 或 /host model <profile>",
             )
         worker_status = next(
@@ -785,7 +816,7 @@ class Orchestrator:
                 worker_status.setup_hint,
                 worker_status.executable,
             )
-        probe = spec.host_probe or spec.probe
+        probe = spec.probe
         if not self.discover_agents or probe is None:
             return AgentReadiness(
                 HOST_NAME,
@@ -822,10 +853,17 @@ class Orchestrator:
                 reference=selection.reference or "profile",
             )
         spec = self._host_agent_spec(selection.target)
-        if spec is None or spec.host_factory is None:
+        capability = (
+            spec.agent_host_capability() if spec is not None else None
+        )
+        if spec is None or capability is None:
             raise HostBackendValidationError(
                 f"agent {selection.target!r} 不能作为 host")
-        return spec.host_factory()
+        adapter = capability.factory()
+        if getattr(adapter, "name", None) != spec.name:
+            raise HostBackendValidationError(
+                f"agent {selection.target!r} 的 host factory 返回身份不匹配 adapter")
+        return adapter
 
     def _host_fresh_replay_floor(self) -> int:
         """Return the durable no-replay floor for fresh Host sessions."""

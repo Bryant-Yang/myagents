@@ -2,7 +2,7 @@
 
 <!-- harness:behaviour-evidence=canonical-source -->
 
-> 作者：Bryant Yang　最近更新：2026-08-28
+> 作者：Bryant Yang　最近更新：2026-08-29
 >
 > 本文是关键用户行为与独立证据的唯一事实源。工程边界见
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -303,7 +303,11 @@
 - **查看 / 切换**：`/host` 展示当前 room 的 backend 类型、选择、实际 target、
   transport 与 readiness；`/host model <profile-or-exact-model-id>` 切换直接模型，
   `/host agent <agent>` 切换完整 agent。三者都是本地命令，不进 timeline。
-  首个正式 agent Host 为 Codex。
+  当前注册的 Kimi、OpenCode、Qwen、CodeBuddy、DSH、Pi、Codex 都由各自 adapter
+  声明 host capability，可作为 Host；后续 adapter 只需完成一次相同安全契约。
+- **新会话默认**：内置默认仍是 `model/profile:default`；私有配置
+  `[host.backend]` 可指定此后 fresh room 的初始 kind/target/reference。已经存在的
+  room 永远以 `state.json.host_backend` 为准，不被全局默认变化覆盖。
 - **切换边界**：选择按 room 持久化和恢复。运行/排队中或 Host delivery lock
   已占用时原子拒绝；空闲时有界关闭旧 runtime，原子保存选择并清空 Host
   session，把 cursor 与 replay floor 至少推进到当前 timeline 边界，再发布 fresh
@@ -316,18 +320,22 @@
   精确验证完整 id；无 discovery capability 的 provider 直接使用配置的 exact id，
   由首个 chat 请求接受或拒绝，不伪造模型列表。`glm-5.3-flash` 必须按该精确
   字符串透传；SPEC 不据此推断厂商模型枚举。
-- **权限边界**：model Host 固定 `tool_policy=none`；agent Host 由独立
-  `AgentSpec.host_factory` 构造，每次调用强制 `ExecutionMode.READ_ONLY`，不继承
-  worker/TUI permission handler。Codex Host 还固定 read-only sandbox、never
-  approval、无 JSONL fallback。`/yolo` 不得突破这些 profile。
-- **失败策略**：未知 agent、未声明 host-safe factory、未就绪 backend、损坏配置、
+- **权限边界**：model Host 固定 `tool_policy=none`；agent Host 由具体 adapter 的
+  `AgentHostCapability.factory` 构造，每次调用强制 `ExecutionMode.READ_ONLY`，不继承
+  worker/TUI permission handler。factory 必须返回同身份的全新 adapter，不能复用
+  worker writer/session。Codex Host 固定 read-only sandbox、never approval、无
+  JSONL fallback；OpenCode Host 固定 read-only runtime policy 且无 JSONL fallback；
+  Kimi Host 使用固定 Read/Grep/Glob JSONL profile；Qwen、CodeBuddy、DSH 与 Pi 使用
+  各自已经验收的只读 execution profile。`/yolo` 不得突破这些 profile。
+- **失败策略**：未知 agent、未声明 host capability、未就绪 backend、损坏配置、
   模型服务拒绝均明确 block。恢复到未就绪选择时保留选择并在 timeline 前拒绝，
   不自动 fallback。2xx 后取消/超时/断流/非权威终态与 POST headers 丢失形成
   no-replay；服务端非 2xx 是 pre-commit 拒绝。
 - **安全配置**：文件必须为非 symlink 普通文件、权限 0600、最大 64 KiB；API key
   只由环境引用进入 header，在选择、repr、状态、错误和事件中脱敏。readiness
   只读本地配置/CLI 属性，不联网、不启动或修改服务。
-- **验收**：fake 覆盖 native→Codex→native、room 隔离/恢复、运行中拒绝、旧
+- **验收**：fake 覆盖 native→agent→native、全局默认只初始化 fresh room、room
+  隔离/恢复、运行中拒绝、旧
   runtime 回收、同名 Host/worker 双实例、read-only 与 `/yolo` 反例、unknown/
   unready、无 fallback、provider discovery/no-discovery、GLM 精确 ID、TUI 命令与
   显式 `@worker` 回归。
@@ -339,6 +347,9 @@
   `qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive`，经生产 provider/runtime
   收到 `delivery_committed`、4 个 text chunk 和权威 done，合并正文严格为
   `NATIVE_HOST_OK`；未修改 LM Studio 或用户配置。
+- **本次本机验收**：2026-08-29 再次只读获取本机 LM Studio `/v1/models`，精确
+  找到 `google/gemma-4-e4b`；使用当前私有 default profile 经生产 runtime 在
+  6.4 秒内收到 `delivery_committed`、2 个 text chunk 和权威 done，正文为 `OK.`。
 - **本次远程边界**：未调用真实 GLM，不读取或消耗用户远程凭据/额度。
 - **人工验收边界**：不同本地模型的路由 JSON 可靠性、长上下文质量、吞吐、成本
   与 provider 兼容范围不能由 fake contract 证明。

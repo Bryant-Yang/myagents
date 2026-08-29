@@ -27,13 +27,15 @@ RPC 与 JSONL 属于 agent/runtime protocol。
 - model backend 由 `NativeAgentRuntime` 驱动；它只依赖中立
   `ModelProvider/ModelEvent`，负责流式输出、上下文、单 writer、取消、静默超时、
   权威终态与 no-replay。
-- agent backend 只能来自 `AgentSpec.host_factory/host_probe` 明确声明的
-  host-safe factory。首个正式实现是 Codex app-server。通用层按 capability
-  查找，不按 agent 名分支。
+- agent backend 只能来自具体 adapter 明确声明的 `AgentHostCapability`。声明同时
+  给出真实 transport 与全新只读实例 factory；`AgentSpec` 不重复维护 Host 配置。
+  当前七个生产 adapter 均已声明，通用层按 capability 查找，不按 agent 名分支。
 - `@codex` worker 与 Codex Host 每次由不同 factory 构造，拥有不同 adapter、
   process/thread/session/writer；两者绝不复用。
 
-默认选择仍是 `model/profile:default`，但不是唯一生产 Host。
+内置默认选择仍是 `model/profile:default`，但不是唯一生产 Host。用户可在私有全局
+配置中声明 `[host.backend]`，仅覆盖此后新建 room 的初始选择；已有 room 的持久
+选择永远优先，不随全局默认漂移。
 
 ### 2.2 会话级命令与切换生命周期
 
@@ -72,6 +74,10 @@ writer；持久化失败且旧 runtime 已关闭时才以 fresh runtime 恢复�
 推荐使用命名 profile：
 
 ```toml
+[host.backend]
+kind = "agent"
+target = "opencode"
+
 [host.models.local]
 provider = "openai-compatible"
 base_url = "http://127.0.0.1:1234/v1"
@@ -112,9 +118,17 @@ Authorization header，不进入 selection、repr、readiness、timeline 或错�
 - model Host 永久 `tool_policy=none`，请求不携带 tools/tool_choice。
 - agent Host 的每次 `stream/stream_prepared` 都由 `HostAgent` 强制
   `ExecutionMode.READ_ONLY`，不继承 worker/TUI permission handler。
+- capability factory 必须返回与 `AgentSpec` 身份一致的全新 adapter，不能复用同名
+  worker 的 process/session/writer。
 - Codex Host factory 额外固定 `sandbox=read-only`、`approval_policy=never`、
   `fallback_jsonl=false`。
-- `/yolo` 不能放宽任一 Host profile。未知 agent、无 host-safe factory、未就绪
+- OpenCode Host factory 固定 `fallback_jsonl=false`，并由既有 read-only execution
+  profile 在 runtime 层 deny 未知/有副作用工具，只放行安全读取与本地只读索引。
+- Kimi ACP 尚无独立获证的 runtime hard-deny profile，因此 Host capability 明确选择
+  项目固定的 Read/Grep/Glob JSONL profile；这不是 worker ACP 失败后的跨协议重放。
+- Qwen、CodeBuddy、DSH 与 Pi Host 复用各 adapter 已验收的只读 execution profile，
+  但仍创建独立 runtime/session。
+- `/yolo` 不能放宽任一 Host profile。未知 agent、无 Host capability、未就绪
   target 均明确 block。
 
 ### 2.5 错误与 no-replay
@@ -132,27 +146,31 @@ not-attempted/attempted/committed/rejected 状态，而不是依赖具体实现�
 
 自动验收覆盖：
 
-1. native → Codex agent → native，旧 runtime 有界关闭且每次 fresh；
+1. native → agent Host → native，旧 runtime 有界关闭且每次 fresh；全部生产
+   adapter 声明 capability，factory 都使用独立只读实例；
 2. room 隔离与重启恢复；Host 写入跨 backend cursor 边界并清空 session，
    不碰 `@codex` worker；
 3. 运行中拒绝、unknown/unready block、持久 unready 不自动 fallback；
 4. Host/worker 双实例单 writer，agent Host 强制 read-only，`/yolo` 反例；
 5. discovery 与 no-discovery provider、`glm-5.3-flash` 精确透传、非 2xx pre-commit；
-6. `/host` TUI 展示/切换不进 timeline，显式 `@worker` 不回归；
+6. `[host.backend]` 只初始化 fresh room，已有 room 不漂移；`/host` TUI 展示/切换
+   不进 timeline，显式 `@worker` 不回归；
 7. 原有取消、超时、断流、secret、配置权限、讨论和 workflow tests 全部回归。
 
 主要证据：`tests/test_host_backend.py`、`tests/test_native_agent.py`、
 `tests/fake_openai_compatible_server.py`、`tests/test_tui_completion.py`。
 
-真实 LM Studio 证据沿用 2026-08-27 已完成的只读 `/v1/models` 与一次有界最小
-对话。本次没有调用真实 GLM，也没有读取或消耗远程凭据/额度。
+真实 LM Studio 证据包括 2026-08-27 的原始探针，以及 2026-08-29 对精确模型 ID
+`google/gemma-4-e4b` 的只读 `/v1/models` 检查与一次有界最小对话：生产 runtime
+收到 `delivery_committed`、2 个 text chunk 和权威 done，正文为 `OK.`。本次没有
+调用真实 GLM，也没有读取或消耗远程凭据/额度。
 
 ## 4. 后果与非目标
 
 - 基本主持能力仍可完全不依赖第三方 Agent CLI；需要时可显式选择受约束的完整
   agent Host。
 - room timeline/cursor 仍是持久事实，不新增第二套记忆数据库。
-- 新 provider 作为 `ModelProvider` 实现加入；新 agent Host 通过 `AgentSpec`
-  capability 加入，均不得污染通用路由。
+- 新 provider 作为 `ModelProvider` 实现加入；新 agent Host 通过具体 adapter 的
+  `AgentHostCapability` 加入，`AgentSpec` 只保留 worker 注册事实，均不得污染通用路由。
 - 完整原生 coding 工具集、自动 backend fallback、模型别名猜测、自动迁移
   profile、成本预算和上下文压缩不在本阶段。

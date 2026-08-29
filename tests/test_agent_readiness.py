@@ -26,7 +26,7 @@ from agent_readiness import (
     executable_probe,
     parse_agent_control_command,
 )
-from adapters.base import AgentEvent
+from adapters.base import AgentEvent, AgentHostCapability
 from host import HostAgent, HostDecision
 from orchestrator import AgentSpec, Orchestrator
 from session_manager import SessionManager
@@ -546,15 +546,19 @@ def test_disabled_agent_cannot_be_selected_as_host_backend() -> None:
             prefix="myagents-enable-host-"
         ) as raw:
             config = AgentEnablementConfig(Path(raw) / "config.toml")
+
+            def worker_factory():
+                return FakeAdapter("worker")
+
+            worker_factory.host_capability = lambda: AgentHostCapability(
+                "app-server", lambda: FakeAdapter("worker"))
             orch = Orchestrator(
                 ".",
                 specs=(AgentSpec(
                     "worker",
                     "app-server",
-                    lambda: FakeAdapter("worker"),
+                    worker_factory,
                     probe=_fixed_probe("worker", ReadinessState.READY),
-                    host_factory=lambda: FakeAdapter("worker-host"),
-                    host_probe=_fixed_probe("worker", ReadinessState.READY),
                 ),),
                 persistent=False,
                 discover_agents=True,

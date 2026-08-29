@@ -88,10 +88,12 @@ Orchestrator 看到 fresh/unrestored 后把 cursor 归零，按既有
 `history_limit` 有界 bootstrap。JSONL 与新 ACP session 永不并发写入
 同一 session。
 
-### 2.5 Host 不切换到 Kimi JSONL
+### 2.5 Kimi Host 是显式只读能力，不是 fallback
 
-生产 host 现使用 ADR-0017 的 myagents 原生无工具 model runtime。Kimi print
-mode 不作为 host fallback，也不会因 native provider 失败而跨协议重放。
+生产 Host 默认仍可使用 ADR-0017 的 myagents 原生无工具 model runtime。同一固定
+只读 profile 也可由 `AgentHostCapability` 显式创建为独立 Kimi Host；它是用户选择
+的 Host transport，不是 native provider 或 worker ACP 失败后的自动 fallback。
+它不复用 worker session，也不会在 prompt 提交后跨协议重放。
 
 ## 3. 验收
 

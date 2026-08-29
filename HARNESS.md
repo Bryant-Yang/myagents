@@ -1,6 +1,6 @@
 # myagents 工程契约（HARNESS）
 
-> 作者：Bryant Yang　最近更新：2026-08-28
+> 作者：Bryant Yang　最近更新：2026-08-29
 > Harness Framework：2.1.0（来源 commit：
 > `b3b8fd47ebc49b57abdc365f327688b33970d54c`）
 
@@ -375,7 +375,8 @@ transport。
 - 重启后最后事件非 terminal 的命令必须显示为“已中断”，不得伪装完成。
 - model Host 的 provider/model 只来自 ADR-0017 的 XDG 私有配置文件与显式环境
   临时覆盖；凭据不进入 readiness、事件或错误。agent Host 只来自
-  `AgentSpec.host_factory`，独立于同名 worker 并固定 read-only。
+  具体 adapter 显式声明的 `AgentHostCapability`，独立于同名 worker 并固定
+  read-only；`AgentSpec` 不得再复制一套 Host factory/probe。
 
 ### 4.7 Codex app-server（M4）
 
@@ -422,7 +423,10 @@ transport。
 ### 4.9 可切换 HostBackend 与原生模型 Runtime（M4.14）
 
 - `HostAgent` 是 moderator/supervisor 产品角色，不是 transport；room 可显式
-  选择直接模型或声明了 host-safe factory 的完整 agent，默认是原生模型。
+  选择直接模型或 adapter 声明了 `AgentHostCapability` 的完整 agent。内置默认是
+  原生模型；
+  私有全局配置 `[host.backend]` 只决定新建 room 的初始选择，已持久化 room 不受
+  后续全局默认变化影响。
 - `HostBackendSelection` 只持久化 kind/target/reference；切换只在 Host 空闲或
   阶段边界执行，有界关闭旧 runtime 后创建 fresh session，不跨 backend 重放。
   持久选择不可用时必须阻断，不得自动 fallback。
@@ -434,8 +438,11 @@ transport。
   `[host.model]` 兼容 default 与 `[host.models.<name>]` 命名 profile；命名 profile
   只引用 `api_key_env`。readiness 只读文件/环境语法与 0600 权限，不联网。
   API key 只进入 header，并在 repr/错误/事件中脱敏。
-- model Host 永久 `tool_policy=none`；agent Host 必须由独立 factory 构造并
-  强制 `READ_ONLY`，不复用同名 worker session/writer。`/yolo` 不得扩权。
+- model Host 永久 `tool_policy=none`；agent Host capability 必须构造独立 adapter
+  并强制 `READ_ONLY`，不复用同名 worker session/writer。`/yolo` 不得扩权。
+  当前全部生产 adapter 都提供已验证声明：OpenCode Host 禁用 JSONL fallback，
+  Codex 固定 read-only sandbox，Kimi 选择固定只读 JSONL 工具闭集，其余沿用各自
+  已验收的只读 execution profile。
 - `/host`、`/host model <profile-or-id>`、`/host agent <agent>` 是不进 timeline
   的 room 本地命令；只有明确注册 host capability 的 agent 可被选择。
 - runtime 每 room 隔离上下文并保持单 writer；提交后的取消、静默超时、断流和

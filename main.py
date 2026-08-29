@@ -53,7 +53,11 @@ from agent_readiness import (
     AgentUnavailableError,
     parse_agent_control_command,
 )
-from host_backend import HostBackendValidationError, parse_host_command
+from host_backend import (
+    HostBackendValidationError,
+    configured_default_host_backend,
+    parse_host_command,
+)
 from context_lifecycle import (
     ContextCommandValidationError,
     ContextLifecycleError,
@@ -959,12 +963,17 @@ class ChatApp(App):
         else:
             requested_session = normalize_session_name(
                 session_name or DEFAULT_SESSION_NAME)
+            default_host_backend = (
+                configured_default_host_backend()
+                if persistent else None
+            )
             self.orch = Orchestrator(
                 workdir,
                 persistent=persistent,
                 session_name=requested_session,
                 discover_agents=True,
                 agent_enablement=AgentEnablementConfig(),
+                default_host_backend=default_host_backend,
             )
         self.session_name = self.orch.session_name
         # 持久模式由 SessionManager 集中拥有多个隔离 runtime；非持久测试仍沿用

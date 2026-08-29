@@ -19,7 +19,7 @@ import re
 import signal
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import AsyncIterator, Mapping, Protocol
+from typing import AsyncIterator, Callable, Mapping, Protocol
 
 
 # Stateful transports may be silent while a local or remote model pre-fills a
@@ -162,6 +162,28 @@ class AgentAdapter(Protocol):
     ) -> AsyncIterator[AgentEvent]:
         """异步生成器：执行一轮对话，边执行边吐事件。"""
         ...
+
+
+@dataclass(frozen=True)
+class AgentHostCapability:
+    """Adapter-owned proof and constructor for an independent read-only Host.
+
+    Merely accepting ``ExecutionMode.READ_ONLY`` is not enough: declaring this
+    capability means the concrete adapter enforces that mode in its runtime
+    policy and that ``factory`` creates a fresh writer/session.  The generic
+    Host layer never infers safety from an agent name or transport.
+    """
+
+    transport: str
+    factory: Callable[[], AgentAdapter]
+
+    def __post_init__(self) -> None:
+        transport = self.transport.strip()
+        if not transport or any(ch in transport for ch in "\r\n\0"):
+            raise ValueError("Host capability transport 无效")
+        if not callable(self.factory):
+            raise TypeError("Host capability factory 必须可调用")
+        object.__setattr__(self, "transport", transport)
 
 
 class BoundedLog:

@@ -56,7 +56,10 @@ Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 co
   ACP 或 JSON/JSONL fallback。
 - `@host`：负责意图识别、路由、直接回答、讨论主持和总结。默认由 myagents
   自有的无工具 native model runtime 驱动，也可按会话显式切换到注册为 host-safe
-  的完整 agent；agent Host 独立于同名 worker 且始终只读，`/yolo` 不扩权。
+  的完整 agent；当前注册的 Kimi、OpenCode、Qwen、CodeBuddy、DSH、Pi、Codex
+  均可使用。Host 能力由各 adapter 一次性声明，不需要在编排器逐个加分支；也可用
+  `[host.backend]` 设定此后新会话的全局初始 Host。agent Host 独立于同名 worker
+  且始终只读，`/yolo` 不扩权。
 - Agent 就绪中心：启动时只读取当前进程的 PATH、环境变量和可执行文件属性，
   不启动或安装 agent。`/agents` 显示注册项的可用状态和设置提示，
   `/agents rescan` 在用户修复 PATH 或安装后被动重扫；缺失目标会在时间线写入前
@@ -375,6 +378,10 @@ model_id = "把这里替换为 /v1/models 返回的精确 id"
 也可以配置多个命名 profile；远程凭据只引用环境变量名：
 
 ```toml
+[host.backend]
+kind = "agent"
+target = "opencode"
+
 [host.models.local]
 provider = "openai-compatible"
 base_url = "http://127.0.0.1:1234/v1"
@@ -400,11 +407,19 @@ Host 可在当前会话中查看和切换；命令不进入聊天时间线：
 /host
 /host model local
 /host model glm
+/host agent kimi
+/host agent opencode
+/host agent qwen
+/host agent codebuddy
+/host agent dsh
+/host agent pi
 /host agent codex
 ```
 
-切换只允许在当前会话无运行/排队任务时执行并持久恢复。Codex Host 与
-`@codex` worker 使用独立进程/session/writer，Host 永远只读；`/yolo` 不扩权。
+`[host.backend]` 只初始化新建会话；已有会话继续使用各自持久化选择。切换只允许
+在当前会话无运行/排队任务时执行并持久恢复。Agent Host 都由 adapter capability
+创建独立进程/session/writer，Host 永远只读；Kimi Host 使用固定只读 JSONL 工具
+闭集，OpenCode Host 不启用 JSONL fallback，`/yolo` 不扩权。
 选择不可用时保留选择并显示错误，不会偷偷换回其他 backend。`/agents` 也会显示
 当前 Host transport/readiness。
 

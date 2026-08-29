@@ -365,9 +365,14 @@ class RoomStore:
 
     def __init__(self, workdir: str | Path,
                  state_root: str | Path | None = None, *,
-                 session_name: str = DEFAULT_SESSION_NAME) -> None:
+                 session_name: str = DEFAULT_SESSION_NAME,
+                 default_host_backend: HostBackendSelection | None = None,
+                 ) -> None:
         self.workdir = normalize_workdir(workdir)
         self.session_name = normalize_session_name(session_name)
+        self.default_host_backend = (
+            default_host_backend or HostBackendSelection.default()
+        ).validated()
         self.room_name = Path(self.workdir).name
         self.state_root = (Path(state_root).expanduser().resolve()
                            if state_root is not None else default_state_root())
@@ -439,7 +444,7 @@ class RoomStore:
             "session_name": self.session_name,
             "agents": {},
             "session_roles": {},
-            "host_backend": HostBackendSelection.default().to_state(),
+            "host_backend": self.default_host_backend.to_state(),
             "host_replay_floor": 0,
             "context_checkpoints": {},
         }

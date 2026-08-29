@@ -15,6 +15,7 @@ from adapters.base import (
     AgentDeliveryCancelledError,
     AgentDeliveryUncertainError,
     AgentEvent,
+    AgentHostCapability,
     ExecutionMode,
     redact_sensitive_text,
 )
@@ -50,6 +51,17 @@ class CodexAppServerAdapter:
     # Codex turn 可能执行有副作用的工具。旧 thread 无法恢复时，宁可丢失旧
     # 上下文也不能把已经投递过的 transcript 自动 bootstrap 到新 thread。
     replay_history_on_fresh_session = False
+
+    @classmethod
+    def host_capability(cls) -> AgentHostCapability:
+        return AgentHostCapability(
+            "app-server",
+            lambda: cls(
+                sandbox="read-only",
+                approval_policy="never",
+                fallback_jsonl=False,
+            ),
+        )
 
     def __init__(
         self,

@@ -27,6 +27,7 @@ from adapters.base import (
     AgentDeliveryCancelledError,
     AgentDeliveryUncertainError,
     AgentEvent,
+    AgentHostCapability,
     ExecutionMode,
     redact_sensitive_text,
 )
@@ -149,6 +150,10 @@ class PiRpcAdapter:
     # A missing native session must not cause the orchestrator to replay old
     # tool-bearing assignments into a fresh Pi process.
     replay_history_on_fresh_session = False
+
+    @classmethod
+    def host_capability(cls) -> AgentHostCapability:
+        return AgentHostCapability("rpc", cls)
 
     def __init__(
         self,

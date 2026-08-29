@@ -160,6 +160,7 @@ expected_specs = {
     ("codebuddy", "acp", "AcpCodeBuddyAdapter"),
     ("dsh", "acp", "AcpDshAdapter"),
     ("pi", "rpc", "PiRpcAdapter"),
+    ("codex", "app-server", "CodexAppServerAdapter"),
 }
 for name, transport, factory in sorted(expected_specs - registered_specs):
     errors.append(
@@ -169,6 +170,54 @@ if any(name == "workbuddy" for name, _transport, _factory in registered_specs):
     errors.append(
         "[R4] orchestrator.py: 旧 @workbuddy 不得继续注册；"
         "独立 CLI 的产品身份必须是 @codebuddy")
+
+# Agent Host safety is adapter-owned. AgentSpec must not grow a second manual
+# factory/probe registry, and every production adapter currently promises the
+# same replaceable Host seam.
+agent_spec = next(
+    (node for node in tree.body
+     if isinstance(node, ast.ClassDef) and node.name == "AgentSpec"),
+    None,
+)
+if agent_spec is None:
+    errors.append("[R4] orchestrator.py: 缺少 AgentSpec")
+else:
+    forbidden_host_fields = {
+        node.target.id for node in agent_spec.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id in {"host_factory", "host_probe", "host_transport"}
+    }
+    if forbidden_host_fields:
+        errors.append(
+            "[R4] orchestrator.py: AgentSpec 不得重复维护 Host 字段："
+            + ", ".join(sorted(forbidden_host_fields)))
+
+host_capability_classes = {
+    ROOT / "acp/adapter.py": {
+        "AcpKimiAdapter", "AcpOpenCodeAdapter", "AcpQwenAdapter",
+        "AcpCodeBuddyAdapter",
+    },
+    ROOT / "dsh_acp/adapter.py": {"AcpDshAdapter"},
+    ROOT / "pi_rpc/adapter.py": {"PiRpcAdapter"},
+    ROOT / "codex_app_server/adapter.py": {"CodexAppServerAdapter"},
+}
+for path, class_names in host_capability_classes.items():
+    module = parse(path)
+    for class_name in sorted(class_names):
+        class_node = next(
+            (node for node in module.body
+             if isinstance(node, ast.ClassDef) and node.name == class_name),
+            None,
+        )
+        methods = set() if class_node is None else {
+            node.name for node in class_node.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        if "host_capability" not in methods:
+            errors.append(
+                f"[R4] {path.relative_to(ROOT)}: {class_name} 必须由 adapter "
+                "声明 host_capability")
 
 acp_adapter = ROOT / "acp/adapter.py"
 acp_source = acp_adapter.read_text(encoding="utf-8")

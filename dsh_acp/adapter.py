@@ -23,6 +23,7 @@ from acp.client import AcpClient, AcpError
 from adapters.base import (
     DEFAULT_AGENT_INACTIVITY_TIMEOUT,
     AgentEvent,
+    AgentHostCapability,
     ExecutionMode,
 )
 from agent_readiness import AgentReadiness, ExecutableResolver, ReadinessState
@@ -910,6 +911,10 @@ def dsh_readiness_probe(
 
 class AcpDshAdapter(AcpAdapter):
     """Official DSH profile adapter with two process-isolated policies."""
+
+    @classmethod
+    def host_capability(cls) -> AgentHostCapability:
+        return AgentHostCapability("acp", cls)
 
     def __init__(
         self,

@@ -2,7 +2,7 @@
 
 <!-- harness:controls-read-policy=on-demand -->
 
-> 作者：Bryant Yang　最近更新：2026-08-28
+> 作者：Bryant Yang　最近更新：2026-08-29
 >
 > 本文是所有编码 agent 的项目级入场入口，也是唯一的协作规则源。详细工程契约见
 > [`HARNESS.md`](HARNESS.md)，按任务选读规则见
@@ -121,12 +121,14 @@ app-server），同时仅为已获证路径保留 JSONL 兼容回退。
 - 新增 agent 时实现统一 `AgentAdapter`，在 `AGENT_SPECS` 注册；不要把
   name-specific 逻辑散进编排器。
 - `HostAgent` 是 moderator/supervisor 产品角色；room 默认使用 ADR-0017 的
-  myagents 原生无工具 model runtime，也可显式选择由
-  `AgentSpec.host_factory/host_probe` 声明的 host-safe agent backend。model
-  provider 只能在 `native_agent/` 内选择，agent Host 必须使用独立 adapter/
-  session/writer 并强制 `READ_ONLY`；通用 Orchestrator 不感知具体 provider wire
-  protocol，也不得按 agent 名分支。`/yolo` 不得突破 Host profile，未就绪选择
-  必须阻断且不得自动 fallback。
+  myagents 原生无工具 model runtime；用户可在私有全局配置的
+  `[host.backend]` 为新 room 选择另一个已验证 host-safe backend，也可显式选择由
+  具体 adapter 的 `AgentHostCapability` 声明的 host-safe agent backend。
+  `AgentSpec` 不重复维护 Host factory；同一 adapter 完成一次安全适配即可同时作为
+  worker 与可替换 Host。model provider 只能在 `native_agent/` 内选择，agent Host
+  必须使用独立 adapter/session/writer 并强制 `READ_ONLY`；通用 Orchestrator 不感知
+  具体 provider wire protocol，也不得按 agent 名分支。`/yolo` 不得突破 Host
+  profile，未就绪选择必须阻断且不得自动 fallback。
 - 权限处理器返回值必须绑定本次 `params.options` 校验；异常、空值或未知
   `optionId` 一律 cancelled。
 - ACP session 同一时刻只有一个 writer；不要让独立 native TUI 与 ACP client

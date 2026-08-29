@@ -228,6 +228,22 @@ def load_native_model_catalog(
         environ, config_path=config_path)
 
 
+def load_host_config_table(
+    environ: Mapping[str, str] | None = None,
+    *,
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """Read the shared private ``[host]`` table without resolving secrets."""
+    values = os.environ if environ is None else environ
+    if config_path is not None:
+        path = Path(config_path).expanduser()
+    elif environ is None or XDG_CONFIG_HOME_ENV in values:
+        path = native_model_config_path(values)
+    else:
+        return {}
+    return _read_host_config_file(path)
+
+
 def native_model_profile_names(
     environ: Mapping[str, str] | None = None,
     *,
@@ -436,9 +452,15 @@ def _read_host_config_file(path: Path) -> dict[str, object]:
         raise NativeModelConfigurationError(
             "原生 host 配置文件包含未知顶层字段")
     host = payload.get("host", {})
-    if not isinstance(host, dict) or set(host) - {"model", "models"}:
+    if not isinstance(host, dict) or set(host) - {
+        "backend", "model", "models",
+    }:
         raise NativeModelConfigurationError(
             "原生 host 配置的 [host] 结构无效")
+    backend = host.get("backend", {})
+    if not isinstance(backend, dict):
+        raise NativeModelConfigurationError(
+            "host 配置的 [host.backend] 结构无效")
     model = host.get("model", {})
     if not isinstance(model, dict):
         raise NativeModelConfigurationError(

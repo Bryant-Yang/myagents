@@ -50,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from adapters.base import (  # noqa: E402
     AgentDeliveryUncertainError,
     AgentEvent,
+    AgentHostCapability,
     ExecutionMode,
 )
 from adapters import codex_adapter as codex_jsonl  # noqa: E402
@@ -291,16 +292,22 @@ def test_agent_host_routes_image_to_worker_without_host_local_image() -> None:
             image = attachments / "img-0001.png"
             image.write_bytes(_PNG)
             image.chmod(0o600)
-            spec = AgentSpec(
-                "codex",
+            def worker_factory():
+                return CodexAppServerAdapter(CMD, fallback_jsonl=False)
+
+            worker_factory.host_capability = lambda: AgentHostCapability(
                 "app-server",
-                lambda: CodexAppServerAdapter(CMD, fallback_jsonl=False),
-                host_factory=lambda: CodexAppServerAdapter(
+                lambda: CodexAppServerAdapter(
                     CMD,
                     sandbox="read-only",
                     approval_policy="never",
                     fallback_jsonl=False,
                 ),
+            )
+            spec = AgentSpec(
+                "codex",
+                "app-server",
+                worker_factory,
             )
             orch = Orchestrator(
                 str(workdir), specs=(spec,), store=store)

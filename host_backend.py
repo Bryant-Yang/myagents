@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping
 
 from agent_readiness import AgentReadiness
 
@@ -90,6 +93,50 @@ class HostBackendSelection:
             return f"agent:{self.target}"
         prefix = "profile" if self.reference == "profile" else "model"
         return f"{prefix}:{self.target}"
+
+
+def configured_default_host_backend(
+    environ: Mapping[str, str] | None = None,
+    *,
+    config_path: str | os.PathLike[str] | None = None,
+) -> HostBackendSelection:
+    """Load the optional app-wide default used only when creating a room."""
+    from native_agent.config import (
+        NativeModelConfigurationError,
+        load_host_config_table,
+    )
+
+    try:
+        host = load_host_config_table(
+            environ,
+            config_path=Path(config_path) if config_path is not None else None,
+        )
+    except NativeModelConfigurationError as exc:
+        raise HostBackendValidationError(
+            f"无法读取默认 host backend：{exc}") from exc
+    raw = host.get("backend")
+    if raw is None:
+        return HostBackendSelection.default()
+    if not isinstance(raw, dict):
+        raise HostBackendValidationError(
+            "[host.backend] 必须是 TOML table")
+    unknown = set(raw) - {"kind", "target", "reference"}
+    if unknown:
+        rendered = ", ".join(sorted(str(item) for item in unknown))
+        raise HostBackendValidationError(
+            f"[host.backend] 包含未知字段：{rendered}")
+    kind = raw.get("kind")
+    target = raw.get("target")
+    reference = raw.get("reference")
+    if not isinstance(kind, str) or not isinstance(target, str):
+        raise HostBackendValidationError(
+            "[host.backend] 必须包含字符串 kind 与 target")
+    if reference is not None and not isinstance(reference, str):
+        raise HostBackendValidationError(
+            "[host.backend].reference 必须是字符串")
+    if kind == "model" and reference is None:
+        reference = "profile"
+    return HostBackendSelection(kind, target, reference).validated()
 
 
 @dataclass(frozen=True)

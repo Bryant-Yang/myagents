@@ -27,6 +27,7 @@ from storage.store import (
     RoomStore,
     RoomLease,
 )
+from host_backend import HostBackendSelection
 
 _ROOM_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 _MENTION_RE = re.compile(r"(?<!\w)@\w+")
@@ -54,12 +55,20 @@ class SessionSummary:
 class SessionCatalog:
     """从私有状态根发现并摘要会话，不触碰目标工作区。"""
 
-    def __init__(self, state_root: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        state_root: str | Path | None = None,
+        *,
+        default_host_backend: HostBackendSelection | None = None,
+    ) -> None:
         self.state_root = (
             Path(state_root).expanduser().resolve()
             if state_root is not None
             else default_state_root()
         )
+        self.default_host_backend = (
+            default_host_backend or HostBackendSelection.default()
+        ).validated()
         self.rooms_root = self.state_root / "rooms"
 
     def create_session(self, workdir: str | Path) -> SessionSummary:
@@ -75,6 +84,7 @@ class SessionCatalog:
             normalized,
             state_root=self.state_root,
             session_name=session_name,
+            default_host_backend=self.default_host_backend,
         )
         store.set_session_title("新会话", pending=True)
         return self._read_summary(store.room_dir)
