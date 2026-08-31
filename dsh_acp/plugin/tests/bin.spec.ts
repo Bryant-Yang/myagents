@@ -132,8 +132,8 @@ async function handshake(image = false): Promise<void> {
     }), stream)
     const initialized = await client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     expect(initialized.agentInfo?._meta).toMatchObject({
-      'deepseek.ai/dsh-runtime-version': '0.1.1-rc.2',
-      'deepseek.ai/dsh-compatibility-revision': 1,
+      'deepseek.ai/dsh-runtime-version': '0.1.2-alpha.2',
+      'deepseek.ai/dsh-compatibility-revision': 2,
       'deepseek.ai/dsh-myagents-profile': 'read-only',
     })
     expect(initialized.agentCapabilities).toMatchObject({

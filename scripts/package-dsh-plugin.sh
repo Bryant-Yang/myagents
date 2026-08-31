@@ -38,7 +38,7 @@ esbuild_bin="$("$repo_root/.venv/bin/python" \
   --contract "$runtime_contract" \
   --print-esbuild-bin)"
 
-tarball="$output_dir/myagents-dsh-acp-host-0.1.0.tgz"
+tarball="$output_dir/myagents-dsh-acp-host-0.1.1.tgz"
 if [[ -e "$tarball" ]]; then
   echo "拒绝覆盖已有 tarball：$tarball" >&2
   exit 2

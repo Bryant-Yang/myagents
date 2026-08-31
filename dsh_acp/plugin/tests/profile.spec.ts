@@ -1,5 +1,5 @@
-import { effectiveSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
+import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
 import ApprovalService, { effectiveApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
@@ -26,6 +26,7 @@ function fixture(name: string, execute: () => Promise<string>) {
 
 async function profiled(profile: 'workspace-write' | 'read-only'): Promise<BridgeHarness> {
   const harness = await makeBridgeHarness({ config: { setup: profileSetup(profile) } })
+  await harness.ctx.plugin(SandboxPolicyService, { mode: 'read-only' })
   await harness.ctx.plugin(ApprovalService)
   for (const toolName of ALL_TOOLS) {
     harness.ctx.tools.register(fixture(toolName, () => Promise.resolve(toolName)))
@@ -44,19 +45,19 @@ describe('myagents-owned DSH ACP profiles', () => {
   })
 
   it('publishes the exact host and stock-runtime compatibility identity', () => {
-    expect(HOST_VERSION).toBe('0.1.0')
-    expect(DSH_RUNTIME_VERSION).toBe('0.1.1-rc.2')
-    expect(COMPATIBILITY_REVISION).toBe(1)
+    expect(HOST_VERSION).toBe('0.1.1')
+    expect(DSH_RUNTIME_VERSION).toBe('0.1.2-alpha.2')
+    expect(COMPATIBILITY_REVISION).toBe(2)
     expect(hostAgentInfo('workspace-write')).toEqual({
       name: 'dsh-myagents-acp',
       title: 'DeepSeek Harness for myagents',
-      version: '0.1.0',
+      version: '0.1.1',
       _meta: {
         'deepseek.ai/dsh-myagents-profile': 'workspace-write',
         'deepseek.ai/dsh-myagents-policy-revision': 1,
         'deepseek.ai/dsh-myagents-read-only-tools': ['read', 'glob', 'grep'],
-        'deepseek.ai/dsh-runtime-version': '0.1.1-rc.2',
-        'deepseek.ai/dsh-compatibility-revision': 1,
+        'deepseek.ai/dsh-runtime-version': '0.1.2-alpha.2',
+        'deepseek.ai/dsh-compatibility-revision': 2,
       },
     })
   })
@@ -67,7 +68,7 @@ describe('myagents-owned DSH ACP profiles', () => {
     if (agent === undefined) throw new Error('profile test created no agent')
     expect(harness.ctx.tools.schemas(agent).map((tool) => tool.name).sort())
       .toEqual([...READ_ONLY_TOOLS].sort())
-    expect(effectiveSandboxMode(agent.session.events)).toBe('read-only')
+    expect(harness.ctx.get('sandboxPolicy')?.resolve({ session: agent.session }).mode).toBe('read-only')
     expect(effectiveApprovalPolicy(agent.session.events)).toBe('never')
 
     let shadowRan = false
@@ -96,7 +97,7 @@ describe('myagents-owned DSH ACP profiles', () => {
     harness = await profiled('workspace-write')
     const agent = harness.ctx.agents.list()[0]
     if (agent === undefined) throw new Error('profile test created no agent')
-    expect(effectiveSandboxMode(agent.session.events)).toBe('workspace-write')
+    expect(harness.ctx.get('sandboxPolicy')?.resolve({ session: agent.session }).mode).toBe('workspace-write')
     expect(effectiveApprovalPolicy(agent.session.events)).toBe('ask')
     harness.onPermission = () => ({ outcome: { outcome: 'selected', optionId: 'allow-once' } })
 

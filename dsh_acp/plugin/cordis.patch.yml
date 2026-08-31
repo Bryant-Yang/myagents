@@ -132,6 +132,8 @@
   disabled: true
 - id: web-search-deepseek
   disabled: true
+- id: web-fetch-http
+  disabled: true
 - id: tool-web
   disabled: true
 

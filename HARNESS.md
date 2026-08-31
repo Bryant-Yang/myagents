@@ -179,8 +179,8 @@ transport。
   profile 中的标准 bundle 加载。profile home/state/workspace/source/plugin/CLI/config
   不得重叠或 symlink 逃逸；readiness 必须被动核验官方 CLI identity、profile
   dependencies、exact bundle 顺序 `@deepseek-ai/dsh-base` →
-  `@myagents/dsh-acp-host`，以及解析后的 host `0.1.0`、
-  `dsh.bundle.patch=./cordis.patch.yml`、entry/patch 与 runtime `0.1.1-rc.2`，缺一即
+  `@myagents/dsh-acp-host`，以及解析后的 host `0.1.1`、
+  `dsh.bundle.patch=./cordis.patch.yml`、entry/patch 与 runtime `0.1.2-alpha.2`，缺一即
   invalid。readiness 不执行 pnpm/build/CLI/真实 agent。
   产品专属 Python adapter/readiness、TypeScript ACP server 与 host composition 的
   canonical source 均归 `dsh_acp/`；标准 bundle 的 canonical package、entry 与

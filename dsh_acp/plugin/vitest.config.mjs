@@ -17,7 +17,7 @@ const { default: ts } = await import(pathToFileURL(join(
 )).href)
 const source = (relative) => join(dshRoot, relative)
 const aliasTargets = {
-  '@agentclientprotocol/sdk': source('node_modules/@agentclientprotocol/sdk/dist/acp.js'),
+  '@agentclientprotocol/sdk': source('apps/cli/node_modules/@agentclientprotocol/sdk/dist/acp.js'),
   '@deepseek-ai/cordis': source('vendor/cordis/src/index.ts'),
   '@deepseek-ai/schemastery': source('vendor/schemastery/src/index.ts'),
   '@deepseek-ai/dsh-agent': source('packages/core/agent/src/index.ts'),
@@ -33,6 +33,7 @@ const aliasTargets = {
   '@deepseek-ai/dsh-llm-deepseek': source('packages/llm/llm-deepseek/src/index.ts'),
   '@deepseek-ai/dsh-sandbox-policy': source('packages/sandbox/sandbox-policy/src/index.ts'),
   '@deepseek-ai/dsh-session': source('packages/core/session/src/index.ts'),
+  '@deepseek-ai/dsh-session-projection': source('packages/session/session-projection/src/index.ts'),
   '@deepseek-ai/dsh-session-checkpoint-policy': source('packages/session/session-checkpoint-policy/src/index.ts'),
   '@deepseek-ai/dsh-session-persistence-jsonl': source('packages/session/session-persistence-jsonl/src/index.ts'),
   '@deepseek-ai/dsh-session-query': source('packages/session-query/session-query/src/index.ts'),

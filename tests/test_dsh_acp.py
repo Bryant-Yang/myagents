@@ -70,7 +70,7 @@ def _fake_profile(root: Path) -> tuple[Path, Path]:
     (profile / "package.json").write_text(json.dumps({
         "name": "dsh-profile-myagents",
         "private": True,
-        "dependencies": {"@myagents/dsh-acp-host": "0.1.0"},
+        "dependencies": {"@myagents/dsh-acp-host": "0.1.1"},
         "dsh": {"profile": {"bundles": [
             "@deepseek-ai/dsh-base",
             "@myagents/dsh-acp-host",
@@ -82,7 +82,7 @@ def _fake_profile(root: Path) -> tuple[Path, Path]:
     )
     (plugin / "package.json").write_text(json.dumps({
         "name": "@myagents/dsh-acp-host",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "main": "lib/index.js",
         "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
     }) + "\n", encoding="utf-8")
@@ -107,12 +107,12 @@ def _fake_cli_body(marker: Path | None = None) -> str:
         + touch
         + "profile = sys.argv[sys.argv.index('--profile') + 1]\n"
         "os.environ['FAKE_ACP_AGENT_NAME'] = 'dsh-myagents-acp'\n"
-        "os.environ['FAKE_ACP_AGENT_VERSION'] = '0.1.0'\n"
+        "os.environ['FAKE_ACP_AGENT_VERSION'] = '0.1.1'\n"
         "os.environ['FAKE_ACP_AGENT_PROFILE'] = "
         "os.environ.get('DSH_ACP_PROFILE', '')\n"
-        "os.environ['FAKE_ACP_AGENT_RUNTIME_VERSION'] = '0.1.1-rc.2'\n"
+        "os.environ['FAKE_ACP_AGENT_RUNTIME_VERSION'] = '0.1.2-alpha.2'\n"
         "os.environ.setdefault("
-        "'FAKE_ACP_AGENT_COMPATIBILITY_REVISION', '1')\n"
+        "'FAKE_ACP_AGENT_COMPATIBILITY_REVISION', '2')\n"
         "os.environ.setdefault("
         "'FAKE_ACP_AGENT_POLICY_REVISION', '1')\n"
         "os.environ['FAKE_ACP_AGENT_READ_ONLY_TOOLS'] = "
@@ -143,7 +143,7 @@ def _fake_install(root: Path, marker: Path | None = None) -> tuple[Path, Path]:
     )
     (package / "package.json").write_text(json.dumps({
         "name": "@deepseek-ai/dsh",
-        "version": "0.1.1-rc.2",
+        "version": "0.1.2-alpha.2",
         "bin": {"dsh": "lib/bin.js"},
     }) + "\n", encoding="utf-8")
     link = root / "bin/dsh"
@@ -159,11 +159,11 @@ def _fake_source(root: Path) -> tuple[Path, Path, Path]:
     source.mkdir(parents=True, exist_ok=True)
     (source / "package.json").write_text(json.dumps({
         "name": "@deepseek-ai/dsh-root",
-        "version": "0.1.1-rc.2",
+        "version": "0.1.2-alpha.2",
     }) + "\n", encoding="utf-8")
     (cli_root / "package.json").write_text(json.dumps({
         "name": "@deepseek-ai/dsh",
-        "version": "0.1.1-rc.2",
+        "version": "0.1.2-alpha.2",
         "bin": {"dsh": "lib/bin.js"},
     }) + "\n", encoding="utf-8")
     node = _write_executable(
@@ -255,7 +255,7 @@ def test_readiness_rejects_version_profile_and_bundle_drift() -> None:
         result = dsh_readiness_probe(environ=env, resolver=FakeResolver({}))
         assert result.state is ReadinessState.INVALID
         assert "版本不兼容" in result.detail
-        cli_data["version"] = "0.1.1-rc.2"
+        cli_data["version"] = "0.1.2-alpha.2"
         cli_package.write_text(json.dumps(cli_data), encoding="utf-8")
 
         profile_path = home / "profiles/myagents/package.json"
@@ -276,7 +276,7 @@ def test_readiness_rejects_version_profile_and_bundle_drift() -> None:
         assert result.state is ReadinessState.INVALID
         assert "bundle 版本不兼容" in result.detail
 
-        bundle["version"] = "0.1.0"
+        bundle["version"] = "0.1.1"
         bundle["dsh"]["bundle"]["patch"] = "./other.yml"
         plugin_path.write_text(json.dumps(bundle), encoding="utf-8")
         result = dsh_readiness_probe(environ=env, resolver=FakeResolver({}))

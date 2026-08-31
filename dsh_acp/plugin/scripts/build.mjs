@@ -24,7 +24,10 @@ if (outdirFlag < 0 || process.argv[outdirFlag + 1] === undefined) {
 const outdir = resolve(process.argv[outdirFlag + 1])
 await mkdir(outdir, { recursive: true })
 
-const acpSdk = await realpath(join(sourceRoot, 'node_modules/@agentclientprotocol/sdk/dist/acp.js'))
+const acpSdk = await realpath(join(
+  sourceRoot,
+  'apps/cli/node_modules/@agentclientprotocol/sdk/dist/acp.js',
+))
 execFileSync(esbuild, [
   'src/index.ts',
   '--bundle',

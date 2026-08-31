@@ -291,7 +291,8 @@ def _verify_source(source_root: Path, contract: dict) -> Path:
     if not isinstance(acp_sdk, dict):
         _fail("runtime-contract.json 缺少 acpSdk")
     sdk_root = (
-        source_root / "node_modules" / "@agentclientprotocol" / "sdk"
+        source_root / "apps" / "cli" / "node_modules" /
+        "@agentclientprotocol" / "sdk"
     ).resolve(strict=True)
     sdk_manifest = _json_object(sdk_root / "package.json", "ACP SDK manifest")
     if (

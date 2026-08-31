@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
 import {
-  CallId,
+  ToolCallId,
   createToolResultMessage,
   createUserMessage,
   freezeMessage,
@@ -16,8 +16,8 @@ import { makeBridgeHarness, textResponse, type BridgeHarness } from './harness.t
 function toolCallResponse(): StreamChunk[] {
   return [
     { type: 'block-start', index: 0, blockType: 'tool-call' },
-    { type: 'tool-call-delta', index: 0, id: CallId('call-1'), name: 'echo', argumentsDelta: '{}' },
-    { type: 'block-end', index: 0, block: { type: 'tool-call', id: CallId('call-1'), name: 'echo', arguments: '{}' } },
+    { type: 'tool-call-delta', index: 0, id: ToolCallId('call-1'), name: 'echo', argumentsDelta: '{}' },
+    { type: 'block-end', index: 0, block: { type: 'tool-call', id: ToolCallId('call-1'), name: 'echo', arguments: '{}' } },
     { type: 'finish', reason: { kind: 'tool-calls' } },
   ]
 }
@@ -171,7 +171,7 @@ describe('ACP automation output boundary', () => {
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
     const agent = harness.ctx.agents.get(SessionId(sessionId))!
-    const callId = CallId('live-replaced-result')
+    const callId = ToolCallId('live-replaced-result')
     agent.session.append('turn/start', { turn: 1 })
     agent.session.append('step/start', { turn: 1, step: 1 })
     agent.session.append('tool/call', {
@@ -266,7 +266,7 @@ describe('ACP automation output boundary', () => {
       agent.session.append('tool/call', {
         turn: 1,
         step: 1,
-        callId: CallId(`blocked-${index}`),
+        callId: ToolCallId(`blocked-${index}`),
         name: 'read',
         arguments: `{"path":"file-${index}"}`,
       })
@@ -275,7 +275,7 @@ describe('ACP automation output boundary', () => {
     agent.session.append('tool/call', {
       turn: 1,
       step: 1,
-      callId: CallId('blocked-overflow'),
+      callId: ToolCallId('blocked-overflow'),
       name: 'read',
       arguments: '{"path":"overflow"}',
     })
@@ -306,13 +306,13 @@ describe('ACP automation output boundary', () => {
     }
     const prompt = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'hold output' }] })
     await vi.waitFor(() => { expect(harness!.adapter.requests).toHaveLength(1) })
-    const callId = CallId(`call-${'c'.repeat(20_000)}`)
+    const callId = ToolCallId(`call-${'c'.repeat(20_000)}`)
     const toolName = `tool-${'t'.repeat(20_000)}`
 
     agent.session.append('tool/call', {
       turn: 1,
       step: 1,
-      callId: CallId('active-small-call'),
+      callId: ToolCallId('active-small-call'),
       name: 'read',
       arguments: '{"path":"small"}',
     })

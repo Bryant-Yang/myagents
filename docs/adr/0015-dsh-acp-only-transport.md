@@ -49,7 +49,7 @@ seam，足以让 myagents 插件自己拥有完整的 `dsh-myagents-acp` server 
   `package.json` 必须同时满足：`dependencies` 存在
   `@myagents/dsh-acp-host`；`dsh.profile.bundles` 精确、按序等于
   `["@deepseek-ai/dsh-base", "@myagents/dsh-acp-host"]`；解析后的 bundle package 精确为
-  `@myagents/dsh-acp-host@0.1.0`，并声明
+  `@myagents/dsh-acp-host@0.1.1`，并声明
   `dsh.bundle.patch=./cordis.patch.yml`。canonical package entry 与 patch 必须是普通、
   可读、位于解析后的 package root 内；entry 与 patch 的 SHA-256 必须分别匹配
   checked-in runtime contract，并以 no-follow、单链接、有界、读前后身份稳定的方式
@@ -108,7 +108,7 @@ patch 任一不满足为 `invalid`；完整入口才为 `ready`。probe
 
 - `agentCapabilities.loadSession === true`；
 - `agentCapabilities.sessionCapabilities.close` 是对象。
-- `agentInfo.name === "dsh-myagents-acp"` 且 `version === "0.1.0"`；
+- `agentInfo.name === "dsh-myagents-acp"` 且 `version === "0.1.1"`；
 - `agentInfo._meta` 精确满足下述版本化 wire schema。
 
 `_meta` 的五个必需字面量 key 及类型/值契约为：
@@ -118,8 +118,8 @@ patch 任一不满足为 `invalid`；完整入口才为 `ready`。probe
 | `deepseek.ai/dsh-myagents-profile` | string | `"workspace-write"` 或 `"read-only"`，且必须与当前进程的 `DSH_ACP_PROFILE` 一致 |
 | `deepseek.ai/dsh-myagents-policy-revision` | integer | `1` |
 | `deepseek.ai/dsh-myagents-read-only-tools` | array of strings | 按顺序精确为 `["read", "glob", "grep"]` |
-| `deepseek.ai/dsh-runtime-version` | string | `"0.1.1-rc.2"` |
-| `deepseek.ai/dsh-compatibility-revision` | integer | `1` |
+| `deepseek.ai/dsh-runtime-version` | string | `"0.1.2-alpha.2"` |
+| `deepseek.ai/dsh-compatibility-revision` | integer | `2` |
 
 - `deepseek.ai/dsh-myagents-profile` 必须是 JSON string，值精确等于当前
   `DSH_ACP_PROFILE` 的 `workspace-write` 或 `read-only`；
@@ -129,7 +129,7 @@ patch 任一不满足为 `invalid`；完整入口才为 `ready`。probe
   精确为三个 string `read`、`glob`、`grep`；缺项、重复、换序或
   额外工具都失败。
 - runtime version 与 checked-in DSH compatibility contract 必须精确一致；compatibility
-  revision 必须是 JSON integer `1`，boolean `true` 不得借数值相等通过。
+  revision 必须是 JSON integer `2`，boolean `true` 不得借数值相等通过。
 
 host 可以携带其他 `_meta` 扩展，但不能替代或改写上述五项。
 
@@ -273,7 +273,7 @@ MYAGENTS_DSH_SOURCE_ROOT=/absolute/path/to/deepseek-harness \
 1. installed 官方 `dsh` 与 source 已构建官方 CLI 两条入口都以
    `--profile myagents` 完成 initialize/new/prompt/close；
 2. plugin add 后 profile 的 dependency、exact base → host bundle 顺序、解析后的
-   `@myagents/dsh-acp-host@0.1.0`、entry 与 patch 精确；缺失、换序、版本漂移、普通
+   `@myagents/dsh-acp-host@0.1.1`、entry 与 patch 精确；缺失、换序、版本漂移、普通
    dependency 冒充 bundle、profile parent/manifest symlink escape，以及 home/profile
    later-wins 有效 patch 均被动阻断；
 3. 重启后 `session/load` 恢复同一 session，cwd 不匹配和未知 id 明确失败，历史输出

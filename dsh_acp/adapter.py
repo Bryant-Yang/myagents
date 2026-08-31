@@ -49,10 +49,10 @@ _DSH_PROFILE_BUNDLES = (
     "@myagents/dsh-acp-host",
 )
 _DSH_PLUGIN_NAME = "@myagents/dsh-acp-host"
-_DSH_PLUGIN_VERSION = "0.1.0"
+_DSH_PLUGIN_VERSION = "0.1.1"
 _DSH_RUNTIME_PACKAGE = "@deepseek-ai/dsh"
 _DSH_RUNTIME_ROOT_PACKAGE = "@deepseek-ai/dsh-root"
-_DSH_RUNTIME_VERSION = "0.1.1-rc.2"
+_DSH_RUNTIME_VERSION = "0.1.2-alpha.2"
 _DSH_SOURCE_CLI_PACKAGE = Path("apps/cli/package.json")
 _DSH_SOURCE_CLI_BIN = Path("apps/cli/lib/bin.js")
 _MAX_MANIFEST_BYTES = 1_048_576
@@ -72,14 +72,14 @@ _DSH_READ_ONLY_TOOLS_META_KEY = "deepseek.ai/dsh-myagents-read-only-tools"
 _DSH_RUNTIME_VERSION_META_KEY = "deepseek.ai/dsh-runtime-version"
 _DSH_COMPATIBILITY_REVISION_META_KEY = "deepseek.ai/dsh-compatibility-revision"
 _DSH_POLICY_REVISION = 1
-_DSH_COMPATIBILITY_REVISION = 1
+_DSH_COMPATIBILITY_REVISION = 2
 _DSH_READ_ONLY_TOOLS = ["read", "glob", "grep"]
 _DSH_PERMISSION_KINDS = {"allow_once", "reject_once"}
 _DSH_PLUGIN_ENTRY_SHA256 = (
-    "a8515ac654705e07ea04c2f7c2f3df452500c9ad902652cb0d434af49aba3290"
+    "e9e9b09a22c268b6b23a707bad2a935c391fada792837cebd1c8dd6070643688"
 )
 _DSH_PLUGIN_PATCH_SHA256 = (
-    "744d7ce4370c0bac08db1b53e0da407005a2e053077648b85adbd69c996afbb2"
+    "13c78412265c933454d3bb215f0138d384e36a8c223840b1fa2f3404b1d6083c"
 )
 
 

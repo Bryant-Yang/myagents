@@ -87,9 +87,9 @@ AGENT_NAME = os.environ.get("FAKE_ACP_AGENT_NAME", "fake-acp")
 AGENT_VERSION = os.environ.get("FAKE_ACP_AGENT_VERSION", "0.1")
 AGENT_PROFILE = os.environ.get("FAKE_ACP_AGENT_PROFILE", "")
 AGENT_RUNTIME_VERSION = os.environ.get(
-    "FAKE_ACP_AGENT_RUNTIME_VERSION", "0.1.1-rc.2")
+    "FAKE_ACP_AGENT_RUNTIME_VERSION", "0.1.2-alpha.2")
 _compatibility_revision_raw = os.environ.get(
-    "FAKE_ACP_AGENT_COMPATIBILITY_REVISION", "1")
+    "FAKE_ACP_AGENT_COMPATIBILITY_REVISION", "2")
 try:
     # JSON parsing lets tests distinguish integer 1 from bool true.  An
     # unquoted invalid value is intentionally preserved as a string so the

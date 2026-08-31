@@ -524,10 +524,10 @@ expected_dsh_literals = {
     "_DSH_PROFILE_BUNDLES": (
         "@deepseek-ai/dsh-base", "@myagents/dsh-acp-host"),
     "_DSH_PLUGIN_NAME": "@myagents/dsh-acp-host",
-    "_DSH_PLUGIN_VERSION": "0.1.0",
+    "_DSH_PLUGIN_VERSION": "0.1.1",
     "_DSH_RUNTIME_PACKAGE": "@deepseek-ai/dsh",
     "_DSH_RUNTIME_ROOT_PACKAGE": "@deepseek-ai/dsh-root",
-    "_DSH_RUNTIME_VERSION": "0.1.1-rc.2",
+    "_DSH_RUNTIME_VERSION": "0.1.2-alpha.2",
     "DSH_ACP_WORKSPACE_PROFILE": "workspace-write",
     "DSH_ACP_READ_ONLY_PROFILE": "read-only",
     "_DSH_AGENT_NAME": "dsh-myagents-acp",
@@ -540,13 +540,13 @@ expected_dsh_literals = {
     "_DSH_COMPATIBILITY_REVISION_META_KEY": (
         "deepseek.ai/dsh-compatibility-revision"),
     "_DSH_POLICY_REVISION": 1,
-    "_DSH_COMPATIBILITY_REVISION": 1,
+    "_DSH_COMPATIBILITY_REVISION": 2,
     "_DSH_READ_ONLY_TOOLS": ["read", "glob", "grep"],
     "_DSH_PERMISSION_KINDS": {"allow_once", "reject_once"},
     "_DSH_PLUGIN_ENTRY_SHA256": (
-        "a8515ac654705e07ea04c2f7c2f3df452500c9ad902652cb0d434af49aba3290"),
+        "e9e9b09a22c268b6b23a707bad2a935c391fada792837cebd1c8dd6070643688"),
     "_DSH_PLUGIN_PATCH_SHA256": (
-        "744d7ce4370c0bac08db1b53e0da407005a2e053077648b85adbd69c996afbb2"),
+        "13c78412265c933454d3bb215f0138d384e36a8c223840b1fa2f3404b1d6083c"),
 }
 observed_dsh_literals = {
     name: dsh_assignment_values.get(name) for name in expected_dsh_literals
@@ -779,7 +779,7 @@ else:
     package_files = package.get("files")
     package_dsh = package.get("dsh")
     if (package.get("name") != "@myagents/dsh-acp-host"
-            or package.get("version") != "0.1.0"
+            or package.get("version") != "0.1.1"
             or package.get("main") != "lib/index.js"
             or not isinstance(package_exports, dict)
             or package_exports.get(".") != {"default": "./lib/index.js"}
@@ -826,37 +826,37 @@ else:
     )
     dsh_root_contract = runtime_contract.get("dshRoot")
     if (runtime_contract.get("schemaVersion") != 5
-            or runtime_contract.get("hostVersion") != "0.1.0"
-            or runtime_contract.get("compatibilityRevision") != 1
+            or runtime_contract.get("hostVersion") != "0.1.1"
+            or runtime_contract.get("compatibilityRevision") != 2
             or not isinstance(dsh_root_contract, dict)
             or dsh_root_contract.get("name")
             != "@deepseek-ai/dsh-root"
             or dsh_root_contract.get("version")
-            != "0.1.1-rc.2"
+            != "0.1.2-alpha.2"
             or dsh_root_contract.get("sourceCommit")
-            != "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"
+            != "0a53fb55bea101816fa226bb964ae2bed71c343b"
             or dsh_root_contract.get("cliEntry") != "apps/cli/lib/bin.js"
             or dsh_root_contract.get("cliEntrySha256")
-            != "c0226687bb20f45c603ec6fe50f3de16d1c3510c3a803304ec575ef9bc366c62"
+            != "dc23f6c5dd7df8834e3e38bdb9609d77b459834681ae9b7133b417b0c35f3166"
             or dsh_root_contract.get("cliRuntimeFiles") != {
                 "bin.js": (
-                    "c0226687bb20f45c603ec6fe50f3de16d1c3510c3a803304ec575ef9bc366c62"),
-                "dump-config-D-jtgwY3.js": (
-                    "f75ee5e1f3a7392103029f1b254188975c57c41ef6f959c887c2163bc7aaf47d"),
-                "plugin-9h8shc4d.js": (
-                    "6f4459da44f0e5bdb3c72471f4be0ee1929913be352baf8b0da7b700afc1804c"),
-                "profile-boot-BnJoK_kl.js": (
-                    "778c5b338674d986a49972be920c965d28b2c8cac85364ae77f8587070397663"),
-                "profile-boot-DG5t9aNs.js": (
-                    "f83ffea6a4d30cfbe02b41dabcc05104c4ad27bf79c74f601f0ddb6ccdf88969"),
+                    "dc23f6c5dd7df8834e3e38bdb9609d77b459834681ae9b7133b417b0c35f3166"),
+                "dump-config-BNQ_bV66.js": (
+                    "14546c0a59460bd294e5869a780fc848f288e2feea199e5d31fc02e440ba7cd8"),
+                "plugin-F7ZVfRyo.js": (
+                    "692f93eee677c1951bd4693e0dab54ceb2c13d48a6f1aab941e78b084c5da39a"),
+                "profile-boot-BTzzdrGY.js": (
+                    "20daa1648fda862247d78840e52472e84f4c6846394cb69b79db213d8ed79b6a"),
+                "profile-boot-x7_BzdeW.js": (
+                    "624dcfd891d259dd1952d61c7a66f0912b614ce39d4aaa0f29a9f7aabe1ab073"),
             }
             or "runtimeFileCount" in dsh_root_contract
             or "runtimeTreeSha256" in dsh_root_contract
             or runtime_contract.get("acpSdk") != {
                 "name": "@agentclientprotocol/sdk",
-                "version": "0.25.1",
+                "version": "1.4.0",
                 "entrySha256": (
-                    "a99ccb28840ca0338595e1f636cf41527f482bf4d45dded78fd15fdd61cd23d6"),
+                    "cc717d74b018c1fe3e1e53e31ff6355ccf52e729e753666051bda42499be7b9f"),
             }
             or runtime_contract.get("buildTool") != {
                 "name": "esbuild",
@@ -876,9 +876,9 @@ else:
                 "patch": "cordis.patch.yml",
                 "acpSdkBundled": True,
                 "entrySha256": (
-                    "a8515ac654705e07ea04c2f7c2f3df452500c9ad902652cb0d434af49aba3290"),
+                    "e9e9b09a22c268b6b23a707bad2a935c391fada792837cebd1c8dd6070643688"),
                 "patchSha256": (
-                    "744d7ce4370c0bac08db1b53e0da407005a2e053077648b85adbd69c996afbb2"),
+                    "13c78412265c933454d3bb215f0138d384e36a8c223840b1fa2f3404b1d6083c"),
             }
             or not public_package_contracts_valid
             or set(expected_plugin_peers) != expected_peer_names
@@ -894,7 +894,8 @@ else:
         "workspace-write:", "process.env.DSH_ACP_PROFILE",
         "id: myagents-dsh-acp-host",
         "name: '@myagents/dsh-acp-host'", "id: subagent",
-        "id: tool-subagent", "id: web", "disabled: true",
+        "id: tool-subagent", "id: web", "id: web-fetch-http",
+        "disabled: true",
     }
     if (not all(token in patch_text for token in required_patch_tokens)
             or any(token in patch_text for token in (
@@ -921,7 +922,7 @@ else:
         "ProductAcp", "installModelSelection", "profileSetup",
         "READ_ONLY_TOOLS", "agentCtx.tools.restrict",
         "agentCtx.tools.guard", "tools/pre-execute",
-        "effectiveSandboxMode", "effectiveApprovalPolicy",
+        "get('sandboxPolicy')", "sandboxPolicy.resolve", "effectiveApprovalPolicy",
         "ctx.inject", "runtimeCtx.plugin(ProductAcp", "agentInfo:",
         "dsh-myagents-acp", "DSH_ACP_PERSISTENCE_DIR",
         "DSH_ACP_RUNTIME_HOME", "DSH_ACP_ATTACHMENT_HOME",
@@ -1013,7 +1014,7 @@ else:
     required_package_tokens = {
         "MYAGENTS_DSH_SOURCE_ROOT", "mktemp -d /tmp/myagents-dsh-package.",
         "dsh_acp/plugin/scripts/build.mjs", "pack --pack-destination",
-        "myagents-dsh-acp-host-0.1.0.tgz", "拒绝覆盖已有 tarball",
+        "myagents-dsh-acp-host-0.1.1.tgz", "拒绝覆盖已有 tarball",
         "lib/index.js", "runtime-contract.json", "THIRD_PARTY_NOTICES.md",
         "check-dsh-runtime-contract.py", "--source-root",
         "--bundle-entry", "--bundle-patch", "--contract",
@@ -1038,7 +1039,8 @@ else:
     required_runtime_contract_tokens = {
         '"rev-parse", "--show-toplevel"', '"rev-parse", "HEAD"',
         'dsh_root.get("sourceCommit")', 'source_root / "package.json"',
-        'source_root / "node_modules" / "@agentclientprotocol" / "sdk"',
+        'source_root / "apps" / "cli" / "node_modules"',
+        '"@agentclientprotocol" / "sdk"',
         'sdk_root / "dist/acp.js"', 'contract.get("publicPackages")',
         'package_root / "src/index.ts"', 'contract.get("profileBundle")',
         'dsh_root.get("cliEntrySha256")', 'expected.get("runtimeEntry")',

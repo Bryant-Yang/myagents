@@ -507,7 +507,7 @@
   属性，不执行 CLI、pnpm/build 或真实模型，也不创建或修复 profile/state。它要求
   profile dependencies 包含 `@myagents/dsh-acp-host`、bundle 列表精确等于
   `["@deepseek-ai/dsh-base", "@myagents/dsh-acp-host"]`，解析后的 package 精确为
-  `@myagents/dsh-acp-host@0.1.0`，并声明
+  `@myagents/dsh-acp-host@0.1.1`，并声明
   `dsh.bundle.patch=./cordis.patch.yml`；entry 与 patch 必须是 canonical、普通、可读，
   通过 no-follow 稳定读取，且 SHA-256 与 checked-in runtime contract 精确一致。
   `MYAGENTS_DSH_SOURCE_ROOT` 只定位官方已构建
@@ -531,14 +531,14 @@
 - **stateful/lifecycle gate**：initialize 必须在任何 new/load/prompt 前同时广告
   `agentCapabilities.loadSession=true` 与对象形状的
   `sessionCapabilities.close`；`agentInfo` 还必须精确声明 name
-  `dsh-myagents-acp`、精确 host version `0.1.0`，以及符合
+  `dsh-myagents-acp`、精确 host version `0.1.1`，以及符合
   [ADR-0015 §2.2](adr/0015-dsh-acp-only-transport.md)
   的五个 literal `_meta` key：
   `deepseek.ai/dsh-myagents-profile` 字符串必须与当前进程一致，
   `deepseek.ai/dsh-myagents-policy-revision` 必须是 integer `1`，
   `deepseek.ai/dsh-myagents-read-only-tools` 必须是顺序精确的
   `["read", "glob", "grep"]`，`deepseek.ai/dsh-runtime-version` 必须为
-  `0.1.1-rc.2`，`deepseek.ai/dsh-compatibility-revision` 必须是 integer `1`，否则
+  `0.1.2-alpha.2`，`deepseek.ai/dsh-compatibility-revision` 必须是 integer `2`，否则
   进程回收并 block。恢复只用标准
   `session/load`；无 auth 的 load 历史通知直接丢弃，有 auth 时队列上限 64，
   不外泄到当前回复。cancel 有界等待原 prompt，reset/aclose 先有界 close session，
@@ -592,11 +592,18 @@
   Git 状态及含 ignored 文件内容的完整文件树不变。用户 settings/credentials 的 inode、
   mode、size、mtime 与 SHA-256 前后相同，默认 `~/.dsh/profiles/myagents` 未创建，退出后
   无 DSH profile 进程残留。
+- **升级实机验收**：2026-08-31 针对本机官方 DSH `0.1.2-alpha.2`，release gate 在
+  临时 `DSH_HOME` 中完成 12 个测试文件、151 项测试、官方 profile/plugin
+  add/dump、ACP 生命周期、Oxlint、严格 typecheck 与可复现构建；随后仅通过官方
+  `dsh plugin --profile myagents add` 将 `@myagents/dsh-acp-host@0.1.1` 更新到
+  `~/.dsh/profiles/myagents`。仓库 venv 与全局 uv tool 的被动 readiness 均返回
+  `READY`，真实 read-only ACP fresh session 无工具调用并精确返回
+  `DSH_UPDATE_OK` 后 `end_turn`。DSH checkout 的 HEAD 与 Git 状态始终未改变。
 - **人工验收边界**：旧 custom `tsx` host 证据仍为 **superseded**。当前未修改或安装
-  用户级 DSH，因此独立发布包形态的全局 `dsh` 可执行文件仍需在实际安装时复跑同一
-  release gate；真实主动 cancel 时延、长 session/compaction、max-token/refusal 压力
-  与真实图片模型仍未覆盖。对应能力不得超出已获证范围，任何必须修改 DSH 本体才能
-  通过的能力直接判为 no-go。
+  用户级 DSH 本体；本机源码构建的官方 CLI/profile/plugin 路径已经验收，但独立发布包
+  形态的全局 `dsh` 可执行文件仍需在实际安装时复跑同一 release gate。真实主动 cancel
+  时延、长 session/compaction、max-token/refusal 压力与真实图片模型仍未覆盖。对应能力
+  不得超出已获证范围，任何必须修改 DSH 本体才能通过的能力直接判为 no-go。
 - **事实源**：ADR-0015、`dsh_acp/adapter.py`、`dsh_acp/plugin`、`acp/client.py`。
 - **里程碑**：M4.12。
 

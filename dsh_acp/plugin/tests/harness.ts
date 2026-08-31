@@ -17,6 +17,7 @@ import type { ImageAttachmentLimits, ImageAttachmentRef, SaveImageAttachment, St
 import { type GenerateOptions, LlmAdapter, type LlmResolvedModelInfo, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import * as AcpPlugin from '../src/acp.ts'
 import type { AcpConfig } from '../src/acp.ts'
 
@@ -186,6 +187,7 @@ export async function makeBridgeHarness(options: {
   const adapter = new MockAdapter(options.script ?? [], options.imageCapable === true)
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx, { systemPrompt: { persona: options.persona ?? '' } })
+  await ctx.plugin(SessionProjectionRegistry)
   if (options.attachments !== false) await ctx.plugin(MemoryAttachmentStore)
   const loopFiber = await ctx.plugin(AgentLoop, { agents: [] })
   ctx.llm.registerAdapter(['mock'], adapter)

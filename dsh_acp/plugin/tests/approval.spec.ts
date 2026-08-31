@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PROTOCOL_VERSION, type RequestPermissionResponse } from '@agentclientprotocol/sdk'
-import { CallId, createToolResultMessage } from '@deepseek-ai/dsh-llm'
+import { ToolCallId, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import ApprovalService, { type ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
@@ -21,7 +21,7 @@ describe('ACP machine permission policy', () => {
     const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
     const agent = harness.ctx.agents.get(SessionId(sessionId))!
     agent.session.append('turn/start', { turn: 1 })
-    const request = { agent, toolName: 'bash', callId: CallId('call-9'), ...overrides }
+    const request = { agent, toolName: 'bash', callId: ToolCallId('call-9'), ...overrides }
     if (request.callId !== undefined) {
       agent.session.append('tool/call', {
         turn: 1,
@@ -75,7 +75,7 @@ describe('ACP machine permission policy', () => {
       oldest.agent.session.append('tool/call', {
         turn: 1,
         step: 1,
-        callId: CallId(`flood-${index}`),
+        callId: ToolCallId(`flood-${index}`),
         name: 'read',
         arguments: `{"path":"file-${index}"}`,
       })
@@ -92,7 +92,7 @@ describe('ACP machine permission policy', () => {
     await expect(harness.ctx.approval.request({
       agent: oldest.agent,
       toolName: 'read',
-      callId: CallId('flood-255'),
+      callId: ToolCallId('flood-255'),
     })).resolves.toBe('allowed-once')
     expect(harness.permissionRequests.at(-1)?.toolCall).toMatchObject({
       toolCallId: 'flood-255',
@@ -106,7 +106,7 @@ describe('ACP machine permission policy', () => {
     harness = await makeBridgeHarness()
     harness.onPermission = () => ({ outcome: { outcome: 'selected', optionId: 'allow-once' } })
     const request = await ownedRequest()
-    const callId = CallId('oversized-call')
+    const callId = ToolCallId('oversized-call')
     request.agent.session.append('tool/call', {
       turn: 1,
       step: 1,
@@ -192,7 +192,7 @@ describe('ACP machine permission policy', () => {
 
     for (let index = 0; index < 16; index += 1) {
       const agent = index < 8 ? firstAgent : secondAgent
-      const callId = index === 0 ? first.callId! : CallId(`pending-${index}`)
+      const callId = index === 0 ? first.callId! : ToolCallId(`pending-${index}`)
       if (index > 0) {
         agent.session.append('tool/call', {
           turn: 1,
@@ -214,7 +214,7 @@ describe('ACP machine permission policy', () => {
       await expect(decision).resolves.toBe('cancelled')
     }
 
-    const overflowId = CallId('pending-overflow')
+    const overflowId = ToolCallId('pending-overflow')
     firstAgent.session.append('tool/call', {
       turn: 1,
       step: 1,
@@ -308,7 +308,7 @@ describe('ACP machine permission policy', () => {
     const foreign = {
       session: { id: request.agent.session.id, events: [{ type: 'turn/start' }], append: () => ({}) },
     } as unknown as Agent
-    await expect(harness.ctx.approval.request({ agent: foreign, toolName: 'bash', callId: CallId('call') }))
+    await expect(harness.ctx.approval.request({ agent: foreign, toolName: 'bash', callId: ToolCallId('call') }))
       .resolves.toBe('unavailable')
     expect(harness.permissionRequests).toHaveLength(0)
   })

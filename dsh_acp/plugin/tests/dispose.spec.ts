@@ -145,7 +145,7 @@ describe('ACP connection ownership', () => {
     await expect(harness.client.closeSession({ sessionId })).rejects.toThrow(/unknown session/)
   })
 
-  it('fails prompt admission during close and shares teardown with connection shutdown', async () => {
+  it('rejects a late prompt across the close boundary and shares teardown with connection shutdown', async () => {
     harness = await makeBridgeHarness()
     const create = harness.ctx.agents.create.bind(harness.ctx.agents)
     const disposeStarted = Promise.withResolvers<undefined>()
@@ -167,11 +167,14 @@ describe('ACP connection ownership', () => {
 
     const closing = harness.client.closeSession({ sessionId })
     await disposeStarted.promise
-    await expect(harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'late' }] }))
-      .rejects.toThrow(/session is closing/)
-    await harness.closeClientTransport()
+    const latePrompt = harness.client.prompt({
+      sessionId,
+      prompt: [{ type: 'text', text: 'late' }],
+    })
     releaseDispose.resolve(undefined)
     await expect(closing).resolves.toEqual({})
+    await expect(latePrompt).rejects.toThrow(/unknown session|session is closing/)
+    await harness.closeClientTransport()
     await harness.acpFiber.dispose()
 
     expect(attempts).toBe(1)

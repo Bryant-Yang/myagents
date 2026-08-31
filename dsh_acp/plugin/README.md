@@ -35,7 +35,7 @@ MYAGENTS_DSH_SOURCE_ROOT=/absolute/path/to/deepseek-harness \
   bash scripts/package-dsh-plugin.sh /tmp/myagents-dsh-package
 DSH_HOME=/absolute/product/profile-home \
   dsh plugin --profile myagents add \
-  /tmp/myagents-dsh-package/myagents-dsh-acp-host-0.1.0.tgz --offline
+  /tmp/myagents-dsh-package/myagents-dsh-acp-host-0.1.1.tgz --offline
 DSH_HOME=/absolute/product/profile-home \
   DSH_ACP_PROFILE=read-only \
   dsh --profile myagents

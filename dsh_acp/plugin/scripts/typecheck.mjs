@@ -20,7 +20,7 @@ if (config.error !== undefined) {
   throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'))
 }
 const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, sourceRoot, {}, configPath)
-const sdkTypes = join(sourceRoot, 'node_modules/@agentclientprotocol/sdk/dist/acp.d.ts')
+const sdkTypes = join(sourceRoot, 'apps/cli/node_modules/@agentclientprotocol/sdk/dist/acp.d.ts')
 const options = {
   ...parsed.options,
   noEmit: true,

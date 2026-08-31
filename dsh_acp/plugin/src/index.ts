@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { installModelSelection, type AgentSetup, type ModelSelection } from '@deepseek-ai/dsh-agent'
-import { effectiveSandboxMode, setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
+import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import type { PreToolDecision, ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
 import { effectiveApprovalPolicy, setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import * as ProductAcp from './acp.ts'
@@ -24,9 +24,9 @@ export type Profile = 'workspace-write' | 'read-only'
 
 export const READ_ONLY_TOOLS = ['read', 'glob', 'grep'] as const
 
-export const HOST_VERSION = '0.1.0'
-export const DSH_RUNTIME_VERSION = '0.1.1-rc.2'
-export const COMPATIBILITY_REVISION = 1
+export const HOST_VERSION = '0.1.1'
+export const DSH_RUNTIME_VERSION = '0.1.2-alpha.2'
+export const COMPATIBILITY_REVISION = 2
 
 export interface Config {
   profile: Profile
@@ -262,7 +262,9 @@ export function profileSetup(profile: Profile): AgentSetup {
             throw new Error(`myagents DSH host: safe tool identity changed before publication: ${toolName}`)
           }
         }
-        if (effectiveSandboxMode(agent.session.events) !== profile) {
+        const sandboxPolicy = agentCtx.get('sandboxPolicy')
+        if (sandboxPolicy === undefined
+          || sandboxPolicy.resolve({ session: agent.session }).mode !== profile) {
           throw new Error(`myagents DSH host: sandbox profile attestation failed: ${profile}`)
         }
         const expectedApproval = profile === 'read-only' ? 'never' : 'ask'
