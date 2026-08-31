@@ -33,7 +33,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
-from textual.events import Resize
+from textual.events import Blur, Resize
 from textual.message import Message as TextualMessage
 from textual.screen import ModalScreen
 from textual.widgets import (
@@ -793,6 +793,9 @@ class ActivityPanel(Static):
 
     def action_activity_close(self) -> None:
         self.app.close_activity_navigation()
+
+    def on_blur(self, _event: Blur) -> None:
+        self.app.compact_activity_navigation()
 
 
 class ChatApp(App):
@@ -1730,20 +1733,44 @@ class ChatApp(App):
         except NoMatches:
             # Session watcher 可能恰好在 Textual 已卸载子节点后完成收尾。
             return
-        command_ids = self._activity_feed.command_ids()
-        if not command_ids:
+        all_command_ids = self._activity_feed.command_ids()
+        if not all_command_ids:
             panel.update("")
             panel.styles.display = "none"
             return
+        browsing = self._selected_activity_id is not None
+        command_ids = (
+            all_command_ids
+            if browsing else self._activity_feed.compact_command_ids()
+        )
+        hidden_count = len(all_command_ids) - len(command_ids)
         rendered = Text()
         rendered.append("任务活动", "bold")
-        rendered.append("  ·  Ctrl+G 浏览  ·  /details 展开", "dim")
+        if browsing:
+            rendered.append(
+                "  ·  ↑↓ 选择  ·  Enter 展开/收起  ·  Esc 返回", "dim")
+        else:
+            rendered.append(
+                "  ·  当前与最近  ·  Ctrl+G 浏览全部  ·  /details 展开",
+                "dim",
+            )
+        if hidden_count:
+            rendered.append(
+                f"\n已收起 {hidden_count} 个任务  ·  Ctrl+G 浏览全部",
+                "dim",
+            )
         for command_id in command_ids:
             rendered.append("\n")
             rendered.append_text(self._render_activity_card(command_id))
         panel.update(rendered)
         visual_lines = rendered.plain.count("\n") + 1
-        panel.styles.height = min(14, max(3, visual_lines + 2))
+        expanded = any(
+            command_id in self._expanded_activity
+            for command_id in command_ids
+        )
+        height_limit = 14 if browsing or expanded else 7
+        panel.styles.height = min(
+            height_limit, max(3, visual_lines + 2))
         panel.styles.display = "block"
 
     def _system(self, text: str) -> None:
@@ -2491,9 +2518,15 @@ class ChatApp(App):
 
     def close_activity_navigation(self) -> None:
         """退出活动卡导航，清除选中标记并把焦点还给输入框。"""
+        self.compact_activity_navigation()
+        self.query_one("#composer", ComposerInput).focus()
+
+    def compact_activity_navigation(self) -> None:
+        """活动区失焦后恢复紧凑投影，不强行改变新的焦点目标。"""
+        if self._selected_activity_id is None:
+            return
         self._selected_activity_id = None
         self._refresh_activity_cards()
-        self.query_one("#composer", ComposerInput).focus()
 
     def action_paste_image(self) -> None:
         """保存系统剪贴板图片，并把本地附件引用插入当前草稿。"""

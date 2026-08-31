@@ -137,6 +137,35 @@ def test_activity_feed_shows_pending_requests_without_duplicate_text() -> None:
         "cmd-failed", expanded=False)
 
 
+def test_activity_feed_compact_view_prioritizes_actionable_tasks() -> None:
+    feed = ActivityFeed()
+    for index in range(4):
+        command_id = f"cmd-old-{index}"
+        feed.begin(command_id)
+        feed.set_command_state(command_id, "completed")
+    for index in range(4):
+        feed.begin(f"cmd-queued-{index}", "queued")
+    feed.begin("cmd-running")
+    feed.begin("cmd-latest")
+    feed.set_command_state("cmd-latest", "completed")
+
+    assert feed.compact_command_ids() == (
+        "cmd-queued-0",
+        "cmd-queued-1",
+        "cmd-running",
+        "cmd-latest",
+    )
+
+    completion_order = ActivityFeed()
+    completion_order.begin("cmd-created-first")
+    completion_order.begin("cmd-created-second")
+    completion_order.set_command_state("cmd-created-second", "completed")
+    completion_order.set_command_state("cmd-created-first", "completed")
+    assert completion_order.compact_command_ids() == (
+        "cmd-created-first",
+    )
+
+
 def test_activity_feed_renders_first_class_collaboration_handoff() -> None:
     long_assignment = (
         "基于前序证据制定方案，并逐项核对约束、风险、回滚和验收证据，"
@@ -820,6 +849,50 @@ def test_keyboard_navigates_and_toggles_one_activity_card() -> None:
     asyncio.run(run())
 
 
+def test_activity_panel_compacts_history_until_keyboard_browse() -> None:
+    async def run() -> None:
+        app = ChatApp(workdir=".", orchestrator=make_orch())
+        async with app.run_test(size=(100, 30)) as pilot:
+            for index in range(12):
+                command_id = f"cmd-history-{index:02d}"
+                app._activity_feed.begin(command_id)
+                app._activity_feed.record_status(
+                    command_id, "host", "本轮响应结束", state="completed")
+                app._activity_feed.set_command_state(
+                    command_id, "completed", elapsed_seconds=1.0)
+            app._refresh_activity_cards()
+            await pilot.pause()
+
+            panel = app.query_one("#activity-panel", Static)
+            compact = _activity_text(app)
+            compact_height = panel.size.height
+            assert "任务 cmd-hist" in compact
+            assert compact.count("任务 cmd-hist") == 1
+            assert "已收起 11 个任务" in compact
+            assert compact_height <= 6
+
+            await pilot.press("ctrl+g")
+            await pilot.pause()
+            browsing = _activity_text(app)
+            assert browsing.count("任务 cmd-hist") == 12
+            assert "已收起" not in browsing
+            assert panel.size.height > compact_height
+            assert panel.max_scroll_y > 0
+
+            await pilot.click("#composer")
+            await pilot.pause()
+            assert app.query_one("#composer").has_focus
+            assert _activity_text(app).count("任务 cmd-hist") == 1
+
+            await pilot.press("ctrl+g")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert _activity_text(app).count("任务 cmd-hist") == 1
+
+    asyncio.run(run())
+
+
 def test_activity_keyboard_reaches_latest_card_in_long_panel() -> None:
     """长活动列表必须形成真实滚动区域，选中末卡后自动进入视口。"""
     async def run() -> None:
@@ -1078,8 +1151,15 @@ def test_external_background_command_freezes_authoritative_duration() -> None:
                 assert "[worker] 后台回复已完成" in chat
                 assert "响应耗时" in rendered
                 assert "响应耗时 未知" not in rendered
-                assert "已取消" in rendered
-                assert rendered.count("· /details 展开") == 2, rendered
+                assert "已结束" in rendered
+                assert "已收起 1 个任务" in rendered
+                assert rendered.count("· /details 展开") == 1, rendered
+                await pilot.press("ctrl+g")
+                await pilot.pause()
+                browsing = _activity_text(app)
+                assert browsing.count("任务 ") == 2, browsing
+                assert "已收起" not in browsing
+                assert "已取消" in browsing
 
     asyncio.run(run())
 
@@ -1214,6 +1294,7 @@ def test_interrupted_partial_is_summarized_without_repeating_body() -> None:
 if __name__ == "__main__":
     test_activity_feed_coalesces_progress_and_tool_updates()
     test_activity_feed_shows_pending_requests_without_duplicate_text()
+    test_activity_feed_compact_view_prioritizes_actionable_tasks()
     test_activity_feed_renders_first_class_collaboration_handoff()
     test_older_detail_snapshot_cannot_roll_back_live_plan()
     test_details_restores_collaboration_plan_after_restart()
@@ -1228,6 +1309,7 @@ if __name__ == "__main__":
     test_tui_failure_stays_visible_outside_activity_details()
     test_details_toggles_only_the_latest_activity_card()
     test_keyboard_navigates_and_toggles_one_activity_card()
+    test_activity_panel_compacts_history_until_keyboard_browse()
     test_activity_keyboard_reaches_latest_card_in_long_panel()
     test_consecutive_tui_inputs_show_and_consume_pending_queue()
     test_background_commit_clears_room_pending_preview()

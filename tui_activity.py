@@ -60,6 +60,8 @@ _MAX_REQUEST_PREVIEW_CHARS = 120
 _DEFAULT_MAX_TERMINAL_CARDS = 100
 _DEFAULT_MAX_TOOLS_PER_CARD = 50
 _DEFAULT_MAX_DETAIL_ROWS = 80
+_COMPACT_ACTIVE_CARDS = 3
+_COMPACT_TERMINAL_CARDS = 1
 _TERMINAL_STATES = {
     "completed", "failed", "cancelled", "interrupted", "skipped"}
 
@@ -176,6 +178,7 @@ class ActivityFeed:
                 or max_detail_rows < 1):
             raise ValueError("活动卡、工具与详情行上限必须为正数")
         self._cards: OrderedDict[str, _ActivityCard] = OrderedDict()
+        self._terminal_order: OrderedDict[str, None] = OrderedDict()
         self._max_terminal_cards = max_terminal_cards
         self._max_tools_per_card = max_tools_per_card
         self._max_detail_rows = max_detail_rows
@@ -184,12 +187,15 @@ class ActivityFeed:
 
     def clear(self) -> None:
         self._cards.clear()
+        self._terminal_order.clear()
         self._evicted.clear()
 
     def begin(self, command_id: str, state: str = "running") -> bool:
         if command_id in self._cards:
             return False
         self._cards[command_id] = self._new_card(command_id, state)
+        if state in _TERMINAL_STATES:
+            self._terminal_order[command_id] = None
         return True
 
     def _new_card(
@@ -235,6 +241,29 @@ class ActivityFeed:
 
     def command_ids(self) -> tuple[str, ...]:
         return tuple(self._cards)
+
+    def compact_command_ids(self) -> tuple[str, ...]:
+        """返回默认面板需要展示的当前任务与最近终态任务。"""
+        active = [
+            command_id for command_id, card in self._cards.items()
+            if card.command_state not in _TERMINAL_STATES
+        ]
+        running = [
+            command_id for command_id in active
+            if self._cards[command_id].command_state
+            in {"running", "cancelling"}
+        ]
+        pending = [
+            command_id for command_id in active
+            if command_id not in running
+        ]
+        active = (running + pending)[:_COMPACT_ACTIVE_CARDS]
+        terminal = tuple(self._terminal_order)[-_COMPACT_TERMINAL_CARDS:]
+        visible = set((*active, *terminal))
+        return tuple(
+            command_id for command_id in self._cards
+            if command_id in visible
+        )
 
     def has_terminal_persisted_details(self, command_id: str) -> bool:
         card = self._cards.get(command_id)
@@ -570,6 +599,7 @@ class ActivityFeed:
         card = self._cards.get(command_id)
         if card is None:
             return False
+        previous_state = card.command_state
         cleared_pending = state == "failed" and bool(card.pending_request)
         if cleared_pending:
             card.pending_request = ""
@@ -604,6 +634,11 @@ class ActivityFeed:
         card.command_state = state
         card.error = normalized_error
         if state in _TERMINAL_STATES:
+            if previous_state not in _TERMINAL_STATES:
+                self._terminal_order[command_id] = None
+        else:
+            self._terminal_order.pop(command_id, None)
+        if state in _TERMINAL_STATES:
             self._prune_terminal_cards()
         return True
 
@@ -614,12 +649,8 @@ class ActivityFeed:
         return evicted
 
     def _prune_terminal_cards(self) -> None:
-        terminal_ids = [
-            command_id for command_id, card in self._cards.items()
-            if card.command_state in _TERMINAL_STATES
-        ]
-        while len(terminal_ids) > self._max_terminal_cards:
-            command_id = terminal_ids.pop(0)
+        while len(self._terminal_order) > self._max_terminal_cards:
+            command_id, _ = self._terminal_order.popitem(last=False)
             snapshot = self.render(command_id, expanded=False).replace(
                 "/details 展开", "活动已归档"
             )

@@ -469,7 +469,8 @@ def test_tui() -> None:
                 str(line.text) for line in app.query_one(RichLog).lines
             ]
             activity = str(app.query_one("#activity-panel", Static).render())
-            assert activity.count("· /details 展开") == 2
+            assert activity.count("· /details 展开") == 1
+            assert "已收起 1 个任务" in activity
             assert "[kimi] kimi 收到" in rendered
             await pilot.press("ctrl+g", "up", "enter")
             await pilot.pause()
