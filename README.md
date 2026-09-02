@@ -722,6 +722,11 @@ daemon shutdown、任意 control passthrough 或远程 `/yolo` 入口。待批�
 不要把带 fragment 的链接发给不受信的人。完整边界见
 [ADR-0021](docs/adr/0021-detachable-daemon-and-remote-companion.md)。
 
+Web 界面以对话为主区域，任务与权限收进可折叠活动面板；桌面端使用双栏，窄屏端
+变为抽屉。消息通过安全 DOM 节点呈现常见标题、列表、行内代码和代码块，不解释
+agent 输出中的 HTML；输入框支持 `Enter` 发送、`Shift+Enter` 换行，滚动查看历史
+时不会强制跳回底部。运行中的任务可以取消或尝试既有 capability-bounded 插话。
+
 ## 权限与安全
 
 Kimi/OpenCode ACP 的权限请求会进入 TUI 弹窗。默认策略是 `deny`；

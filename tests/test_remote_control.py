@@ -201,9 +201,15 @@ def test_remote_static_client_never_interprets_agent_html() -> None:
     source = (ROOT / "remote_control/static/app.js").read_text("utf-8")
     assert "textContent" in source
     assert "innerHTML" not in source
+    assert "insertAdjacentHTML" not in source
+    assert "document.write" not in source
+    assert "eval(" not in source
     assert "location.hash" in source and "history.replaceState" in source
     assert "localStorage" not in source
     assert "let refreshing" in source
+    assert "/steer" in source and "/cancel" in source and "/deny" in source
+    assert "/approve" not in source and "/runtime/shutdown" not in source
+    assert "远程端只能拒绝" in source
 
 
 def test_remote_api_controls_the_existing_daemon_owner() -> None:
