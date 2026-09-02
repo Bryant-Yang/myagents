@@ -2,7 +2,7 @@
 
 <!-- harness:behaviour-evidence=canonical-source -->
 
-> 作者：Bryant Yang　最近更新：2026-08-29
+> 作者：Bryant Yang　最近更新：2026-09-02
 >
 > 本文是关键用户行为与独立证据的唯一事实源。工程边界见
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -37,6 +37,7 @@
 | M7 | 完成 | 自然语言有序协作、2–4 步串行接力与失败/取消收口 |
 | M7.1 | 完成 | 一等协作计划、步骤交接投影与重启详情恢复 |
 | M7.2 | 完成 | capability-first 上下文预算、原生 Host 压缩与 checkpoint 恢复 |
+| M8 | 完成 | 单 room 后台 daemon、可重新附着 TUI 与 loopback remote companion |
 
 ## 1. 角色
 
@@ -1227,3 +1228,33 @@
 - **人工验收边界**：两个真实桌面 TUI 实例竞争同一房间的交互体验尚未
   验收。
 - **里程碑**：M3。
+
+### UC-DAEMON-001 后台继续、重新附着与远程伴侣
+
+- **角色 / 触发**：用户需要关闭当前终端但让长任务继续，稍后从本机 TUI 或
+  已授权浏览器查看、发送、取消或拒绝权限。
+- **前置条件**：用户显式执行 `myagents daemon start <workdir>`；该
+  `(workdir, session_name)` 没有其他 owner。attach/remote 都只使用经 lstat、
+  0600、room/workdir/PID 校验的 ControlClient endpoint。
+- **主流程**：daemon 独占 lease/Orchestrator/CommandBus/ControlServer 和 agent；
+  首个 attach 提交任务后可直接退出，任务继续。再次 attach 恢复同一 timeline、
+  current/queued 状态和权限请求，不重发用户输入；`Esc`/`Ctrl+X` 精确取消当前
+  command，daemon 仍存活。`daemon stop` 经 control 请求有界回收。
+- **权限分支**：attach 只能看到脱敏标题和本次 option 闭集；关闭权限弹窗或整个
+  attach 不自动拒绝/批准，重连后仍是同一 request。只接受精确 option id；remote
+  只有 deny 路由，没有 approve、`/yolo` 扩权或 runtime shutdown。
+- **远程分支**：`myagents remote` 只连接现存 daemon 并绑定 loopback；API 强制
+  Bearer 和精确 Host allowlist，请求 ≤128 KiB。token 文件 0600/目录 0700，
+  拒绝 symlink；浏览器从 fragment 读入 sessionStorage 后清除地址栏，不把 agent
+  文本当 HTML。跨设备必须经用户另行配置的受信反向代理。
+- **故障 / no-replay**：控制客户端断线只中断观察。重复提交由 request_id 幂等；
+  daemon 重启不自动恢复不确定执行或重投已提交 command。启动失败不宣称 ready；
+  SIGINT/SIGTERM/stop 都按权限 → control → bus → adapters 顺序收口。
+- **验收**：in-process 和真实 detached CLI start/status/stop；任务跨两次 attach；
+  权限弹窗 detach/reattach；Esc 精确取消；Bearer/Host/loopback/body 上限；
+  approve/shutdown 404；deny-only；token mode/symlink；DOM text-only。
+- **独立证据来源**：`tests/test_runtime_daemon.py`、
+  `tests/test_remote_control.py`、`tests/test_m3_control.py` 与 R7 gate。
+- **人工验收边界**：真实 Tailscale 跨设备、睡眠/断网恢复、SIGKILL 后的交互提示
+  尚未人工验收；自动化不宣称提供公网账户系统或 OS sandbox。
+- **里程碑**：M8。

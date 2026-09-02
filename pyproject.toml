@@ -14,7 +14,9 @@ authors = [
 dependencies = [
   "httpx>=0.27,<1",
   "mcp>=1.27,<2",
+  "starlette>=1,<2",
   "textual>=1.0",
+  "uvicorn>=0.52,<1",
 ]
 
 [project.scripts]
@@ -25,6 +27,7 @@ myagents-mcp = "myagents_mcp:main"
 include-package-data = true
 py-modules = [
   "agent_readiness",
+  "attached_tui",
   "clipboard_image",
   "collaboration",
   "context_lifecycle",
@@ -34,6 +37,7 @@ py-modules = [
   "main",
   "myagents_mcp",
   "orchestrator",
+  "runtime_daemon",
   "session_catalog",
   "session_manager",
   "session_roles",
@@ -54,6 +58,7 @@ include = [
   "dsh_acp*",
   "native_agent*",
   "pi_rpc*",
+  "remote_control*",
   "storage*",
   "workspace*",
 ]
@@ -68,4 +73,8 @@ dsh_acp = [
   "plugin/scripts/*.mjs",
   "plugin/src/*.ts",
   "plugin/tests/*.ts",
+]
+remote_control = [
+  "static/*.html",
+  "static/*.js",
 ]

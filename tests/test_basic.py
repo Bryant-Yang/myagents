@@ -768,6 +768,19 @@ def test_main_loop_reopens_requested_session() -> None:
 
     args = parse_args(["--session", "review", "/tmp"])
     assert (args.workdir, args.session) == ("/tmp", "review")
+    daemon = parse_args([
+        "daemon", "start", "/tmp", "--session", "review"])
+    assert (daemon.command, daemon.action, daemon.workdir) == (
+        "daemon", "start", "/tmp")
+    attached = parse_args(["attach", "/tmp", "--session", "review"])
+    assert (attached.command, attached.workdir) == ("attach", "/tmp")
+    remote = parse_args([
+        "remote", "/tmp", "--session", "review", "--port", "9123",
+        "--allowed-host", "macbook.example.ts.net",
+    ])
+    assert (remote.command, remote.workdir, remote.port) == (
+        "remote", "/tmp", 9123)
+    assert remote.allowed_host == ["macbook.example.ts.net"]
     run_chat_loop(
         "/tmp",
         "default",
@@ -796,8 +809,9 @@ def test_cli_room_busy_is_actionable_without_traceback() -> None:
     except SystemExit as exc:
         message = str(exc)
         assert "Traceback" not in message
-        assert "会话 'default' 已在另一个 TUI 中运行" in message
+        assert "会话 'default' 已由另一个 owner 持有" in message
         assert "owner PID=123" in message
+        assert "myagents attach" in message
         assert "uv run main.py --session <新名称> '/tmp/project with spaces'" \
             in message
 

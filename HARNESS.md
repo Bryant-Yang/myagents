@@ -88,10 +88,11 @@ transport。
 - `host.py` 包装一个 adapter 做路由/主持，不拥有 transport 实现。
 - `storage/store.py` 负责 timeline/events/state 持久化与 owner lease，不做路由
   或协议判断；只读辅助实例不得获取 lease。
-- `control/command_bus.py` 是 TUI 进程内唯一命令入口（FIFO 单 worker），
+- `control/command_bus.py` 是 room owner（前台 TUI 或 daemon）进程内唯一命令入口
+  （FIFO 单 worker），
   不拥有 Orchestrator；`control/server.py` 只做 socket 序列化，
   `control/client.py` 只做发现与连接验证。
-- `myagents_mcp.py` 是 stdio MCP bridge：只连运行中 TUI 的控制 socket，
+- `myagents_mcp.py` 是 stdio MCP bridge：只连运行中 owner 的控制 socket，
   绝不实例化 Orchestrator、不获取 lease、不直写 timeline。
 
 跨层协议变化必须同步实现、调用方、fake fixture、tests 和
@@ -295,7 +296,8 @@ transport。
 
 ### 4.5 控制层与 MCP 外部入口（M3）
 
-- TUI 输入与外部控制统一经 CommandBus FIFO（单 worker 串行执行）；
+- room owner（普通 TUI 或 daemon）的输入与外部控制统一经 CommandBus FIFO
+  （单 worker 串行执行）；
   `request_id` 在 bus 生命周期内永久幂等；命令记录有容量硬上限；
   `wait` 有界（≤30s）且超时不取消任务；`aclose()` 把 active/queued
   命令兜底置 cancelled，不残留 task，不关闭 Orchestrator。
@@ -310,8 +312,8 @@ transport。
   每次调用仍实际连接验证。
 - MCP bridge 八个 `myagents_*` 工具只翻译到上述 socket 协议；
   `ControlClientError` 一律转为可操作 tool error，不使 server 崩溃；
-  stdout 只输出 MCP 帧；stdin EOF 后干净退出；权限请求仍由 TUI 决策，
-  bridge 无 `auto` 入口。
+  stdout 只输出 MCP 帧；stdin EOF 后干净退出；权限请求仍由 owner 的 broker
+  fail-closed，并只允许附着 TUI 在原 option 闭集内决定，bridge 无 `auto` 入口。
 - 退出顺序：先取消权限 Future，再停 control server（停止接收、删除
   endpoint/socket），随后 bus 收尾，最后关闭 Orchestrator 并释放 lease。
 
@@ -472,6 +474,26 @@ transport。
 - HostBackend/profile 切换不得复用 checkpoint。`/context` 只展示策略、计数与代次，
   不显示摘要正文、prompt、凭据或 chain-of-thought。完整契约见 ADR-0020。
 
+### 4.11 可分离 daemon、attach 与远程伴侣（M8）
+
+- 普通 TUI 的 owner/退出语义保持不变。`DaemonRuntime` 是一个
+  `(workdir, session_name)` 的唯一后台 owner，独占 room lease、Orchestrator、
+  CommandBus、ControlServer、权限等待和 agent runtime；客户端不得创建第二份。
+- daemon start 只有在受信 endpoint 返回匹配 PID/owner_kind 后才成功；stop 只走
+  `runtime.shutdown` 有界关闭，不以 PID 文件强杀。SIGINT/SIGTERM 与显式 stop
+  共享权限 fail-closed → control → bus → adapters 的关闭顺序。
+- attach/remote 只依赖 `ControlClient`。detach 不取消任务、不解决权限、不关闭
+  owner；重连只按 seq 补读，不重新提交原 command。attach 可查看当前/排队任务、
+  `Esc`/`Ctrl+X` 精确取消，并按服务端原始 option 解决仍待处理权限。
+- remote 只允许 loopback bind，API 强制随机 Bearer token 与精确 Host allowlist；
+  token 文件 0600、目录 0700、拒绝 symlink，浏览器 token 只经 URL fragment 进入
+  sessionStorage。响应 no-store，agent 文本只用 DOM `textContent`。
+- remote 可读状态、提交幂等命令、取消和调用既有有界 steering；权限只可查看和
+  cancelled。不得开放 approve、runtime shutdown、任意 control passthrough、远程
+  `/yolo` 扩权、自动拉起 owner 或 fallback。外部访问只能通过 Tailscale Serve
+  等受信反向代理，并显式 opt-in 代理 Host。
+- 完整契约与 no-replay/进程异常边界见 ADR-0021。
+
 ## 5. 测试策略
 
 | 层级 | 证据 |
@@ -498,6 +520,7 @@ transport。
 | M3 command bus | `tests/test_m3_bus.py` |
 | M3 控制 socket 安全/协议 | `tests/test_m3_control.py` |
 | M3 MCP stdio | `tests/test_m3_mcp.py`（官方 SDK client） |
+| M8 daemon/attach/remote | `tests/test_runtime_daemon.py` + `tests/test_remote_control.py`（本地 fake/ASGI，不调用真实 agent 或外网） |
 | M4 Codex app-server | `tests/test_codex_app_server.py` + `tests/fake_codex_app_server.py` |
 | M4.3 剪贴板图片 | `tests/test_clipboard_image.py` + macOS 人工截图验收 |
 | 真实协议边界 | `docs/SPEC.md` 登记的 Kimi/OpenCode/CodeBuddy ACP + Textual/受限临时目录 E2E；Qwen 上游源码与本机启动证据；Pi 0.84.3 临时目录握手/短回复/逐次授权写入 E2E；DSH 仅登记 ADR-0015 真实验收清单，尚未宣称 E2E |
@@ -517,7 +540,7 @@ harness 文档引用 → redlines → py_compile → readiness → basic → 会
 → DSH ACP
 → Pi RPC + permission bridge
 → native model host → storage → M2.5 → M3 bus → M3 control → M3 MCP stdio → M4 app-server
-→ M4.3 clipboard image
+→ M4.3 clipboard image → M8 daemon/attach/remote
 ```
 
 运行：
@@ -538,8 +561,9 @@ branch protection / required checks 需要单独配置后才能宣称生效。
 
 - 新抽象是否真的比现有 `AgentSpec + AgentAdapter` 更简单；
 - 某 agent 的 ACP 适配器是否成熟到作为 JSONL fallback 的主路径；
-- 外部入口传输已定为私有 Unix socket + stdio MCP（ADR-0001）；是否引入
-  Streamable HTTP、远程认证或 A2A 仍需人工决策，M3 不做；
+- owner 内部入口保持私有 Unix socket + stdio MCP（ADR-0001）；M8 remote 只提供
+  ADR-0021 的 loopback Bearer companion，不是 Streamable HTTP MCP 或 A2A；公网
+  账户、多用户 ACL 与跨组织协作仍需人工决策；
 - 真实工具调用的权限风险是否可接受；
 - TUI 的可用性、长会话 token/内存表现和真实 cancel 时延；
 - 原生 host 已于 2026-08-27 通过本机 LM Studio `/v1/models` + 单轮
@@ -584,7 +608,7 @@ branch protection / required checks 需要单独配置后才能宣称生效。
 
 具体 Owner、Sensor 与处置见 [`docs/harness-controls.md`](docs/harness-controls.md)。
 
-## 8. 红线（6 条，违反必驳回）
+## 8. 红线（7 条，违反必驳回）
 
 | # | 红线 | 守门 |
 | --- | --- | --- |
@@ -594,6 +618,7 @@ branch protection / required checks 需要单独配置后才能宣称生效。
 | R4 | Kimi/OpenCode 必须受限 ACP-first；Qwen/CodeBuddy/DSH 必须 ACP-only 且固定 runtime profile；DSH 还必须以 myagents 标准 bundle + stock `dsh --profile myagents` 实现专用 ACP server、把 stock DSH 作为不可变依赖、使用被动 profile/bundle readiness、load+close hard gate、绝对状态目录、仅 end_turn 成功和零 fallback；Pi 必须是原生 RPC-only + 固定 bridge/wrapper/tool/profile attestation，禁止 raw RPC bash 和 fallback；OpenCode 普通轮风险工具 ask、只读轮 runtime deny；CodeBuddy 只用独立 CLI、固定已验收 region、按需有界认证且登录 URL fail-closed；JSONL 仅获证的 prepare-only 只读降级 | `bash scripts/check-redlines.sh` 的 registry/policy/profile/bridge gate |
 | R5 | 自然语言讨论与 `/discuss` 必须共用 2–3 人、1–3 轮、终局主持状态机；自然语言协作必须保持 2–4 步、至少两个 worker、严格串行且失败/取消即停；两者均不得递归 dispatch/动态扩员；会话角色不得改变参与者、步骤/轮数、权限或 runtime | `bash scripts/check-redlines.sh` 的 discussion/collaboration bounds 与 AST gate + `tests/test_discussion.py` + `tests/test_session_roles.py` + `tests/test_collaboration.py` |
 | R6 | `/workflow` 必须保持固定角色/阶段、单 writer、最多一次 repair/reverify、read-only 复核和有界 steering | `bash scripts/check-redlines.sh` 的 workflow bounds/mode/AST gate |
+| R7 | attach/remote 只能通过 ControlClient 连接 daemon，不得创建 owner 层；remote 仅 loopback + Bearer + 精确 Host allowlist，权限 deny-only，且无 approve/shutdown/passthrough/自动 owner | `bash scripts/check-redlines.sh` 的 client-layer/route/bind AST gate + `tests/test_runtime_daemon.py` + `tests/test_remote_control.py` |
 
 红线变更必须同步本文、`AGENTS.md`、`docs/workflow.md`、enforcement 与
 `docs/harness-controls.md`，并重新做正向和负向验证。
@@ -627,6 +652,8 @@ branch protection / required checks 需要单独配置后才能宣称生效。
   [`docs/adr/0019-first-class-collaboration-plan-projection.md`](docs/adr/0019-first-class-collaboration-plan-projection.md)。
 - M7.2 上下文生命周期事实源：
   [`docs/adr/0020-capability-bounded-context-lifecycle.md`](docs/adr/0020-capability-bounded-context-lifecycle.md)。
+- M8 后台 owner、attach 与远程伴侣事实源：
+  [`docs/adr/0021-detachable-daemon-and-remote-companion.md`](docs/adr/0021-detachable-daemon-and-remote-companion.md)。
 - 当前路线图：[`README.md`](README.md)“路线图”。
 - 重大协议/安全边界改变先形成可评审设计记录，再修改本契约。
 - Steering 只在同类失败至少两次或已有趋势证据时建立；单次失败只修当前问题。

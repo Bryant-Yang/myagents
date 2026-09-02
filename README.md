@@ -4,7 +4,7 @@
 Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M4.11、M4.12、M4.13、M4.14、M5.1、M5、M6、M7、M7.1 与 M7.2 已完成。
+> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M4.11、M4.12、M4.13、M4.14、M5.1、M5、M6、M7、M7.1、M7.2 与 M8 已完成。
 > 共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
 > stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
@@ -96,6 +96,11 @@ Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 co
   成功；用户消息持久确认后才在 TUI 显示。
 - 房间单写者 lease：owner.lock（flock）保证同一房间同一时刻只有一个
   写入进程。
+- 可分离后台：`myagents daemon start` 让任务脱离终端窗口继续运行；
+  `myagents attach` 可反复附着同一 timeline、任务和权限等待，退出 attach
+  不取消任务或关闭 agent。
+- 远程伴侣：`myagents remote` 提供只监听 loopback 的轻量网页，Bearer token
+  鉴权后可查看、发送和取消任务；远端权限只能拒绝，批准必须回到本机 attach。
 - 内部 command bus：TUI 输入与外部控制统一的 FIFO 入口；`request_id`
   幂等去重；单 worker 串行执行，命令状态可查、可有界等待。
 - 本机控制 socket：TUI 私有的 Unix socket JSONL 协议（**不是 MCP**）；
@@ -150,8 +155,8 @@ Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 co
 
 ```text
 ┌────────────────────────────────────────────┐
-│ main.py                                    │
-│ Textual TUI / shared timeline / permission │
+│ main.py / runtime_daemon.py                 │
+│ 前台 TUI owner 或单 room daemon owner       │
 └──────────────────────┬─────────────────────┘
                        │
 ┌──────────────────────▼─────────────────────┐
@@ -174,10 +179,10 @@ Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 co
 │ state + owner lease    │  │ 私有 Unix 控制 socket  │
 └────────────────────────┘  └───────────▲────────────┘
                                         │ 只连 socket
-                            ┌───────────┴────────────┐
-                            │ myagents_mcp.py        │
-                            │ stdio MCP bridge       │
-                            └────────────────────────┘
+                     ┌──────┴────────┬────────────────────┐
+                     │ myagents_mcp  │ attach / remote    │
+                     │ stdio bridge  │ ControlClient only │
+                     └───────────────┴────────────────────┘
 ```
 
 核心原则是 **Hub-and-Spoke**：所有消息先进入 Orchestrator，worker agent
@@ -333,6 +338,15 @@ myagents /absolute/path/to/project
 myagents --session review /absolute/path/to/project
 ```
 
+长任务可改由 daemon 持有，并随时附着：
+
+```bash
+myagents daemon start /absolute/path/to/project --session review
+myagents daemon status /absolute/path/to/project --session review
+myagents attach /absolute/path/to/project --session review
+myagents daemon stop /absolute/path/to/project --session review
+```
+
 卸载全局入口不会删除源码或会话状态：
 
 ```bash
@@ -451,7 +465,8 @@ Host 可在当前会话中查看和切换；命令不进入聊天时间线：
 图片 attachments、agent cursor/session 映射和
 owner lease 存放在 `${XDG_STATE_HOME:-~/.local/state}/myagents/rooms/<room_id>`，
 不会写进目标工作区。未指定名称时使用兼容旧历史的 `default` 会话；同一房间
-同一时刻只允许一个 TUI 实例写入。
+同一时刻只允许一个 owner（前台 TUI 或 daemon）持有写权，attach/remote 只能经
+owner 的控制入口操作。
 
 ### 会话级自然语言角色
 
@@ -614,13 +629,14 @@ policy/tool source attestation；普通/写 profile 的风险工具逐次询权�
 ## MCP 外部入口（M3）
 
 本机其他 coding agent（Codex skill、Claude 等 MCP host）可以通过 MCP
-stdio bridge 向**正在运行的** TUI 房间提交消息、读取时间线和执行进度，
+stdio bridge 向**正在运行的** TUI 或 daemon 房间提交消息、读取时间线和执行进度，
 也可精确取消命令。前提：
 
 - 依赖已安装：`requirements.txt` 固定 `mcp>=1.27,<2`（官方 Python SDK
   稳定 v1）；
-- TUI 必须先运行：`.venv/bin/python main.py /path/to/project`；
-- bridge 只做发现与连接，**绝不自动拉起 TUI，也绝不创建第二个
+- room owner 必须先运行：`.venv/bin/python main.py /path/to/project` 或
+  `myagents daemon start /path/to/project`；
+- bridge 只做发现与连接，**绝不自动拉起 owner，也绝不创建第二个
   Orchestrator**。
 
 MCP host 的 stdio 配置示例（`--workdir` 必填，必须与目标 TUI 的
@@ -674,10 +690,37 @@ myagents_read_timeline(after_seq=0, limit=50)
   为 MCP；MCP 只存在于 bridge 的 stdio 一侧；
 - 外部消息走与 TUI 输入完全相同的 CommandBus FIFO 和
   `Orchestrator.dispatch`，单写者约束不变；
-- 外部消息触发工具权限时仍由所属会话的当前 TUI 决策；bridge 没有开关或绕过
-  入口。默认弹窗，只有该会话已由用户显式输入 `/yolo` 才自动批准；
-- TUI 未运行、endpoint stale 或房间不匹配时，工具返回可操作错误
+- 外部消息触发工具权限时仍由所属 owner 决策：普通 TUI 弹窗；daemon 由
+  attach 展示可恢复请求。bridge 没有开关或绕过入口；
+- owner 未运行、endpoint stale 或房间不匹配时，工具返回可操作错误
   （含启动命令），不创建任何状态。
+
+## 后台与远程伴侣（M8）
+
+`attach` 只连接 daemon，不创建第二个 Orchestrator。它显示同一持久时间线、当前/
+排队任务和仍在等待的权限；`Esc` 或 `Ctrl+X` 精确取消当前任务，关闭窗口只是
+detach。
+
+需要从浏览器或另一台已授权设备查看时，先保持 daemon 运行，再启动：
+
+```bash
+myagents remote /absolute/path/to/project --session review
+```
+
+命令打印一个 `http://127.0.0.1:8765/#token=...` 链接。服务只监听 loopback，
+不会直接暴露到局域网或公网。跨设备建议使用 Tailscale Serve，并把代理保留的
+Host 精确加入 allowlist，例如：
+
+```bash
+myagents remote /absolute/path/to/project --session review \
+  --allowed-host my-mac.example.ts.net
+```
+
+remote 可查看 timeline/任务、提交、取消和使用既有有界 steering；它没有权限批准、
+daemon shutdown、任意 control passthrough 或远程 `/yolo` 入口。待批准工具只能回到
+本机 `myagents attach ...` 处理，remote 只能拒绝。token 存在 myagents 私有状态目录，
+不要把带 fragment 的链接发给不受信的人。完整边界见
+[ADR-0021](docs/adr/0021-detachable-daemon-and-remote-companion.md)。
 
 ## 权限与安全
 
@@ -856,9 +899,14 @@ myagents/
 - [x] M7：自然语言 2–4 步有序协作、前序结果接力、失败/取消即停。
 - [x] M7.1：一等协作计划、逐步骤交接投影与重启详情恢复。
 - [x] M7.2：上下文字符预算、原生 Host 自动/手动压缩与 checkpoint 恢复。
+- [x] M8：单 room 后台 daemon、可重新附着 TUI 与 loopback remote companion。
 - [ ] Later：只有出现跨机器、跨组织 agent 协作需求时再评估 A2A。
 
 ## 当前限制
+
+- M8 daemon 首版一次只持有一个 `(workdir, session)`；多命名会话需分别启动。
+  remote 自动化验收覆盖本地 ASGI 与安全反例，未在真实 Tailscale 网络上做跨设备
+  人工验收；远端故意不能批准工具。
 
 - M4.14 原生 host 已于 2026-08-27 通过本机 LM Studio 真实最小探针：从
   `/v1/models` 选择当前已加载的精确 id

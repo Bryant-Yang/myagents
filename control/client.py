@@ -1,4 +1,4 @@
-"""Client for the TUI-owned local control socket."""
+"""Client for the room-owner local control socket."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ class ControlClientError(Exception):
 
 
 class ControlUnavailableError(ControlClientError):
-    """No verified TUI control endpoint is available."""
+    """No verified room-owner control endpoint is available."""
 
 
 class ControlRemoteError(ControlClientError):
@@ -64,9 +64,10 @@ class ControlClient:
             else f" --session {shlex.quote(self.session_name)}"
         )
         return (
-            "请先启动该房间 TUI："
+            "请先启动该房间 TUI 或 daemon："
             f".venv/bin/python main.py{session_arg} "
-            f"{shlex.quote(self.workdir)}"
+            f"{shlex.quote(self.workdir)}；或 myagents daemon start "
+            f"{shlex.quote(self.workdir)}{session_arg}"
         )
 
     def _read_endpoint(self) -> dict[str, Any]:
@@ -81,11 +82,12 @@ class ControlClient:
             raw = self.endpoint_path.read_bytes()
         except FileNotFoundError as exc:
             raise ControlUnavailableError(
-                f"未发现活跃 TUI endpoint：{self.endpoint_path}；{self._hint()}"
+                f"未发现活跃 TUI/daemon endpoint：{self.endpoint_path}；"
+                f"{self._hint()}"
             ) from exc
         except OSError as exc:
             raise ControlUnavailableError(
-                f"无法读取 TUI endpoint：{exc}；{self._hint()}") from exc
+                f"无法读取 TUI/daemon endpoint：{exc}；{self._hint()}") from exc
         if len(raw) > 64 * 1024:
             raise ControlUnavailableError(
                 f"endpoint 文件异常过大；{self._hint()}")
@@ -130,7 +132,7 @@ class ControlClient:
                 str(self.socket_path), limit=MAX_RESPONSE_BYTES + 1)
         except OSError as exc:
             raise ControlUnavailableError(
-                f"无法连接活跃 TUI：{exc}；{self._hint()}") from exc
+                f"无法连接活跃 TUI/daemon：{exc}；{self._hint()}") from exc
         try:
             writer.write(raw)
             await writer.drain()
@@ -189,6 +191,9 @@ class ControlClient:
     async def get_command(self, command_id: str) -> dict[str, Any]:
         return await self.call("command.get", {"command_id": command_id})
 
+    async def list_commands(self, limit: int = 50) -> dict[str, Any]:
+        return await self.call("command.list", {"limit": limit})
+
     async def wait_command(self, command_id: str,
                            timeout: float = 30.0) -> dict[str, Any]:
         return await self.call(
@@ -207,3 +212,24 @@ class ControlClient:
             "command_id": command_id,
             "instruction": instruction,
         })
+
+    async def list_permissions(self) -> dict[str, Any]:
+        return await self.call("permission.list")
+
+    async def resolve_permission(
+        self,
+        request_id: str,
+        *,
+        outcome: str,
+        option_id: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "request_id": request_id,
+            "outcome": outcome,
+        }
+        if option_id is not None:
+            params["option_id"] = option_id
+        return await self.call("permission.resolve", params)
+
+    async def shutdown_runtime(self) -> dict[str, Any]:
+        return await self.call("runtime.shutdown")

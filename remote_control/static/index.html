@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>myagents remote</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    body { margin: 0; background: #101214; color: #e8e8e3; }
+    main { width: min(920px, calc(100% - 24px)); margin: 0 auto; min-height: 100vh; display: grid; grid-template-rows: auto 1fr auto; }
+    header { padding: 18px 2px 12px; border-bottom: 1px solid #35393d; }
+    h1 { font-size: 17px; margin: 0 0 7px; font-weight: 650; }
+    #status { color: #969da3; font-size: 12px; }
+    #timeline { overflow: auto; padding: 14px 0 120px; }
+    .message { margin: 0 0 14px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .speaker { color: #52b7da; margin-right: 8px; font-weight: 700; }
+    .user .speaker { color: #f0b44d; }
+    .system .speaker, .activity .speaker { color: #81878d; }
+    #permissions { position: sticky; bottom: 82px; display: grid; gap: 8px; }
+    #tasks { display: grid; gap: 7px; margin: 10px 0; }
+    .task { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #aeb5ba; border: 1px solid #30363a; border-radius: 8px; padding: 8px 10px; }
+    .task button { padding: 5px 9px; border-color: #77514b; background: #32201d; }
+    .permission { background: #241a18; border: 1px solid #8e5147; padding: 11px; border-radius: 8px; }
+    form { position: sticky; bottom: 0; background: #101214; border-top: 1px solid #35393d; padding: 12px 0 18px; display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+    textarea { resize: vertical; min-height: 42px; max-height: 180px; border: 1px solid #444b51; border-radius: 8px; background: #181b1e; color: inherit; padding: 10px; font: inherit; }
+    button { border: 1px solid #4b8ca3; border-radius: 8px; background: #173642; color: #eaf8fc; padding: 9px 14px; font: inherit; cursor: pointer; }
+    button.deny { border-color: #8e5147; background: #3a201c; margin-top: 8px; }
+    @media (max-width: 600px) { main { width: calc(100% - 18px); } form { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <header><h1>myagents remote</h1><div id="status">正在连接…</div><section id="tasks" aria-label="任务活动"></section></header>
+  <section id="timeline" aria-live="polite"></section>
+  <div>
+    <section id="permissions"></section>
+    <form id="composer"><textarea id="message" placeholder="输入消息" required></textarea><button type="submit">发送</button></form>
+  </div>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

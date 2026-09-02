@@ -1,8 +1,8 @@
-"""TUI-owned local control server.
+"""Room-owner local control server.
 
-The Unix socket is a private transport for the running TUI.  It only exposes
-the existing RoomStore and CommandBus; it never creates an Orchestrator or
-touches an agent session directly.
+The Unix socket is a private transport for a running TUI or daemon owner.  It
+only exposes the existing RoomStore and CommandBus; it never creates an
+Orchestrator or touches an agent session directly.
 """
 
 from __future__ import annotations
@@ -13,10 +13,12 @@ import errno
 import json
 import os
 import tempfile
+from inspect import isawaitable
 from pathlib import Path
 from typing import Any, Callable
 
 from control.command_bus import (
+    MAX_COMMAND_LIST,
     MAX_WAIT_TIMEOUT,
     CommandBus,
     CommandBusClosedError,
@@ -27,8 +29,9 @@ from control.command_bus import (
     CommandValidationError,
 )
 from storage.store import DEFAULT_READ_LIMIT, MAX_READ_LIMIT
+from control.permissions import PermissionBroker, PermissionBrokerError
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_REQUEST_BYTES = 128 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 ENDPOINT_MODE = 0o600
@@ -66,7 +69,7 @@ def _validate_keys(params: dict[str, Any], *, required: set[str],
 
 
 class ControlServer:
-    """JSON-Lines control endpoint owned by one persistent ChatApp."""
+    """JSON-Lines control endpoint owned by one persistent room runtime."""
 
     def __init__(
         self,
@@ -74,6 +77,9 @@ class ControlServer:
         command_bus: CommandBus,
         *,
         command_submit_sink: Callable[[CommandSnapshot], None] | None = None,
+        owner_kind: str = "tui",
+        permission_broker: PermissionBroker | None = None,
+        shutdown_sink: Callable[[], Any] | None = None,
     ) -> None:
         store = getattr(orchestrator, "store", None)
         if store is None:
@@ -82,6 +88,13 @@ class ControlServer:
         self._store = store
         self._bus = command_bus
         self._command_submit_sink = command_submit_sink
+        if owner_kind not in {"tui", "daemon"}:
+            raise ControlServerError("owner_kind 只能是 tui 或 daemon")
+        if owner_kind != "daemon" and shutdown_sink is not None:
+            raise ControlServerError("只有 daemon owner 可以暴露 shutdown")
+        self._owner_kind = owner_kind
+        self._permission_broker = permission_broker
+        self._shutdown_sink = shutdown_sink
         self.socket_path = store.room_dir / "control.sock"
         self.endpoint_path = store.room_dir / "endpoint.json"
         self._server: asyncio.AbstractServer | None = None
@@ -313,6 +326,7 @@ class ControlServer:
                 "protocol_version": PROTOCOL_VERSION,
                 "active": True,
                 "pid": os.getpid(),
+                "owner_kind": self._owner_kind,
                 "room_id": self._store.room_id,
                 "room_name": self._store.room_name,
                 "session_name": self._store.session_name,
@@ -381,6 +395,17 @@ class ControlServer:
             if not isinstance(command_id, str) or not command_id:
                 raise _InvalidParams("command_id 必须是非空字符串")
             return self._bus.get(command_id).to_dict()
+        if method == "command.list":
+            _validate_keys(params, required=set(), optional={"limit"})
+            limit = params.get("limit", 50)
+            if (isinstance(limit, bool) or not isinstance(limit, int)
+                    or not 1 <= limit <= MAX_COMMAND_LIST):
+                raise _InvalidParams(
+                    f"limit 必须是 1..{MAX_COMMAND_LIST} 的整数")
+            return {
+                "items": [item.to_dict()
+                          for item in self._bus.snapshots(limit=limit)]
+            }
         if method == "command.wait":
             _validate_keys(
                 params, required={"command_id"}, optional={"timeout"})
@@ -405,6 +430,34 @@ class ControlServer:
             if not isinstance(instruction, str) or not instruction.strip():
                 raise _InvalidParams("instruction 必须是非空字符串")
             return self._bus.steer(command_id, instruction)
+        if method == "permission.list":
+            _validate_keys(params, required=set())
+            items = (
+                () if self._permission_broker is None
+                else self._permission_broker.list_pending()
+            )
+            return {"items": [item.to_dict() for item in items]}
+        if method == "permission.resolve":
+            if self._permission_broker is None:
+                raise _InvalidParamsMethod(method)
+            _validate_keys(
+                params,
+                required={"request_id", "outcome"},
+                optional={"option_id"},
+            )
+            return self._permission_broker.resolve(
+                params["request_id"],
+                outcome=params["outcome"],
+                option_id=params.get("option_id"),
+            )
+        if method == "runtime.shutdown":
+            if self._shutdown_sink is None:
+                raise _InvalidParamsMethod(method)
+            _validate_keys(params, required=set())
+            result = self._shutdown_sink()
+            if isawaitable(result):
+                await result
+            return {"accepted": True}
         raise _InvalidParamsMethod(method)
 
     async def _send(self, writer: asyncio.StreamWriter,

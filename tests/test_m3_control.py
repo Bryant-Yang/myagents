@@ -22,6 +22,7 @@ from control import (
     CommandBus,
     ControlBusyError,
     ControlClient,
+    PermissionBroker,
     ControlRemoteError,
     ControlServer,
     ControlServerError,
@@ -108,6 +109,11 @@ def test_protocol_roundtrip() -> None:
             assert r1["status"] == r2["status"] == "completed"
             assert (await room.client.get_command(
                 first["command_id"]))["status"] == "completed"
+            listed = await room.client.list_commands(limit=2)
+            assert [item["command_id"] for item in listed["items"]] == [
+                first["command_id"], second["command_id"]]
+            assert all(item["status"] == "completed"
+                       for item in listed["items"])
             assert len(room.agent.calls) == 2
 
             page1 = await room.client.read_timeline(limit=2)
@@ -151,7 +157,117 @@ def test_protocol_roundtrip() -> None:
             room.cleanup()
 
     asyncio.run(run())
-    print("ok  control 八方法 + FIFO/idempotency + timeline/events + cancel/steer")
+    print("ok  control 闭集 + FIFO/idempotency + timeline/events + list/cancel/steer")
+
+
+def test_daemon_control_exposes_reconnectable_permission_gate() -> None:
+    async def run() -> None:
+        room = Room()
+        broker = PermissionBroker()
+        shutdown_requested = asyncio.Event()
+        room.server = ControlServer(
+            room.orch,
+            room.bus,
+            owner_kind="daemon",
+            permission_broker=broker,
+            shutdown_sink=shutdown_requested.set,
+        )
+        try:
+            await room.start()
+            info = await room.client.get_room()
+            assert info["owner_kind"] == "daemon"
+
+            pending_task = asyncio.create_task(broker.request(
+                "kimi",
+                {
+                    "toolCall": {
+                        "title": "写入结果",
+                        "rawInput": {"path": "/tmp/result.txt"},
+                    },
+                    "options": [
+                        {
+                            "optionId": "allow-once-7",
+                            "kind": "allow_once",
+                            "name": "允许一次",
+                        },
+                        {
+                            "optionId": "reject-7",
+                            "kind": "reject_once",
+                            "name": "拒绝",
+                        },
+                    ],
+                },
+            ))
+            for _ in range(50):
+                pending = await room.client.list_permissions()
+                if pending["items"]:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(pending["items"]) == 1
+            request = pending["items"][0]
+            assert request["agent"] == "kimi"
+            assert request["tool_call"]["title"] == "写入结果"
+            assert "/tmp/result.txt" not in str(request)
+            assert [item["option_id"] for item in request["options"]] == [
+                "allow-once-7", "reject-7"]
+
+            try:
+                await room.client.resolve_permission(
+                    request["request_id"],
+                    outcome="selected",
+                    option_id="invented",
+                )
+                raise AssertionError("未知 optionId 必须拒绝")
+            except ControlRemoteError as exc:
+                assert exc.code == "INVALID_PARAMS"
+            assert not pending_task.done()
+
+            await room.client.resolve_permission(
+                request["request_id"],
+                outcome="selected",
+                option_id="allow-once-7",
+            )
+            assert await pending_task == {
+                "outcome": "selected", "optionId": "allow-once-7"}
+            assert (await room.client.list_permissions())["items"] == []
+
+            await room.client.shutdown_runtime()
+            await asyncio.wait_for(shutdown_requested.wait(), 1)
+        finally:
+            await broker.aclose()
+            await room.close()
+            room.cleanup()
+
+    asyncio.run(run())
+    print("ok  daemon owner + reconnectable permission gate + explicit shutdown")
+
+
+def test_permission_broker_bounds_fail_closed() -> None:
+    async def run() -> None:
+        try:
+            PermissionBroker(max_pending=True)
+            raise AssertionError("bool max_pending 必须拒绝")
+        except ValueError:
+            pass
+        broker = PermissionBroker()
+        try:
+            too_many = [
+                {"optionId": f"option-{index}", "kind": "allow_once"}
+                for index in range(33)
+            ]
+            assert await broker.request(
+                "kimi", {"options": too_many}
+            ) == {"outcome": "cancelled"}
+            assert await broker.request("kimi", {
+                "options": [{"optionId": "x" * 201,
+                             "kind": "allow_once"}],
+            }) == {"outcome": "cancelled"}
+            assert broker.list_pending() == ()
+        finally:
+            await broker.aclose()
+
+    asyncio.run(run())
+    print("ok  daemon permission option 数量/长度超限 fail-closed")
 
 
 def test_named_session_control_discovery() -> None:
@@ -543,6 +659,8 @@ def test_external_permission_stays_in_tui() -> None:
 
 if __name__ == "__main__":
     test_protocol_roundtrip()
+    test_daemon_control_exposes_reconnectable_permission_gate()
+    test_permission_broker_bounds_fail_closed()
     test_named_session_control_discovery()
     test_submit_observer_failure_does_not_make_commit_uncertain()
     test_permissions_cleanup_and_unavailable()

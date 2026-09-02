@@ -33,6 +33,7 @@ required=(
   docs/adr/0018-capability-bounded-runtime-interjection.md
   docs/adr/0019-first-class-collaboration-plan-projection.md
   docs/adr/0020-capability-bounded-context-lifecycle.md
+  docs/adr/0021-detachable-daemon-and-remote-companion.md
   scripts/check-redlines.sh
   scripts/check-dsh-runtime-contract.py
   scripts/package-dsh-plugin.sh
@@ -87,6 +88,7 @@ docs = [
     root / "docs/adr/0018-capability-bounded-runtime-interjection.md",
     root / "docs/adr/0019-first-class-collaboration-plan-projection.md",
     root / "docs/adr/0020-capability-bounded-context-lifecycle.md",
+    root / "docs/adr/0021-detachable-daemon-and-remote-companion.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -118,8 +120,8 @@ if [ ! -x .venv/bin/python ]; then
 fi
 
 .venv/bin/python -m py_compile \
-  main.py myagents_mcp.py orchestrator.py host.py context_lifecycle.py discussion.py collaboration.py workflow.py session_roles.py session_catalog.py session_manager.py tui_activity.py agent_readiness.py \
-  acp/*.py pi_rpc/*.py codex_app_server/*.py native_agent/*.py adapters/*.py control/*.py storage/*.py workspace/*.py tests/*.py \
+  main.py myagents_mcp.py runtime_daemon.py attached_tui.py orchestrator.py host.py context_lifecycle.py discussion.py collaboration.py workflow.py session_roles.py session_catalog.py session_manager.py tui_activity.py agent_readiness.py \
+  acp/*.py pi_rpc/*.py codex_app_server/*.py native_agent/*.py adapters/*.py control/*.py remote_control/*.py storage/*.py workspace/*.py tests/*.py \
   scripts/e2e-m3-real.py scripts/e2e-m5-real.py
 .venv/bin/python tests/test_agent_readiness.py
 .venv/bin/python tests/test_packaging.py
@@ -151,6 +153,8 @@ fi
 .venv/bin/python tests/test_m25.py
 .venv/bin/python tests/test_m3_bus.py
 .venv/bin/python tests/test_m3_control.py
+.venv/bin/python tests/test_runtime_daemon.py
+.venv/bin/python tests/test_remote_control.py
 .venv/bin/python tests/test_m3_mcp.py
 .venv/bin/python tests/test_codex_app_server.py
 

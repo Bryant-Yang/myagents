@@ -38,6 +38,7 @@ from adapters.base import (
 MAX_MESSAGE_BYTES = 64 * 1024      # message 的 UTF-8 字节上限
 MAX_REQUEST_ID_CHARS = 128         # request_id 的字符上限
 MAX_WAIT_TIMEOUT = 30.0            # wait() 的 timeout 上限（秒）
+MAX_COMMAND_LIST = 200             # 单次控制面命令快照上限
 _MAX_ERROR_CHARS = 200             # failed 记录里保存的错误摘要上限
 _MAX_INTERJECTION_CHARS = 1000      # 与 workflow 单条 steering 上限一致
 
@@ -272,6 +273,15 @@ class CommandBus:
     def get(self, command_id: str) -> CommandSnapshot:
         """按 command_id 查快照；不存在抛 CommandNotFoundError。"""
         return self._lookup(command_id).snapshot()
+
+    def snapshots(self, limit: int = 50) -> tuple[CommandSnapshot, ...]:
+        """按创建顺序返回最近命令；只暴露不可变快照。"""
+        if (isinstance(limit, bool) or not isinstance(limit, int)
+                or not 1 <= limit <= MAX_COMMAND_LIST):
+            raise CommandValidationError(
+                f"limit 必须是 1..{MAX_COMMAND_LIST} 的整数")
+        commands = list(self._commands.values())[-limit:]
+        return tuple(command.snapshot() for command in commands)
 
     def active(self) -> CommandSnapshot | None:
         """返回当前 running 命令；没有则为 None。"""

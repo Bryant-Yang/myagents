@@ -6,6 +6,8 @@ from .command_bus import (CommandBus, CommandBusClosedError, CommandBusError,
                           CommandValidationError)
 from .client import (ControlClient, ControlClientError, ControlRemoteError,
                      ControlUnavailableError)
+from .permissions import (PermissionBroker, PermissionBrokerError,
+                          PermissionOption, PermissionRequest)
 from .server import (ControlBusyError, ControlServer, ControlServerError)
 
 __all__ = [
@@ -24,4 +26,8 @@ __all__ = [
     "ControlServer",
     "ControlServerError",
     "ControlUnavailableError",
+    "PermissionBroker",
+    "PermissionBrokerError",
+    "PermissionOption",
+    "PermissionRequest",
 ]

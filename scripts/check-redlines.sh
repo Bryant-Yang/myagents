@@ -1653,6 +1653,134 @@ for path in [ROOT / "workflow.py"]:
                     fail("R6", path, node,
                          "workflow 不得启动 git；必须注入 WorkspaceInspector")
 
+# R7: daemon companions are clients, never a second room/runtime owner.  The
+# network companion is a closed-world loopback API and may deny, but never
+# approve permissions or shut down the owner.
+client_paths = [ROOT / "attached_tui.py"] + sorted(
+    (ROOT / "remote_control").glob("*.py"))
+for path in client_paths:
+    if not path.is_file():
+        errors.append(f"[R7] {path.relative_to(ROOT)}: 客户端模块缺失")
+        continue
+    module = parse(path)
+    for node in ast.walk(module):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = (
+                [alias.name for alias in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module or ""]
+            )
+            forbidden_modules = {
+                "orchestrator", "storage", "runtime_daemon", "adapters",
+                "acp", "pi_rpc", "codex_app_server", "native_agent",
+                "subprocess",
+            }
+            if any(
+                name == prefix or name.startswith(prefix + ".")
+                for name in names for prefix in forbidden_modules
+            ):
+                fail("R7", path, node,
+                     "attach/remote 只能依赖 ControlClient，不得导入 owner、"
+                     "adapter、storage 或进程层")
+            imported = {alias.name for alias in node.names}
+            forbidden_symbols = {
+                "CommandBus", "ControlServer", "Orchestrator", "RoomStore",
+                "DaemonRuntime", "AgentSpec",
+            }
+            if imported & forbidden_symbols:
+                fail("R7", path, node,
+                     "attach/remote 不得导入 owner 层符号")
+        if isinstance(node, ast.Call):
+            target = node.func
+            name = (
+                target.id if isinstance(target, ast.Name)
+                else target.attr if isinstance(target, ast.Attribute)
+                else ""
+            )
+            if name in {
+                "CommandBus", "ControlServer", "Orchestrator", "RoomStore",
+                "DaemonRuntime", "Popen", "create_subprocess_exec",
+                "create_subprocess_shell",
+            }:
+                fail("R7", path, node,
+                     f"attach/remote 创建了 owner 或进程对象 {name}")
+
+remote_gateway = ROOT / "remote_control/gateway.py"
+if remote_gateway.is_file():
+    remote_tree = parse(remote_gateway)
+    remote_source = remote_gateway.read_text(encoding="utf-8")
+    required_remote_markers = {
+        '_LOOPBACK_BINDS = frozenset({"127.0.0.1", "::1"})':
+            "监听地址必须保持 loopback 闭集",
+        "hmac.compare_digest": "Bearer token 必须使用常量时间比较",
+        'outcome="cancelled"': "remote 权限只能 cancelled",
+    }
+    for marker, message in required_remote_markers.items():
+        if marker not in remote_source:
+            errors.append(f"[R7] remote_control/gateway.py: {message}")
+
+    expected_routes = {
+        ("/", ("GET",)),
+        ("/app.js", ("GET",)),
+        ("/api/room", ("GET",)),
+        ("/api/timeline", ("GET",)),
+        ("/api/events", ("GET",)),
+        ("/api/commands", ("GET",)),
+        ("/api/commands", ("POST",)),
+        ("/api/commands/{command_id:str}/cancel", ("POST",)),
+        ("/api/commands/{command_id:str}/steer", ("POST",)),
+        ("/api/permissions", ("GET",)),
+        ("/api/permissions/{request_id:str}/deny", ("POST",)),
+    }
+    routes: set[tuple[str, tuple[str, ...]]] = set()
+    for node in ast.walk(remote_tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "Route"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            continue
+        methods: tuple[str, ...] = ()
+        for keyword in node.keywords:
+            if keyword.arg == "methods":
+                try:
+                    methods = tuple(ast.literal_eval(keyword.value))
+                except (ValueError, TypeError):
+                    methods = ()
+        routes.add((node.args[0].value, methods))
+    if routes != expected_routes:
+        errors.append(
+            "[R7] remote_control/gateway.py: route 闭集漂移；不得新增 "
+            "approve/shutdown/passthrough")
+
+    allowed_client_methods = {
+        "get_room", "read_timeline", "read_events", "list_commands",
+        "submit", "cancel_command", "steer_command", "list_permissions",
+        "resolve_permission",
+    }
+    for node in ast.walk(remote_tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "client"
+        ):
+            continue
+        if node.func.attr not in allowed_client_methods:
+            fail("R7", remote_gateway, node,
+                 f"remote 调用了未授权 control method {node.func.attr}")
+        if node.func.attr == "resolve_permission":
+            outcome = next(
+                (item.value for item in node.keywords
+                 if item.arg == "outcome"), None)
+            if not (isinstance(outcome, ast.Constant)
+                    and outcome.value == "cancelled"):
+                fail("R7", remote_gateway, node,
+                     "remote resolve_permission 只能使用 cancelled")
+
 if errors:
     print("红线检查失败：")
     for error in errors:
@@ -1666,4 +1794,5 @@ print("✓ R3 子进程仅由 transport 层启动")
 print("✓ R4 Kimi/OpenCode 受限 ACP-first + Qwen/CodeBuddy/DSH ACP-only + Pi attested RPC-only")
 print("✓ R5 自然语言讨论、/discuss 与有序协作均有界且不递归 dispatch")
 print("✓ R6 /workflow 固定阶段/单 writer/一次 repair/steering 有界")
+print("✓ R7 attach/remote 仅 ControlClient，loopback Bearer 且权限 deny-only")
 PY

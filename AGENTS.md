@@ -2,7 +2,7 @@
 
 <!-- harness:controls-read-policy=on-demand -->
 
-> 作者：Bryant Yang　最近更新：2026-08-29
+> 作者：Bryant Yang　最近更新：2026-09-02
 >
 > 本文是所有编码 agent 的项目级入场入口，也是唯一的协作规则源。详细工程契约见
 > [`HARNESS.md`](HARNESS.md)，按任务选读规则见
@@ -108,6 +108,12 @@ app-server），同时仅为已获证路径保留 JSONL 兼容回退。
   implement → verify，最多一次同 writer repair/reverify 和一次 host final；
   review/verify/final 必须 read-only，steering 只允许在阶段边界按冻结上限追加，
   禁止递归派发、换角色、扩权限或无界修复。
+- **R7 后台客户端不得成为第二 owner**：`attached_tui.py` 与
+  `remote_control/` 只能通过 `ControlClient` 访问 daemon，不得创建/导入
+  RoomStore、Orchestrator、CommandBus、adapter 或子进程。remote 必须只监听
+  loopback、使用 Bearer token 与精确 Host allowlist；只允许查看、提交、取消、
+  既有有界 steering 和拒绝权限，不得开放 approve、runtime shutdown、任意
+  control passthrough、`/yolo` 扩权或自动启动/fallback。
 
 ## 4. 工作要求
 
@@ -151,6 +157,10 @@ app-server），同时仅为已获证路径保留 JSONL 兼容回退。
   永不因压缩改写；通用层只消费显式 capability，未获证 transport 必须拒绝；
   自动压缩只在安全阶段边界与用户 prompt 前执行，checkpoint 写失败使房间
   fail-closed，fresh 恢复不得跨 backend/profile 或越过 no-replay cursor。
+- 后台与远程控制遵守
+  [`ADR-0021`](docs/adr/0021-detachable-daemon-and-remote-companion.md)：daemon
+  是单 room 唯一 owner；attach/remote 退出不改变任务；remote 只经 loopback
+  Bearer 网关并保持 deny-only 权限；任何重连都不得重投原 command。
 - DSH ACP-only 接入遵守
   [`ADR-0015`](docs/adr/0015-dsh-acp-only-transport.md)：官方 profile 入口、标准
   myagents bundle、被动 readiness、两 execution safety profile、load/close hard gate、

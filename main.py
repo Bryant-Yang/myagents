@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import re
 import shlex
+import sys
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -68,7 +69,13 @@ from adapters.base import (
     AgentEvent,
     redact_sensitive_text,
 )
-from control import CommandBus, CommandNotFoundError, ControlServer
+from control import (
+    CommandBus,
+    CommandNotFoundError,
+    ControlClientError,
+    ControlServer,
+    ControlServerError,
+)
 from clipboard_image import (
     ClipboardImageError,
     attachment_reference,
@@ -3412,15 +3419,74 @@ class ChatApp(App):
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    values = list(sys.argv[1:] if argv is None else argv)
+    if values[:1] == ["daemon"]:
+        parser = argparse.ArgumentParser(
+            prog="myagents daemon",
+            description="后台持有一个 myagents room",
+        )
+        parser.add_argument(
+            "action", choices=("start", "run", "status", "stop")
+        )
+        parser.add_argument("workdir", nargs="?", default=".")
+        parser.add_argument("--session", default=DEFAULT_SESSION_NAME)
+        parser.add_argument("--state-root")
+        parser.add_argument("--timeout", type=float, default=8.0)
+        parsed = parser.parse_args(values[1:])
+        parsed.command = "daemon"
+        return parsed
+    if values[:1] == ["attach"]:
+        parser = argparse.ArgumentParser(
+            prog="myagents attach",
+            description="附着到一个后台 myagents room",
+        )
+        parser.add_argument("workdir", nargs="?", default=".")
+        parser.add_argument("--session", default=DEFAULT_SESSION_NAME)
+        parser.add_argument("--state-root")
+        parser.add_argument("--poll-interval", type=float, default=0.5)
+        parsed = parser.parse_args(values[1:])
+        parsed.command = "attach"
+        return parsed
+    if values[:1] == ["remote"]:
+        parser = argparse.ArgumentParser(
+            prog="myagents remote",
+            description="为一个后台 myagents room 启动本机远程伴侣",
+        )
+        parser.add_argument("workdir", nargs="?", default=".")
+        parser.add_argument("--session", default=DEFAULT_SESSION_NAME)
+        parser.add_argument("--state-root")
+        parser.add_argument("--host", default="127.0.0.1")
+        parser.add_argument("--port", type=int, default=8765)
+        parser.add_argument("--token-file")
+        parser.add_argument(
+            "--allowed-host", action="append", default=[],
+            help="受信反向代理保留的 Host header；可重复",
+        )
+        parsed = parser.parse_args(values[1:])
+        parsed.command = "remote"
+        return parsed
     parser = argparse.ArgumentParser(
-        description="Local multi-agent TUI")
+        description="Local multi-agent TUI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "后台与远程命令:\n"
+            "  myagents daemon start [workdir]   后台运行当前会话\n"
+            "  myagents daemon status [workdir]  查看后台状态\n"
+            "  myagents daemon stop [workdir]    优雅停止后台会话\n"
+            "  myagents attach [workdir]         附着到后台会话\n"
+            "  myagents remote [workdir]         启动本机远程伴侣\n"
+            "各命令可追加 --help 查看完整参数。"
+        ),
+    )
     parser.add_argument(
         "workdir", nargs="?", default=".",
         help="Agent working directory (default: current directory)")
     parser.add_argument(
         "--session", default=DEFAULT_SESSION_NAME,
         help="Create or resume one named conversation session")
-    return parser.parse_args(argv)
+    parsed = parser.parse_args(values)
+    parsed.command = "chat"
+    return parsed
 
 
 def run_chat_loop(
@@ -3432,11 +3498,121 @@ def run_chat_loop(
     ).run()
 
 
+def run_attach_loop(
+    workdir: str,
+    session_name: str,
+    *,
+    state_root: str | None = None,
+    poll_interval: float = 0.5,
+) -> None:
+    from attached_tui import AttachedChatApp
+    from control import ControlClient
+
+    client = ControlClient(
+        workdir,
+        state_root=state_root,
+        session_name=normalize_session_name(session_name),
+    )
+    owner = asyncio.run(client.get_room())
+    if owner.get("owner_kind") != "daemon":
+        raise RuntimeError("attach 只连接 daemon owner")
+    AttachedChatApp(client, poll_interval=poll_interval).run()
+
+
 def run_cli(
         argv: list[str] | None = None, *,
         runner=run_chat_loop) -> None:
     """解析 CLI 并把可恢复的启动冲突转换为无 traceback 的操作提示。"""
     args = parse_args(argv)
+    if args.command == "daemon":
+        from runtime_daemon import (
+            daemon_status,
+            serve_daemon,
+            start_daemon_detached,
+            stop_daemon,
+        )
+        try:
+            if args.action == "start":
+                room = start_daemon_detached(
+                    args.workdir,
+                    session_name=args.session,
+                    state_root=args.state_root,
+                    timeout=args.timeout,
+                )
+                print(
+                    f"myagents daemon 已启动：PID {room['pid']} · "
+                    f"会话 {room['session_name']} · 日志 {room['log_path']}"
+                )
+                return
+            if args.action == "run":
+                asyncio.run(serve_daemon(
+                    args.workdir,
+                    session_name=args.session,
+                    state_root=args.state_root,
+                ))
+                return
+            if args.action == "status":
+                room = daemon_status(
+                    args.workdir,
+                    session_name=args.session,
+                    state_root=args.state_root,
+                )
+                label = (
+                    "后台运行中"
+                    if room.get("owner_kind") == "daemon"
+                    else "由 TUI 持有"
+                )
+                print(
+                    f"{label}：PID {room['pid']} · 会话 "
+                    f"{room['session_name']} · {room['workdir']}"
+                )
+                return
+            room = stop_daemon(
+                args.workdir,
+                session_name=args.session,
+                state_root=args.state_root,
+                timeout=args.timeout,
+            )
+            print(
+                f"myagents daemon 已停止：PID {room['pid']} · "
+                f"会话 {room['session_name']}"
+            )
+            return
+        except (
+            ControlClientError,
+            ControlServerError,
+            RoomBusyError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            raise SystemExit(f"myagents daemon: {exc}") from None
+    if args.command == "attach":
+        try:
+            run_attach_loop(
+                args.workdir,
+                args.session,
+                state_root=args.state_root,
+                poll_interval=args.poll_interval,
+            )
+        except (ControlClientError, OSError, RuntimeError, ValueError) as exc:
+            raise SystemExit(f"myagents attach: {exc}") from None
+        return
+    if args.command == "remote":
+        from remote_control import run_remote_gateway
+
+        try:
+            run_remote_gateway(
+                args.workdir,
+                session_name=normalize_session_name(args.session),
+                state_root=args.state_root,
+                host=args.host,
+                port=args.port,
+                token_file=args.token_file,
+                allowed_hosts=tuple(args.allowed_host),
+            )
+        except (ControlClientError, OSError, RuntimeError, ValueError) as exc:
+            raise SystemExit(f"myagents remote: {exc}") from None
+        return
     try:
         runner(
             args.workdir,
@@ -3446,9 +3622,10 @@ def run_cli(
         session = normalize_session_name(args.session)
         workdir = shlex.quote(str(args.workdir))
         raise SystemExit(
-            f"myagents: 会话 {session!r} 已在另一个 TUI 中运行。\n"
+            f"myagents: 会话 {session!r} 已由另一个 owner 持有。\n"
             f"{exc}\n"
-            "请关闭已有 TUI，或打开一个新会话：\n"
+            "若它是 daemon，可执行 myagents attach；否则请关闭已有 TUI，"
+            "或打开一个新会话：\n"
             f"  uv run main.py --session <新名称> {workdir}"
         ) from None
 

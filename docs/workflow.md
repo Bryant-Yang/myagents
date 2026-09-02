@@ -23,6 +23,7 @@
 | 12 | 改 HostBackend、原生模型 provider/runtime 或 agent Host | [`adr/0017-native-model-backed-host.md`](adr/0017-native-model-backed-host.md)；[`SPEC.md`](SPEC.md) UC-HOST-001；`../HARNESS.md` §4.9 | R1–R6、provider-neutral、model tool-less、adapter-owned Host capability、独立只读、no-replay、无 fallback | `host_backend.py`、`native_agent/`、`host.py`、具体 adapter、`AgentSpec`、RoomStore、TUI、fake tests | room 级 model/agent 切换与恢复；provider discovery capability；所有已声明 adapter 自动可选；fresh session；同名 worker 隔离；运行中拒绝；权限/no-fallback/显式 @ 反例通过 |
 | 13 | 改 Esc 取消、运行中插话或 transport steering capability | [`adr/0018-capability-bounded-runtime-interjection.md`](adr/0018-capability-bounded-runtime-interjection.md)；[`adr/0009-bounded-milestone-workflow-steering.md`](adr/0009-bounded-milestone-workflow-steering.md)；[`SPEC.md`](SPEC.md) UC-INTERJECT-001；`../HARNESS.md` §4.3、§4.6 | R2–R6、单 writer、能力显式、no-replay、workflow bounds | adapter capability、Orchestrator active delivery、CommandBus FIFO/execution events、TUI、fake transport tests | Esc 精确取消且 overlay 优先；Alt+↑ 只提升最早 queued command，草稿不参与；其余保持 FIFO；Pi 同 session native steer、Codex 同 turn native steer；ACP/多目标 fail-closed；requested 在协议写入前持久化，uncertain 源命令不得重放 |
 | 14 | 改长会话预算、压缩或摘要恢复 | [`adr/0020-capability-bounded-context-lifecycle.md`](adr/0020-capability-bounded-context-lifecycle.md)；[`adr/0001-persistent-room-command-bus-mcp.md`](adr/0001-persistent-room-command-bus-mcp.md)；[`SPEC.md`](SPEC.md) UC-CONTEXT-001；`../HARNESS.md` §4.10 | R1–R4、单 writer、capability-first、timeline append-only、no-replay | `context_lifecycle.py`、明确声明 capability 的 adapter/runtime、RoomStore、Orchestrator/TUI、fake tests | 自动/手动均只在安全边界；权威摘要后才替换；checkpoint 可恢复；未获证 transport 拒绝；跨 backend/profile 不复用；持久失败 fail-closed |
+| 15 | 改后台 daemon、attach 或远程伴侣 | [`adr/0021-detachable-daemon-and-remote-companion.md`](adr/0021-detachable-daemon-and-remote-companion.md)；[`adr/0001-persistent-room-command-bus-mcp.md`](adr/0001-persistent-room-command-bus-mcp.md)；[`SPEC.md`](SPEC.md) UC-DAEMON-001；`../HARNESS.md` §4.11 | R1–R4、R7、单 owner/writer、权限 fail-closed、no-replay | `runtime_daemon.py`、`attached_tui.py`、`control/`、`remote_control/`、对应 tests | detach 不停止任务；重连不重投；权限等待可恢复且远端只能拒绝；remote 仅 loopback + Bearer；客户端不创建 owner 组件；关闭无残留 |
 
 不在表内且会改变协议、安全或外部接口的任务，先向用户确认范围。
 
@@ -36,6 +37,7 @@
 | R4 | Kimi/OpenCode 保持受限 hybrid；Qwen Code/CodeBuddy/DSH 保持 ACP-only；DSH 以 stock `dsh --profile myagents` 加载 myagents 标准 bundle、stock DSH 不可变，并保持被动 profile/bundle readiness、load+close gate、两 execution safety profile、零 fallback；Pi 保持 RPC-only + 固定 bridge/wrapper/attestation；所有 runtime profile 受约束 |
 | R5 | 自然语言讨论与 `/discuss` 固定 2–3 人、1–3 轮，不由 agent 自主续轮 |
 | R6 | `/workflow` 固定角色/阶段、单 writer、一次 repair 上限和有界 steering |
+| R7 | attach/remote 只做 ControlClient；remote 仅 loopback + Bearer、deny-only 权限且无 shutdown/passthrough |
 
 ## 3. 上下文按需载入
 

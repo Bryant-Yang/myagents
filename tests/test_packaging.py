@@ -48,6 +48,9 @@ def test_dsh_bundle_resources_are_part_of_the_distribution() -> None:
         "plugin/*.yml",
         "plugin/src/*.ts",
     } <= patterns
+    assert set(
+        config["tool"]["setuptools"]["package-data"]["remote_control"]
+    ) == {"static/*.html", "static/*.js"}
 
 
 if __name__ == "__main__":
