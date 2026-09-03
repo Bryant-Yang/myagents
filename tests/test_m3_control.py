@@ -95,7 +95,18 @@ def test_protocol_roundtrip() -> None:
             assert info["active"] is True
             assert info["room_id"] == room.store.room_id
             assert info["workdir"] == str(room.workdir.resolve())
-            assert {"name": "kimi", "transport": "acp+jsonl"} in info["agents"]
+            kimi = next(item for item in info["agents"]
+                        if item["name"] == "kimi")
+            assert kimi["transport"] == "acp+jsonl"
+            assert type(kimi["ready"]) is bool
+            assert kimi["state"] in {
+                "ready", "not_found", "invalid", "disabled"}
+            host = next(item for item in info["agents"]
+                        if item["name"] == "host")
+            assert host["transport"]
+            assert type(host["ready"]) is bool
+            assert host["state"] in {
+                "ready", "not_found", "invalid", "disabled"}
 
             first = await room.client.submit("@kimi first", request_id="same")
             duplicate = await room.client.submit(
@@ -135,6 +146,12 @@ def test_protocol_roundtrip() -> None:
             assert "running" in first_events
             assert "partial" in first_events
             assert first_events[-1] == "completed"
+            details = await room.client.read_command_events(
+                first["command_id"], limit=80)
+            assert details["command_id"] == first["command_id"]
+            assert details["total_count"] == len(first_events)
+            assert details["kind_counts"]["partial"] == 1
+            assert details["partial_char_count"] > 0
             # terminal cancel 幂等，不改变成功结果。
             cancelled = await room.client.cancel_command(first["command_id"])
             assert cancelled["status"] == "completed"

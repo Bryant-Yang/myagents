@@ -322,6 +322,11 @@ class ControlServer:
                         params: dict[str, Any]) -> dict[str, Any]:
         if method == "room.get":
             _validate_keys(params, required=set())
+            readiness = {
+                item.name: item
+                for item in self._orch.agent_readiness_snapshot()
+            }
+            host = self._orch.host_backend_status()
             return {
                 "protocol_version": PROTOCOL_VERSION,
                 "active": True,
@@ -332,9 +337,19 @@ class ControlServer:
                 "session_name": self._store.session_name,
                 "workdir": self._store.workdir,
                 "agents": [
-                    {"name": spec.name, "transport": spec.transport}
+                    {
+                        "name": spec.name,
+                        "transport": spec.transport,
+                        "ready": readiness[spec.name].ready,
+                        "state": readiness[spec.name].state.value,
+                    }
                     for spec in self._orch.specs
-                ],
+                ] + [{
+                    "name": "host",
+                    "transport": host.transport,
+                    "ready": host.readiness.ready,
+                    "state": host.readiness.state.value,
+                }],
             }
         if method == "timeline.read":
             _validate_keys(
@@ -405,6 +420,23 @@ class ControlServer:
             return {
                 "items": [item.to_dict()
                           for item in self._bus.snapshots(limit=limit)]
+            }
+        if method == "command.events":
+            _validate_keys(
+                params, required={"command_id"}, optional={"limit"})
+            command_id = params["command_id"]
+            limit = params.get("limit", 80)
+            if not isinstance(command_id, str) or not command_id:
+                raise _InvalidParams("command_id 必须是非空字符串")
+            if (isinstance(limit, bool) or not isinstance(limit, int)
+                    or not 1 <= limit <= MAX_READ_LIMIT):
+                raise _InvalidParams(
+                    f"limit 必须是 1..{MAX_READ_LIMIT} 的整数")
+            page = self._store.read_command_events(command_id, limit=limit)
+            return {
+                **page,
+                "items": [item.to_dict() for item in page["items"]],
+                "agents": list(page["agents"]),
             }
         if method == "command.wait":
             _validate_keys(

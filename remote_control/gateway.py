@@ -217,6 +217,11 @@ def create_remote_app(
         limit = _query_int(request, "limit", 50, minimum=1, maximum=200)
         return JSONResponse(await client.list_commands(limit))
 
+    async def command_events(request: Request) -> Response:
+        limit = _query_int(request, "limit", 80, minimum=1, maximum=200)
+        return JSONResponse(await client.read_command_events(
+            request.path_params["command_id"], limit))
+
     async def submit(request: Request) -> Response:
         value = await _read_json(request)
         _exact_fields(value, required={"message", "request_id"})
@@ -257,6 +262,8 @@ def create_remote_app(
         Route("/api/events", events, methods=["GET"]),
         Route("/api/commands", commands, methods=["GET"]),
         Route("/api/commands", submit, methods=["POST"]),
+        Route("/api/commands/{command_id:str}/events", command_events,
+              methods=["GET"]),
         Route("/api/commands/{command_id:str}/cancel", cancel, methods=["POST"]),
         Route("/api/commands/{command_id:str}/steer", steer, methods=["POST"]),
         Route("/api/permissions", permissions, methods=["GET"]),

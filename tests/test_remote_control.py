@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import stat
 import sys
 from pathlib import Path
@@ -35,7 +36,15 @@ class FakeControlClient:
 
     async def get_room(self):
         return {"owner_kind": "daemon", "room_id": "room-1",
-                "session_name": "default", "workdir": "/tmp/work"}
+                "session_name": "default", "workdir": "/tmp/work",
+                "agents": [
+                    {"name": "kimi", "transport": "acp+jsonl",
+                     "ready": True, "state": "ready"},
+                    {"name": "qwen", "transport": "acp",
+                     "ready": False, "state": "not_found"},
+                    {"name": "host", "transport": "NATIVE-MODEL",
+                     "ready": False, "state": "invalid"},
+                ]}
 
     async def read_timeline(self, after_seq=0, limit=50):
         return {"items": [{"seq": 1, "speaker": "host", "text": "你好"}],
@@ -47,6 +56,35 @@ class FakeControlClient:
     async def list_commands(self, limit=50):
         return {"items": [{"command_id": "cmd-1", "message": "hi",
                             "status": "running"}]}
+
+    async def read_command_events(self, command_id, limit=80):
+        assert command_id == "cmd-1"
+        return {
+            "command_id": command_id,
+            "items": [
+                {
+                    "seq": 1,
+                    "command_id": command_id,
+                    "agent": "worker",
+                    "kind": "tool",
+                    "text": "读取 README.md · 已完成",
+                    "created_at": "2026-09-02T01:02:03Z",
+                },
+                {
+                    "seq": 2,
+                    "command_id": command_id,
+                    "agent": "worker",
+                    "kind": "partial",
+                    "text": "过程正文不在详情重复显示",
+                    "created_at": "2026-09-02T01:02:04Z",
+                },
+            ],
+            "total_count": 2,
+            "omitted_count": 0,
+            "kind_counts": {"tool": 1, "partial": 1},
+            "agents": ["worker"],
+            "partial_char_count": 42,
+        }
 
     async def submit(self, message, request_id=None):
         self.submitted.append((message, request_id))
@@ -102,9 +140,16 @@ def test_remote_api_requires_bearer_and_never_exposes_approval() -> None:
             room = await http.get("/api/room", headers=headers)
             assert room.status_code == 200
             assert room.json()["owner_kind"] == "daemon"
+            assert [item["name"] for item in room.json()["agents"]] == [
+                "kimi", "qwen", "host"]
+            assert room.json()["agents"][-1]["ready"] is False
             timeline = await http.get(
                 "/api/timeline?after_seq=0&limit=20", headers=headers)
             assert timeline.json()["items"][0]["text"] == "你好"
+            details = await http.get(
+                "/api/commands/cmd-1/events?limit=80", headers=headers)
+            assert details.status_code == 200
+            assert details.json()["items"][0]["kind"] == "tool"
             submitted = await http.post(
                 "/api/commands",
                 headers=headers,
@@ -212,6 +257,18 @@ def test_remote_static_client_never_interprets_agent_html() -> None:
     assert "远程端只能拒绝" in source
 
 
+def test_remote_client_state_model_behaviour() -> None:
+    completed = subprocess.run(
+        ["node", str(ROOT / "tests/remote_client_state_test.js")],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
 def test_remote_api_controls_the_existing_daemon_owner() -> None:
     async def run() -> None:
         with TemporaryDirectory(dir="/tmp") as tmp:
@@ -262,5 +319,6 @@ if __name__ == "__main__":
     test_remote_rejects_untrusted_hosts_and_oversize_json()
     test_remote_token_is_stable_private_and_not_a_symlink()
     test_remote_static_client_never_interprets_agent_html()
+    test_remote_client_state_model_behaviour()
     test_remote_api_controls_the_existing_daemon_owner()
     print("ok  remote bearer/loopback/deny-only/token 安全边界")

@@ -194,6 +194,16 @@ class ControlClient:
     async def list_commands(self, limit: int = 50) -> dict[str, Any]:
         return await self.call("command.list", {"limit": limit})
 
+    async def read_command_events(
+        self,
+        command_id: str,
+        limit: int = 80,
+    ) -> dict[str, Any]:
+        return await self.call("command.events", {
+            "command_id": command_id,
+            "limit": limit,
+        })
+
     async def wait_command(self, command_id: str,
                            timeout: float = 30.0) -> dict[str, Any]:
         return await self.call(

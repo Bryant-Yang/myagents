@@ -492,6 +492,13 @@ transport。
   cancelled。不得开放 approve、runtime shutdown、任意 control passthrough、远程
   `/yolo` 扩权、自动拉起 owner 或 fallback。外部访问只能通过 Tailscale Serve
   等受信反向代理，并显式 opt-in 代理 Host。
+- Web 的 `@agent` 候选只消费 `room.get` 返回的当前 `AgentSpec` 与被动 readiness
+  投影并附加产品级 host，可用项优先但不隐藏未就绪项，不维护第二份 worker 名单。
+  活动抽屉只显示未结束任务和最近四个已结束或上次中断任务；逐卡
+  详情通过只读 `command.events` 有界读取 80 条代表事件，显示阶段、工具、权限、
+  控制与输出统计。daemon 重启后按持久事件末态从 timeline 的 `command_id`
+  补出最近历史卡，未见终态的任务明确标记为“上次运行中断”，
+  不重复 partial 正文、不显示 thought，也不增加任何写操作。
 - 完整契约与 no-replay/进程异常边界见 ADR-0021。
 
 ## 5. 测试策略

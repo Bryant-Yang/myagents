@@ -1246,13 +1246,20 @@
 - **远程分支**：`myagents remote` 只连接现存 daemon 并绑定 loopback；API 强制
   Bearer 和精确 Host allowlist，请求 ≤128 KiB。token 文件 0600/目录 0700，
   拒绝 symlink；浏览器从 fragment 读入 sessionStorage 后清除地址栏，不把 agent
-  文本当 HTML。跨设备必须经用户另行配置的受信反向代理。
+  文本当 HTML。输入 `@` 时只从 `room.get.agents` 派生 worker/readiness 候选并
+  附加 host，可用项优先、未就绪项不隐藏并支持连续点名；活动抽屉显示当前与最近
+  任务，展开详情按 command 有界读取已有
+  执行事件，只呈现阶段/工具/权限/控制/错误和输出统计，不重复 partial 正文或
+  显示 thought；daemon 重启后从 timeline 的 `command_id` 恢复最近四个已结束或
+  上次中断任务，状态以持久事件末态为准，缺少终态时明确显示中断。
+  跨设备必须经用户另行配置的受信反向代理。
 - **故障 / no-replay**：控制客户端断线只中断观察。重复提交由 request_id 幂等；
   daemon 重启不自动恢复不确定执行或重投已提交 command。启动失败不宣称 ready；
   SIGINT/SIGTERM/stop 都按权限 → control → bus → adapters 顺序收口。
 - **验收**：in-process 和真实 detached CLI start/status/stop；任务跨两次 attach；
   权限弹窗 detach/reattach；Esc 精确取消；Bearer/Host/loopback/body 上限；
-  approve/shutdown 404；deny-only；token mode/symlink；DOM text-only。
+  approve/shutdown 404；deny-only；token mode/symlink；DOM text-only；多 agent
+  `@` 补全可用键盘连续选择；终态与运行中 command 的详情均可展开且保持有界。
 - **独立证据来源**：`tests/test_runtime_daemon.py`、
   `tests/test_remote_control.py`、`tests/test_m3_control.py` 与 R7 gate。
 - **人工验收边界**：真实 Tailscale 跨设备、睡眠/断网恢复、SIGKILL 后的交互提示

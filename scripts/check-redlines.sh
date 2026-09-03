@@ -1727,6 +1727,7 @@ if remote_gateway.is_file():
         ("/api/events", ("GET",)),
         ("/api/commands", ("GET",)),
         ("/api/commands", ("POST",)),
+        ("/api/commands/{command_id:str}/events", ("GET",)),
         ("/api/commands/{command_id:str}/cancel", ("POST",)),
         ("/api/commands/{command_id:str}/steer", ("POST",)),
         ("/api/permissions", ("GET",)),
@@ -1758,6 +1759,7 @@ if remote_gateway.is_file():
 
     allowed_client_methods = {
         "get_room", "read_timeline", "read_events", "list_commands",
+        "read_command_events",
         "submit", "cancel_command", "steer_command", "list_permissions",
         "resolve_permission",
     }

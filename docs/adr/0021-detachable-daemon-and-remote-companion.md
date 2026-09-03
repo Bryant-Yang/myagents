@@ -50,6 +50,14 @@
 - remote 可读 room/timeline/events/command 状态，可提交带 `request_id` 的命令、
   精确取消和调用既有有界 steering。它只能查看并**拒绝**权限；没有 approve、
   runtime shutdown、任意 control method passthrough 或权限模式切换路由。
+- Web 输入补全从 `room.get.agents` 派生当前 worker/readiness 候选并附加 host，
+  支持连续点名、可用项优先且保留未就绪项，不在前端维护第二份 agent 注册表。
+  任务详情只经显式只读
+  `command.events(command_id, limit)` 读取存储层已有的有界首尾事件投影；界面隐藏
+  partial 正文和 thought，只呈现阶段、工具、权限、控制、错误与输出统计。内存
+  command 列表因 daemon 重启为空时，timeline 已有的 `command_id` 只用于补出最近
+  四个已结束或上次中断任务；状态由持久事件末态判定，缺少终态时明确显示中断，
+  详情仍回到同一持久事件事实源读取。
 - remote token 不是 room lease 或 agent 凭据。网关不读取模型/agent secret，
   不自动启动 daemon，也不自动 fallback。
 
@@ -74,7 +82,8 @@
   start/status/stop、权限弹窗退出后仍等待、重新附着精确选择、Esc 精确取消且
   daemon 继续存活。
 - `tests/test_remote_control.py`：Bearer/Host/loopback/请求上限、命令控制、
-  approve/shutdown 反例、deny-only 权限、0600 token/symlink、DOM 文本渲染。
+  command 详情、approve/shutdown 反例、deny-only 权限、0600 token/symlink、
+  DOM 文本渲染。
 - `tests/test_m3_control.py`：owner kind、command list、权限 broker、socket 生命周期。
 - R7 AST gate：attach/remote 不得导入 owner 层；remote 必须保留 loopback、
   deny-only、无 approve/shutdown 路由。
