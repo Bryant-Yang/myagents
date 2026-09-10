@@ -97,6 +97,7 @@ from storage.store import (
     normalize_session_name,
     normalize_workdir,
 )
+from session_catalog import SessionCatalogError
 from session_manager import (
     SessionManager,
     SessionNotice,
@@ -396,10 +397,14 @@ class SessionPickerScreen(ModalScreen[str | None]):
 
     def _refresh(self) -> None:
         query = self.query_one("#session-search", Input).value
-        items = self._manager.list_sessions(
-            include_all=self._include_all,
-            query=query,
-        )
+        try:
+            items = self._manager.list_sessions(
+                include_all=self._include_all,
+                query=query,
+            )
+        except SessionCatalogError as exc:
+            self._show_catalog_error(str(exc))
+            return
         if self._include_all:
             grouped: dict[str, list[SessionSnapshot]] = {}
             for item in items:
@@ -435,6 +440,21 @@ class SessionPickerScreen(ModalScreen[str | None]):
         prompt_width = max(16, option_list.size.width - 6)
         option_list.set_options(self._render_options(prompt_width))
         self._sync_selection()
+
+    def _show_catalog_error(self, message: str) -> None:
+        """目录读取失败时在面板内呈现错误；异常不得杀掉整个应用。"""
+        self._items = ()
+        self._selected = 0
+        self._option_indexes = {}
+        self._item_indexes = {}
+        self.query_one("#session-scope", Label).update("读取失败")
+        option_list = self.query_one("#session-options", OptionList)
+        option_list.set_options([Option(
+            f"会话目录读取失败：{message}",
+            id="catalog-error",
+            disabled=True,
+        )])
+        option_list.highlighted = None
 
     @staticmethod
     def _activity_label(value: str | None) -> str:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -156,6 +157,35 @@ def test_catalog_delete_requires_exact_title_and_exact_room() -> None:
         )] == [survivor.room_id]
 
 
+def test_catalog_skips_sessions_whose_project_directory_was_deleted() -> None:
+    """项目目录已删除的悬空房间被跳过，不得阻塞整个会话列表。"""
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        workdir = root / "project"
+        doomed = root / "doomed"
+        workdir.mkdir()
+        doomed.mkdir()
+        state_root = root / "state"
+
+        default = RoomStore(workdir, state_root=state_root)
+        default.append("user", "当前项目还在")
+        stale = RoomStore(
+            doomed,
+            state_root=state_root,
+            session_name="gone",
+        )
+        stale.append("user", "项目目录即将消失")
+        shutil.rmtree(doomed)
+
+        sessions = SessionCatalog(state_root).list_sessions(
+            current_workdir=workdir,
+            include_all=True,
+        )
+
+        assert [item.room_id for item in sessions] == [default.room_id]
+        assert sessions[0].last_user_message == "当前项目还在"
+
+
 def test_catalog_fails_loudly_for_incomplete_room_shaped_directory() -> None:
     """合法 room_id 形状的半初始化目录不能被选择器静默隐藏。"""
     with TemporaryDirectory() as tmp:
@@ -184,5 +214,6 @@ if __name__ == "__main__":
     test_catalog_creates_stable_untitled_sessions()
     test_catalog_renames_title_without_changing_identity()
     test_catalog_delete_requires_exact_title_and_exact_room()
+    test_catalog_skips_sessions_whose_project_directory_was_deleted()
     test_catalog_fails_loudly_for_incomplete_room_shaped_directory()
     print("ok  会话目录兼容旧房间并生成本地摘要")

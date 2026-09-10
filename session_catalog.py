@@ -26,6 +26,7 @@ from storage.store import (
     room_id_for,
     RoomStore,
     RoomLease,
+    StorageError,
 )
 from host_backend import HostBackendSelection
 
@@ -37,6 +38,14 @@ _LEGACY_IMAGE_RE = re.compile(r"\[图片附件：[^\]\r\n]+\]")
 
 class SessionCatalogError(Exception):
     """会话目录无法安全完成操作。"""
+
+
+class StaleSessionError(SessionCatalogError):
+    """会话绑定的项目目录已不存在。
+
+    房间自身结构完好，只是 workdir 已从磁盘消失，无法再激活；这只读
+    发现阶段跳过即可，不与真正的存储损坏混淆。
+    """
 
 
 @dataclass(frozen=True)
@@ -144,6 +153,11 @@ class SessionCatalog:
         include_all: bool = False,
         query: str = "",
     ) -> tuple[SessionSummary, ...]:
+        """列出可发现会话；项目目录已删除的悬空房间被跳过。
+
+        跳过只针对 StaleSessionError（workdir 消失）；state/timeline
+        损坏或 room_id 不匹配仍然抛 SessionCatalogError，不得静默忽略。
+        """
         current = normalize_workdir(current_workdir)
         if not self.rooms_root.is_dir():
             return ()
@@ -160,7 +174,12 @@ class SessionCatalog:
                 raise SessionCatalogError(
                     f"会话目录不完整：{room_dir.name}"
                 )
-            summary = self._read_summary(room_dir)
+            try:
+                summary = self._read_summary(room_dir)
+            except StaleSessionError:
+                # 项目目录已删除的房间无法再激活；发现是只读的，跳过，
+                # 不能让一个悬空房间阻塞整个会话列表。
+                continue
             searchable = "\n".join((
                 summary.title,
                 summary.last_user_message,
@@ -189,6 +208,10 @@ class SessionCatalog:
             session_name = normalize_session_name(
                 data.get("session_name", DEFAULT_SESSION_NAME)
             )
+        except StorageError as exc:
+            raise StaleSessionError(
+                f"会话项目目录已不存在：{room_dir.name}（{exc}）"
+            ) from exc
         except (KeyError, ValueError, OSError) as exc:
             raise SessionCatalogError(
                 f"会话身份非法：{room_dir.name}（{exc}）") from exc

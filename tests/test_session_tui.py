@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -89,6 +90,92 @@ def test_ctrl_o_opens_searchable_current_project_picker() -> None:
                 filtered = _picker_text(app.screen)
                 assert "talk" in filtered
                 assert "default" not in filtered
+
+    asyncio.run(run())
+
+
+def test_ctrl_o_survives_session_whose_project_directory_was_deleted() -> None:
+    """悬空房间只被跳过；Ctrl+O 不得让整个应用崩溃退出。"""
+    async def run() -> None:
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "project"
+            workdir.mkdir()
+            doomed = root / "doomed"
+            doomed.mkdir()
+            state_root = root / "state"
+            default = RoomStore(workdir, state_root=state_root)
+            default.append("user", "默认会话里的问题")
+            stale = RoomStore(
+                doomed,
+                state_root=state_root,
+                session_name="gone",
+            )
+            stale.append("user", "项目目录即将消失")
+            orch = Orchestrator(str(workdir), store=default)
+            app = ChatApp(workdir=str(workdir), orchestrator=orch)
+
+            async with app.run_test() as pilot:
+                shutil.rmtree(doomed)
+                await pilot.press("ctrl+o")
+                await pilot.pause()
+                assert isinstance(app.screen, SessionPickerScreen)
+                rendered = _picker_text(app.screen)
+                assert "默认会话里的问题" in rendered
+                assert "项目目录即将消失" not in rendered
+
+                # 切到全部项目范围：悬空房间被跳过，应用仍然存活。
+                await pilot.press("tab")
+                await pilot.pause()
+                assert isinstance(app.screen, SessionPickerScreen)
+                rendered = _picker_text(app.screen)
+                assert "project" in rendered
+                assert "doomed" not in rendered
+                assert "项目目录即将消失" not in rendered
+
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not isinstance(app.screen, SessionPickerScreen)
+
+    asyncio.run(run())
+
+
+def test_ctrl_o_shows_catalog_error_inline_for_corrupt_room() -> None:
+    """真正的损坏房间在面板内报错；应用不得异常退出。"""
+    async def run() -> None:
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            workdir = root / "project"
+            workdir.mkdir()
+            other = root / "other"
+            other.mkdir()
+            state_root = root / "state"
+            default = RoomStore(workdir, state_root=state_root)
+            default.append("user", "默认会话里的问题")
+            broken = RoomStore(
+                other,
+                state_root=state_root,
+                session_name="broken",
+            )
+            broken.append("user", "这条会话随后损坏")
+            # 目录存在但状态文件损坏：这是真损坏，必须 fail loudly，
+            # 但只能在面板内报错，不能让异常逃出 Textual。
+            (state_root / "rooms" / broken.room_id / "state.json") \
+                .write_text("{oops", encoding="utf-8")
+            orch = Orchestrator(str(workdir), store=default)
+            app = ChatApp(workdir=str(workdir), orchestrator=orch)
+
+            async with app.run_test() as pilot:
+                await pilot.press("ctrl+o")
+                await pilot.pause()
+                assert isinstance(app.screen, SessionPickerScreen)
+                rendered = _picker_text(app.screen)
+                assert "会话目录读取失败" in rendered
+
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not isinstance(app.screen, SessionPickerScreen)
+                assert app.is_running
 
     asyncio.run(run())
 
@@ -587,6 +674,8 @@ def test_background_external_cancel_resolves_its_permission_future() -> None:
 
 if __name__ == "__main__":
     test_ctrl_o_opens_searchable_current_project_picker()
+    test_ctrl_o_survives_session_whose_project_directory_was_deleted()
+    test_ctrl_o_shows_catalog_error_inline_for_corrupt_room()
     test_picker_keeps_two_line_rows_and_scrolls_in_narrow_terminals()
     test_picker_switches_history_and_restores_per_session_drafts()
     test_ctrl_n_creates_untitled_session_without_name_dialog()
