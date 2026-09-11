@@ -58,6 +58,7 @@ from adapters.base import (
     ExecutionMode,
 )
 from codex_app_server.adapter import CodexAppServerAdapter
+from claude_code.adapter import ClaudeCodeAdapter, claude_readiness_probe
 from clipboard_image import prompt_images
 from context_lifecycle import (
     AdapterContextSnapshot,
@@ -214,7 +215,7 @@ class _RuntimeInterjectionProposal:
 # ACP prepare 失败前使用只读 JSONL fallback；OpenCode 使用同一 ACP seam，
 # 但由专用 adapter 注入 ask-by-default 权限策略和 OpenCode 只读配置；
 # Qwen Code 使用 ACP-only；Codex 使用官方 app-server 长连接；旧 Codex JSONL
-# adapter 保留为 fallback。
+# adapter 保留为 fallback；Claude Code 使用官方 headless stream-json 长连接。
 AGENT_SPECS: tuple[AgentSpec, ...] = (
     AgentSpec(
         "kimi", "acp+jsonl", AcpKimiAdapter,
@@ -250,6 +251,11 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         "codex", "app-server", CodexAppServerAdapter,
         executable_probe("codex", ("codex",), "安装 Codex CLI"),
         display_name="Codex", purpose="代码实现、审查与工具执行",
+    ),
+    AgentSpec(
+        "claude", "stream-json", ClaudeCodeAdapter,
+        claude_readiness_probe,
+        display_name="Claude Code", purpose="代码实现、审查与工具执行",
     ),
 )
 AGENTS: dict[str, AgentSpec] = {spec.name: spec for spec in AGENT_SPECS}

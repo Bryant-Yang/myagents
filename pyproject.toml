@@ -53,6 +53,7 @@ where = ["."]
 include = [
   "acp*",
   "adapters*",
+  "claude_code*",
   "codex_app_server*",
   "control*",
   "dsh_acp*",

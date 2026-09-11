@@ -115,7 +115,8 @@ def make_orch(**adapters) -> Orchestrator:
     """真实 Orchestrator + 假 adapter；未指定的工人用 FakeJsonl 占位。"""
     orch = Orchestrator(workdir="/tmp", persistent=False)
     for name in (
-            "kimi", "opencode", "qwen", "codebuddy", "dsh", "pi", "codex"):
+            "kimi", "opencode", "qwen", "codebuddy", "dsh", "pi", "codex",
+            "claude"):
         orch.adapters[name] = adapters.get(name, FakeJsonl(name))
     orch.host = FakeHost()
     orch.adapters["host"] = orch.host
@@ -132,6 +133,7 @@ def test_agent_specs() -> None:
     assert AGENTS["codebuddy"].transport == "acp"
     assert AGENTS["dsh"].transport == "acp"
     assert AGENTS["pi"].transport == "rpc"
+    assert AGENTS["claude"].transport == "stream-json"
 
     orch = Orchestrator("/tmp", persistent=False)
     kimi = orch.adapters["kimi"]
@@ -171,7 +173,8 @@ def test_agent_specs() -> None:
     assert isinstance(kimi._fallback, KimiAdapter)
     assert isinstance(opencode._fallback, OpenCodeAdapter)
     print("ok  AgentSpec 注册（kimi/opencode=ACP+JSONL，"
-          "qwen/codebuddy/dsh=ACP，pi=RPC，codex=app-server）")
+          "qwen/codebuddy/dsh=ACP，pi=RPC，codex=app-server，"
+          "claude=stream-json）")
 
 
 # ---- 2. ACP 增量上下文 ----
@@ -651,7 +654,7 @@ def test_tui_status_and_shutdown() -> None:
             await pilot.pause()
             lines = _richlog_text(app)
             assert "聊天室已就绪" in lines
-            assert "8/8" in lines
+            assert "9/9" in lines
             app.action_show_agents()
             lines = _richlog_text(app)
             assert "@kimi · 可用 · ACP+JSONL" in lines

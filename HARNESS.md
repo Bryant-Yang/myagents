@@ -529,10 +529,11 @@ transport。
 | M3 MCP stdio | `tests/test_m3_mcp.py`（官方 SDK client） |
 | M8 daemon/attach/remote | `tests/test_runtime_daemon.py` + `tests/test_remote_control.py`（本地 fake/ASGI，不调用真实 agent 或外网） |
 | M4 Codex app-server | `tests/test_codex_app_server.py` + `tests/fake_codex_app_server.py` |
+| M4.15 Claude stream-json/权限桥/两 profile | `tests/test_claude_stream_client.py` + `tests/test_claude_adapter.py` + `tests/test_claude_permission_server.py` + `tests/fake_claude_stream.py`（只调用 fixture，不调用真实 Claude CLI） |
 | M4.3 剪贴板图片 | `tests/test_clipboard_image.py` + macOS 人工截图验收 |
 | 真实协议边界 | `docs/SPEC.md` 登记的 Kimi/OpenCode/CodeBuddy ACP + Textual/受限临时目录 E2E；Qwen 上游源码与本机启动证据；Pi 0.84.3 临时目录握手/短回复/逐次授权写入 E2E；DSH 仅登记 ADR-0015 真实验收清单，尚未宣称 E2E |
 
-普通测试禁止调用真实 Kimi/Codex/OpenCode/Qwen/CodeBuddy/DSH/Pi 或模型服务。真实 agent/provider 验收必须由用户明确授权，
+普通测试禁止调用真实 Kimi/Codex/OpenCode/Qwen/CodeBuddy/DSH/Pi/Claude 或模型服务。真实 agent/provider 验收必须由用户明确授权，
 在临时目录运行，并在结束后检查没有残留进程。
 
 ## 6. 质量门禁
@@ -546,6 +547,7 @@ harness 文档引用 → redlines → py_compile → readiness → basic → 会
 → CodeBuddy ACP
 → DSH ACP
 → Pi RPC + permission bridge
+→ Claude stream-json + permission server
 → native model host → storage → M2.5 → M3 bus → M3 control → M3 MCP stdio → M4 app-server
 → M4.3 clipboard image → M8 daemon/attach/remote
 ```
@@ -622,7 +624,7 @@ branch protection / required checks 需要单独配置后才能宣称生效。
 | R1 | 生产构造不得显式使用 `permission="auto"`，权限默认必须为 `deny` | `bash scripts/check-redlines.sh` 的 AST permission gate |
 | R2 | 通用 orchestration/transport 层不得按具体 agent 名做条件分支 | `bash scripts/check-redlines.sh` 的 AST name-branch gate |
 | R3 | UI、orchestrator、host 不得直接启动 shell/子进程 | `bash scripts/check-redlines.sh` 的 AST process-boundary gate |
-| R4 | Kimi/OpenCode 必须受限 ACP-first；Qwen/CodeBuddy/DSH 必须 ACP-only 且固定 runtime profile；DSH 还必须以 myagents 标准 bundle + stock `dsh --profile myagents` 实现专用 ACP server、把 stock DSH 作为不可变依赖、使用被动 profile/bundle readiness、load+close hard gate、绝对状态目录、仅 end_turn 成功和零 fallback；Pi 必须是原生 RPC-only + 固定 bridge/wrapper/tool/profile attestation，禁止 raw RPC bash 和 fallback；OpenCode 普通轮风险工具 ask、只读轮 runtime deny；CodeBuddy 只用独立 CLI、固定已验收 region、按需有界认证且登录 URL fail-closed；JSONL 仅获证的 prepare-only 只读降级 | `bash scripts/check-redlines.sh` 的 registry/policy/profile/bridge gate |
+| R4 | Kimi/OpenCode 必须受限 ACP-first；Qwen/CodeBuddy/DSH 必须 ACP-only 且固定 runtime profile；DSH 还必须以 myagents 标准 bundle + stock `dsh --profile myagents` 实现专用 ACP server、把 stock DSH 作为不可变依赖、使用被动 profile/bundle readiness、load+close hard gate、绝对状态目录、仅 end_turn 成功和零 fallback；Pi 必须是原生 RPC-only + 固定 bridge/wrapper/tool/profile attestation，禁止 raw RPC bash 和 fallback；Claude 必须是原生 headless stream-json-only + `--setting-sources ""` + 硬化 env + socket token 权限桥（普通轮无桥 fail-closed）+ 仅 `result subtype success` 终态 + 被动 readiness + 零 fallback，且 v1 禁止未文档化 control 协议与运行中插话；OpenCode 普通轮风险工具 ask、只读轮 runtime deny；CodeBuddy 只用独立 CLI、固定已验收 region、按需有界认证且登录 URL fail-closed；JSONL 仅获证的 prepare-only 只读降级 | `bash scripts/check-redlines.sh` 的 registry/policy/profile/bridge gate |
 | R5 | 自然语言讨论与 `/discuss` 必须共用 2–3 人、1–3 轮、终局主持状态机；自然语言协作必须保持 2–4 步、至少两个 worker、严格串行且失败/取消即停；两者均不得递归 dispatch/动态扩员；会话角色不得改变参与者、步骤/轮数、权限或 runtime | `bash scripts/check-redlines.sh` 的 discussion/collaboration bounds 与 AST gate + `tests/test_discussion.py` + `tests/test_session_roles.py` + `tests/test_collaboration.py` |
 | R6 | `/workflow` 必须保持固定角色/阶段、单 writer、最多一次 repair/reverify、read-only 复核和有界 steering | `bash scripts/check-redlines.sh` 的 workflow bounds/mode/AST gate |
 | R7 | attach/remote 只能通过 ControlClient 连接 daemon，不得创建 owner 层；remote 仅 loopback + Bearer + 精确 Host allowlist，权限 deny-only，且无 approve/shutdown/passthrough/自动 owner | `bash scripts/check-redlines.sh` 的 client-layer/route/bind AST gate + `tests/test_runtime_daemon.py` + `tests/test_remote_control.py` |
@@ -661,6 +663,8 @@ branch protection / required checks 需要单独配置后才能宣称生效。
   [`docs/adr/0020-capability-bounded-context-lifecycle.md`](docs/adr/0020-capability-bounded-context-lifecycle.md)。
 - M8 后台 owner、attach 与远程伴侣事实源：
   [`docs/adr/0021-detachable-daemon-and-remote-companion.md`](docs/adr/0021-detachable-daemon-and-remote-companion.md)。
+- M4.15 Claude Code stream-json transport 与权限桥事实源：
+  [`docs/adr/0022-claude-code-stream-json-transport.md`](docs/adr/0022-claude-code-stream-json-transport.md)。
 - 当前路线图：[`README.md`](README.md)“路线图”。
 - 重大协议/安全边界改变先形成可评审设计记录，再修改本契约。
 - Steering 只在同类失败至少两次或已有趋势证据时建立；单次失败只修当前问题。

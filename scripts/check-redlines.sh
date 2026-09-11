@@ -161,6 +161,7 @@ expected_specs = {
     ("dsh", "acp", "AcpDshAdapter"),
     ("pi", "rpc", "PiRpcAdapter"),
     ("codex", "app-server", "CodexAppServerAdapter"),
+    ("claude", "stream-json", "ClaudeCodeAdapter"),
 }
 for name, transport, factory in sorted(expected_specs - registered_specs):
     errors.append(
@@ -201,6 +202,7 @@ host_capability_classes = {
     ROOT / "dsh_acp/adapter.py": {"AcpDshAdapter"},
     ROOT / "pi_rpc/adapter.py": {"PiRpcAdapter"},
     ROOT / "codex_app_server/adapter.py": {"CodexAppServerAdapter"},
+    ROOT / "claude_code/adapter.py": {"ClaudeCodeAdapter"},
 }
 for path, class_names in host_capability_classes.items():
     module = parse(path)
@@ -1419,6 +1421,157 @@ else:
             errors.append(
                 "[R4] adapters/opencode_readonly_fallback.json: permission "
                 "必须精确为 deny-all + read/glob/grep/list allow")
+
+# Claude Code is a native headless stream-json transport (ADR-0022).  The
+# constrained argv, hardened environment, socket-authenticated permission
+# bridge, success-only terminal, and the absence of any undocumented
+# mid-turn steer must stay inseparable.  There is no Claude ACP/JSONL
+# fallback, and the control_request wire format stays forbidden.
+claude_adapter = ROOT / "claude_code/adapter.py"
+claude_client = ROOT / "claude_code/client.py"
+claude_bridge = ROOT / "claude_code/permission_server.py"
+for required_path in (claude_adapter, claude_client, claude_bridge):
+    if not required_path.is_file():
+        errors.append(
+            f"[R4] {required_path.relative_to(ROOT)}: "
+            "Claude stream-json 受控路径缺失")
+
+expected_claude_hardened_env = {
+    "DISABLE_AUTOUPDATER": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_ERROR_REPORTING": "1",
+}
+if claude_adapter.is_file():
+    claude_adapter_source = claude_adapter.read_text(encoding="utf-8")
+    claude_adapter_tree = parse(claude_adapter)
+    claude_constants: dict[str, object] = {}
+    for node in claude_adapter_tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if (isinstance(target, ast.Name)
+                    and target.id in {
+                        "CLAUDE_STREAM_TRANSPORT",
+                        "CLAUDE_PERMISSION_SERVER",
+                        "CLAUDE_PERMISSION_SCRIPT",
+                        "CLAUDE_PERMISSION_SOCKET_ENV",
+                        "CLAUDE_PERMISSION_TOKEN_ENV",
+                        "CLAUDE_PERMISSION_TOOL",
+                        "CLAUDE_READ_ONLY_TOOLS",
+                        "CLAUDE_HARDENED_ENV",
+                        "CLAUDE_SUCCESS_SUBTYPE",
+                    }):
+                try:
+                    claude_constants[target.id] = ast.literal_eval(node.value)
+                except (ValueError, TypeError):
+                    claude_constants[target.id] = None
+    expected_claude_constants = {
+        "CLAUDE_STREAM_TRANSPORT": "stream-json",
+        "CLAUDE_PERMISSION_SERVER": "myagents-claude-permission",
+        "CLAUDE_PERMISSION_SCRIPT": "permission_server.py",
+        "CLAUDE_PERMISSION_SOCKET_ENV": "MYAGENTS_CLAUDE_PERMISSION_SOCKET",
+        "CLAUDE_PERMISSION_TOKEN_ENV": "MYAGENTS_CLAUDE_PERMISSION_TOKEN",
+        "CLAUDE_PERMISSION_TOOL": "request_permission",
+        "CLAUDE_READ_ONLY_TOOLS": "Read,Glob,Grep",
+        "CLAUDE_HARDENED_ENV": expected_claude_hardened_env,
+        "CLAUDE_SUCCESS_SUBTYPE": "success",
+    }
+    if claude_constants != expected_claude_constants:
+        errors.append(
+            "[R4] claude_code/adapter.py: Claude transport/权限桥/硬化 env "
+            "常量必须保持固定")
+
+    claude_class_node = next((
+        node for node in claude_adapter_tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "ClaudeCodeAdapter"
+    ), None)
+    claude_class_source = (
+        ast.get_source_segment(claude_adapter_source, claude_class_node)
+        if claude_class_node is not None else ""
+    )
+    if claude_class_source:
+        if "def interject" in claude_class_source:
+            errors.append(
+                "[R4] claude_code/adapter.py: Claude v1 不得声明运行中插话"
+                "能力（control_request 线格式未文档化，ADR-0022 block 列表）")
+        claude_command = next((
+            node for node in claude_class_node.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_command"
+        ), None)
+        claude_command_source = (
+            ast.get_source_segment(claude_adapter_source, claude_command)
+            if claude_command is not None else ""
+        )
+        expected_claude_flags = (
+            "-p", "--input-format", "stream-json", "--output-format",
+            "--verbose", "--include-partial-messages", "--setting-sources",
+            "--strict-mcp-config", "--restricted", "--tools",
+            "--permission-prompts", "none", "--no-session-persistence",
+            "--mcp-config", "--permission-prompt-tool",
+            "--permission-mode", "default",
+            "--replay-user-messages",
+        )
+        for flag in expected_claude_flags:
+            if f'"{flag}"' not in claude_command_source:
+                errors.append(
+                    f"[R4] claude_code/adapter.py: _command 缺少受约束 flag "
+                    f"{flag}；两 profile 的 argv 闭集必须完整")
+        # Session 绑定 flag 位于 prepare 逻辑；同样必须存在。
+        for session_flag in ("--session-id", "--resume"):
+            if session_flag not in claude_class_source:
+                errors.append(
+                    f"[R4] claude_code/adapter.py: ClaudeCodeAdapter 缺少 "
+                    f"session 绑定 flag {session_flag}")
+        for forbidden in (
+            "--dangerously-skip-permissions", "bypassPermissions",
+            "--bare", "control_request", "--fallback-model",
+        ):
+            if forbidden in claude_command_source:
+                errors.append(
+                    f"[R4] claude_code/adapter.py: _command 出现禁用项 "
+                    f"{forbidden}")
+    if "compare_digest" not in claude_adapter_source:
+        errors.append(
+            "[R4] claude_code/adapter.py: 权限桥 token 校验必须是常数时间比较")
+    if "delivery_committed" not in claude_adapter_source:
+        errors.append(
+            "[R4] claude_code/adapter.py: 缺少 delivery_committed no-replay 边界")
+
+if claude_client.is_file():
+    claude_client_source = claude_client.read_text(encoding="utf-8")
+    if "control_request" in claude_client_source:
+        errors.append(
+            "[R4] claude_code/client.py: 未文档化的 control_request 线格式"
+            "不得出现")
+    if "start_new_session=True" not in claude_client_source:
+        errors.append(
+            "[R4] claude_code/client.py: 子进程必须独立进程组")
+    if "signal.SIGINT" not in claude_client_source:
+        errors.append(
+            "[R4] claude_code/client.py: 取消必须使用文档化的 SIGINT")
+    if "os.killpg" not in claude_client_source:
+        errors.append(
+            "[R4] claude_code/client.py: 回收必须 killpg 整个进程组")
+
+if claude_bridge.is_file():
+    claude_bridge_source = claude_bridge.read_text(encoding="utf-8")
+    if '"behavior": "deny"' not in claude_bridge_source:
+        errors.append(
+            "[R4] claude_code/permission_server.py: 权限桥必须默认 deny")
+    if "MYAGENTS_CLAUDE_PERMISSION_SOCKET" not in claude_bridge_source:
+        errors.append(
+            "[R4] claude_code/permission_server.py: socket 凭据环境变量必须"
+            "与 adapter 固定一致")
+    if "MYAGENTS_CLAUDE_PERMISSION_TOKEN" not in claude_bridge_source:
+        errors.append(
+            "[R4] claude_code/permission_server.py: token 环境变量必须与 "
+            "adapter 固定一致")
+    if "subprocess" in claude_bridge_source:
+        errors.append(
+            "[R4] claude_code/permission_server.py: 权限桥不得启动子进程")
 
 # R5: natural discussion, explicit discussion, and natural-language
 # collaboration are hard-bounded. Models produce content/plans only;

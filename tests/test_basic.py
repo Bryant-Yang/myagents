@@ -49,7 +49,8 @@ def make_orch() -> Orchestrator:
     orch.adapters = {
         n: FakeAdapter(n)
         for n in (
-            "kimi", "opencode", "qwen", "codebuddy", "dsh", "pi", "codex"
+            "kimi", "opencode", "qwen", "codebuddy", "dsh", "pi", "codex",
+            "claude",
         )
     }
     orch.host = FakeHost()

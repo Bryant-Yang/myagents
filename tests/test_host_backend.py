@@ -273,6 +273,7 @@ def test_all_registered_agents_declare_adapter_owned_host_capability() -> None:
     }
     assert set(capabilities) == {
         "kimi", "opencode", "qwen", "codebuddy", "dsh", "pi", "codex",
+        "claude",
     }
     assert all(capability is not None for capability in capabilities.values())
     assert {
@@ -286,6 +287,7 @@ def test_all_registered_agents_declare_adapter_owned_host_capability() -> None:
         "dsh": "acp",
         "pi": "rpc",
         "codex": "app-server",
+        "claude": "stream-json",
     }
 
     created = []

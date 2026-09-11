@@ -330,7 +330,8 @@ def make_plan_orchestrator(plan: CollaborationPlan):
     adapters = {
         name: RecordingAdapter(name, calls)
         for name in (
-            "kimi", "opencode", "qwen", "codebuddy", "dsh", "pi", "codex"
+            "kimi", "opencode", "qwen", "codebuddy", "dsh", "pi", "codex",
+            "claude",
         )
     }
     host = PlanHost(calls, plan)

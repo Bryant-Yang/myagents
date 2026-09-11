@@ -90,6 +90,27 @@ app-server），同时仅为已获证路径保留 JSONL 兼容回退。
   no-replay cursor 已持久化后运行；只有明确成功闭集内的 assistant terminal 才能
   完成本轮，缺失/未知 terminal、error/abort 与权限终止工具必须记为失败。生产 client 不得暴露任意 RPC passthrough 或
   发送 raw RPC `type: "bash"`；Pi 没有跨协议 fallback，提交后严格 no-replay。
+  Claude 必须以
+  `AgentSpec("claude", "stream-json", ClaudeCodeAdapter, ...)` 走官方
+  `claude -p` headless stream-json 长连接，不得冒充 ACP、使用社区 ACP
+  适配层或回退 JSON/JSONL。readiness 只被动解析 `MYAGENTS_CLAUDE_CLI` 或
+  PATH 中的 `claude`，不执行 CLI。进程 argv 固定为两 profile 闭集并注入
+  硬化 env；`--setting-sources ""` 不得移除（settings 级 allow 规则会绕过
+  TUI 弹窗），不设置 `CLAUDE_CONFIG_DIR`，复用既有登录态且不提供认证流。
+  普通轮必须经 `--mcp-config --strict-mcp-config` 注入固定
+  `permission_server.py` stdio MCP 权限桥，`system/init` 未列出该桥或
+  `mcp_server_errors` 非空时 fail-closed 拒绝启动；桥请求逐条校验
+  version/token/toolName/input 闭集，畸形、超时、断连一律 deny，弹窗只在
+  no-replay cursor 持久化后展示。只读轮固定
+  `--restricted --tools "Read,Glob,Grep" --permission-prompts none
+  --no-session-persistence` 且不注入桥。session checkpoint 是 myagents
+  自持的 `claude:v1:` token，不解析 Claude transcript；fresh 轮
+  `--session-id`、重启 `--resume`，仅 stderr 精确 resume-not-found 允许
+  回退 fresh 一次。交付以 `--replay-user-messages` 回执为
+  `delivery_committed`；仅 `result.subtype == "success"` 是成功终态；
+  取消用文档化 SIGINT 并在未确认时回收进程组，committed 未 settled 必须
+  重建进程。未文档化的 stdin control 协议禁用，v1 不声明 `interject`；
+  Claude 没有跨协议 fallback。
   运行中插话只允许把同 room FIFO 中最早的 queued command 提升到当前 running
   command；composer 未提交草稿不得参与。原 prompt 的 `delivery_committed` cursor
   已持久化后，才可通过同一 Pi client 发送官方 `steer`，或通过同一 Codex

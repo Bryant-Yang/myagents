@@ -39,6 +39,7 @@ AGENTS = (
     ("dsh", "ACP"),
     ("pi", "RPC"),
     ("codex", "APP-SERVER"),
+    ("claude", "STREAM-JSON"),
     ("host", "MODERATOR · NATIVE MODEL"),
 )
 
@@ -59,7 +60,7 @@ def test_completion_parser_and_command_boundary() -> None:
     assert "@kimi" not in [item.value for item in multi.items]
     assert [item.value for item in multi.items] == [
         "@opencode", "@qwen", "@codebuddy", "@dsh", "@pi", "@codex",
-        "@host"]
+        "@claude", "@host"]
 
     slash = completion_context("/ca", 3, AGENTS)
     assert slash is not None
@@ -124,14 +125,14 @@ def test_agent_completion_keyboard_and_focus() -> None:
             assert app._completion is not None
             assert [item.value for item in app._completion.items] == [
                 "@kimi", "@opencode", "@qwen", "@codebuddy", "@dsh", "@pi",
-                "@codex", "@host"]
+                "@codex", "@claude", "@host"]
             popup = app.query_one("#completion-list", OptionList)
             assert "@dsh" in visible_widget_text(popup)
 
             # ↑ 从首项循环到末项；↓ 回首项后再选第二项。
             await pilot.press("up")
             await pilot.pause()
-            assert app._completion_index == 7
+            assert app._completion_index == 8
             await pilot.press("down")
             await pilot.pause()
             assert app._completion_index == 0
@@ -284,6 +285,7 @@ def test_unready_dsh_remains_visible_after_ready_candidates() -> None:
         ("dsh", "acp"),
         ("pi", "rpc"),
         ("codex", "app-server"),
+        ("claude", "stream-json"),
     )
     specs = tuple(
         AgentSpec(
@@ -313,8 +315,14 @@ def test_unready_dsh_remains_visible_after_ready_candidates() -> None:
                 await pilot.press("@")
                 await pilot.pause()
                 assert app._completion is not None
+                assert "@claude" in [
+                    item.value for item in app._completion.items]
                 assert app._completion.items[-1].value == "@dsh"
                 popup = app.query_one("#completion-list", OptionList)
+                # 候选已到 9 项，弹层视口放不下全部：按 ↑ 环绕到末项，
+                # 未就绪的 @dsh 仍可见且带设置提示。
+                await pilot.press("up")
+                await pilot.pause()
                 visible = visible_widget_text(popup)
                 assert "@dsh" in visible
                 assert "未检测到 CLI" in visible

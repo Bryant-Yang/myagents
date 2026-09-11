@@ -15,7 +15,7 @@
 | 调节目标 | 当前覆盖 | 证据索引 | 明确不保证 |
 | --- | --- | --- | --- |
 | Maintainability | 部分：项目入口、场景索引、文档引用、Python 语法和测试 gate | `AGENTS.md`、`workflow.md`、`scripts/check-harness.sh` | 没有 formatter、lint、静态类型检查和复杂度阈值 |
-| Architecture Fitness | 较强：transport 边界、ACP-first/Pi RPC-only、DSH ACP-only 生命周期 gate、权限默认值、Pi bridge attestation、会话角色边界、有界讨论、单写者 workflow 与 remote 单 owner 有确定性检查 | HARNESS R1–R7、`test_session_roles.py`、`test_phase2.py`、`test_dsh_acp.py`、Pi RPC tests、`test_discussion.py`、`test_workflow.py`、`test_runtime_daemon.py`、`test_remote_control.py` | 不证明新抽象必要，也不覆盖生产性能或 OS sandbox |
+| Architecture Fitness | 较强：transport 边界、ACP-first/Pi RPC-only、DSH ACP-only 生命周期 gate、Claude stream-json-only 权限桥 gate、权限默认值、Pi bridge attestation、会话角色边界、有界讨论、单写者 workflow 与 remote 单 owner 有确定性检查 | HARNESS R1–R7、`test_session_roles.py`、`test_phase2.py`、`test_dsh_acp.py`、Pi RPC tests、`test_discussion.py`、`test_workflow.py`、`test_runtime_daemon.py`、`test_remote_control.py` | 不证明新抽象必要，也不覆盖生产性能或 OS sandbox |
 | Behaviour | 关键 Phase 2 + M2.5（持久化/恢复/lease）+ M3（command bus/控制 socket/MCP stdio）路径有 fake contract tests 与真实 Kimi E2E 双证据 | [`SPEC.md#关键行为用例`](SPEC.md#关键行为用例) | 不保证所有 CLI 版本、长会话 compaction 或真实 cancel 时延 |
 
 ## 2. Control Map
@@ -39,6 +39,7 @@
 | C15 | Pi RPC 只通过已 attested 的唯一权限 bridge 与 wrapper 闭集执行 | ADR-0014；HARNESS §3、§4.2–4.3；SPEC UC-RPC-001 | R4 registry/bridge/profile/raw-bash gate；`test_pi_rpc_client.py`、`test_pi_adapter.py`、`test_pi_permission_bridge.py` + fake server；授权临时目录反例 | 阻断；恢复 RPC-only、隔离 flags、bridge/hash/nonce/tool source 精确核验、三 profile fresh session 与逐次 allow_once；不得用 fallback、prompt-only 或 raw RPC command 绕过 | Bryant Yang |
 | C16 | DSH 只通过 stock `dsh --profile myagents` 加载 myagents 标准 bundle，以完整 stateful 生命周期和两 execution safety profile 执行；stock DSH 保持不可变 | ADR-0015；HARNESS §3、§4.2–4.3；SPEC UC-ACP-005 | R4 registry/official-launcher/profile/exact-bundle/name-version/entry+patch SHA/capability/state/no-fallback gate；临时 `DSH_HOME` 的 `test_dsh_acp.py` + fake server；`scripts/check-dsh-plugin.sh` 校验 pinned source/runtime contract 且证明 DSH HEAD/Git/完整文件树 invariant；2026-08-26 核心真实 session/load、reject 与 read-only 清单已执行，主动 cancel 时延、长会话/压力与真实图片仍属人工边界 | 阻断；恢复标准 bundle canonical ownership、stock DSH 零改动、被动 profile/bundle 解析、load/close hard gate、绝对状态目录、execution profile fresh session、仅 end_turn 成功与零 fallback；缺 runtime 工具守卫证据或需 DSH 补丁时不得宣称生产安全 | Bryant Yang |
 | C17 | 运行中插话只提升 FIFO 最早 queued command、只走显式已验收 capability，且持久化先于协议写入 | ADR-0018；ADR-0009；SPEC UC-INTERJECT-001 | `test_m3_bus.py`、`test_tui_completion.py`、`test_phase2.py`、Pi RPC 与 Codex app-server client/adapter fake contract；R2/R4/R6 | 阻断；恢复队首选择、其余 FIFO、唯一活动 delivery、能力检查、Pi/Codex commit gate、requested no-replay event、uncertain 源命令 terminal 和不支持 transport 的 fail-closed 行为 | Bryant Yang |
+| C18 | Claude 只通过官方 headless stream-json 长连接执行：普通轮必须携带 socket token 权限桥且 `system/init` 确认桥已连接，仅 `result subtype success` 是成功终态，v1 无运行中插话与任何跨协议 fallback | ADR-0022；HARNESS §3、§4.2–4.3；SPEC UC-CLAUDE-001 | R4 registry/argv/env/bridge/no-control-request/no-interject gate；`test_claude_stream_client.py`、`test_claude_adapter.py`、`test_claude_permission_server.py` + fake stream server；真实 TUI 探针清单见 ADR-0022 §6 | 阻断；恢复 `--setting-sources ""` 与硬化 env、两 profile argv 闭集、`claude:v1` checkpoint 绑定、replay 回执交付边界、SIGINT 取消与 committed 未 settled 重建；不得用 `--bare`、bypassPermissions、settings allow 规则或未文档化 control 协议绕过 | Bryant Yang |
 | C18 | daemon 是唯一 room owner；attach/remote 不创建 owner 且远程权限 deny-only | ADR-0021；HARNESS §4.11；SPEC UC-DAEMON-001 | R7 client-layer/route/bind gate；`test_runtime_daemon.py`；`test_remote_control.py`；`test_m3_control.py` | 阻断；移除客户端 owner/import/passthrough，恢复 loopback + Bearer + Host allowlist、精确 option 与 deny-only 权限后复验 | Bryant Yang |
 
 ## 3. 约束等级
@@ -47,7 +48,7 @@
 | --- | --- | --- | --- |
 | R1–R7 | Deterministic Gate | AST/注册表/有界常量检查低误报且能定位文件 | 违反必拦，修复后复验 |
 | S1 | Inferential Review Criterion | 新抽象、跨层职责、重复逻辑需要语义判断 | review 提供证据与替代方案，不假装机械事实 |
-| S2 | Inferential Review Criterion | fake server 是否仍代表真实 ACP/Pi RPC 边界 | 比较真实 wire/options/extension UI；必要时更新 fixture |
+| S2 | Inferential Review Criterion | fake server 是否仍代表真实 ACP/Pi RPC/Claude stream-json 边界 | 比较真实 wire/options/extension UI/replay 回执；必要时更新 fixture |
 | A1 | Human Acceptance Decision | 真实工具调用、auto 权限和外部系统写入风险 | 只有用户明确授权才执行 |
 | A2 | Human Acceptance Decision | 公网账户、多用户 ACL、A2A/Streamable HTTP MCP；M8 只冻结 loopback remote companion | Owner 决定后再冻结协议 |
 

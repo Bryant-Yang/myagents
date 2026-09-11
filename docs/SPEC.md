@@ -2,7 +2,7 @@
 
 <!-- harness:behaviour-evidence=canonical-source -->
 
-> 作者：Bryant Yang　最近更新：2026-09-02
+> 作者：Bryant Yang　最近更新：2026-09-10
 >
 > 本文是关键用户行为与独立证据的唯一事实源。工程边界见
 > [`../HARNESS.md`](../HARNESS.md)。
@@ -38,6 +38,7 @@
 | M7.1 | 完成 | 一等协作计划、步骤交接投影与重启详情恢复 |
 | M7.2 | 完成 | capability-first 上下文预算、原生 Host 压缩与 checkpoint 恢复 |
 | M8 | 完成 | 单 room 后台 daemon、可重新附着 TUI 与 loopback remote companion |
+| M4.15 | 完成 | Claude Code headless stream-json 长连接、MCP 权限桥、两 profile 与零 fallback |
 
 ## 1. 角色
 
@@ -716,6 +717,9 @@
 - **异常分支**：probe 异常、不可执行文件、无效显式路径或 adapter 构造失败记为
   `invalid` 并 fail-closed；状态错误不删除角色、cursor、session id 或历史事实。
   Pi 只被动解析 `pi` 可执行文件；probe 不以启动 RPC/attestation 代替 readiness。
+  Claude 只被动解析 `MYAGENTS_CLAUDE_CLI` 或 PATH 中的 `claude` 可执行文件；
+  probe 不以 `--version`、登录态检查或任何 CLI 执行代替 readiness，登录与
+  未登录的差别只在真实轮次中作为诚实失败证据出现。
 - **验收**：`tests/test_agent_readiness.py` 使用 fake resolver、临时文件与符号链接
   覆盖零/部分/新增 CLI、原子门、全局开关、跨 room 同步和 host 候选；
   `tests/test_tui_completion.py` 覆盖 ready 排序、状态文案、rescan、enable/disable
@@ -1203,6 +1207,88 @@
   `SELF_ONE`/`SELF_TWO`，同 PID/thread；两组 `aclose()` 后对应 PID 均
   不存在。app-server 为实验接口，真实模型探针不进入普通快速 gate。
 - **里程碑**：M4。
+
+### UC-CLAUDE-001 Claude Code headless stream-json 接入
+
+- **角色 / 触发**：用户在聊天室输入 `@claude`，或把 Claude 选为普通会话、
+  discussion、自然语言有序协作或 workflow 中满足既有边界的 worker。
+- **前置条件**：本机 `claude` CLI 已安装并完成登录；`MYAGENTS_CLAUDE_CLI`
+  可显式指定可执行文件。readiness 只被动解析 PATH/文件属性，不执行 CLI。
+- **主流程**：`AGENT_SPECS` 以
+  `AgentSpec("claude", "stream-json", ClaudeCodeAdapter)` 注册。adapter
+  启动常驻 `claude -p --input-format stream-json --output-format
+  stream-json --verbose --include-partial-messages --setting-sources ""
+  --strict-mcp-config` 进程，每轮写一条 user NDJSON 帧、流式收
+  `stream_event`/`assistant`/`user` 帧，并以恰好一条 `result` 帧收口。
+  Claude 声明 stateful session，复用通用增量 cursor、delivery lock、
+  图片信任根、活动事件与统一回收。
+- **主流程（启动时序）**：Claude 是输入驱动启动——spawn 后、首条 stdin
+  消息前进程完全静默（2026-09-10 实测）。adapter 的 prepare 只拉起进程与
+  权限桥 socket，不等待 init；首个 turn 在回执等待中依次消费
+  `system/init` 与（实测存在于二者之间的 `system/status` 等启动杂音后）
+  replay 回执，`delivery_committed` 前完成桥校验。启动失败（非法 flag、
+  `--resume` 未命中）因此在首个 turn 浮出，后者允许一次性回退 fresh。
+- **隔离与权限桥**：`--setting-sources ""` 关闭全部用户/项目 settings
+  （排除 settings 级 `permissions.allow` 绕过 TUI 弹窗），env 固定注入
+  `DISABLE_AUTOUPDATER` / `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` /
+  `DISABLE_TELEMETRY` / `DISABLE_ERROR_REPORTING`；不设置
+  `CLAUDE_CONFIG_DIR`，复用既有登录态。普通轮经 `--mcp-config` +
+  `--permission-prompt-tool` 注入 `claude_code/permission_server.py`
+  （stdio MCP 权限桥）：桥由 claude 进程按 env 注入的 socket 路径与
+  每进程 token 自行拉起，把 `tool_name`/`input` 转发回 adapter 的 0600
+  Unix socket，映射为共享 TUI 弹窗的 `allow_once`/`reject_once`。token
+  常数时间比较；畸形请求、未授权连接、超时、断连一律 deny。
+  `system/init` 校验：普通轮必须列出该桥且 `mcp_server_errors` 为空，
+  否则 fail-closed 拒绝启动；绝不以无桥模式跑可写轮。弹窗只在
+  `delivery_committed`（no-replay cursor 已持久化）之后展示。
+- **execution profile**：`DEFAULT`/`WORKSPACE_WRITE` 共用普通 profile；
+  `READ_ONLY` 加 `--restricted --tools "Read,Glob,Grep"
+  --permission-prompts none --no-session-persistence`（不注入桥、不落盘
+  session）。跨 profile 重建进程。只读轮保留 durable checkpoint 原样，
+  后续普通轮仍可 resume。
+- **交付与恢复**：session checkpoint 是 myagents 自持的
+  `claude:v1:` token（uuid + workspace + profile），不解析 Claude
+  transcript。fresh 轮 `--session-id <uuid4>`，重启后 `--resume`；仅
+  stderr 精确出现 `No conversation found with session ID:` 允许回退
+  fresh 一次，其余错误 fail-closed。写 stdin 后以
+  `--replay-user-messages` 回执为 `delivery_committed`；回执前事件、
+  非回执首帧都是协议错误。
+- **故障与重放边界**：`result.subtype == "success"` 是唯一成功终态，
+  `error_*` 与 result session 不一致一律 no-replay 失败。取消发送文档化
+  SIGINT（只对 CLI pid）并有界等待；未确认或 committed 未 settled 必须
+  重建进程。空闲 300s / 活跃工具 900s 看护；帧上限 32MiB。v1 不声明
+  `interject`（无文档化 mid-turn steer），运行中插话 fail-closed；无
+  ACP/JSONL fallback。
+- **验收**：`tests/fake_claude_stream.py` +
+  `tests/test_claude_stream_client.py` 固定 init 握手、回执时序、
+  resume-miss 映射、SIGINT 与 killpg 回收、帧上限与图片预算；
+  `tests/test_claude_adapter.py` 固定注册形状、两 profile argv/env 闭集、
+  复用/重建、token 绑定、权限桥 fail-closed、权限 outcome 校验、socket
+  全链路、Host 只读构造器与探针三态；`tests/test_claude_permission_server.py`
+  固定凭据缺失、畸形参数 deny 与应答归一化。`scripts/check-redlines.sh`
+  Claude 专段阻断 control_request、`--bare`、bypassPermissions 与
+  v1 插话回流。默认 Harness 不调用真实 Claude CLI，不修改用户
+  Claude 配置。
+- **真实协议证据**：2026-09-10 核实官方文档面与本机 CLI 2.1.267 的
+  `--help`：stream-json 双向模式、`--replay-user-messages`、
+  `--permission-prompt-tool`、`--permission-prompts none`（≥2.1.259）、
+  `--restricted`（≥2.1.248）、`--session-id`/`--resume` 与 SIGINT/SIGTERM
+  语义均出自官方文档；官方无 ACP 支持面。2026-09-10/11 真实探针
+  （`scripts/e2e-m415-claude-real.py`）九项全部通过：冷/热两轮同进程
+  复用（6.7s 冷轮）、真实 MCP 桥 allow/deny（文件写写/不动）、只读轮
+  `--restricted` 重建与写入自动拒绝、重启 `--resume` 记忆前文、提交后
+  取消 no-replay 无残留、绿色 PNG 识别为 "green"。实测并修正三处契约：
+  输入驱动启动（首条 stdin 前 cli 静默，init 非开机即发）、pre-echo
+  存在 `system/status` 杂音帧、权限桥必须显式 `--permission-prompt-tool
+  mcp__<server>__request_permission` 且经验证拆包转发（详见
+  ADR-0022 §6）。TUI 键盘路径与未登录负例仍属人工边界。
+- **人工验收边界**：权限桥是应用层决策通道，不是 OS sandbox；批准
+  shell 后仍继承 myagents 进程权限。复用登录态继承该账号配额与计费。
+  `system/init` 的 `mcp_servers` 条目形状、MCP 工具调用超时上限与真实
+  回执时序待真实探针确认。
+- **事实源**：ADR-0022、`claude_code/client.py`、`claude_code/adapter.py`、
+  `claude_code/permission_server.py`。
+- **里程碑**：M4.15。
 
 ### UC-CTRL-002 控制 socket 安全与生命周期
 

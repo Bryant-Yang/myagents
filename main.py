@@ -4,7 +4,7 @@
     .venv/bin/python main.py            # 在当前目录启动
     .venv/bin/python main.py /path/to/project   # 指定 agent 的工作目录
 
-聊天室里 @kimi / @opencode / @qwen / @codebuddy / @dsh / @pi / @codex 把消息派发给对应 agent，支持一条消息
+聊天室里 @kimi / @opencode / @qwen / @codebuddy / @dsh / @pi / @codex / @claude 把消息派发给对应 agent，支持一条消息
 @多个（并发执行）。@host 叫当前会话选择的 HostBackend 出来总结/仲裁；不带 @
 的消息由 host 用一次调用直接回答或决定派给谁。Host 可在直接模型与明确注册的
 只读 agent backend 之间切换。
@@ -12,7 +12,8 @@
 有界讨论，再由指定 moderator 最终仲裁。
 
 接入协议：可靠官方长连接优先。Kimi/OpenCode 走 ACP 长驻会话，Codex 走原生
-app-server，Pi 走原生 RPC；Qwen Code/CodeBuddy 走 ACP-only。仅已证明安全的 ACP
+app-server，Pi 走原生 RPC，Claude Code 走原生 headless stream-json；
+Qwen Code/CodeBuddy 走 ACP-only。仅已证明安全的 ACP
 prepare 失败才进入受限 JSONL。权限请求会弹窗交给用户决策。启动信息里
 能看到每个 agent 的传输协议。
 """
@@ -119,7 +120,8 @@ from tui_activity import ActivityDetailEvent, ActivityFeed
 _COLORS = {"user": "yellow", "kimi": "cyan", "opencode": "green",
            "qwen": "bright_blue", "codebuddy": "bright_magenta",
            "dsh": "spring_green2",
-           "pi": "deep_sky_blue1", "codex": "orange1", "host": "magenta",
+           "pi": "deep_sky_blue1", "codex": "orange1",
+           "claude": "violet", "host": "magenta",
            "activity": "bright_black"}
 
 # 权限弹窗的固定应答：用户取消 / 退出 TUI 兜底

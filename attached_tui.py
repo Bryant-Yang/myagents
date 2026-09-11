@@ -33,6 +33,7 @@ _SPEAKER_STYLES = {
     "dsh": "bold spring_green2",
     "pi": "bold deep_sky_blue1",
     "codex": "bold orange1",
+    "claude": "bold violet",
 }
 
 

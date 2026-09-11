@@ -10,7 +10,7 @@
 | # | 场景 | 先读哪份 | 必守红线 | 产出落点 | DoD |
 | --- | --- | --- | --- | --- | --- |
 | 1 | 改路由、history、fan-out 或有界讨论 | [`SPEC.md`](SPEC.md) 路由/讨论/增量用例；[`adr/0008-bounded-multi-agent-discussion.md`](adr/0008-bounded-multi-agent-discussion.md)；`../HARNESS.md` §4.1 | R2、R3、R5 | `discussion.py`、`orchestrator.py`、`host.py`、对应测试 | 快照与并发顺序测试通过；讨论有界、不递归；无 name-specific 协议分支 |
-| 2 | 改 ACP/RPC、权限、取消、session 或 hybrid fallback | [`acp-migration.md`](acp-migration.md)、[`adr/0006-kimi-hybrid-transport-policy.md`](adr/0006-kimi-hybrid-transport-policy.md)、[`adr/0007-opencode-hybrid-transport-policy.md`](adr/0007-opencode-hybrid-transport-policy.md)、[`adr/0014-pi-rpc-permission-bridge.md`](adr/0014-pi-rpc-permission-bridge.md)、[`adr/0015-dsh-acp-only-transport.md`](adr/0015-dsh-acp-only-transport.md)、[`adr/0016-explicit-auto-approve-mode.md`](adr/0016-explicit-auto-approve-mode.md)；`../HARNESS.md` §4.2–4.3 | R1–R4 | `acp/` / `pi_rpc/`、具体 adapter/profile/bridge、fake server、protocol tests 与文档 | fail-closed、attestation、串行化、no-replay、回收测试通过；高风险变化有真实/人工验收计划 |
+| 2 | 改 ACP/RPC/stream-json、权限、取消、session 或 hybrid fallback | [`acp-migration.md`](acp-migration.md)、[`adr/0006-kimi-hybrid-transport-policy.md`](adr/0006-kimi-hybrid-transport-policy.md)、[`adr/0007-opencode-hybrid-transport-policy.md`](adr/0007-opencode-hybrid-transport-policy.md)、[`adr/0014-pi-rpc-permission-bridge.md`](adr/0014-pi-rpc-permission-bridge.md)、[`adr/0015-dsh-acp-only-transport.md`](adr/0015-dsh-acp-only-transport.md)、[`adr/0016-explicit-auto-approve-mode.md`](adr/0016-explicit-auto-approve-mode.md)、[`adr/0022-claude-code-stream-json-transport.md`](adr/0022-claude-code-stream-json-transport.md)；`../HARNESS.md` §4.2–4.3 | R1–R4 | `acp/` / `pi_rpc/`、具体 adapter/profile/bridge、fake server、protocol tests 与文档 | fail-closed、attestation、串行化、no-replay、回收测试通过；高风险变化有真实/人工验收计划 |
 | 3 | 新增或迁移 agent | `../HARNESS.md` §1–§3；`acp-migration.md`；有独立权限模型时读取对应 ADR | R2–R4 | 具体 adapter + `AGENT_SPECS` + tests + README | adapter 接口统一；transport 状态可见；fallback 只按获证契约开放 |
 | 4 | 改 TUI 或权限交互 | [`SPEC.md`](SPEC.md) 权限用例；[`adr/0016-explicit-auto-approve-mode.md`](adr/0016-explicit-auto-approve-mode.md)；`../HARNESS.md` §4.2–4.3 | R1、R3 | `main.py` + Textual pilot tests | UI 不阻塞；退出无 Future/进程残留；来源 agent 与当前权限模式可见 |
 | 5 | 只做 review / 文档 / Harness | 本文件；相关契约；必要时 [`harness-controls.md`](harness-controls.md) | 所有受影响红线 | 对应文档、Sensor 或 review 结论 | 引用无悬空；红线 gate 与相关测试通过 |
@@ -34,7 +34,7 @@
 | R1 | 权限默认 deny，生产不得显式 auto |
 | R2 | 通用层不按 agent 名分支 |
 | R3 | 子进程只在 transport 层启动 |
-| R4 | Kimi/OpenCode 保持受限 hybrid；Qwen Code/CodeBuddy/DSH 保持 ACP-only；DSH 以 stock `dsh --profile myagents` 加载 myagents 标准 bundle、stock DSH 不可变，并保持被动 profile/bundle readiness、load+close gate、两 execution safety profile、零 fallback；Pi 保持 RPC-only + 固定 bridge/wrapper/attestation；所有 runtime profile 受约束 |
+| R4 | Kimi/OpenCode 保持受限 hybrid；Qwen Code/CodeBuddy/DSH 保持 ACP-only；DSH 以 stock `dsh --profile myagents` 加载 myagents 标准 bundle、stock DSH 不可变，并保持被动 profile/bundle readiness、load+close gate、两 execution safety profile、零 fallback；Pi 保持 RPC-only + 固定 bridge/wrapper/attestation；Claude 保持 headless stream-json-only + `--setting-sources ""` + socket token 权限桥（普通轮无桥 fail-closed）+ 仅 success 终态 + 零 fallback，v1 禁止 control 协议与运行中插话；所有 runtime profile 受约束 |
 | R5 | 自然语言讨论与 `/discuss` 固定 2–3 人、1–3 轮，不由 agent 自主续轮 |
 | R6 | `/workflow` 固定角色/阶段、单 writer、一次 repair 上限和有界 steering |
 | R7 | attach/remote 只做 ControlClient；remote 仅 loopback + Bearer、deny-only 权限且无 shutdown/passthrough |

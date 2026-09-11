@@ -1,15 +1,15 @@
 # myagents
 
 原生长连接优先的本地多 agent 终端编排器：在一个 Textual TUI 中点名 Kimi、
-Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
+Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi、Claude Code 等 coding agent，共享时间线、流式接收回复，并统一处理权限、
 上下文和进程生命周期。
 
-> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M4.11、M4.12、M4.13、M4.14、M5.1、M5、M6、M7、M7.1、M7.2 与 M8 已完成。
+> 当前状态：M2.5、M3、M3.1、M4、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M4.9、M4.10、M4.11、M4.12、M4.13、M4.14、M4.15、M5.1、M5、M6、M7、M7.1、M7.2 与 M8 已完成。
 > 共享 timeline 与执行 events 持久化、ACP session
 > 恢复、房间单写者 lease、内部 command bus、本机控制 socket 与 MCP
 > stdio 外部入口、执行心跳、精确取消、Codex app-server 长连接与同项目独立会话均已落地。
 > Kimi/OpenCode 使用 ACP-first + prepare-only 只读 JSONL fallback，Qwen Code /
-> CodeBuddy/DSH 使用 ACP-only，Pi 使用官方 RPC + 权限 bridge，Codex worker 使用官方 app-server；host 使用 myagents 原生模型 runtime；JSONL 不会在已提交任务后跨协议重放。真实 Kimi + MCP
+> CodeBuddy/DSH 使用 ACP-only，Pi 使用官方 RPC + 权限 bridge，Codex worker 使用官方 app-server，Claude Code 使用官方 headless stream-json + MCP 权限桥；host 使用 myagents 原生模型 runtime；JSONL 不会在已提交任务后跨协议重放。真实 Kimi + MCP
 > 端到端验收是发布前手工证据，见“当前限制”。
 
 ## 为什么做这个项目
@@ -54,9 +54,21 @@ Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 co
   hard-deny；授权弹窗只会在本轮 no-replay checkpoint 已持久化后出现。图片每轮
   最多 16 张、合计 20 MiB；不提供
   ACP 或 JSON/JSONL fallback。
+- `@claude`：通过官方 `claude -p` headless stream-json 长连接使用持久
+  session。myagents 以 `--setting-sources ""` 与硬化环境变量启动子进程，
+  关闭自动更新/遥测并排除用户 settings 里的权限规则；不设置
+  `CLAUDE_CONFIG_DIR`，复用既有登录态，不提供认证流，也不解析 Claude
+  transcript。普通轮经固定 stdio MCP 权限桥把工具审批桥回 TUI（`--setting-sources` 隔离下用户 settings 的 allow 规则不生效），桥未连接时
+  fail-closed 拒绝启动；`--replay-user-messages` 回执是 no-replay 交付
+  边界，仅 `result.subtype success` 记为成功；取消使用文档化 SIGINT。
+  只读轮固定 `--restricted --tools "Read,Glob,Grep"
+  --permission-prompts none --no-session-persistence` 且不注入桥。
+  未文档化的 stdin control 协议被禁用，v1 不支持运行中插话；不提供
+  ACP 或 JSON/JSONL fallback。细节见
+  [ADR-0022](docs/adr/0022-claude-code-stream-json-transport.md)。
 - `@host`：负责意图识别、路由、直接回答、讨论主持和总结。默认由 myagents
   自有的无工具 native model runtime 驱动，也可按会话显式切换到注册为 host-safe
-  的完整 agent；当前注册的 Kimi、OpenCode、Qwen、CodeBuddy、DSH、Pi、Codex
+  的完整 agent；当前注册的 Kimi、OpenCode、Qwen、CodeBuddy、DSH、Pi、Codex、Claude
   均可使用。Host 能力由各 adapter 一次性声明，不需要在编排器逐个加分支；也可用
   `[host.backend]` 设定此后新会话的全局初始 Host。agent Host 独立于同名 worker
   且始终只读，`/yolo` 不扩权。
@@ -170,6 +182,9 @@ Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 co
 │ Qwen/CodeBuddy/ │ │ permission    │ │ runtime            │
 │ DSH             │ │ bridge        │ │                    │
 └─────────────────┘ └───────────────┘ └────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ claude_code/  Claude headless stream-json + MCP 权限桥      │
+└────────────────────────────────────────────────────────────┘
           │              │                │
           └──────────────┴────────┬───────┘
                                   │ adapters/ JSONL fallback
@@ -186,8 +201,8 @@ Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 co
 ```
 
 核心原则是 **Hub-and-Spoke**：所有消息先进入 Orchestrator，worker agent
-之间不直接通信。ACP/Pi RPC/app-server 只负责“如何驱动 agent”，不参与“任务应该
-派给谁”的决策。
+之间不直接通信。ACP/Pi RPC/app-server/headless stream-json 只负责“如何驱动
+agent”，不参与“任务应该派给谁”的决策。
 
 ## 环境要求
 
@@ -203,6 +218,11 @@ Codex、OpenCode、Qwen Code、CodeBuddy、DeepSeek Harness（DSH）、Pi 等 co
   - [Qwen Code](https://github.com/QwenLM/qwen-code)
   - Pi Coding Agent：`pi` 命令必须能从当前进程 PATH 解析，并支持
     `pi --mode rpc`。myagents 只给子进程传入隔离参数，不修改用户已有 Pi 配置。
+  - [Claude Code CLI](https://code.claude.com)：`claude` 命令必须能从当前
+    进程 PATH 解析并已完成登录（≥2.1.259 以支持 `--permission-prompts`，
+    ≥2.1.248 以支持 `--restricted`）；也可用 `MYAGENTS_CLAUDE_CLI` 指向
+    可执行文件。myagents 以 `--setting-sources ""` 启动子进程并注入硬化
+    环境变量，复用既有登录态，不修改用户 Claude 配置、不解析其 transcript。
   - [CodeBuddy Code CLI](https://www.codebuddy.cn/docs/cli/installation)：安装可独立
     运行的官方 CLI，例如 `npm install -g @tencent-ai/codebuddy-code`。项目不会
     调用 WorkBuddy.app 包内私有二进制；若 CLI 不在 PATH，用
@@ -581,7 +601,7 @@ implementer 可写。未指定 `--verifier` 时由 reviewer 复核。`/steer` �
 | DSH | ACP（stock `dsh --profile myagents` + `@myagents/dsh-acp-host` bundle） | 持久 session + 增量 history；workspace-write/read-only fresh execution profile；load/close hard gate | ACP-only fake/release contract 与临时 profile 核心真实验收已通过 |
 | Pi | RPC (`pi --mode rpc`) | 持久 session + 增量 history；唯一 permission bridge、三 profile fresh session | RPC-only；fake contract 已验收 |
 | Host（直接模型） | myagents native model runtime | 持久内部消息 + 字符预算 + 安全摘要 checkpoint；fresh runtime 从摘要后增量恢复 | 自动/手动 compaction fake contract 已验收 |
-| Claude | 未接入 | 预留 AgentSpec/adapter 扩展点 | 规划中 |
+| Claude Code | headless stream-json (`claude -p` 双向 NDJSON) | 持久 session + 增量 history；`claude:v1` 自持 checkpoint + `--resume`；MCP 权限桥 + 两 profile | stream-json-only；fake contract 已验收，真实探针待人工验收 |
 
 有状态 agent 首次接入只收到最近 `history_limit` 条共享记录；后续只收到 cursor
 之后的新消息，并过滤它自己的回复。提交前明确失败时 cursor 不推进、下轮补发；
@@ -806,6 +826,7 @@ Harness markers/links
 → M3 control socket tests
 → M3 MCP stdio tests
 → M4 Codex app-server contract tests
+→ M4.15 Claude stream-json client/adapter/permission server contract tests
 ```
 
 也可以单独运行：
@@ -824,9 +845,12 @@ Harness markers/links
 .venv/bin/python tests/test_m3_control.py
 .venv/bin/python tests/test_m3_mcp.py
 .venv/bin/python tests/test_codex_app_server.py
+.venv/bin/python tests/test_claude_stream_client.py
+.venv/bin/python tests/test_claude_adapter.py
+.venv/bin/python tests/test_claude_permission_server.py
 ```
 
-普通测试全部使用 fake adapter/fake ACP/Pi RPC server，不会调用真实外部 agent，
+普通测试全部使用 fake adapter/fake ACP/Pi RPC server/Claude stream fake，不会调用真实外部 agent，
 也不会 build 或启动真实 DSH。
 真实 Kimi + MCP 端到端验收（见“当前限制”）是发布前手工证据，不在
 默认 gate 内。
@@ -842,6 +866,7 @@ myagents/
 ├── native_agent/              # 中立 model provider + 原生无工具 agent runtime
 ├── acp/                       # 通用 ACP client 与 adapter
 ├── pi_rpc/                    # Pi 原生 RPC client/adapter + 固定权限 bridge
+├── claude_code/               # Claude headless stream-json client/adapter + MCP 权限桥
 ├── adapters/                  # JSONL adapter 与进程工具
 ├── control/                   # CommandBus + 私有 Unix 控制 socket server/client
 ├── storage/                   # RoomStore：timeline/events/state/owner lease
@@ -877,6 +902,7 @@ myagents/
 - [docs/adr/0016-explicit-auto-approve-mode.md](docs/adr/0016-explicit-auto-approve-mode.md)：`/yolo` 会话级自动批准、持续危险提示与只读硬边界。
 - [docs/adr/0017-native-model-backed-host.md](docs/adr/0017-native-model-backed-host.md)：会话级 HostBackend、原生模型 provider/runtime 与只读 agent Host。
 - [docs/adr/0018-capability-bounded-runtime-interjection.md](docs/adr/0018-capability-bounded-runtime-interjection.md)：Esc 精确取消、Alt+↑ 能力受限插话，以及 Pi/Codex 原生同轮 steer。
+- [docs/adr/0022-claude-code-stream-json-transport.md](docs/adr/0022-claude-code-stream-json-transport.md)：Claude headless stream-json 长连接、MCP 权限桥、两 profile 与零 fallback。
 - [docs/concepts.md](docs/concepts.md)：相关协议与编排模式。
 - [docs/knowledge-map.html](docs/knowledge-map.html)：可交互知识地图。
 
@@ -902,6 +928,8 @@ myagents/
   workflow read-only 硬边界。
 - [x] M4.14：myagents 原生模型 provider/runtime、LM Studio
   OpenAI-compatible 首版、无工具 host 与 no-replay 生命周期。
+- [x] M4.15：Claude Code headless stream-json 长连接、MCP 权限桥、
+  `--restricted` 只读闭集与 `--resume` 持久 checkpoint。
 - [x] M5.1：自然语言或 `/discuss` 进入 1–3 轮有界讨论与终局 moderator。
 - [x] M5：干净 Git fixed point、review → 单 writer 修改 → 独立复核、最多
   一次 repair/reverify、阶段边界 steering 与 TUI 阶段状态。
@@ -913,6 +941,15 @@ myagents/
 - [ ] Later：只有出现跨机器、跨组织 agent 协作需求时再评估 A2A。
 
 ## 当前限制
+
+- M4.15 Claude 接入的核心真实验收已于 2026-09-10/11 通过
+  （`scripts/e2e-m415-claude-real.py`）：冷/热两轮同进程复用、真实 MCP
+  桥 allow/deny、只读轮 `--restricted` 闭集、重启 `--resume` 记忆前文、
+  提交后取消无残留、PNG 图片识别。尚未覆盖：TUI 内 Esc/截图键盘路径、
+  未登录负例、Claude CLI 升级后的版本门槛重跑
+  （`--permission-prompts` ≥2.1.259、`--restricted` ≥2.1.248）。
+  v1 不声明运行中插话（无文档化 mid-turn steer），能力缺失时按 ADR-0018
+  fail-closed 拒绝。
 
 - M8 daemon 首版一次只持有一个 `(workdir, session)`；多命名会话需分别启动。
   remote 自动化验收覆盖本地 ASGI 与安全反例，未在真实 Tailscale 网络上做跨设备

@@ -92,7 +92,7 @@ def test_tui_status_panel_tracks_agent_lifecycle() -> None:
         async with app.run_test() as pilot:
             idle_panel = str(app.query_one("#task-status", Static).render())
             assert "主持 模型" in idle_panel
-            assert "Agent 7/7" in idle_panel
+            assert "Agent 8/8" in idle_panel
             command_id = "cmd-panel"
             app._on_agent_event("user", AgentEvent(
                 "committed",

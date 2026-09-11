@@ -34,6 +34,7 @@ required=(
   docs/adr/0019-first-class-collaboration-plan-projection.md
   docs/adr/0020-capability-bounded-context-lifecycle.md
   docs/adr/0021-detachable-daemon-and-remote-companion.md
+  docs/adr/0022-claude-code-stream-json-transport.md
   scripts/check-redlines.sh
   scripts/check-dsh-runtime-contract.py
   scripts/package-dsh-plugin.sh
@@ -89,6 +90,7 @@ docs = [
     root / "docs/adr/0019-first-class-collaboration-plan-projection.md",
     root / "docs/adr/0020-capability-bounded-context-lifecycle.md",
     root / "docs/adr/0021-detachable-daemon-and-remote-companion.md",
+    root / "docs/adr/0022-claude-code-stream-json-transport.md",
 ]
 missing: list[str] = []
 pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -121,8 +123,8 @@ fi
 
 .venv/bin/python -m py_compile \
   main.py myagents_mcp.py runtime_daemon.py attached_tui.py orchestrator.py host.py context_lifecycle.py discussion.py collaboration.py workflow.py session_roles.py session_catalog.py session_manager.py tui_activity.py agent_readiness.py \
-  acp/*.py pi_rpc/*.py codex_app_server/*.py native_agent/*.py adapters/*.py control/*.py remote_control/*.py storage/*.py workspace/*.py tests/*.py \
-  scripts/e2e-m3-real.py scripts/e2e-m5-real.py
+  acp/*.py pi_rpc/*.py codex_app_server/*.py claude_code/*.py native_agent/*.py adapters/*.py control/*.py remote_control/*.py storage/*.py workspace/*.py tests/*.py \
+  scripts/e2e-m3-real.py scripts/e2e-m5-real.py scripts/e2e-m415-claude-real.py
 .venv/bin/python tests/test_agent_readiness.py
 .venv/bin/python tests/test_packaging.py
 .venv/bin/python tests/test_basic.py
@@ -157,5 +159,8 @@ fi
 .venv/bin/python tests/test_remote_control.py
 .venv/bin/python tests/test_m3_mcp.py
 .venv/bin/python tests/test_codex_app_server.py
+.venv/bin/python tests/test_claude_stream_client.py
+.venv/bin/python tests/test_claude_adapter.py
+.venv/bin/python tests/test_claude_permission_server.py
 
 echo "✓ myagents Harness 全部通过"
