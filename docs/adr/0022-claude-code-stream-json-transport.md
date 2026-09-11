@@ -120,8 +120,11 @@ Claude Code 是市占最高的 coding agent，但在 myagents 的传输表中长
   `delivery_committed`（先于一切可见事件）。init 校验在 `delivery_committed`
   之前执行：普通轮 `mcp_servers` 缺桥或 `mcp_server_errors` 非空即
   fail-closed，且该进程不复用；**回执消费之后的任何失败（含 init 校验
-  失败）必须以 `AgentDeliveryUncertainError` 收口**，否则 orchestrator
-  不推进 no-replay cursor，已交付轮可被重投。写入失败按
+  失败与 CLI 合成的 API 错误 assistant 帧）必须以
+  `AgentDeliveryUncertainError` 收口**，否则 orchestrator 不推进
+  no-replay cursor，已交付轮可被重投。CLI 合成帧以
+  `message.model == "<synthetic>"` 识别，错误原文经脱敏附在失败证据里。
+  写入失败按
   may_have_written 区分
   pre-submit 失败与 `AgentDeliveryUncertainError`；resume 未命中在读取
   stdin 之前发生（本轮必然未执行），允许 `stream_prepared` 层一次性回退
@@ -232,6 +235,11 @@ Claude 子进程仍继承 myagents 的本机进程权限；复用用户既有登
    转发会把整个 arguments 当 `updatedInput` 回写，被模型侧 schema 校验
    拒绝（表现为"权限层配置故障"）。
 5. claude 写文件带尾换行，验收比较按内容语义处理。
+6. **认证在 settings.json 的 env 块**：`--setting-sources ""` 会把代理
+   认证一起屏蔽，CLI 对 API 错误会**本地合成一条 assistant 消息
+   （`model == "<synthetic>"`，无流式 delta、无错误标志字段）并仍返回
+   success result**。adapter 现将认证键挑拣进 0600 `--settings` 副本，
+   并把 synthetic assistant 帧如实判为 uncertain（附错误原文）。
 
 ## 7. 不选择的方案
 

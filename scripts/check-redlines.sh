@@ -1512,7 +1512,7 @@ if claude_adapter.is_file():
             "--permission-prompts", "none", "--no-session-persistence",
             "--mcp-config", "--permission-prompt-tool",
             "--permission-mode", "default",
-            "--replay-user-messages",
+            "--replay-user-messages", "--settings",
         )
         for flag in expected_claude_flags:
             if f'"{flag}"' not in claude_command_source:

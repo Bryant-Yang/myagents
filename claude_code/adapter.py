@@ -19,6 +19,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import shutil
 import sys
 import uuid as uuid_module
@@ -75,6 +76,7 @@ _UUID_RE = re.compile(
 _MAX_ENVELOPE_BYTES = 16 * 1024
 _MAX_SOCKET_PAYLOAD_BYTES = 64 * 1024
 _MAX_PERMISSION_INPUT_CHARS = 64 * 1024
+_MAX_USER_SETTINGS_BYTES = 2 * 1024 * 1024
 _MAX_TOOL_NAME_CHARS = 256
 _MAX_PROMPT_IMAGES = 16
 _PERMISSION_EVENT_QUEUE_LIMIT = 256
@@ -224,6 +226,7 @@ class ClaudeCodeAdapter:
         self._permission_socket_path: Path | None = None
         self._permission_token = ""
         self._mcp_config_path: Path | None = None
+        self._auth_settings_path: Path | None = None
         self._pending_resume_fallback = False
 
     @property
@@ -313,6 +316,7 @@ class ClaudeCodeAdapter:
         profile: str,
         mcp_config: Path | None,
         session_args: tuple[str, ...],
+        auth_settings: Path | None = None,
     ) -> list[str]:
         command = [
             *self._base_cmd,
@@ -324,6 +328,8 @@ class ClaudeCodeAdapter:
             "--setting-sources", "",
             "--strict-mcp-config",
         ]
+        if auth_settings is not None:
+            command.extend(("--settings", str(auth_settings)))
         if profile == _PROFILE_READ_ONLY:
             command.extend((
                 "--restricted",
@@ -342,6 +348,79 @@ class ClaudeCodeAdapter:
         command.extend(session_args)
         command.append("--replay-user-messages")
         return command
+
+    def _user_settings_auth(self) -> dict:
+        """Cherry-pick auth keys from the user's settings.json.
+
+        ``--setting-sources ""`` 会连同认证一起屏蔽用户 settings（GLM 等
+        代理用户的 ANTHROPIC_BASE_URL/AUTH_TOKEN 就在 settings 的 env 块
+        里，2026-09-11 真实探针实测）。这里只挑拣认证相关的三个键写进
+        我们自己的 ``--settings`` 文件；permissions/hooks/enabledPlugins
+        等永远不会加载，TUI 弹窗边界不变。
+        """
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+        base = Path(config_dir).expanduser() if config_dir else (
+            Path.home() / ".claude")
+        path = base / "settings.json"
+        try:
+            info = path.lstat()
+        except OSError:
+            return {}
+        if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+            return {}
+        if info.st_size > _MAX_USER_SETTINGS_BYTES:
+            return {}
+        try:
+            payload = path.read_bytes().decode("utf-8")
+            value = json.loads(payload)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        if not isinstance(value, dict):
+            return {}
+        auth: dict = {}
+        env = value.get("env")
+        if isinstance(env, dict) and env:
+            cleaned = {
+                key: item for key, item in env.items()
+                if isinstance(key, str) and isinstance(item, str)
+            }
+            if cleaned:
+                auth["env"] = cleaned
+        for key in ("apiKeyHelper", "model"):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                auth[key] = item
+        return auth
+
+    def _write_auth_settings(self, session_dir: Path) -> Path | None:
+        auth = self._user_settings_auth()
+        if not auth:
+            return None
+        payload = json.dumps(
+            auth, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        target = session_dir / "auth-settings.json"
+        temporary = target.with_name(
+            f".{target.name}.{secrets.token_hex(6)}")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = -1
+        try:
+            fd = os.open(temporary, flags, 0o600)
+            os.write(fd, payload)
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            os.replace(temporary, target)
+        except BaseException:
+            if fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+            raise
+        with contextlib.suppress(OSError):
+            os.chmod(target, 0o600)
+        return target
 
     def _write_mcp_config(self, session_dir: Path, socket_path: Path) -> Path:
         """Write the bridge config as a 0600 file.
@@ -677,6 +756,9 @@ class ClaudeCodeAdapter:
             durable_token = resume_session_id
 
         session_dir = self._session_dir(canonical_workdir, profile)
+        # 认证对两个 profile 都必需（只读轮也要调模型）。
+        auth_settings = self._write_auth_settings(session_dir)
+        self._auth_settings_path = auth_settings
         if profile == _PROFILE_DEFAULT:
             if self._permission_script.is_symlink() or not (
                     self._permission_script.is_file()):
@@ -703,6 +785,7 @@ class ClaudeCodeAdapter:
                 profile=profile,
                 mcp_config=mcp_config_path,
                 session_args=session_args,
+                auth_settings=auth_settings,
             )
             client = self._client_factory(
                 command,
@@ -1015,6 +1098,14 @@ class ClaudeCodeAdapter:
                     else:
                         yield event
                 elif raw_type == "assistant":
+                    synthetic_error = self._synthetic_assistant_error(payload)
+                    if synthetic_error is not None:
+                        # CLI 在 API 错误/未登录时本地合成一条 assistant
+                        # 消息（model == "<synthetic>"）并仍返回 success
+                        # result——若不拦截就会记成"成功但无正文"。
+                        delivery_maybe_sent = True
+                        raise AgentDeliveryUncertainError(
+                            f"Claude 未完成模型调用：{synthetic_error}")
                     tool_events = self._assistant_tool_events(
                         payload, active_tool_ids)
                     for event in tool_events:
@@ -1127,6 +1218,25 @@ class ClaudeCodeAdapter:
             return None
         return AgentEvent("activity", meta={"phase": event_type})
 
+    @staticmethod
+    def _synthetic_assistant_error(payload: dict) -> str | None:
+        """Return redacted error text when the CLI synthesized the message."""
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            return None
+        if message.get("model") != "<synthetic>":
+            return None
+        content = message.get("content")
+        chunks: list[str] = []
+        if isinstance(content, list):
+            for block in content:
+                if (isinstance(block, dict) and block.get("type") == "text"
+                        and isinstance(block.get("text"), str)):
+                    chunks.append(block["text"])
+        detail = " ".join(chunk for chunk in chunks if chunk) or (
+            "CLI 合成了错误消息")
+        return redact_sensitive_text(detail, limit=400)
+
     def _assistant_tool_events(
         self,
         payload: dict,
@@ -1227,6 +1337,10 @@ class ClaudeCodeAdapter:
             with contextlib.suppress(OSError):
                 self._mcp_config_path.unlink()
         self._mcp_config_path = None
+        if self._auth_settings_path is not None:
+            with contextlib.suppress(OSError):
+                self._auth_settings_path.unlink()
+        self._auth_settings_path = None
         self._started = False
         self.session_id = None
         self._active_profile = None

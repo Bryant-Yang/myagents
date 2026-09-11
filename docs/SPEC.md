@@ -1228,6 +1228,14 @@
   `system/init` 与（实测存在于二者之间的 `system/status` 等启动杂音后）
   replay 回执，`delivery_committed` 前完成桥校验。启动失败（非法 flag、
   `--resume` 未命中）因此在首个 turn 浮出，后者允许一次性回退 fresh。
+- **认证传递（settings 副本）**：`--setting-sources ""` 会连认证一起
+  屏蔽用户 settings——代理用户（GLM 等）的 ANTHROPIC_BASE_URL/AUTH_TOKEN
+  就在 settings 的 `env` 块。adapter 只从用户 settings.json 挑拣
+  `env`/`apiKeyHelper`/`model` 三个认证键写入 0600 `--settings` 文件
+  （两 profile 都注入，进程结束即清理）；`permissions`/`hooks` 等
+  永不加载，TUI 弹窗边界不变。CLI 对 API 错误会本地合成 assistant 消息
+  （`model == "<synthetic>"`、无流式 delta）并仍返回 success result，
+  adapter 将其如实判为 uncertain 并附脱敏错误原文。
 - **隔离与权限桥**：`--setting-sources ""` 关闭全部用户/项目 settings
   （排除 settings 级 `permissions.allow` 绕过 TUI 弹窗），env 固定注入
   `DISABLE_AUTOUPDATER` / `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` /

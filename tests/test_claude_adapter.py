@@ -11,8 +11,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import struct
 import sys
+import tempfile
 import uuid as uuid_module
 import zlib
 from pathlib import Path
@@ -70,6 +72,7 @@ class FakeClaudeClient:
     hang_after_echo = False
     error_result = False
     wrong_session = False
+    synthetic_error_text: str | None = None
 
     def __init__(
         self,
@@ -162,6 +165,27 @@ class FakeClaudeClient:
                 },
                 "parent_tool_use_id": None,
             }
+            if FakeClaudeClient.synthetic_error_text:
+                # CLI 对 API 错误/未登录会本地合成 assistant 消息并仍返回
+                # success result（model == "<synthetic>"，无流式 delta）。
+                yield {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "model": "<synthetic>",
+                        "content": [{
+                            "type": "text",
+                            "text": FakeClaudeClient.synthetic_error_text,
+                        }],
+                    },
+                    "parent_tool_use_id": None,
+                }
+                yield {
+                    "type": "result",
+                    "subtype": "success",
+                    "session_id": adapter_script._session_id(),
+                }
+                return
             yield {
                 "type": "assistant",
                 "message": {
@@ -228,6 +252,16 @@ def reset_fakes() -> None:
     FakeClaudeClient.hang_after_echo = False
     FakeClaudeClient.error_result = False
     FakeClaudeClient.wrong_session = False
+    FakeClaudeClient.synthetic_error_text = None
+    # 测试不依赖开发机的真实 ~/.claude：指向独立空目录（无认证可挑拣）。
+    global FAKE_CLAUDE_CONFIG_DIR
+    FAKE_CLAUDE_CONFIG_DIR = Path(tempfile.mkdtemp(
+        prefix="m415-claude-home-"))
+    FAKE_CLAUDE_CONFIG_DIR.mkdir(mode=0o700, exist_ok=True)
+    os.environ["CLAUDE_CONFIG_DIR"] = str(FAKE_CLAUDE_CONFIG_DIR)
+
+
+FAKE_CLAUDE_CONFIG_DIR = ""
 
 
 def make_adapter(
@@ -879,6 +913,57 @@ def test_host_capability_builds_read_only_adapter() -> None:
     print("ok  Host 构造器强制只读闭集")
 
 
+def test_synthetic_assistant_error_is_uncertain() -> None:
+    async def body() -> None:
+        reset_fakes()
+        FakeClaudeClient.synthetic_error_text = "Not logged in · Please run /login"
+        with TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            adapter = make_adapter(tmp)
+            try:
+                await drain(adapter.stream("hello", workdir(tmp)))
+            except AgentDeliveryUncertainError as exc:
+                assert "未完成模型调用" in str(exc)
+                assert "Not logged in" in str(exc)
+            else:
+                raise AssertionError("synthetic assistant must be uncertain")
+            finally:
+                await adapter.aclose()
+
+    run(body())
+    print("ok  CLI 合成错误消息如实判为 uncertain 且附错误原文")
+
+
+def test_auth_settings_copied_from_user_config() -> None:
+    async def body() -> None:
+        reset_fakes()
+        (FAKE_CLAUDE_CONFIG_DIR / "settings.json").write_text(json.dumps({
+            "env": {"ANTHROPIC_BASE_URL": "https://proxy.example",
+                    "ANTHROPIC_AUTH_TOKEN": "tok"},
+            "model": "glm-x",
+            "permissions": {"allow": ["Bash"]},
+            "enabledPlugins": {"evil": True},
+        }), encoding="utf-8")
+        with TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            adapter = make_adapter(tmp)
+            await drain(adapter.stream("hello", workdir(tmp)))
+            client = FakeClaudeClient.instances[0]
+            assert "--settings" in client.cmd
+            auth_path = Path(client.cmd[client.cmd.index("--settings") + 1])
+            assert auth_path.stat().st_mode & 0o777 == 0o600
+            auth = json.loads(auth_path.read_text(encoding="utf-8"))
+            assert auth["env"]["ANTHROPIC_AUTH_TOKEN"] == "tok"
+            assert auth["model"] == "glm-x"
+            assert "permissions" not in auth
+            assert "enabledPlugins" not in auth
+            await adapter.aclose()
+            assert not auth_path.exists(), "reset 后认证副本必须清理"
+
+    run(body())
+    print("ok  认证键挑拣进 0600 --settings 文件且 permissions 不加载")
+
+
 def test_readiness_probe_states() -> None:
     def fake_resolver(name: str) -> str | None:
         return None
@@ -919,6 +1004,8 @@ if __name__ == "__main__":
     test_permission_denied_before_commit()
     test_permission_allow_reject_and_invalid_outcome()
     test_permission_socket_roundtrip()
+    test_synthetic_assistant_error_is_uncertain()
+    test_auth_settings_copied_from_user_config()
     test_images_forwarded_to_client_turn()
     test_aclose_reclaims_and_blocks_further_streams()
     test_host_capability_builds_read_only_adapter()
