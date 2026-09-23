@@ -1,4 +1,5 @@
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
+import { readFile } from 'node:fs/promises'
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
 import ApprovalService, { effectiveApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -13,6 +14,11 @@ import {
 import { makeBridgeHarness, type BridgeHarness } from './harness.ts'
 
 const ALL_TOOLS = [...READ_ONLY_TOOLS, 'write', 'edit', 'bash'] as const
+
+// 与 build/typecheck 同源：期望值从 runtime-contract.json 读取，不再持有字面版本号
+const contract = JSON.parse(
+  await readFile(new URL('../runtime-contract.json', import.meta.url), 'utf8'),
+)
 
 
 function fixture(name: string, execute: () => Promise<string>) {
@@ -45,19 +51,19 @@ describe('myagents-owned DSH ACP profiles', () => {
   })
 
   it('publishes the exact host and stock-runtime compatibility identity', () => {
-    expect(HOST_VERSION).toBe('0.1.1')
-    expect(DSH_RUNTIME_VERSION).toBe('0.1.2-alpha.2')
-    expect(COMPATIBILITY_REVISION).toBe(2)
+    expect(HOST_VERSION).toBe(contract.hostVersion)
+    expect(DSH_RUNTIME_VERSION).toBe(contract.dshRoot.version)
+    expect(COMPATIBILITY_REVISION).toBe(contract.compatibilityRevision)
     expect(hostAgentInfo('workspace-write')).toEqual({
       name: 'dsh-myagents-acp',
       title: 'DeepSeek Harness for myagents',
-      version: '0.1.1',
+      version: contract.hostVersion,
       _meta: {
         'deepseek.ai/dsh-myagents-profile': 'workspace-write',
-        'deepseek.ai/dsh-myagents-policy-revision': 1,
+        'deepseek.ai/dsh-myagents-policy-revision': contract.policyRevision,
         'deepseek.ai/dsh-myagents-read-only-tools': ['read', 'glob', 'grep'],
-        'deepseek.ai/dsh-runtime-version': '0.1.2-alpha.2',
-        'deepseek.ai/dsh-compatibility-revision': 2,
+        'deepseek.ai/dsh-runtime-version': contract.dshRoot.version,
+        'deepseek.ai/dsh-compatibility-revision': contract.compatibilityRevision,
       },
     })
   })

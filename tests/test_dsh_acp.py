@@ -16,11 +16,11 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from acp.client import AcpError
-from adapters.base import ExecutionMode
-from agent_readiness import ReadinessState
-from dsh_acp import AcpDshAdapter, dsh_readiness_probe
-import dsh_acp.adapter as adapter_module
+import dsh_acp.adapter as adapter_module  # noqa: E402  (sys.path bootstrap)
+from acp.client import AcpError  # noqa: E402
+from adapters.base import ExecutionMode  # noqa: E402
+from agent_readiness import ReadinessState  # noqa: E402
+from dsh_acp import AcpDshAdapter, dsh_readiness_probe  # noqa: E402
 
 SERVER = ROOT / "tests/fake_acp_server.py"
 _FAKE_PLUGIN_ENTRY = b"export {}\n"
@@ -28,21 +28,20 @@ _FAKE_PLUGIN_PATCH = b"[]\n"
 _RUNTIME_CONTRACT = json.loads(
     (ROOT / "dsh_acp/plugin/runtime-contract.json").read_text(encoding="utf-8")
 )
-_PROFILE_BUNDLE_CONTRACT = _RUNTIME_CONTRACT["profileBundle"]
-assert _PROFILE_BUNDLE_CONTRACT["entrySha256"] == (
-    adapter_module._DSH_PLUGIN_ENTRY_SHA256
-)
-assert _PROFILE_BUNDLE_CONTRACT["patchSha256"] == (
-    adapter_module._DSH_PLUGIN_PATCH_SHA256
-)
-# This standalone contract script uses tiny local artifacts. The release gate
-# separately proves that the production build matches the pinned digests above.
-adapter_module._DSH_PLUGIN_ENTRY_SHA256 = hashlib.sha256(
-    _FAKE_PLUGIN_ENTRY
-).hexdigest()
-adapter_module._DSH_PLUGIN_PATCH_SHA256 = hashlib.sha256(
-    _FAKE_PLUGIN_PATCH
-).hexdigest()
+_RUNTIME_VERSION = _RUNTIME_CONTRACT["dshRoot"]["version"]
+_HOST_VERSION = _RUNTIME_CONTRACT["hostVersion"]
+# 版本与 bundle 哈希的唯一事实源是 runtime-contract.json；测试用合成契约
+# 替换加载器，把 bundle 哈希指向本地 tiny artifact（生产构建的正式哈希由
+# release gate 另行证明）。
+_FAKE_CONTRACT = {
+    **_RUNTIME_CONTRACT,
+    "profileBundle": {
+        **_RUNTIME_CONTRACT["profileBundle"],
+        "entrySha256": hashlib.sha256(_FAKE_PLUGIN_ENTRY).hexdigest(),
+        "patchSha256": hashlib.sha256(_FAKE_PLUGIN_PATCH).hexdigest(),
+    },
+}
+adapter_module._contract.load = lambda *, path=None: _FAKE_CONTRACT
 
 
 class FakeResolver:
@@ -82,7 +81,7 @@ def _fake_profile(root: Path) -> tuple[Path, Path]:
     )
     (plugin / "package.json").write_text(json.dumps({
         "name": "@myagents/dsh-acp-host",
-        "version": "0.1.1",
+        "version": _HOST_VERSION,
         "main": "lib/index.js",
         "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
     }) + "\n", encoding="utf-8")
@@ -107,14 +106,17 @@ def _fake_cli_body(marker: Path | None = None) -> str:
         + touch
         + "profile = sys.argv[sys.argv.index('--profile') + 1]\n"
         "os.environ['FAKE_ACP_AGENT_NAME'] = 'dsh-myagents-acp'\n"
-        "os.environ['FAKE_ACP_AGENT_VERSION'] = '0.1.1'\n"
+        "os.environ['FAKE_ACP_AGENT_VERSION'] = " + repr(_HOST_VERSION) + "\n"
         "os.environ['FAKE_ACP_AGENT_PROFILE'] = "
         "os.environ.get('DSH_ACP_PROFILE', '')\n"
-        "os.environ['FAKE_ACP_AGENT_RUNTIME_VERSION'] = '0.1.2-alpha.2'\n"
+        "os.environ['FAKE_ACP_AGENT_RUNTIME_VERSION'] = "
+        + repr(_RUNTIME_VERSION) + "\n"
         "os.environ.setdefault("
-        "'FAKE_ACP_AGENT_COMPATIBILITY_REVISION', '2')\n"
+        "'FAKE_ACP_AGENT_COMPATIBILITY_REVISION', "
+        + repr(str(_RUNTIME_CONTRACT["compatibilityRevision"])) + ")\n"
         "os.environ.setdefault("
-        "'FAKE_ACP_AGENT_POLICY_REVISION', '1')\n"
+        "'FAKE_ACP_AGENT_POLICY_REVISION', "
+        + repr(str(_RUNTIME_CONTRACT["policyRevision"])) + ")\n"
         "os.environ['FAKE_ACP_AGENT_READ_ONLY_TOOLS'] = "
         "'[\"read\",\"glob\",\"grep\"]'\n"
         "if os.environ.get('FAKE_DSH_ARGV'):\n"
@@ -143,7 +145,7 @@ def _fake_install(root: Path, marker: Path | None = None) -> tuple[Path, Path]:
     )
     (package / "package.json").write_text(json.dumps({
         "name": "@deepseek-ai/dsh",
-        "version": "0.1.2-alpha.2",
+        "version": _RUNTIME_VERSION,
         "bin": {"dsh": "lib/bin.js"},
     }) + "\n", encoding="utf-8")
     link = root / "bin/dsh"
@@ -159,11 +161,11 @@ def _fake_source(root: Path) -> tuple[Path, Path, Path]:
     source.mkdir(parents=True, exist_ok=True)
     (source / "package.json").write_text(json.dumps({
         "name": "@deepseek-ai/dsh-root",
-        "version": "0.1.2-alpha.2",
+        "version": _RUNTIME_VERSION,
     }) + "\n", encoding="utf-8")
     (cli_root / "package.json").write_text(json.dumps({
         "name": "@deepseek-ai/dsh",
-        "version": "0.1.2-alpha.2",
+        "version": _RUNTIME_VERSION,
         "bin": {"dsh": "lib/bin.js"},
     }) + "\n", encoding="utf-8")
     node = _write_executable(
@@ -255,7 +257,7 @@ def test_readiness_rejects_version_profile_and_bundle_drift() -> None:
         result = dsh_readiness_probe(environ=env, resolver=FakeResolver({}))
         assert result.state is ReadinessState.INVALID
         assert "版本不兼容" in result.detail
-        cli_data["version"] = "0.1.2-alpha.2"
+        cli_data["version"] = _RUNTIME_VERSION
         cli_package.write_text(json.dumps(cli_data), encoding="utf-8")
 
         profile_path = home / "profiles/myagents/package.json"
@@ -276,7 +278,7 @@ def test_readiness_rejects_version_profile_and_bundle_drift() -> None:
         assert result.state is ReadinessState.INVALID
         assert "bundle 版本不兼容" in result.detail
 
-        bundle["version"] = "0.1.1"
+        bundle["version"] = _HOST_VERSION
         bundle["dsh"]["bundle"]["patch"] = "./other.yml"
         plugin_path.write_text(json.dumps(bundle), encoding="utf-8")
         result = dsh_readiness_probe(environ=env, resolver=FakeResolver({}))
@@ -794,7 +796,8 @@ def test_product_state_is_isolated_and_user_config_is_not_modified() -> None:
                 persistence / "config-inputs/settings.yaml",
                 persistence / "config-inputs/.credentials.yaml",
             )
-            for original, copied in zip((settings, credentials), copies):
+            for original, copied in zip(
+                    (settings, credentials), copies, strict=True):
                 payload, before = originals[original]
                 after = original.stat()
                 assert original.read_bytes() == copied.read_bytes() == payload

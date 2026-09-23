@@ -30,9 +30,13 @@
 import json
 import os
 import sys
+import tempfile
 import time
 
-STATE = os.environ.get("FAKE_ACP_STATE", "/tmp/fake_acp_state")
+# 默认兜底改为进程私有临时目录；实际测试均显式传 FAKE_ACP_STATE。
+STATE = os.environ.get(
+    "FAKE_ACP_STATE",
+    os.path.join(tempfile.mkdtemp(prefix="fake_acp_state-"), "state.json"))
 SESSION_ID = "fake-session-1"
 CANCEL_DELAY = float(os.environ.get("FAKE_ACP_CANCEL_DELAY", "0.3"))
 CANCEL_STOP_REASON = os.environ.get(
@@ -86,10 +90,11 @@ NO_IMAGE_CAP = os.environ.get("FAKE_ACP_NO_IMAGE_CAP") == "1"
 AGENT_NAME = os.environ.get("FAKE_ACP_AGENT_NAME", "fake-acp")
 AGENT_VERSION = os.environ.get("FAKE_ACP_AGENT_VERSION", "0.1")
 AGENT_PROFILE = os.environ.get("FAKE_ACP_AGENT_PROFILE", "")
+# 默认值不再持有真实 DSH 版本字面量；DSH 相关测试通过环境变量显式注入契约值。
 AGENT_RUNTIME_VERSION = os.environ.get(
-    "FAKE_ACP_AGENT_RUNTIME_VERSION", "0.1.2-alpha.2")
+    "FAKE_ACP_AGENT_RUNTIME_VERSION", "0-fake-default")
 _compatibility_revision_raw = os.environ.get(
-    "FAKE_ACP_AGENT_COMPATIBILITY_REVISION", "2")
+    "FAKE_ACP_AGENT_COMPATIBILITY_REVISION", "0")
 try:
     # JSON parsing lets tests distinguish integer 1 from bool true.  An
     # unquoted invalid value is intentionally preserved as a string so the
@@ -336,7 +341,8 @@ def main() -> None:
                     return
         elif method == "session/list":
             send({"jsonrpc": "2.0", "id": rid, "result": {
-                "sessions": [{"sessionId": SESSION_ID, "cwd": "/tmp"}]}})
+                "sessions": [{"sessionId": SESSION_ID,
+                              "cwd": "/fake-acp-session-cwd"}]}})
         elif method == "session/load":
             log("load:" + params.get("sessionId", ""))
             if DISCONNECT_LOAD:

@@ -7,6 +7,23 @@ if (dshRoot === undefined || !isAbsolute(dshRoot)) {
 }
 
 const pluginRoot = dirname(fileURLToPath(import.meta.url))
+
+// 与 build.mjs 同源：版本与 revision 只存于 runtime-contract.json
+const { readFile } = await import('node:fs/promises')
+const contractPath = join(pluginRoot, 'runtime-contract.json')
+let contract
+try {
+  contract = JSON.parse(await readFile(contractPath, 'utf8'))
+} catch (error) {
+  throw new Error(`unreadable runtime contract at ${contractPath}: ${error instanceof Error ? error.message : String(error)}`)
+}
+const contractDefines = {
+  __MYAGENTS_HOST_VERSION__: JSON.stringify(contract.hostVersion),
+  __MYAGENTS_DSH_RUNTIME_VERSION__: JSON.stringify(contract.dshRoot.version),
+  __MYAGENTS_COMPATIBILITY_REVISION__: JSON.stringify(contract.compatibilityRevision),
+  __MYAGENTS_POLICY_REVISION__: JSON.stringify(contract.policyRevision),
+}
+
 const { default: tsconfigPaths } = await import(pathToFileURL(join(
   dshRoot,
   'node_modules/vite-tsconfig-paths/dist/index.js',
@@ -79,6 +96,7 @@ export default {
     standardDecoratorPlugin(),
   ],
   resolve: { alias: aliases },
+  define: contractDefines,
   test: {
     include: [join(pluginRoot, 'tests/**/*.spec.ts')],
     pool: 'forks',

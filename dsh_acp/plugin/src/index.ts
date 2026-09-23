@@ -24,9 +24,17 @@ export type Profile = 'workspace-write' | 'read-only'
 
 export const READ_ONLY_TOOLS = ['read', 'glob', 'grep'] as const
 
-export const HOST_VERSION = '0.1.1'
-export const DSH_RUNTIME_VERSION = '0.1.2-alpha.2'
-export const COMPATIBILITY_REVISION = 2
+// 版本与 revision 由 build.mjs / vitest.config.mjs 从 runtime-contract.json
+// 以 esbuild define 注入；本文件不再持有任何字面版本号。
+declare const __MYAGENTS_HOST_VERSION__: string
+declare const __MYAGENTS_DSH_RUNTIME_VERSION__: string
+declare const __MYAGENTS_COMPATIBILITY_REVISION__: number
+declare const __MYAGENTS_POLICY_REVISION__: number
+
+export const HOST_VERSION = __MYAGENTS_HOST_VERSION__
+export const DSH_RUNTIME_VERSION = __MYAGENTS_DSH_RUNTIME_VERSION__
+export const COMPATIBILITY_REVISION = __MYAGENTS_COMPATIBILITY_REVISION__
+export const POLICY_REVISION = __MYAGENTS_POLICY_REVISION__
 
 export interface Config {
   profile: Profile
@@ -204,7 +212,7 @@ export function hostAgentInfo(profile: Profile) {
     version: HOST_VERSION,
     _meta: {
       'deepseek.ai/dsh-myagents-profile': profile,
-      'deepseek.ai/dsh-myagents-policy-revision': 1,
+      'deepseek.ai/dsh-myagents-policy-revision': POLICY_REVISION,
       'deepseek.ai/dsh-myagents-read-only-tools': [...READ_ONLY_TOOLS],
       'deepseek.ai/dsh-runtime-version': DSH_RUNTIME_VERSION,
       'deepseek.ai/dsh-compatibility-revision': COMPATIBILITY_REVISION,

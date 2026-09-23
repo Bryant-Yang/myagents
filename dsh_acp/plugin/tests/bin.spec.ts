@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
@@ -26,6 +26,9 @@ if (testHomeInput === undefined || !isAbsolute(testHomeInput)) {
 const sourceRoot = await realpath(sourceInput)
 const testHome = await realpath(testHomeInput)
 const dshBin = join(sourceRoot, 'apps/cli/lib/bin.js')
+const contract = JSON.parse(
+  await readFile(new URL('../runtime-contract.json', import.meta.url), 'utf8'),
+)
 const dirs: string[] = []
 
 afterEach(async () => {
@@ -132,8 +135,8 @@ async function handshake(image = false): Promise<void> {
     }), stream)
     const initialized = await client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     expect(initialized.agentInfo?._meta).toMatchObject({
-      'deepseek.ai/dsh-runtime-version': '0.1.2-alpha.2',
-      'deepseek.ai/dsh-compatibility-revision': 2,
+      'deepseek.ai/dsh-runtime-version': contract.dshRoot.version,
+      'deepseek.ai/dsh-compatibility-revision': contract.compatibilityRevision,
       'deepseek.ai/dsh-myagents-profile': 'read-only',
     })
     expect(initialized.agentCapabilities).toMatchObject({

@@ -2363,7 +2363,7 @@ def test_execution_mode_command_profile_restarts_process() -> None:
         events = state_events()
         assert events.count(f"new:{TMP_WORKDIR}") == 3, events
         assert not any(item.startswith("load:") for item in events), events
-        assert events.count(f"process-cwd:{Path('/tmp').resolve()}") == 3, events
+        assert events.count(f"process-cwd:{TMP_WORKDIR}") == 3, events
 
     asyncio.run(run())
     print("ok  execution mode CLI profile 切换重建进程/session")

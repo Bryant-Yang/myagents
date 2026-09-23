@@ -526,10 +526,8 @@ expected_dsh_literals = {
     "_DSH_PROFILE_BUNDLES": (
         "@deepseek-ai/dsh-base", "@myagents/dsh-acp-host"),
     "_DSH_PLUGIN_NAME": "@myagents/dsh-acp-host",
-    "_DSH_PLUGIN_VERSION": "0.1.1",
     "_DSH_RUNTIME_PACKAGE": "@deepseek-ai/dsh",
     "_DSH_RUNTIME_ROOT_PACKAGE": "@deepseek-ai/dsh-root",
-    "_DSH_RUNTIME_VERSION": "0.1.2-alpha.2",
     "DSH_ACP_WORKSPACE_PROFILE": "workspace-write",
     "DSH_ACP_READ_ONLY_PROFILE": "read-only",
     "_DSH_AGENT_NAME": "dsh-myagents-acp",
@@ -541,25 +539,18 @@ expected_dsh_literals = {
     "_DSH_RUNTIME_VERSION_META_KEY": "deepseek.ai/dsh-runtime-version",
     "_DSH_COMPATIBILITY_REVISION_META_KEY": (
         "deepseek.ai/dsh-compatibility-revision"),
-    "_DSH_POLICY_REVISION": 1,
-    "_DSH_COMPATIBILITY_REVISION": 2,
     "_DSH_READ_ONLY_TOOLS": ["read", "glob", "grep"],
     "_DSH_PERMISSION_KINDS": {"allow_once", "reject_once"},
-    "_DSH_PLUGIN_ENTRY_SHA256": (
-        "e9e9b09a22c268b6b23a707bad2a935c391fada792837cebd1c8dd6070643688"),
-    "_DSH_PLUGIN_PATCH_SHA256": (
-        "13c78412265c933454d3bb215f0138d384e36a8c223840b1fa2f3404b1d6083c"),
 }
 observed_dsh_literals = {
     name: dsh_assignment_values.get(name) for name in expected_dsh_literals
 }
 if (observed_dsh_literals != expected_dsh_literals
-        or type(observed_dsh_literals.get("_DSH_POLICY_REVISION")) is not int
-        or type(observed_dsh_literals.get(
-            "_DSH_COMPATIBILITY_REVISION")) is not int):
+        or "from dsh_acp import contract as _contract" not in dsh_source):
     errors.append(
         "[R4] dsh_acp/adapter.py: DSH official CLI/profile/bundle、两种 "
-        "execution safety profile 与 identity wire literals 必须保持精确")
+        "execution safety profile 与 identity literals 必须保持精确；"
+        "版本与 bundle 哈希必须从 runtime-contract.json 加载（_contract）")
 
 required_dsh_adapter_tokens = {
     'Path("apps/cli/package.json")', 'Path("apps/cli/lib/bin.js")',
@@ -574,7 +565,10 @@ required_dsh_adapter_tokens = {
     '"NODE_OPTIONS"', '"NODE_PATH"', "_DSH_CHILD_ENV_REMOVALS",
 }
 if (not all(token in dsh_source for token in required_dsh_adapter_tokens)
-        or "_DSH_HOST_VERSION = _DSH_PLUGIN_VERSION" not in dsh_source):
+        or '_expected_contract()["hostVersion"]' not in dsh_source
+        or '_expected_contract()["dshRoot"]["version"]' not in dsh_source
+        or '_expected_contract()["profileBundle"]["entrySha256"]'
+        not in dsh_source):
     errors.append(
         "[R4] dsh_acp/adapter.py: DSH 必须被动解析官方 launcher/stock profile，"
         "固定标准 bundle identity，并隔离 state/workspace/config")
@@ -582,10 +576,11 @@ if (not all(token in dsh_source for token in required_dsh_adapter_tokens)
 dsh_profile_source = dsh_function_source("_validated_profile")
 required_dsh_profile_tokens = {
     "_DSH_PROFILE_BUNDLES", 'manifest.get("dependencies")',
-    "_DSH_PLUGIN_NAME", "_DSH_PLUGIN_VERSION",
+    "_DSH_PLUGIN_NAME", '_expected_contract()["hostVersion"]',
     'patch_value != "./cordis.patch.yml"',
     'main_value != "lib/index.js"', "_validated_bundle_artifact",
-    "_DSH_PLUGIN_ENTRY_SHA256", "_DSH_PLUGIN_PATCH_SHA256",
+    '_expected_contract()["profileBundle"]["entrySha256"]',
+    '_expected_contract()["profileBundle"]["patchSha256"]',
     "_MAX_PLUGIN_ENTRY_BYTES", "_MAX_PLUGIN_PATCH_BYTES",
     "_canonical_profile_directory",
     "_read_canonical_bounded_file", "_MAX_MANIFEST_BYTES",
@@ -645,7 +640,7 @@ if ('_validated_profile(launch.profile_home)' not in dsh_revalidate_source
 dsh_source_launch_source = dsh_function_source("_validated_source_launch")
 required_dsh_source_launch_tokens = {
     "_DSH_RUNTIME_ROOT_PACKAGE", "_DSH_RUNTIME_PACKAGE",
-    "_DSH_RUNTIME_VERSION", "_DSH_SOURCE_CLI_PACKAGE",
+    '_expected_contract()["dshRoot"]["version"]', "_DSH_SOURCE_CLI_PACKAGE",
     "_DSH_SOURCE_CLI_BIN", "_declared_dsh_bin", 'find("node")',
     "_validated_executable",
 }
@@ -781,7 +776,7 @@ else:
     package_files = package.get("files")
     package_dsh = package.get("dsh")
     if (package.get("name") != "@myagents/dsh-acp-host"
-            or package.get("version") != "0.1.1"
+            or package.get("version") != runtime_contract.get("hostVersion")
             or package.get("main") != "lib/index.js"
             or not isinstance(package_exports, dict)
             or package_exports.get(".") != {"default": "./lib/index.js"}
@@ -827,67 +822,78 @@ else:
         )
     )
     dsh_root_contract = runtime_contract.get("dshRoot")
+
+    def _hex64(value: object) -> bool:
+        return (isinstance(value, str) and len(value) == 64
+                and all(ch in "0123456789abcdef" for ch in value))
+
+    def _sha_of(path: pathlib.Path) -> str:
+        import hashlib
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    acp_sdk_contract = runtime_contract.get("acpSdk")
+    build_tool_contract = runtime_contract.get("buildTool")
+    profile_bundle_contract = runtime_contract.get("profileBundle")
+    cli_runtime_files = (
+        dsh_root_contract.get("cliRuntimeFiles")
+        if isinstance(dsh_root_contract, dict) else None)
+    binary_hashes = (
+        build_tool_contract.get("binarySha256ByPlatform")
+        if isinstance(build_tool_contract, dict) else None)
+
+    # 结构化校验：契约的形状与结构约定必须成立；具体版本/哈希值由
+    # check-dsh-runtime-contract.py 对真实 checkout 验证，这里不再快照。
+    # 本地可验证的交叉一致性必须成立：契约 patchSha256 == 实际 patch 文件。
     if (runtime_contract.get("schemaVersion") != 5
-            or runtime_contract.get("hostVersion") != "0.1.1"
-            or runtime_contract.get("compatibilityRevision") != 2
+            or not isinstance(runtime_contract.get("hostVersion"), str)
+            or not runtime_contract.get("hostVersion")
+            or isinstance(runtime_contract.get("compatibilityRevision"), bool)
+            or not isinstance(
+                runtime_contract.get("compatibilityRevision"), int)
+            or isinstance(runtime_contract.get("policyRevision"), bool)
+            or not isinstance(runtime_contract.get("policyRevision"), int)
             or not isinstance(dsh_root_contract, dict)
-            or dsh_root_contract.get("name")
-            != "@deepseek-ai/dsh-root"
-            or dsh_root_contract.get("version")
-            != "0.1.2-alpha.2"
-            or dsh_root_contract.get("sourceCommit")
-            != "0a53fb55bea101816fa226bb964ae2bed71c343b"
+            or dsh_root_contract.get("name") != "@deepseek-ai/dsh-root"
+            or not isinstance(dsh_root_contract.get("version"), str)
+            or not dsh_root_contract.get("version")
+            or not isinstance(dsh_root_contract.get("sourceCommit"), str)
             or dsh_root_contract.get("cliEntry") != "apps/cli/lib/bin.js"
-            or dsh_root_contract.get("cliEntrySha256")
-            != "dc23f6c5dd7df8834e3e38bdb9609d77b459834681ae9b7133b417b0c35f3166"
-            or dsh_root_contract.get("cliRuntimeFiles") != {
-                "bin.js": (
-                    "dc23f6c5dd7df8834e3e38bdb9609d77b459834681ae9b7133b417b0c35f3166"),
-                "dump-config-BNQ_bV66.js": (
-                    "14546c0a59460bd294e5869a780fc848f288e2feea199e5d31fc02e440ba7cd8"),
-                "plugin-F7ZVfRyo.js": (
-                    "692f93eee677c1951bd4693e0dab54ceb2c13d48a6f1aab941e78b084c5da39a"),
-                "profile-boot-BTzzdrGY.js": (
-                    "20daa1648fda862247d78840e52472e84f4c6846394cb69b79db213d8ed79b6a"),
-                "profile-boot-x7_BzdeW.js": (
-                    "624dcfd891d259dd1952d61c7a66f0912b614ce39d4aaa0f29a9f7aabe1ab073"),
-            }
+            or not _hex64(dsh_root_contract.get("cliEntrySha256"))
+            or not isinstance(cli_runtime_files, dict)
+            or not cli_runtime_files
+            or not all(_hex64(v) for v in cli_runtime_files.values())
             or "runtimeFileCount" in dsh_root_contract
             or "runtimeTreeSha256" in dsh_root_contract
-            or runtime_contract.get("acpSdk") != {
-                "name": "@agentclientprotocol/sdk",
-                "version": "1.4.0",
-                "entrySha256": (
-                    "cc717d74b018c1fe3e1e53e31ff6355ccf52e729e753666051bda42499be7b9f"),
-            }
-            or runtime_contract.get("buildTool") != {
-                "name": "esbuild",
-                "version": "0.28.1",
-                "entry": "lib/main.js",
-                "entrySha256": (
-                    "8331fe1d8b3a07381f33cc425fcfaa94776e263113653f80ec3ba433e9657e73"),
-                "binary": "bin/esbuild",
-                "binarySha256ByPlatform": {
-                    "darwin-arm64": (
-                        "e2dc9a52440a2a34f09434a2f4843cb1e30f84e40dcf238976ec61ef8cd7f36a"),
-                },
-            }
-            or runtime_contract.get("profileBundle") != {
-                "name": "@myagents/dsh-acp-host",
-                "main": "lib/index.js",
-                "patch": "cordis.patch.yml",
-                "acpSdkBundled": True,
-                "entrySha256": (
-                    "e9e9b09a22c268b6b23a707bad2a935c391fada792837cebd1c8dd6070643688"),
-                "patchSha256": (
-                    "13c78412265c933454d3bb215f0138d384e36a8c223840b1fa2f3404b1d6083c"),
-            }
+            or not isinstance(acp_sdk_contract, dict)
+            or acp_sdk_contract.get("name") != "@agentclientprotocol/sdk"
+            or not isinstance(acp_sdk_contract.get("version"), str)
+            or not acp_sdk_contract.get("version")
+            or not _hex64(acp_sdk_contract.get("entrySha256"))
+            or not isinstance(build_tool_contract, dict)
+            or build_tool_contract.get("name") != "esbuild"
+            or not isinstance(build_tool_contract.get("version"), str)
+            or not build_tool_contract.get("version")
+            or build_tool_contract.get("entry") != "lib/main.js"
+            or not _hex64(build_tool_contract.get("entrySha256"))
+            or build_tool_contract.get("binary") != "bin/esbuild"
+            or not isinstance(binary_hashes, dict)
+            or not binary_hashes
+            or not all(_hex64(v) for v in binary_hashes.values())
+            or not isinstance(profile_bundle_contract, dict)
+            or profile_bundle_contract.get("name") != "@myagents/dsh-acp-host"
+            or profile_bundle_contract.get("main") != "lib/index.js"
+            or profile_bundle_contract.get("patch") != "cordis.patch.yml"
+            or profile_bundle_contract.get("acpSdkBundled") is not True
+            or not _hex64(profile_bundle_contract.get("entrySha256"))
+            or profile_bundle_contract.get("patchSha256")
+            != _sha_of(plugin_patch)
             or not public_package_contracts_valid
             or set(expected_plugin_peers) != expected_peer_names
             or package.get("peerDependencies") != expected_plugin_peers):
         errors.append(
             "[R4] dsh_acp/plugin: package peers、host/DSH/ACP SDK 版本与 "
-            "checked-in standard bundle compatibility contract 必须精确一致")
+            "checked-in standard bundle compatibility contract 必须结构一致；"
+            "契约 patchSha256 必须等于实际 cordis.patch.yml")
 
     required_patch_tokens = {
         "id: session-persistence-jsonl", "compression: none",

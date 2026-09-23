@@ -49,7 +49,7 @@ seam，足以让 myagents 插件自己拥有完整的 `dsh-myagents-acp` server 
   `package.json` 必须同时满足：`dependencies` 存在
   `@myagents/dsh-acp-host`；`dsh.profile.bundles` 精确、按序等于
   `["@deepseek-ai/dsh-base", "@myagents/dsh-acp-host"]`；解析后的 bundle package 精确为
-  `@myagents/dsh-acp-host@0.1.1`，并声明
+  `@myagents/dsh-acp-host@<runtime-contract.json 的 hostVersion>`，并声明
   `dsh.bundle.patch=./cordis.patch.yml`。canonical package entry 与 patch 必须是普通、
   可读、位于解析后的 package root 内；entry 与 patch 的 SHA-256 必须分别匹配
   checked-in runtime contract，并以 no-follow、单链接、有界、读前后身份稳定的方式
@@ -108,7 +108,8 @@ patch 任一不满足为 `invalid`；完整入口才为 `ready`。probe
 
 - `agentCapabilities.loadSession === true`；
 - `agentCapabilities.sessionCapabilities.close` 是对象。
-- `agentInfo.name === "dsh-myagents-acp"` 且 `version === "0.1.1"`；
+- `agentInfo.name === "dsh-myagents-acp"` 且 `version ===` checked-in
+  `runtime-contract.json` 的 `hostVersion`；
 - `agentInfo._meta` 精确满足下述版本化 wire schema。
 
 `_meta` 的五个必需字面量 key 及类型/值契约为：
@@ -116,20 +117,32 @@ patch 任一不满足为 `invalid`；完整入口才为 `ready`。probe
 | literal key | JSON type | 允许的精确值 |
 | --- | --- | --- |
 | `deepseek.ai/dsh-myagents-profile` | string | `"workspace-write"` 或 `"read-only"`，且必须与当前进程的 `DSH_ACP_PROFILE` 一致 |
-| `deepseek.ai/dsh-myagents-policy-revision` | integer | `1` |
+| `deepseek.ai/dsh-myagents-policy-revision` | integer | checked-in `runtime-contract.json` 的 `policyRevision` |
 | `deepseek.ai/dsh-myagents-read-only-tools` | array of strings | 按顺序精确为 `["read", "glob", "grep"]` |
-| `deepseek.ai/dsh-runtime-version` | string | `"0.1.2-alpha.2"` |
-| `deepseek.ai/dsh-compatibility-revision` | integer | `2` |
+| `deepseek.ai/dsh-runtime-version` | string | checked-in `runtime-contract.json` 的 `dshRoot.version` |
+| `deepseek.ai/dsh-compatibility-revision` | integer | checked-in `runtime-contract.json` 的 `compatibilityRevision` |
 
 - `deepseek.ai/dsh-myagents-profile` 必须是 JSON string，值精确等于当前
   `DSH_ACP_PROFILE` 的 `workspace-write` 或 `read-only`；
-- `deepseek.ai/dsh-myagents-policy-revision` 必须是 JSON integer `1`，
-  boolean `true` 不得借数值相等通过；
+- `deepseek.ai/dsh-myagents-policy-revision` 必须是 JSON integer，值精确等于
+  checked-in contract 的 `policyRevision`，boolean `true` 不得借数值相等通过；
 - `deepseek.ai/dsh-myagents-read-only-tools` 必须是 JSON array，且按顺序
   精确为三个 string `read`、`glob`、`grep`；缺项、重复、换序或
   额外工具都失败。
 - runtime version 与 checked-in DSH compatibility contract 必须精确一致；compatibility
-  revision 必须是 JSON integer `2`，boolean `true` 不得借数值相等通过。
+  revision 必须是 JSON integer，值精确等于 contract 的 `compatibilityRevision`，
+  boolean `true` 不得借数值相等通过。
+
+**版本身份的单一事实源与续约**：DSH runtime 版本、bundle 版本、两个 revision 与
+全部 entry SHA-256 只存于 checked-in
+`dsh_acp/plugin/runtime-contract.json`（经 `dsh_acp/contract.py` 加载校验）。
+Python adapter、TypeScript plugin（build/vitest 经 esbuild define 注入）、测试与
+本文档一律引用契约值，不得复制字面版本号。升级 DSH checkout 后运行
+`scripts/dsh-contract-refresh.py`（默认 dry-run 打印 diff，`--accept` 落盘并同步
+plugin `package.json` peerDependencies，最后用
+`check-dsh-runtime-contract.py` 同一算法自证）。`compatibilityRevision` 与
+`policyRevision` 只能人工随语义变更 bump，refresh 不改写。版本/哈希漂移在启动前
+fail-closed 的要求不变。
 
 host 可以携带其他 `_meta` 扩展，但不能替代或改写上述五项。
 
@@ -273,7 +286,7 @@ MYAGENTS_DSH_SOURCE_ROOT=/absolute/path/to/deepseek-harness \
 1. installed 官方 `dsh` 与 source 已构建官方 CLI 两条入口都以
    `--profile myagents` 完成 initialize/new/prompt/close；
 2. plugin add 后 profile 的 dependency、exact base → host bundle 顺序、解析后的
-   `@myagents/dsh-acp-host@0.1.1`、entry 与 patch 精确；缺失、换序、版本漂移、普通
+   `@myagents/dsh-acp-host@<contract hostVersion>`、entry 与 patch 精确；缺失、换序、版本漂移、普通
    dependency 冒充 bundle、profile parent/manifest symlink escape，以及 home/profile
    later-wins 有效 patch 均被动阻断；
 3. 重启后 `session/load` 恢复同一 session，cwd 不匹配和未知 id 明确失败，历史输出

@@ -28,6 +28,7 @@ from adapters.base import (
 )
 from agent_readiness import AgentReadiness, ExecutableResolver, ReadinessState
 from clipboard_image import prompt_images
+from dsh_acp import contract as _contract
 
 _CANCEL_TIMEOUT = 10
 _TOOL_INACTIVITY_TIMEOUT = 900
@@ -49,10 +50,8 @@ _DSH_PROFILE_BUNDLES = (
     "@myagents/dsh-acp-host",
 )
 _DSH_PLUGIN_NAME = "@myagents/dsh-acp-host"
-_DSH_PLUGIN_VERSION = "0.1.1"
 _DSH_RUNTIME_PACKAGE = "@deepseek-ai/dsh"
 _DSH_RUNTIME_ROOT_PACKAGE = "@deepseek-ai/dsh-root"
-_DSH_RUNTIME_VERSION = "0.1.2-alpha.2"
 _DSH_SOURCE_CLI_PACKAGE = Path("apps/cli/package.json")
 _DSH_SOURCE_CLI_BIN = Path("apps/cli/lib/bin.js")
 _MAX_MANIFEST_BYTES = 1_048_576
@@ -65,22 +64,26 @@ _UNAVAILABLE_COMMAND = "/__myagents_dsh_configuration_required__/dsh"
 DSH_ACP_WORKSPACE_PROFILE = "workspace-write"
 DSH_ACP_READ_ONLY_PROFILE = "read-only"
 _DSH_AGENT_NAME = "dsh-myagents-acp"
-_DSH_HOST_VERSION = _DSH_PLUGIN_VERSION
 _DSH_PROFILE_META_KEY = "deepseek.ai/dsh-myagents-profile"
 _DSH_POLICY_REVISION_META_KEY = "deepseek.ai/dsh-myagents-policy-revision"
 _DSH_READ_ONLY_TOOLS_META_KEY = "deepseek.ai/dsh-myagents-read-only-tools"
 _DSH_RUNTIME_VERSION_META_KEY = "deepseek.ai/dsh-runtime-version"
 _DSH_COMPATIBILITY_REVISION_META_KEY = "deepseek.ai/dsh-compatibility-revision"
-_DSH_POLICY_REVISION = 1
-_DSH_COMPATIBILITY_REVISION = 2
 _DSH_READ_ONLY_TOOLS = ["read", "glob", "grep"]
 _DSH_PERMISSION_KINDS = {"allow_once", "reject_once"}
-_DSH_PLUGIN_ENTRY_SHA256 = (
-    "e9e9b09a22c268b6b23a707bad2a935c391fada792837cebd1c8dd6070643688"
-)
-_DSH_PLUGIN_PATCH_SHA256 = (
-    "13c78412265c933454d3bb215f0138d384e36a8c223840b1fa2f3404b1d6083c"
-)
+
+
+# 版本与 bundle 哈希只存于 runtime-contract.json（见 dsh_acp/contract.py）；
+# 这里唯一保留的间接层是契约加载本身，测试通过 monkeypatch _contract.load
+# 注入合成契约。
+
+
+def _expected_contract() -> dict:
+    """加载 checked-in 契约；不可用即本轮 DSH 不可用（fail-closed）。"""
+    try:
+        return _contract.load()
+    except _contract.ContractError as exc:
+        raise AcpError(f"DSH runtime contract 不可用：{exc}") from exc
 
 
 class _DshNotFoundError(AcpError):
@@ -220,10 +223,11 @@ def _validated_cli_package(entry: Path) -> Path:
         observed.append(f"{manifest.get('name')!r}@{manifest.get('version')!r}")
         if manifest.get("name") != _DSH_RUNTIME_PACKAGE:
             continue
-        if manifest.get("version") != _DSH_RUNTIME_VERSION:
+        expected_runtime_version = _expected_contract()["dshRoot"]["version"]
+        if manifest.get("version") != expected_runtime_version:
             raise AcpError(
                 "DSH CLI 版本不兼容：期望 "
-                f"{_DSH_RUNTIME_VERSION}，实际 {manifest.get('version')!r}"
+                f"{expected_runtime_version}，实际 {manifest.get('version')!r}"
             )
         declared_entry = _declared_dsh_bin(manifest, package_root)
         if declared_entry != entry:
@@ -464,10 +468,11 @@ def _validated_profile(profile_home: Path) -> tuple[Path, Path]:
             "myagents DSH bundle package identity 不匹配："
             f"{plugin_manifest.get('name')!r}"
         )
-    if plugin_manifest.get("version") != _DSH_PLUGIN_VERSION:
+    expected_plugin_version = _expected_contract()["hostVersion"]
+    if plugin_manifest.get("version") != expected_plugin_version:
         raise AcpError(
             "myagents DSH bundle 版本不兼容：期望 "
-            f"{_DSH_PLUGIN_VERSION}，实际 {plugin_manifest.get('version')!r}"
+            f"{expected_plugin_version}，实际 {plugin_manifest.get('version')!r}"
         )
     plugin_dsh = plugin_manifest.get("dsh")
     bundle = plugin_dsh.get("bundle") if isinstance(plugin_dsh, dict) else None
@@ -491,14 +496,14 @@ def _validated_profile(profile_home: Path) -> tuple[Path, Path]:
         "myagents DSH bundle patch",
         parent=plugin_root,
         byte_limit=_MAX_PLUGIN_PATCH_BYTES,
-        expected_sha256=_DSH_PLUGIN_PATCH_SHA256,
+        expected_sha256=_expected_contract()["profileBundle"]["patchSha256"],
     )
     _validated_bundle_artifact(
         plugin_root / main_value,
         "myagents DSH bundle main",
         parent=plugin_root,
         byte_limit=_MAX_PLUGIN_ENTRY_BYTES,
-        expected_sha256=_DSH_PLUGIN_ENTRY_SHA256,
+        expected_sha256=_expected_contract()["profileBundle"]["entrySha256"],
     )
     return profile_dir, plugin_root
 
@@ -519,13 +524,14 @@ def _validated_source_launch(
     root_manifest = _read_json_object(
         source_root / "package.json", "DSH source root package.json"
     )
+    expected_runtime_version = _expected_contract()["dshRoot"]["version"]
     if (
         root_manifest.get("name") != _DSH_RUNTIME_ROOT_PACKAGE
-        or root_manifest.get("version") != _DSH_RUNTIME_VERSION
+        or root_manifest.get("version") != expected_runtime_version
     ):
         raise AcpError(
             "DSH source root identity/version 不兼容：期望 "
-            f"{_DSH_RUNTIME_ROOT_PACKAGE}@{_DSH_RUNTIME_VERSION}"
+            f"{_DSH_RUNTIME_ROOT_PACKAGE}@{expected_runtime_version}"
         )
     cli_package_root = (source_root / _DSH_SOURCE_CLI_PACKAGE).parent
     cli_manifest = _read_json_object(
@@ -533,11 +539,11 @@ def _validated_source_launch(
     )
     if (
         cli_manifest.get("name") != _DSH_RUNTIME_PACKAGE
-        or cli_manifest.get("version") != _DSH_RUNTIME_VERSION
+        or cli_manifest.get("version") != expected_runtime_version
     ):
         raise AcpError(
             "DSH source CLI identity/version 不兼容：期望 "
-            f"{_DSH_RUNTIME_PACKAGE}@{_DSH_RUNTIME_VERSION}"
+            f"{_DSH_RUNTIME_PACKAGE}@{expected_runtime_version}"
         )
     cli_entry = _declared_dsh_bin(cli_manifest, cli_package_root)
     expected_entry = _validated_regular_file(
@@ -1067,20 +1073,22 @@ class AcpDshAdapter(AcpAdapter):
                 "DSH ACP agentInfo.name 身份校验失败："
                 f"期望 {_DSH_AGENT_NAME!r}，实际 {actual!r}"
             )
-        if agent_info.get("version") != _DSH_HOST_VERSION:
+        expected_host_version = _expected_contract()["hostVersion"]
+        if agent_info.get("version") != expected_host_version:
             raise AcpError(
                 "DSH ACP agentInfo.version 校验失败："
-                f"期望 {_DSH_HOST_VERSION!r}，实际 {agent_info.get('version')!r}"
+                f"期望 {expected_host_version!r}，实际 {agent_info.get('version')!r}"
             )
         metadata = agent_info.get("_meta")
         if not isinstance(metadata, dict):
             raise AcpError("DSH ACP agentInfo._meta 缺失")
+        contract = _expected_contract()
         expected = {
             _DSH_PROFILE_META_KEY: expected_profile,
-            _DSH_POLICY_REVISION_META_KEY: _DSH_POLICY_REVISION,
+            _DSH_POLICY_REVISION_META_KEY: contract["policyRevision"],
             _DSH_READ_ONLY_TOOLS_META_KEY: _DSH_READ_ONLY_TOOLS,
-            _DSH_RUNTIME_VERSION_META_KEY: _DSH_RUNTIME_VERSION,
-            _DSH_COMPATIBILITY_REVISION_META_KEY: _DSH_COMPATIBILITY_REVISION,
+            _DSH_RUNTIME_VERSION_META_KEY: contract["dshRoot"]["version"],
+            _DSH_COMPATIBILITY_REVISION_META_KEY: contract["compatibilityRevision"],
         }
         integer_revision_keys = {
             _DSH_POLICY_REVISION_META_KEY,

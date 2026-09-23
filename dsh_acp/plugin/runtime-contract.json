@@ -2,6 +2,7 @@
   "schemaVersion": 5,
   "hostVersion": "0.1.1",
   "compatibilityRevision": 2,
+  "policyRevision": 1,
   "dshRoot": {
     "name": "@deepseek-ai/dsh-root",
     "version": "0.1.2-alpha.2",

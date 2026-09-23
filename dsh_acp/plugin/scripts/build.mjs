@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdir, realpath } from 'node:fs/promises'
+import { mkdir, readFile, realpath } from 'node:fs/promises'
 import { isAbsolute, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -24,6 +24,24 @@ if (outdirFlag < 0 || process.argv[outdirFlag + 1] === undefined) {
 const outdir = resolve(process.argv[outdirFlag + 1])
 await mkdir(outdir, { recursive: true })
 
+// 版本与 revision 唯一来源：runtime-contract.json（与 Python adapter、验收 gate 同源）
+const contractPath = join(pluginRoot, 'runtime-contract.json')
+let contract
+try {
+  contract = JSON.parse(await readFile(contractPath, 'utf8'))
+} catch (error) {
+  throw new Error(`unreadable runtime contract at ${contractPath}: ${error instanceof Error ? error.message : String(error)}`)
+}
+const defines = {
+  __MYAGENTS_HOST_VERSION__: JSON.stringify(contract.hostVersion),
+  __MYAGENTS_DSH_RUNTIME_VERSION__: JSON.stringify(contract.dshRoot.version),
+  __MYAGENTS_COMPATIBILITY_REVISION__: JSON.stringify(contract.compatibilityRevision),
+  __MYAGENTS_POLICY_REVISION__: JSON.stringify(contract.policyRevision),
+}
+const defineFlags = Object.entries(defines).map(
+  ([identifier, expression]) => `--define:${identifier}=${expression}`,
+)
+
 const acpSdk = await realpath(join(
   sourceRoot,
   'apps/cli/node_modules/@agentclientprotocol/sdk/dist/acp.js',
@@ -39,5 +57,6 @@ execFileSync(esbuild, [
   '--legal-comments=none',
   '--external:@deepseek-ai/*',
   `--alias:@agentclientprotocol/sdk=${acpSdk}`,
+  ...defineFlags,
   `--outfile=${join(outdir, 'index.js')}`,
 ], { cwd: pluginRoot, stdio: 'inherit' })

@@ -149,14 +149,16 @@ home 的 settings/credentials 经 no-follow 有界读取后复制为 `config-inp
 标准 bundle 提供。首个
 session 操作前必须看到 load/close capability，且无
 headless、SDK RPC 或 JSONL fallback。initialize 还必须通过专用 host identity gate：
-name 为 `dsh-myagents-acp`、version 精确为 `0.1.1`，metadata 必须遵守
+name 为 `dsh-myagents-acp`、version 精确等于 checked-in `runtime-contract.json` 的
+`hostVersion`，metadata 必须遵守
 [ADR-0015 §2.2](adr/0015-dsh-acp-only-transport.md)
 的五个 literal key/schema：`deepseek.ai/dsh-myagents-profile` 是与当前
 `DSH_ACP_PROFILE` 一致的
-profile string，`deepseek.ai/dsh-myagents-policy-revision` 是 integer `1`，
+profile string，`deepseek.ai/dsh-myagents-policy-revision` 是 integer，值等于契约
+`policyRevision`，
 `deepseek.ai/dsh-myagents-read-only-tools` 是顺序精确的
-`["read", "glob", "grep"]`，runtime version 为 `0.1.2-alpha.2`，compatibility
-revision 为 integer `2`。权限 options 每次都必须是不同 id 的
+`["read", "glob", "grep"]`，runtime version 等于契约 `dshRoot.version`，compatibility
+revision 等于契约 `compatibilityRevision`。权限 options 每次都必须是不同 id 的
 `allow_once` / `reject_once` 两项；任何 `allow_always` 或结构漂移直接 cancelled。
 源码 launcher 的 argv 定位不依赖 ambient cwd，但 transport 必须在 initialize 前把 DSH
 子进程 cwd 绑定为目标 workspace；同一活跃进程跨 cwd 使用必须 fail-closed。

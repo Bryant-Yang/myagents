@@ -509,7 +509,7 @@
   属性，不执行 CLI、pnpm/build 或真实模型，也不创建或修复 profile/state。它要求
   profile dependencies 包含 `@myagents/dsh-acp-host`、bundle 列表精确等于
   `["@deepseek-ai/dsh-base", "@myagents/dsh-acp-host"]`，解析后的 package 精确为
-  `@myagents/dsh-acp-host@0.1.1`，并声明
+  `@myagents/dsh-acp-host@<contract hostVersion>`，并声明
   `dsh.bundle.patch=./cordis.patch.yml`；entry 与 patch 必须是 canonical、普通、可读，
   通过 no-follow 稳定读取，且 SHA-256 与 checked-in runtime contract 精确一致。
   `MYAGENTS_DSH_SOURCE_ROOT` 只定位官方已构建
@@ -533,14 +533,16 @@
 - **stateful/lifecycle gate**：initialize 必须在任何 new/load/prompt 前同时广告
   `agentCapabilities.loadSession=true` 与对象形状的
   `sessionCapabilities.close`；`agentInfo` 还必须精确声明 name
-  `dsh-myagents-acp`、精确 host version `0.1.1`，以及符合
+  `dsh-myagents-acp`、精确 host version 等于 checked-in contract `hostVersion`，以及符合
   [ADR-0015 §2.2](adr/0015-dsh-acp-only-transport.md)
   的五个 literal `_meta` key：
   `deepseek.ai/dsh-myagents-profile` 字符串必须与当前进程一致，
-  `deepseek.ai/dsh-myagents-policy-revision` 必须是 integer `1`，
+  `deepseek.ai/dsh-myagents-policy-revision` 必须是 integer，值等于 contract
+  `policyRevision`，
   `deepseek.ai/dsh-myagents-read-only-tools` 必须是顺序精确的
-  `["read", "glob", "grep"]`，`deepseek.ai/dsh-runtime-version` 必须为
-  `0.1.2-alpha.2`，`deepseek.ai/dsh-compatibility-revision` 必须是 integer `2`，否则
+  `["read", "glob", "grep"]`，`deepseek.ai/dsh-runtime-version` 必须等于契约
+  `dshRoot.version`，`deepseek.ai/dsh-compatibility-revision` 必须是 integer，值等于
+  契约 `compatibilityRevision`，否则
   进程回收并 block。恢复只用标准
   `session/load`；无 auth 的 load 历史通知直接丢弃，有 auth 时队列上限 64，
   不外泄到当前回复。cancel 有界等待原 prompt，reset/aclose 先有界 close session，
