@@ -5,7 +5,7 @@
   "policyRevision": 1,
   "dshRoot": {
     "name": "@deepseek-ai/dsh-root",
-    "version": "0.1.5-rc.2",
+    "version": "0.1.5-rc.3",
     "sourceCommit": "0a53fb55bea101816fa226bb964ae2bed71c343b",
     "cliEntry": "apps/cli/lib/bin.js",
     "cliEntrySha256": "0ff7f1d72c4e0cbe14001709c81e20a04b70464118a7f78568952988e28f2ac5",
@@ -37,7 +37,7 @@
     "main": "lib/index.js",
     "patch": "cordis.patch.yml",
     "acpSdkBundled": true,
-    "entrySha256": "62dd2bb08164535e3475ddcd3cae6bc2cb9ce71abc64e227ed854995c7ab5874",
+    "entrySha256": "c5705f84e89eebc606cd95877159e11d431cdd12d32534f43510b053472f1fa3",
     "patchSha256": "13c78412265c933454d3bb215f0138d384e36a8c223840b1fa2f3404b1d6083c"
   },
   "publicPackages": {
