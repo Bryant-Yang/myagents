@@ -16,6 +16,7 @@ refresh 与验收 gate 永远算的是同一套东西。
 from __future__ import annotations
 
 import argparse
+import copy
 import difflib
 import importlib.util
 import json
@@ -93,6 +94,27 @@ def _cli_runtime_closure(source_root: Path, entry: Path) -> dict[str, str]:
     return observed
 
 
+def _resolve_installed_cli(raw: str) -> Path:
+    """npm 安装模式的官方 dsh 入口（lib/bin.js）；只被动读取。"""
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        _fail(f"--cli 必须是绝对路径：{candidate}")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        _fail(f"dsh 入口不存在：{candidate}（{exc}）")
+    if not resolved.is_file():
+        _fail(f"dsh 入口不是普通文件：{resolved}")
+    package_root = resolved.parent.parent
+    manifest = check._json_object(
+        package_root / "package.json", "installed dsh package.json")
+    if manifest.get("name") != "@deepseek-ai/dsh":
+        _fail(
+            "入口所属 package 不是官方 @deepseek-ai/dsh："
+            f"{manifest.get('name')!r}（{package_root}）")
+    return resolved
+
+
 def _resolve_source_root(raw: str) -> Path:
     candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
@@ -167,6 +189,29 @@ def _platform_key() -> str:
 def _old_dict(parent: dict, key: str) -> dict:
     value = parent.get(key)
     return value if isinstance(value, dict) else {}
+
+
+def _build_contract_installed(
+    old: dict, cli_entry: Path, bundle_entry: Path | None) -> dict:
+    """npm 安装模式：对齐 dshRoot.version 与 cliEntrySha256。
+
+    可选 --bundle-entry 同时更新 profileBundle.entrySha256（重新构建
+    plugin bundle 后）。源码绑定字段（sourceCommit/cliRuntimeFiles/
+    publicPackages/acpSdk/buildTool）保留原值——installed 模式不消费
+    它们，但它们已代表旧 checkout；下次拿源码树时必须用 --source-root
+    重新对齐后才能跑源码 release gate。
+    """
+    package_root = cli_entry.parent.parent
+    manifest = check._json_object(
+        package_root / "package.json", "installed dsh package.json")
+    new = copy.deepcopy(old)
+    new["dshRoot"]["version"] = manifest.get("version")
+    new["dshRoot"]["cliEntrySha256"] = _sha(
+        cli_entry, "installed DSH CLI entry")
+    if bundle_entry is not None:
+        new["profileBundle"]["entrySha256"] = _sha(
+            bundle_entry, "rebuilt myagents DSH bundle entry")
+    return new
 
 
 def _build_contract(
@@ -313,6 +358,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="重新生成 DSH runtime contract（默认 dry-run）")
     parser.add_argument(
+        "--cli", type=str, default=None,
+        help="npm 安装的官方 dsh 入口（lib/bin.js 绝对路径）；"
+             "installed 模式只更新 dshRoot.version 与 cliEntrySha256")
+    parser.add_argument(
         "--source-root", type=str, default=None,
         help="官方 DSH checkout 绝对路径；缺省读 MYAGENTS_DSH_SOURCE_ROOT")
     parser.add_argument(
@@ -336,9 +385,9 @@ def main() -> None:
             _fail(f"{label} 必须使用绝对路径：{path}")
     raw_source = arguments.source_root or os.environ.get(
         "MYAGENTS_DSH_SOURCE_ROOT")
-    if raw_source is None:
-        _fail("必须提供 --source-root 或环境变量 MYAGENTS_DSH_SOURCE_ROOT")
-    source_root = _resolve_source_root(raw_source)
+    raw_cli = arguments.cli or os.environ.get("MYAGENTS_DSH_CLI")
+    if raw_source and raw_cli:
+        _fail("--source-root 与 --cli 互斥：一次只能对齐一种模式")
     old = check._json_object(arguments.contract, "DSH runtime contract")
 
     bundle_entry = arguments.bundle_entry
@@ -347,6 +396,35 @@ def main() -> None:
             bundle_entry = bundle_entry.resolve(strict=True)
         except (OSError, RuntimeError) as exc:
             _fail(f"bundle entry 不可用：{arguments.bundle_entry}（{exc}）")
+
+    if raw_cli:
+        cli_entry = _resolve_installed_cli(raw_cli)
+        new = _build_contract_installed(old, cli_entry, bundle_entry)
+        diff = _unified_diff(old, new)
+        if not diff:
+            print("✓ 契约已是最新，无需更新")
+            return
+        print(diff, end="")
+        if not arguments.accept:
+            print("（dry-run：未写入。确认后加 --accept）")
+            return
+        tmp_contract = _atomic_write(arguments.contract, _render(new))
+        try:
+            tmp_contract.replace(arguments.contract)
+        except OSError as exc:
+            tmp_contract.unlink(missing_ok=True)
+            _fail(f"写入失败（原文件未动）：{exc}")
+        print(f"✓ 已写入 {arguments.contract}")
+        print(
+            "注意：sourceCommit/cliRuntimeFiles/publicPackages/acpSdk/"
+            "buildTool 仍基于旧源码 checkout，源码 release gate 在用 "
+            "--source-root 重新对齐前不可用。")
+        return
+
+    if raw_source is None:
+        _fail("必须提供 --source-root/--cli 或环境变量 "
+              "MYAGENTS_DSH_SOURCE_ROOT/MYAGENTS_DSH_CLI")
+    source_root = _resolve_source_root(raw_source)
 
     new = _build_contract(
         source_root, old,

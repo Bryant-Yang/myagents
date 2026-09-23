@@ -11,3 +11,4 @@ dist/
 .env
 .env.*
 *.log
+dsh_acp/plugin/lib/

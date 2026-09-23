@@ -12,10 +12,10 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { installModelSelection, type AgentSetup, type ModelSelection } from '@deepseek-ai/dsh-agent'
+import { installModelSelection, type Agent, type AgentSetup, type ModelSelection } from '@deepseek-ai/dsh-agent'
 import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import type { PreToolDecision, ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
-import { effectiveApprovalPolicy, setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
+import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import * as ProductAcp from './acp.ts'
 
 export const name = 'myagents-dsh-acp-host'
@@ -35,6 +35,22 @@ export const HOST_VERSION = __MYAGENTS_HOST_VERSION__
 export const DSH_RUNTIME_VERSION = __MYAGENTS_DSH_RUNTIME_VERSION__
 export const COMPATIBILITY_REVISION = __MYAGENTS_COMPATIBILITY_REVISION__
 export const POLICY_REVISION = __MYAGENTS_POLICY_REVISION__
+
+/**
+ * rc.2 起 user-approval 不再导出 effectiveApprovalPolicy；policy 改为
+ * session 事件流里的 `approval/policy` 事件。复刻其 overrideOf 语义：
+ * 逆序找最近一条 policy 事件，不回退 service 默认值——本 attestation
+ * 只承认 setApprovalPolicy 显式写入的值。
+ */
+export function effectiveApprovalPolicy(
+  session: { seq: number, eventAt(seq: number): { type?: string, data?: { policy?: string } } | undefined },
+): string | undefined {
+  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+    const event = session.eventAt(seq)
+    if (event?.type === 'approval/policy') return event.data?.policy
+  }
+  return undefined
+}
 
 export interface Config {
   profile: Profile
@@ -243,9 +259,9 @@ function isSafeCall(
 }
 
 export function profileSetup(profile: Profile): AgentSetup {
-  return (agentCtx) => {
-    const agent = agentCtx.agent
-    if (agent === undefined) throw new Error('myagents DSH host: agent setup has no owner')
+  // rc.2 起 AgentSetup 显式传入 agent：(agentCtx, agent)。未发布 scope 上
+  // 读 agentCtx.agent 会被 cordis 代理拒绝（without inject）。
+  return (agentCtx: Context, agent: Agent) => {
     const definitions = safeDefinitions(agentCtx)
     setSandboxMode(agent.session, profile)
     setApprovalPolicy(agent.session, profile === 'read-only' ? 'never' : 'ask')
@@ -256,7 +272,10 @@ export function profileSetup(profile: Profile): AgentSetup {
         ? undefined
         : 'read-only profile permits only the built-in read, glob, and grep tools')
     } else {
-      agentCtx.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
+      agentCtx.on('tools/pre-execute', async (
+        exec: ToolExecution,
+        next: () => Promise<PreToolDecision>,
+      ): Promise<PreToolDecision> => {
         const downstream = await next()
         if (downstream.kind !== 'allow' || isSafeCall(agentCtx, definitions, exec)) return downstream
         return { kind: 'ask', reason: `workspace-write profile requires one-shot approval for ${exec.name}` }
@@ -276,7 +295,7 @@ export function profileSetup(profile: Profile): AgentSetup {
           throw new Error(`myagents DSH host: sandbox profile attestation failed: ${profile}`)
         }
         const expectedApproval = profile === 'read-only' ? 'never' : 'ask'
-        if (effectiveApprovalPolicy(agent.session.events) !== expectedApproval) {
+        if (effectiveApprovalPolicy(agent.session) !== expectedApproval) {
           throw new Error(`myagents DSH host: approval profile attestation failed: ${expectedApproval}`)
         }
         if (profile === 'read-only') {
@@ -316,11 +335,16 @@ async function frozenModelSelection(
   return Object.freeze({ ...selection })
 }
 
+/** settings 服务的最小读取面：本 host 只探测 agent-default-model 是否已注册。 */
+interface SettingsService {
+  get(namespace: 'agent-default-model'): object | undefined
+}
+
 async function awaitModelSettingsRegistration(ctx: Context): Promise<void> {
-  const settings = ctx.get('settings') as { get(namespace: never): unknown } | undefined
+  const settings = ctx.get('settings') as SettingsService | undefined
   if (settings === undefined) throw new Error('myagents DSH host: settings service is unavailable')
   for (let attempt = 0; attempt < 16; attempt += 1) {
-    if (settings.get('agent-default-model' as never) !== undefined) return
+    if (settings.get('agent-default-model') !== undefined) return
     await new Promise<void>(resolve => { setImmediate(resolve) })
   }
   throw new Error('myagents DSH host: agent-default-model settings did not become ready')
@@ -356,9 +380,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   ], async (runtimeCtx) => {
     await awaitModelSettingsRegistration(runtimeCtx)
     const selection = await frozenModelSelection(runtimeCtx, explicitSelection)
-    const setup: AgentSetup = (agentCtx) => {
+    const setup: AgentSetup = (agentCtx, agent) => {
       installModelSelection(agentCtx, { current: selection, assembled: undefined })
-      return profileSetup(config.profile)(agentCtx)
+      return profileSetup(config.profile)(agentCtx, agent)
     }
     await runtimeCtx.plugin(ProductAcp, {
       provider: selection.provider,

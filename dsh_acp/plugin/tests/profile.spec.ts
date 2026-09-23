@@ -1,7 +1,7 @@
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import { readFile } from 'node:fs/promises'
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
-import ApprovalService, { effectiveApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
+import ApprovalService from '@deepseek-ai/dsh-user-approval'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   COMPATIBILITY_REVISION,
@@ -75,7 +75,7 @@ describe('myagents-owned DSH ACP profiles', () => {
     expect(harness.ctx.tools.schemas(agent).map((tool) => tool.name).sort())
       .toEqual([...READ_ONLY_TOOLS].sort())
     expect(harness.ctx.get('sandboxPolicy')?.resolve({ session: agent.session }).mode).toBe('read-only')
-    expect(effectiveApprovalPolicy(agent.session.events)).toBe('never')
+    expect(effectiveApprovalPolicy(agent.session)).toBe('never')
 
     let shadowRan = false
     agent.ctx.tools.register(fixture('read', () => {
@@ -104,7 +104,7 @@ describe('myagents-owned DSH ACP profiles', () => {
     const agent = harness.ctx.agents.list()[0]
     if (agent === undefined) throw new Error('profile test created no agent')
     expect(harness.ctx.get('sandboxPolicy')?.resolve({ session: agent.session }).mode).toBe('workspace-write')
-    expect(effectiveApprovalPolicy(agent.session.events)).toBe('ask')
+    expect(effectiveApprovalPolicy(agent.session)).toBe('ask')
     harness.onPermission = () => ({ outcome: { outcome: 'selected', optionId: 'allow-once' } })
 
     const read = await harness.ctx.tools.execute({

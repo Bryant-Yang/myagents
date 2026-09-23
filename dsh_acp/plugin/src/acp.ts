@@ -99,7 +99,9 @@ export interface AcpConfig {
   sessionsRoot?: string
 }
 
-// The runtime-only `stream` seam is intentionally absent from Loader config.
+// SAFETY: runtime-only `stream` seam is intentionally absent from the Loader
+// config schema; the widened AcpConfig type is the product-owned contract and
+// cannot be expressed by Schema.any() members.
 export const Config = Schema.object({
   provider: Schema.string().required(),
   model: Schema.string().required(),
@@ -234,7 +236,7 @@ const MAX_DURABLE_REPLAY_BYTES = 16_777_216
 const MAX_LOADING_LIVE_EVENTS = 256
 const MAX_LOADING_LIVE_BYTES = 1_048_576
 
-function serializedBytes(value: object): number {
+function serializedBytes(value: Record<string, unknown>): number {
   return Buffer.byteLength(JSON.stringify(value), 'utf8')
 }
 
@@ -1090,9 +1092,9 @@ export function apply(ctx: Context, config: AcpConfig): void {
         } catch (error: unknown) {
           throw internalError(errorChain(error))
         }
-        const setup: AgentSetup = async (agentCtx) => {
+        const setup: AgentSetup = async (agentCtx, agent) => {
           const assertResumedCwd = (): void => {
-            if (agentCtx.agent?.session.header.cwd !== params.cwd) {
+            if (agent.session.header.cwd !== params.cwd) {
               throw invalidParams(`cwd does not match resumed session: ${params.cwd}`)
             }
           }
@@ -1100,7 +1102,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
           // factory load. Reject it before trusted product setup observes the
           // wrong workspace, then recheck at the exact publication commit.
           assertResumedCwd()
-          const setupCommit = await config.setup(agentCtx)
+          const setupCommit = await config.setup(agentCtx, agent)
           return {
             commit: () => {
               assertResumedCwd()
